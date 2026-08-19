@@ -1,0 +1,588 @@
+---
+title: "Testing topic usage over the LPS time course"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+Note:
+I previously ran the topic modelling on the following regions:
+IL1B promoter region chr2:112836323-112837385
+TNF promoter region chr6:31575265-31575824
+IL1A upstream intergenic region chr2:112793233-112794969
+PTGS2 promoter chr1:186679985-186681163
+IL8 promoter chr4:73740006-73741332
+CXCL2 promoter chr4:74098863-74099651
+IL6 promoter chr7:22726376-22727094 
+RELB promoter chr19:45001011-45002417
+rs2836882 region chr21:39094468-39094712
+ (this is a region with a SNP thatdisrupts a binding motif and is involved in inflamation. 
+ THP1 should be heterozygous and we should be able to see one allele open and one closed)
+
+ And this returned significant result for 3 topcis for CXCL2, RELB, and IL1A. However, after centering on +/- 1000 bp of the TSS, the results are no longer significant.
+
+
+Purely statistical test of the topic trajectories from
+`1_m6a_promoter_topic_modelling.Rmd`: **does each topic's usage change
+significantly with time?**
+
+Inputs are the per-gene `read_topic_assignments_<outname>.tsv` tables exported
+by notebook 1 (one row per read; `k1..k6` are the topic proportions from the
+binomial `fit$L`; `sample_name` gives the LPS timepoint).
+
+Each gene gets exactly k tests, one per topic: for every gene x topic
+(9 x 6 = 54 tests) the unit of analysis is one read, the response is that
+read's topic proportion, and the predictor is the timepoint treated as
+**categorical** (0 min = reference level):
+
+$$p_i = \beta_0 + \beta_5 I(t_i = 5) + \beta_{10} I(t_i = 10) + \beta_{15} I(t_i = 15) + \epsilon_i$$
+
+- $\beta_0$ = mean loading at 0 min; $\beta_5$, $\beta_{10}$, $\beta_{15}$ =
+  change in mean loading at 5/10/15 min relative to 0 min.
+- The per-topic test is the model F-test: do the timepoint means differ at
+  all? Because time is categorical this does not require the trajectory to be
+  a straight line (a topic that peaks at 5 min and returns to baseline is
+  detected).
+- BH-FDR **within each gene** (across its 6 topics): each gene is treated as
+  its own hypothesis family - "does topic usage change at this gene?" - so a
+  p-value competes only against the other 5 topics of the same gene. Note this
+  does not control false discoveries across the 9 genes jointly.
+
+The read-level test treats reads as independent draws from their timepoint,
+but reads from the same library share culture, prep, and run, so they are
+correlated (pseudoreplication). The **pseudobulk** sections at the end re-run
+the same test at the replicate level: each timepoint was sequenced as 3
+barcoded replicates (R1-R3), reads are aggregated to per-library mean
+proportions (12 libraries = 4 timepoints x 3 replicates), and the error term
+becomes between-replicate variation.
+
+# Settings
+
+Same sample table, regions, and `output_dir` as notebook 1, so the `outname`
+paths resolve to the exported TSVs.
+
+```{r settings}
+options(scipen = 999)
+
+sample_table <- data.frame(
+  sample_name = c("LPS_0", "LPS_5", "LPS_10", "LPS_15"),
+  timepoint   = c(0L, 5L, 10L, 15L)
+)
+
+# original:
+# output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model"
+output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/promoters"
+
+# original (explicit genomic intervals):
+# promoters <- data.frame(
+#   gene  = c("IL1B", "TNF", "IL1A", "PTGS2", "IL8", "CXCL2", "IL6", "RELB", "rs2836882"),
+#   chr   = c("chr2", "chr6", "chr2", "chr1", "chr4", "chr4", "chr7", "chr19", "chr21"),
+#   start = c(112836323, 31575265, 112793233, 186679985, 73740006, 74098863, 22726376, 45001011, 39094468),
+#   end   = c(112837385, 31575824, 112794969, 186681163, 73741332, 74099651, 22727094, 45002417, 39094712)
+# )
+
+# TSS +/- 1000 bp, matching the TSS-centered regions built in
+# 1_m6a_promoter_topic_modelling.Rmd (dominant THP-1 CAGE peak per gene:
+# IL1B/TNF/IL8; GENCODE v49 TSS fallback: IL1A/PTGS2/CXCL2/IL6/RELB).
+# rs2836882 is a SNP locus with no TSS - it keeps its explicit interval.
+promoters <- data.frame(
+  gene  = c("IL1B", "TNF", "IL1A", "PTGS2", "IL8", "CXCL2", "IL6", "RELB", "rs2836882"),
+  chr   = c("chr2", "chr6", "chr2", "chr1", "chr4", "chr4", "chr7", "chr19", "chr21"),
+  start = c(112835779, 31574568, 112783493, 186679922, 73739569, 74098196, 22724884, 45000461, 39094468),
+  end   = c(112837779, 31576568, 112785493, 186681922, 73741569, 74100196, 22726884, 45002461, 39094712)
+)
+```
+
+# Load per-read topic tables
+
+One table per gene from `read_topic_assignments_<outname>.tsv`; `sample_name`
+is mapped to numeric time via `sample_table`.
+
+```{r topic-assignments}
+# check read_topic_assignments_<outname>.tsv files 
+
+topic_assignments <- lapply(seq_len(nrow(promoters)), function(i) {
+  # original:
+  # outname <- paste0(promoters$gene[i], "_", promoters$chr[i], "_",
+  #                   promoters$start[i], "_", promoters$end[i])
+  outname <- promoters$gene[i]
+  file.path(output_dir, outname,
+            paste0("read_topic_assignments_", outname, ".tsv"))
+})
+
+cat(unlist(topic_assignments), sep = "\n")
+
+```
+
+```{r check-files}
+example_file <- topic_assignments[[1]]
+head(read.delim(example_file), n = 3)
+```
+
+                                 RID sample_name  chr     start       end
+1 m84241_260505_182714_s3/103682934/ccs      LPS_15 chr2 112830678 112843009
+2  m84241_260505_182714_s3/13174534/ccs       LPS_5 chr2 112826359 112840099
+3 m84241_260505_182714_s3/135791181/ccs       LPS_5 chr2 112829972 112839548
+  strand  cluster dominant_topic max_loading                k1
+1      - cluster5             k1   0.5705259 0.570525927968593
+2      + cluster2             k6   0.7198507 0.000000009389935
+3      - cluster6             k5   0.6735576 0.222503692486331
+                 k2                k3                k4                k5
+1 0.000000009587537 0.259254589912311 0.163050429693455 0.000000008945988
+2 0.000000009341036 0.000000009331383 0.000000008479193 0.280149259250181
+3 0.000000009336609 0.103938640272882 0.000000008822323 0.673557639145690
+                 k6
+1 0.007169033892115
+2 0.719850704208272
+3 0.000000009936166
+
+
+ IL1B       TNF      IL1A     PTGS2       IL8     CXCL2       IL6      RELB 
+      175       100       192       329       207       215       161       145 
+rs2836882 
+      216 
+
+```{r load-tables}
+per_read_tables <- lapply(seq_len(nrow(promoters)), function(i) {
+  # original:
+  # outname <- paste0(promoters$gene[i], "_", promoters$chr[i], "_",
+  #                   promoters$start[i], "_", promoters$end[i])
+  outname <- promoters$gene[i]
+  df <- read.delim(file.path(output_dir, outname,
+                             paste0("read_topic_assignments_", outname, ".tsv")))
+  df$time <- sample_table$timepoint[match(df$sample_name, sample_table$sample_name)]
+  stopifnot(!any(is.na(df$time)))
+  df
+})
+names(per_read_tables) <- promoters$gene
+
+sapply(per_read_tables, nrow)
+```
+
+# Per-topic linear models of topic proportion vs categorical time
+
+```{r topic-time-lm}
+##################
+# fit linear regression of topic proportion vs categorical time for each gene x topic
+##################
+
+# loops over genes and topics, fit lm(prop ~ time) for each topic's read-level proportions
+
+topic_time_tests <- do.call(rbind, lapply(promoters$gene, function(g) {
+  # pulls out the per-read table for this gene, then loops over its 6 topics
+  df <- per_read_tables[[g]]
+  # identifies the topic columns by regex, then loops over them
+  L_cols <- grep("^k[0-9]+$", colnames(df), value = TRUE)
+
+  # a second loop over the six topic columns within this gene
+  do.call(rbind, lapply(L_cols, function(cl) {
+    # one row per read: topic proportion + categorical time
+    # two columns: prop = topic proportion, time = factor(0/5/10/15)
+    d <- data.frame(prop = df[[cl]],
+                    time = factor(df$time, levels = c(0, 5, 10, 15)))
+    
+    # fit the categorical-time model and extract the coefficients
+    fit <- lm(prop ~ time, data = d)
+    est <- coef(fit)
+    data.frame(gene = g, topic = sub("^k", "topic", cl), n_reads = nrow(d),
+               mean_0min  = est[["(Intercept)"]],
+               beta_5min  = est[["time5"]],
+               beta_10min = est[["time10"]],
+               beta_15min = est[["time15"]],
+               # p_F = does the topic change somewhere across the 4 timepoints? (F-test of the lm)
+               p_F        = anova(fit)$`Pr(>F)`[1])
+  }))
+}))
+
+##################
+# multiple testing correction
+##################
+# BH within each gene: adjust each gene's 6 F-test p-values as one family
+
+## ave() groups by gene, then applies p.adjust() to each gene's p-values
+### apply a function within groups, then return the results in the same positions as the original row
+topic_time_tests$fdr_within_gene <- ave(topic_time_tests$p_F,
+                                        topic_time_tests$gene,
+                                        FUN = function(p) p.adjust(p, method = "BH"))
+
+# verify compositional coupling: within each gene the 0-min means sum to 1
+# across topics, and each timepoint's betas sum to 0 across topics
+stopifnot(all(abs(tapply(topic_time_tests$mean_0min,
+                         topic_time_tests$gene, sum) - 1) < 1e-10))
+for (b in c("beta_5min", "beta_10min", "beta_15min")) {
+  stopifnot(all(abs(tapply(topic_time_tests[[b]],
+                           topic_time_tests$gene, sum)) < 1e-10))
+}
+
+write.table(topic_time_tests, file.path(output_dir, "topic_time_lm_results.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+
+head(topic_time_tests[, c("gene", "topic", "n_reads", "mean_0min",
+                          "beta_5min", "beta_10min", "beta_15min",
+                          "p_F", "fdr_within_gene")], n = 3)
+```
+
+  gene  topic n_reads  mean_0min   beta_5min   beta_10min  beta_15min       p_F
+1 IL1B topic1     175 0.10962695 -0.02813547 -0.044041817  0.01062016 0.3211720
+2 IL1B topic2     175 0.15523414 -0.01584559  0.004705654 -0.03260006 0.8949180
+3 IL1B topic3     175 0.07050958 -0.02343586  0.015932075  0.04110897 0.2963964
+  fdr_within_gene
+1       0.4817580
+2       0.9386838
+3       0.4817580
+
+# Results
+
+All 54 tests sorted by the F-test p-value, then the hits at within-gene FDR < 0.05
+
+
+  gene  topic mean_0min beta_5min beta_10min beta_15min fdr_within_gene
+ CXCL2 topic4    0.1142    0.0739    -0.0415    -0.0453        0.000423
+  RELB topic5    0.1308    0.0149     0.1212     0.2516        0.008786
+  IL1A topic4    0.0702   -0.0133     0.0771     0.0462        0.019013
+
+  
+```{r results}
+print(topic_time_tests[order(topic_time_tests$p_F), ],
+      digits = 3, row.names = FALSE)
+
+cat("\n== significant at within-gene FDR < 0.05 ==\n")
+sig <- topic_time_tests[topic_time_tests$fdr_within_gene < 0.05, ]
+print(sig[order(sig$p_F),
+          c("gene", "topic", "mean_0min", "beta_5min", "beta_10min",
+            "beta_15min", "fdr_within_gene")],
+      digits = 3, row.names = FALSE)
+```
+
+# Plots: raw reads + estimated means, and mean trajectories with 95% CI
+
+Two views of the categorical-time model, per gene (one panel per topic):
+
+1. **Raw reads + estimated mean**: every read's topic proportion, overlaid with the model-estimated mean at each timepoint.
+   Shows how much read-to-read spread sits under each mean.
+2. **Mean trajectory + 95% CI**: the estimated means at 0/5/10/15 min
+   connected, with the model's 95% confidence band
+   (`predict(..., interval = "confidence")`).
+
+Topics significant at within-gene FDR < 0.05 in the read-level test (the
+`sig` table above) are flagged with `***` in their panel title.
+
+Note: the CIs come from the read-level model, so they inherit its assumption
+that reads are independent
+
+
+```{r topic-time-plots, fig.width=9, fig.height=6, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+topic_colors <- c(topic1 = "#E69F00", topic2 = "#56B4E9", topic3 = "#009E73",
+                  topic4 = "#F0E442", topic5 = "#0072B2", topic6 = "#D55E00")
+
+for (g in promoters$gene) {
+  df <- per_read_tables[[g]]
+  L_cols <- grep("^k[0-9]+$", colnames(df), value = TRUE)
+
+  # per-read proportions in long format
+  long <- do.call(rbind, lapply(L_cols, function(cl)
+    data.frame(topic = sub("^k", "topic", cl), time = df$time, prop = df[[cl]])))
+
+  # estimated timepoint means + 95% CI from the categorical-time model
+  nd <- data.frame(time = factor(c(0, 5, 10, 15), levels = c(0, 5, 10, 15)))
+  means <- do.call(rbind, lapply(L_cols, function(cl) {
+    fit <- lm(prop ~ time,
+              data = data.frame(prop = df[[cl]],
+                                time = factor(df$time, levels = c(0, 5, 10, 15))))
+    ci <- predict(fit, nd, interval = "confidence")
+    data.frame(topic = sub("^k", "topic", cl), time = c(0, 5, 10, 15),
+               mean = ci[, "fit"], lwr = ci[, "lwr"], upr = ci[, "upr"])
+  }))
+
+  # label topics significant at within-gene FDR < 0.05 (from `sig`) with ***
+  sig_topics <- sig$topic[sig$gene == g]
+  lab <- function(t) ifelse(t %in% sig_topics, paste0(t, " ***"), t)
+  topic_levels    <- sub("^k", "topic", L_cols)
+  long$topic_lab  <- factor(lab(long$topic),  levels = lab(topic_levels))
+  means$topic_lab <- factor(lab(means$topic), levels = lab(topic_levels))
+
+  # original:
+  # region  <- promoters[promoters$gene == g, ]
+  # outname <- paste0(g, "_", region$chr, "_", region$start, "_", region$end)
+  outname <- g
+
+  # 1. raw reads + estimated mean
+  gg1 <- ggplot() +
+    # plot each read as a point
+    geom_jitter(data = long, aes(time, prop), width = 0.7, height = 0,
+                size = 0.4, alpha = 0.35, color = "grey30") +
+    geom_line(data = means, aes(time, mean, color = topic), linewidth = 0.8) +
+    # point of estimated mean at each timepoint
+    geom_point(data = means, aes(time, mean, color = topic), size = 1.8) +
+    facet_wrap(~ topic_lab) +
+    scale_color_manual(values = topic_colors, guide = "none") +
+    scale_x_continuous(breaks = c(0, 5, 10, 15)) +
+    labs(x = "LPS timepoint (min)", y = "topic proportion",
+         title = paste0(g, " - per-read topic proportions + estimated means")) +
+    theme_classic(base_size = 10) +
+    theme(plot.title = element_text(hjust = 0.5))
+  print(gg1)
+  ggsave(file.path(output_dir, outname,
+                   paste0("topic_reads_mean_", outname, ".pdf")),
+         gg1, width = 9, height = 6)
+
+  # 2. mean trajectory + 95% CI
+  gg2 <- ggplot(means, aes(time, mean, color = topic, fill = topic)) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, color = NA) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.8) +
+    facet_wrap(~ topic_lab) +
+    scale_color_manual(values = topic_colors, guide = "none") +
+    scale_fill_manual(values = topic_colors, guide = "none") +
+    scale_x_continuous(breaks = c(0, 5, 10, 15)) +
+    labs(x = "LPS timepoint (min)", y = "mean topic proportion",
+         title = paste0(g, " - estimated mean trajectory (95% CI)")) +
+    theme_classic(base_size = 10) +
+    theme(plot.title = element_text(hjust = 0.5))
+  print(gg2)
+  ggsave(file.path(output_dir, outname,
+                   paste0("topic_mean_ci_", outname, ".pdf")),
+         gg2, width = 9, height = 6)
+}
+```
+
+# Replicate assignments
+
+Each timepoint's library was sequenced as 3 barcoded replicates (R1-R3). The
+`rid_replicate` maps under
+`<ft_result_dir>/<sample>/extracted_results/replicate_by_chr/` assign every
+read to its replicate. Here every read in the per-gene tables gets its
+replicate label; all reads must be assigned (verified). The genome-wide maps
+are large, so each one is subset to the RIDs we actually use right after
+loading.
+
+```{r replicate-maps}
+ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
+
+# RIDs we need, per chromosome (keeps the genome-wide maps out of memory)
+needed_rids <- lapply(split(promoters$gene, promoters$chr), function(gs)
+  unique(unlist(lapply(per_read_tables[gs], function(df) df$RID))))
+
+# rid -> replicate lookup per (sample, chr), subset to the needed RIDs
+rep_maps <- list()
+for (s in sample_table$sample_name) {
+  for (chr in names(needed_rids)) {
+    f <- file.path(ft_result_dir, s, "extracted_results", "replicate_by_chr",
+                   paste0(s, ".rid_replicate.", chr, ".tsv.gz"))
+    m <- read.delim(f, colClasses = c("character", "character"))
+    m <- m[m$RID %in% needed_rids[[chr]], ]
+    rep_maps[[paste(s, chr, sep = "_")]] <- setNames(m$replicate, m$RID)
+  }
+}
+
+# attach the replicate label to every read
+per_read_tables <- lapply(promoters$gene, function(g) {
+  df  <- per_read_tables[[g]]
+  chr <- promoters$chr[promoters$gene == g]
+  df$replicate <- NA_character_
+  for (s in sample_table$sample_name) {
+    idx <- df$sample_name == s
+    df$replicate[idx] <- unname(rep_maps[[paste(s, chr, sep = "_")]][df$RID[idx]])
+  }
+  stopifnot(!any(is.na(df$replicate)))
+  df
+})
+names(per_read_tables) <- promoters$gene
+
+# reads per timepoint x replicate library, per gene
+for (g in promoters$gene) {
+  cat("=== ", g, " ===\n", sep = "")
+  print(table(time      = per_read_tables[[g]]$time,
+              replicate = per_read_tables[[g]]$replicate))
+}
+
+head(per_read_tables$IL1B[, c("RID", "sample_name", "time", "replicate")], n = 3)
+```
+
+                                    RID sample_name time replicate
+1 m84241_260505_182714_s3/103682934/ccs      LPS_15   15        R2
+2  m84241_260505_182714_s3/13174534/ccs       LPS_5    5        R2
+3 m84241_260505_182714_s3/135791181/ccs       LPS_5    5        R3
+
+# Pseudobulk: aggregate to replicate level
+
+The read-level test above uses read-to-read scatter as its error term, which
+ignores that reads from the same library are correlated. Here each
+(timepoint x replicate) library is collapsed to one observation per topic -
+the **mean topic proportion across its reads** - giving 12 observations per
+gene x topic. The same categorical-time model and F-test are then fit on
+those means, with 3 and 8 degrees of freedom: a timepoint effect now has to
+stand out against between-replicate variation, and must be consistent across
+R1-R3 to be significant. Same within-gene BH as before.
+
+
+```{r pseudobulk}
+pseudobulk_tests <- do.call(rbind, lapply(promoters$gene, function(g) {
+  df <- per_read_tables[[g]]
+  L_cols <- grep("^k[0-9]+$", colnames(df), value = TRUE)
+
+  # one row per (timepoint, replicate) library: mean topic proportions
+  ## aggregate() groups by time and replicate, then takes the mean of each topic column
+  ## for each time x replicate group, calculate the mean of topic proportions across all reads in that library
+  pb <- aggregate(df[, L_cols],
+                  by = list(time = df$time, replicate = df$replicate),
+                  FUN = mean)
+
+  do.call(rbind, lapply(L_cols, function(cl) {
+    d <- data.frame(prop = pb[[cl]],
+                    time = factor(pb$time, levels = c(0, 5, 10, 15)))
+    fit <- lm(prop ~ time, data = d)
+    est <- coef(fit)
+    data.frame(gene = g, topic = sub("^k", "topic", cl),
+               n_libraries = nrow(d),
+               mean_0min  = est[["(Intercept)"]],
+               beta_5min  = est[["time5"]],
+               beta_10min = est[["time10"]],
+               beta_15min = est[["time15"]],
+               p_F        = anova(fit)$`Pr(>F)`[1])
+  }))
+}))
+
+pseudobulk_tests$fdr_within_gene <- ave(pseudobulk_tests$p_F,
+                                        pseudobulk_tests$gene,
+                                        FUN = function(p) p.adjust(p, method = "BH"))
+
+# same compositional coupling holds at the library level
+stopifnot(all(abs(tapply(pseudobulk_tests$mean_0min,
+                         pseudobulk_tests$gene, sum) - 1) < 1e-10))
+for (b in c("beta_5min", "beta_10min", "beta_15min")) {
+  stopifnot(all(abs(tapply(pseudobulk_tests[[b]],
+                           pseudobulk_tests$gene, sum)) < 1e-10))
+}
+
+write.table(pseudobulk_tests,
+            file.path(output_dir, "topic_time_pseudobulk_results.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+head(pseudobulk_tests[, c("gene", "topic", "n_libraries", "mean_0min",
+                          "beta_5min", "beta_10min", "beta_15min",
+                          "p_F", "fdr_within_gene")], n = 3)
+```
+
+
+  gene  topic n_libraries mean_0min    beta_5min  beta_10min  beta_15min
+1 IL1B topic1          12 0.1379681 -0.013478263 -0.01446101 -0.03871273
+2 IL1B topic2          12 0.1528722 -0.072098702 -0.06137230 -0.02076232
+3 IL1B topic3          12 0.1114026 -0.001162152  0.09894804  0.01878489
+         p_F fdr_within_gene
+1 0.87506195       0.9996089
+2 0.08920973       0.3678950
+3 0.19421843       0.3884369
+
+
+# Pseudobulk results
+
+All 54 tests sorted by the F-test p-value, the hits at within-gene
+FDR < 0.05, and a side-by-side of the read-level vs pseudobulk p-values for
+the read-level hits.
+
+ gene  topic mean_0min beta_5min beta_10min beta_15min fdr_within_gene
+  IL8 topic5     0.117   -0.0319     0.0863     0.0211          0.0111
+```{r pseudobulk-results}
+print(pseudobulk_tests[order(pseudobulk_tests$p_F), ],
+      digits = 3, row.names = FALSE)
+
+cat("\n== significant at within-gene FDR < 0.05 ==\n")
+sig_pb <- pseudobulk_tests[pseudobulk_tests$fdr_within_gene < 0.05, ]
+print(sig_pb[order(sig_pb$p_F),
+             c("gene", "topic", "mean_0min", "beta_5min", "beta_10min",
+               "beta_15min", "fdr_within_gene")],
+      digits = 3, row.names = FALSE)
+
+cat("\n== read-level hits: read-level vs pseudobulk ==\n")
+cmp <- merge(sig[, c("gene", "topic", "p_F", "fdr_within_gene")],
+             pseudobulk_tests[, c("gene", "topic", "p_F", "fdr_within_gene")],
+             by = c("gene", "topic"), suffixes = c("_read", "_pseudobulk"))
+print(cmp[order(cmp$p_F_read), ], digits = 3, row.names = FALSE)
+```
+  gene  topic  p_F_read fdr_within_gene_read p_F_pseudobulk
+ CXCL2 topic4 0.0000705             0.000423         0.0302
+  RELB topic5 0.0014644             0.008786         0.0422
+  IL1A topic4 0.0031689             0.019013         0.0174
+ fdr_within_gene_pseudobulk
+                     0.0905
+                     0.1266
+                     0.0523
+
+# IL8 pseudobulk trajectory
+
+Replicate-level view of the one pseudobulk hit. Each panel shows the 12
+library means (one point per timepoint x replicate, shaped by replicate) with
+the pseudobulk model's estimated mean trajectory and its 95% CI - the
+replicate-aware counterpart of the read-level CI plot above. The topic
+significant at within-gene FDR < 0.05 in the pseudobulk test (`sig_pb`) is
+flagged with `***`.
+
+```{r il8-pseudobulk-trajectory, fig.width=9, fig.height=6, message=FALSE, warning=FALSE}
+g  <- "IL8"
+df <- per_read_tables[[g]]
+L_cols <- grep("^k[0-9]+$", colnames(df), value = TRUE)
+
+# per-library mean proportions (same aggregation as the pseudobulk test)
+pb <- aggregate(df[, L_cols],
+                by = list(time = df$time, replicate = df$replicate),
+                FUN = mean)
+
+pb_long <- do.call(rbind, lapply(L_cols, function(cl)
+  data.frame(topic = sub("^k", "topic", cl), time = pb$time,
+             replicate = pb$replicate, prop = pb[[cl]])))
+
+# pseudobulk model means + 95% CI per topic (fit on the 12 library means)
+nd <- data.frame(time = factor(c(0, 5, 10, 15), levels = c(0, 5, 10, 15)))
+means_pb <- do.call(rbind, lapply(L_cols, function(cl) {
+  fit <- lm(prop ~ time,
+            data = data.frame(prop = pb[[cl]],
+                              time = factor(pb$time, levels = c(0, 5, 10, 15))))
+  ci <- predict(fit, nd, interval = "confidence")
+  data.frame(topic = sub("^k", "topic", cl), time = c(0, 5, 10, 15),
+             mean = ci[, "fit"], lwr = ci[, "lwr"], upr = ci[, "upr"])
+}))
+
+# label topics significant at within-gene FDR < 0.05 in the pseudobulk test
+sig_topics <- sig_pb$topic[sig_pb$gene == g]
+lab <- function(t) ifelse(t %in% sig_topics, paste0(t, " ***"), t)
+topic_levels       <- sub("^k", "topic", L_cols)
+pb_long$topic_lab  <- factor(lab(pb_long$topic),  levels = lab(topic_levels))
+means_pb$topic_lab <- factor(lab(means_pb$topic), levels = lab(topic_levels))
+
+# original:
+# region  <- promoters[promoters$gene == g, ]
+# outname <- paste0(g, "_", region$chr, "_", region$start, "_", region$end)
+outname <- g
+
+gg_pb <- ggplot() +
+  geom_ribbon(data = means_pb, aes(time, ymin = lwr, ymax = upr, fill = topic),
+              alpha = 0.2) +
+  geom_line(data = means_pb, aes(time, mean, color = topic), linewidth = 0.8) +
+  geom_point(data = means_pb, aes(time, mean, color = topic), size = 1.8) +
+  geom_point(data = pb_long, aes(time, prop, shape = replicate),
+             size = 1.8, color = "grey20") +
+  facet_wrap(~ topic_lab) +
+  scale_color_manual(values = topic_colors, guide = "none") +
+  scale_fill_manual(values = topic_colors, guide = "none") +
+  scale_x_continuous(breaks = c(0, 5, 10, 15)) +
+  labs(x = "LPS timepoint (min)", y = "mean topic proportion",
+       title = paste0(g, " - pseudobulk trajectory (library means, 95% CI)"),
+       shape = "replicate") +
+  theme_classic(base_size = 10) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+print(gg_pb)
+ggsave(file.path(output_dir, outname,
+                 paste0("topic_pseudobulk_traj_", outname, ".pdf")),
+       gg_pb, width = 9, height = 6)
+```
+

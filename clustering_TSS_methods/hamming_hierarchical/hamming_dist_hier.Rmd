@@ -1,0 +1,361 @@
+---
+title: "Hamming + hierarchical clustering of single molecules at early-response promoters"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Replicates the single-molecule cluster-based phasing of Bellini, Do & Skok
+(2025), "Phasing single-molecule nano-NOMe-seq reveals chromatin state
+heterogeneity in the context of transcription and long-range interactions"
+(bioRxiv 2025.09.08.674887), on THP-1 Fiber-seq m6A instead of nano-NOMe GpC
+methylation. The procedure parameters are the paper's: 50-bp bins; reads
+< 10 bp or with < 10 methylated sites removed; fully methylated /
+unmethylated reads pre-assigned; sliding windows of 60 valid bins with
+>= 20-bin overlap; >= 30 valid bins per read per window; masked Hamming
+distance; average-linkage clustering to t clusters per window; Hungarian
+stitching of adjacent windows; global reassignment of every read to its
+closest stitched profile. See `phasing_functions.r` for the step-by-step
+implementation.
+
+Deviations from the paper (switches in the Settings chunk):
+
+* Data type: Fiber-seq m6A (1 = m6A / accessible, 0 = covered but
+  unmodified, NA = not covered) instead of GpC methylation.
+* Binary 50-bp bins (`binarize_bins`, on): a read's bin value is 1 if the
+  read has any m6A call in the bin, instead of the mean site call.
+  Fractional m6A bins are unimodal near zero, which compresses all masked
+  Hamming distances and collapses the clustering into one cluster plus
+  outliers; binary bins are bimodal like the paper's GpC data.
+* Full-span reads only at the promoters (`full_span_only`, on): the topic
+  model's filter_met_mat row filter, so both analyses cluster the same read
+  set. Not applied at the wide locus (see below).
+* t: the paper predefines t but does not state it for its Pol II analysis
+  (its Sox2 locus analyses used 9 and 7). The promoters use a predefined
+  t = 6; the wide-locus demo instead selects t by average silhouette width
+  (`choose_t()`).
+
+The paper's Pol II analysis clusters single molecules in 2-kb regions centered
+on ChIP-seq-validated, Pol II-bound TSSs and annotates the clusters as Pol II
+states (elongating / active with +1 nucleosome / paused / inactive), ordering
+by a Pol II pausing index. Here the 2-kb regions are the early-response
+promoter windows (TSS +/- 1000 bp, dominant THP-1 CAGE peak or GENCODE v49
+TSS), and the Pol II validation/ordering uses THP-1 RNAPII (phospho-S5)
+ChIP-seq (GSE32324; control and 2 h LPS, 2 reps each) lifted hg19 -> hg38.
+rs2836882 is excluded: its 244-bp interval has at most 5 bins, so no read can
+ever reach the paper's >= 30-valid-bin threshold.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(Matrix)
+library(GenomicRanges)
+library(rtracklayer)
+library(data.table)
+library(Rsamtools)
+library(cowplot)
+library(gplots)
+library(clue)
+```
+
+# Functions
+
+```{r functions}
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_TSS_methods/hamming_hierarchical/phasing_functions.r")
+```
+
+# Settings
+
+```{r settings}
+options(scipen = 999)
+
+sample_table <- tibble::tribble(
+  ~sample_name, ~condition, ~timepoint,
+  "LPS_0",      "LPS",       0L,
+  "LPS_5",      "LPS",       5L,
+  "LPS_10",     "LPS",       10L,
+  "LPS_15",     "LPS",       15L
+)
+sample_names <- sample_table$sample_name[sample_table$condition == "LPS"]
+
+ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
+
+output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Number of clusters for the 2-kb TSS regions: predefined t = 6 (the paper's
+# predefined-t behavior; its Sox2 locus analyses used 9 and 7, its Pol II t is
+# unstated). Data-driven selection (choose_t(), used by the wide demo below)
+# picks t = 2 at every one of these loci.
+t_clusters <- 6
+
+# Optional deviations from the paper, both on for now:
+# - full_span_only: keep only reads covering every m6A site in the region
+#   (filter_met_mat's row filter - the topic model's read set). Applied to
+#   the 2-kb promoters only; at the 20-kb wide locus it would discard nearly
+#   every read and defeat the stitching demo.
+# - binarize_bins: a read's 50-bp bin value is 1 if the read has any m6A call
+#   in the bin (instead of the mean site call), making bins bimodal like the
+#   paper's GpC data.
+# - use_polII_chip: quantify the GSE32324 RNAPII ChIP and order genes by
+#   pausing index, as the paper does. Off for now; with it off the ChIP table
+#   is never read and no PI ordering is applied.
+full_span_only <- TRUE
+binarize_bins  <- TRUE
+use_polII_chip <- FALSE
+
+set.seed(123)
+```
+
+# Promoter regions
+
+TSS +/- 1000 bp (2 kb, the paper's Pol II-analysis geometry). The table is
+built from the GENCODE v49 annotation by `make_promoter_table.R`: TSS =
+strand-aware gene 5' end on the primary chromosomes (IL8 = CXCL8 in GENCODE),
+plus the gene span used for the ChIP pausing-index gene bodies.
+
+```{bash make-regions, eval=FALSE}
+/software/R-4.4.1-el8-x86_64/bin/Rscript \
+  /project/spott/cshan/fiber-seq/code/clustering_TSS_methods/hamming_hierarchical/make_promoter_table.R
+```
+
+```{r regions}
+promoters <- read.delim(file.path(output_dir, "promoter_regions_gencode_v49.tsv"))
+promoters
+```
+
+# PolII ChIP-seq: lifted read counts and pausing index
+
+`quantify_polII_chip.R` lifts the GSE32324 hg19 read coordinates to hg38
+(conservative liftOver, as in `liftover_tracks.R`) and counts overlaps with
+the promoter (TSS +/- 1 kb), pause (TSS -50..+300, strand-aware) and gene-body
+(TSS +300..TES) windows; pausing index PI = pause density / body density.
+
+```{bash chip-quantify, eval=FALSE}
+<!-- /software/R-4.4.1-el8-x86_64/bin/Rscript \ -->
+<!--   /project/spott/cshan/fiber-seq/code/clustering_TSS_methods/hamming_hierarchical/quantify_polII_chip.R -->
+
+
+<!-- sbatch /project/spott/cshan/fiber-seq/code/clustering_TSS_methods/hamming_hierarchical/run_quantify_polII_chip.sh -->
+
+```
+
+Genes are ordered by LPS PI, mirroring the paper's PI-based
+ordering/annotation of the Pol II heatmaps. `use_polII_chip`
+(currently `FALSE`), so by default this section is skipped 
+
+```{r chip-pausing-index}
+# chip_counts_file <- file.path(output_dir, "PolII_chip_tss_counts.tsv")
+# 
+# if (!use_polII_chip) {
+#   cat("use_polII_chip = FALSE; skipping the PolII ChIP table and the PI ordering.\n")
+#   chip_table <- NULL
+# } else if (!file.exists(chip_counts_file)) {
+#   cat("PolII_chip_tss_counts.tsv missing - run quantify_polII_chip.R first; skipping ChIP table.\n")
+#   chip_table <- NULL
+# } else {
+#   chip_counts <- read.delim(chip_counts_file)
+#   chip_table <- chip_counts %>%
+#     dplyr::mutate(condition = sub("_rep[12]$", "", sample)) %>%
+#     dplyr::group_by(gene, condition) %>%
+#     dplyr::summarise(promoter_rpm_per_kb = mean(promoter_rpm_per_kb),
+#                      PI = mean(PI), .groups = "drop") %>%
+#     tidyr::pivot_wider(names_from = condition,
+#                        values_from = c(promoter_rpm_per_kb, PI)) %>%
+#     dplyr::arrange(dplyr::desc(PI_LPS))
+# 
+#   write.table(chip_table, file.path(output_dir, "PolII_chip_pausing_index.tsv"),
+#               sep = "\t", quote = FALSE, row.names = FALSE)
+#   chip_table
+# }
+```
+
+# m6A read x position matrix per promoter
+
+Pooled across the four LPS timepoints, tagging each read with its sample of
+origin (as in the topic-model notebook); m6A only. `get_sparse_met_mat()`
+gives 1 = m6A call, 0 = covered/unmodified, NA = not covered. The full-span
+filter and the bin binarization happen downstream inside `phase_reads()`, so
+the site-level matrix assembled here keeps every read and the raw calls.
+
+```{r assemble-function}
+assemble_region_m6a <- function(sample_names, region_chr, region_start, region_end,
+                                ft_result_dir, verbose = TRUE) {
+  region_gr <- GRanges(region_chr, IRanges(region_start, region_end))
+  reads_list <- lapply(sample_names, function(sample_name) {
+    extracted_file <- file.path(
+      ft_result_dir, sample_name, "extracted_results", "m6a_by_chr",
+      paste0(sample_name, ".ft_extracted_m6a.", region_chr, ".bed.gz"))
+    sample_reads <- extract_ft_region_reads(extracted_file, region_gr,
+                                            keep_pos_in_region_only = TRUE,
+                                            verbose = verbose)
+    if (nrow(sample_reads) == 0) return(NULL)
+    dplyr::mutate(sample_reads, sample_name = sample_name, .before = 1)
+  })
+  reads <- dplyr::bind_rows(reads_list)
+  if (nrow(reads) == 0) stop("no reads in region")
+  rids_df <- extract_ft_read_info(reads, keep_columns = c("sample_name", "score"))
+  met_mat <- get_sparse_met_mat(reads, rids_df,
+                                window_start = region_start,
+                                window_end = region_end, base = "A")
+  list(reads = reads, rids_df = rids_df, met_mat = met_mat)
+}
+```
+
+# Phasing at each promoter
+
+Per gene: `phase_reads()` with predefined t = 6, the full-span read filter
+(reads not covering every m6A site in the 2-kb window are dropped, matching
+the topic model's read set) and binary 50-bp bins. A 2-kb promoter has ~40
+valid bins, i.e. a single window, so clustering here is one average-linkage
+cut with no stitching. Outputs per gene: the phasing object (.rds), per-read
+cluster assignments, global cluster profiles and site coverage (.tsv), and
+five plots - 50-bp-bin heatmap, m6A-site heatmap, cluster profiles, cluster
+composition by timepoint, and per-cluster m6A methylation proportion at each
+site (`cluster_met_profiles`, the topic model's plot of the same name, so the
+two clusterings can be compared panel for panel). Heatmap rows are grouped by
+final cluster (side colors) and ordered by read start within cluster.
+
+```{r phase-promoters, fig.width=8, fig.height=8}
+phase_results <- list()
+for (i in seq_len(nrow(promoters))) {
+  gene <- promoters$gene[i]
+  cat("\n=====", gene, "=====\n")
+  gene_dir <- file.path(output_dir, gene)
+  if (!dir.exists(gene_dir)) dir.create(gene_dir, recursive = TRUE)
+
+  dat <- assemble_region_m6a(sample_names, promoters$chr[i],
+                             promoters$start[i], promoters$end[i],
+                             ft_result_dir, verbose = FALSE)
+  cat(gene, ": ", nrow(dat$rids_df), " reads x ", ncol(dat$met_mat), " m6A sites\n", sep = "")
+
+  res <- phase_reads(dat$met_mat, dat$rids_df, t = t_clusters,
+                     full_span_only = full_span_only,
+                     binarize_bins = binarize_bins)
+  res$assignments$sample_name <- factor(res$assignments$sample_name,
+                                        levels = sample_names)
+  phase_results[[gene]] <- res
+
+  saveRDS(res, file.path(gene_dir, paste0("phasing_", gene, ".rds")))
+  write.table(res$assignments,
+              file.path(gene_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(data.frame(cluster = rownames(res$profiles),
+                         res$profiles, check.names = FALSE),
+              file.path(gene_dir, paste0("global_cluster_profiles_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(res$site_cov,
+              file.path(gene_dir, paste0("site_coverage_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  pdf(file.path(gene_dir, paste0("bin_heatmap_", gene, ".pdf")), width = 8, height = 8)
+  plot_phasing_bin_heatmap(res, zmax = if (binarize_bins) 1 else 0.5,
+                           main = paste0(gene, " (50-bp bins)"))
+  dev.off()
+
+  pdf(file.path(gene_dir, paste0("site_heatmap_", gene, ".pdf")), width = 8, height = 8)
+  plot_phasing_site_heatmap(res, dat$met_mat, main = paste0(gene, " (m6A sites)"))
+  dev.off()
+
+  gg <- plot_global_profiles(res, tss = promoters$tss[i], main = gene)
+  ggsave(file.path(gene_dir, paste0("global_profiles_", gene, ".pdf")), gg,
+         width = 7, height = 1.4 * nrow(res$profiles) + 1)
+
+  gg <- plot_cluster_composition(res, main = gene)
+  ggsave(file.path(gene_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
+         width = 6, height = 4)
+
+  gg <- plot_cluster_met_profiles(res, dat$met_mat, tss = promoters$tss[i],
+                                  main = gene)
+  n_panels <- length(unique(res$assignments$final_cluster[
+    grepl("^cluster|^fully", res$assignments$final_cluster)]))
+  ggsave(file.path(gene_dir, paste0("cluster_met_profiles_", gene, ".pdf")), gg,
+         width = 6, height = 1.4 * n_panels + 1)
+}
+```
+
+# Cluster sizes across genes
+
+Reads per final cluster and gene (t = 6 everywhere; `removed_*` columns
+count reads that failed the informative-read filters; reads dropped by the
+full-span filter are not in the table, as in the topic model).
+
+```{r cluster-summary}
+cluster_summary <- dplyr::bind_rows(lapply(names(phase_results), function(g) {
+  df <- phase_results[[g]]$assignments
+  df %>% dplyr::count(final_cluster) %>% dplyr::mutate(gene = g, .before = 1)
+}))
+write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cluster_summary %>% tidyr::pivot_wider(names_from = final_cluster, values_from = n)
+```
+
+# Wide-locus demo: IL1B TSS +/- 10 kb
+
+A 2-kb promoter gives at most ~40 valid bins, i.e. a single window, so the
+sliding-window + Hungarian machinery degenerates. This 20-kb locus (~400
+bins, 10 overlapping windows) exercises the full stitching procedure.
+Unlike the promoter analysis it keeps partial reads - no full-span filter,
+since partial reads are what the stitching machinery is for, and requiring
+~10-kb HiFi reads to span 20 kb would discard nearly all of them - and t is
+selected by silhouette (`choose_t()`, currently t = 2). Binary bins are used
+as in the promoter analysis. The chunk also runs the paper's held-out
+long-read validation (>= 50 kb reads; with HiFi Fiber-seq read lengths the
+expected report is "not applicable").
+
+```{r wide-demo, fig.width=10, fig.height=8}
+# wide_i <- match("IL1B", promoters$gene)
+# wide <- list(gene = "IL1B", chr = promoters$chr[wide_i],
+#              start = promoters$tss[wide_i] - 10000,
+#              end   = promoters$tss[wide_i] + 10000,
+#              tss   = promoters$tss[wide_i])
+# wide_dir <- file.path(output_dir, "IL1B_wide_20kb")
+# if (!dir.exists(wide_dir)) dir.create(wide_dir, recursive = TRUE)
+# 
+# dat_wide <- assemble_region_m6a(sample_names, wide$chr, wide$start, wide$end,
+#                                 ft_result_dir, verbose = FALSE)
+# cat("IL1B wide: ", nrow(dat_wide$rids_df), " reads x ",
+#     ncol(dat_wide$met_mat), " m6A sites\n", sep = "")
+# 
+# res_wide <- phase_reads(dat_wide$met_mat, dat_wide$rids_df,
+#                         binarize_bins = binarize_bins)
+# res_wide$assignments$sample_name <- factor(res_wide$assignments$sample_name,
+#                                            levels = sample_names)
+# cat("windows clustered:", length(res_wide$win_res), "\n")
+# 
+# saveRDS(res_wide, file.path(wide_dir, "phasing_IL1B_wide.rds"))
+# write.table(res_wide$assignments,
+#             file.path(wide_dir, "read_cluster_assignments_IL1B_wide.tsv"),
+#             sep = "\t", quote = FALSE, row.names = FALSE)
+# 
+# pdf(file.path(wide_dir, "bin_heatmap_IL1B_wide.pdf"), width = 10, height = 8)
+# plot_phasing_bin_heatmap(res_wide, zmax = if (binarize_bins) 1 else 0.5,
+#                          main = "IL1B TSS +/- 10 kb (50-bp bins)")
+# dev.off()
+# 
+# gg <- plot_global_profiles(res_wide, tss = wide$tss, main = "IL1B TSS +/- 10 kb")
+# ggsave(file.path(wide_dir, "global_profiles_IL1B_wide.pdf"), gg,
+#        width = 10, height = 1.4 * nrow(res_wide$profiles) + 1)
+# 
+# # held-out long-read validation (paper: reads >= 50 kb)
+# holdout <- holdout_long_read_accuracy(dat_wide$met_mat, dat_wide$rids_df,
+#                                       binarize_bins = binarize_bins)
+# if (!is.null(holdout)) {
+#   write.table(holdout, file.path(wide_dir, "holdout_long_read_accuracy.tsv"),
+#               sep = "\t", quote = FALSE, row.names = FALSE)
+#   cat("mean held-out long-read accuracy:", mean(holdout$accuracy), "\n")
+# }
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

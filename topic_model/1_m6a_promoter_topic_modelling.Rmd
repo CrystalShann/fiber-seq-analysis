@@ -1,0 +1,1239 @@
+---
+title: "Topic modelling on promoters"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(Matrix)
+library(GenomicRanges)
+library(rtracklayer)
+library(data.table)
+library(Rsamtools)
+library(cowplot)
+library(fastTopics)
+library(NNLM)
+library(gplots)
+library(DescTools)   
+library(vegan)       
+library(stringr)
+library(cowplot)
+```
+
+# Functions
+
+All functions adapted from Kevin Luo's `process_fiberseq_data.R` and
+`topic_model_utils.R`.
+
+```{r functions}
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+```
+
+# Settings
+
+```{r settings}
+options(scipen = 999)
+
+# Sample metadata, defined inline (was: macrophage_FIRE/extract/sample/sample_table.csv).
+# `sample_name` = which sample/file each read comes from; `timepoint` = LPS time (min).
+# assemble_region_met_data() tags every pooled read with `sample_name`, so joining
+# sample_name -> timepoint labels each read's origin for grouping after topic modelling.
+# Add the untreated R replicates as more rows once their BAMs are extracted.
+sample_table <- tibble::tribble(
+  ~sample_name, ~condition, ~timepoint,
+  "LPS_0",      "LPS",       0L,
+  "LPS_5",      "LPS",       5L,
+  "LPS_10",     "LPS",       10L,
+  "LPS_15",     "LPS",       15L
+)
+sample_names <- sample_table$sample_name[sample_table$condition == "LPS"]
+
+# original:
+# ft_result_dir <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
+
+# original:
+# output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model"
+output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/promoters"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+ncore <- 4
+n_topics <- 6
+topic_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00",
+                  "#CC79A7", "#999999")
+
+# palette for read clusters (from Kevin Luo's plots.R)
+colors_25 <- c(
+  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00",
+  "black", "gold1", "skyblue2", "#FB9A99", "palegreen2",
+  "#CAB2D6", "#FDBF6F", "gray70", "khaki2", "maroon",
+  "orchid1", "deeppink1", "blue1", "steelblue4", "darkturquoise",
+  "green1", "yellow4", "yellow3", "darkorange4", "brown"
+)
+
+set.seed(123)
+```
+
+# m6A + CpG extraction from BAMs
+
+The topic model clusters reads by their per-read m6A pattern, so for every sample
+it needs that sample's m6A (and CpG) calls extracted from the BAM and split into
+one tabix-indexed bed per chromosome - the layout `assemble_region_met_data()`
+reads:
+`<ft_result_dir>/<sample>/extracted_results/{m6a,cpg}_by_chr/<sample>.ft_extracted_{m6a,cpg}.<chr>.bed.gz`.
+
+`ft extract` reads each read's alignment span from the BAM, so a position a read
+covers but is unmethylated at is scored `0` (protected), not `NA` (missing) - the
+reason we use `ft extract` here rather than the FiberHMM `recalled_*` beds, which
+store only each modification's call-span.
+
+
+# Promoter regions
+
+Inflammation-related genes (THP-1). Each region is TSS +/- 1000 bp. The TSS is
+the dominant THP-1 CAGE peak per gene; genes without a CAGE peak (IL1A, PTGS2,
+CXCL2, IL6, RELB) fall back to the GENCODE v49 annotated TSS. Both BEDs are
+keyed on Ensembl gene IDs, so gene symbols are mapped explicitly (IL8 = CXCL8
+in GENCODE). `rs2836882` is a motif-disrupting, inflammation-associated SNP
+locus expected to be heterozygous in THP-1 - one allele open, one closed; it
+has no TSS, so it keeps its original explicit interval.
+
+```{r regions}
+# original explicit genomic intervals:
+# promoters <- tibble::tribble(
+#   ~gene,        ~chr,     ~start,      ~end,
+#   "IL1B",       "chr2",   112836323,   112837385,
+#   "TNF",        "chr6",   31575265,    31575824,
+#   "IL1A",       "chr2",   112793233,   112794969,
+#   "PTGS2",      "chr1",   186679985,   186681163,
+#   "IL8",        "chr4",   73740006,    73741332,
+#   "CXCL2",      "chr4",   74098863,    74099651,
+#   "IL6",        "chr7",   22726376,    22727094,
+#   "RELB",       "chr19",  45001011,    45002417,
+#   "rs2836882",  "chr21",  39094468,    39094712
+# )
+
+cage_tss_file    <- "/project/spott/cshan/fiber-seq/macrophage_project/annotations/fantom5_thp1/THP1.consensus.CAGE_peaks.dominantPerGene.bed.gz"
+gencode_tss_file <- "/project/spott/cshan/annotations/TSS.gencode.v49.bed"
+tss_flank <- 1000
+
+# gene symbol -> Ensembl gene ID (both TSS BEDs are keyed on ENSG; IL8 = CXCL8)
+genes <- tibble::tribble(
+  ~gene,    ~gene_id,
+  "IL1B",   "ENSG00000125538",
+  "TNF",    "ENSG00000232810",
+  "IL1A",   "ENSG00000115008",
+  "PTGS2",  "ENSG00000073756",
+  "IL8",    "ENSG00000169429",
+  "CXCL2",  "ENSG00000081041",
+  "IL6",    "ENSG00000136244",
+  "RELB",   "ENSG00000104856"
+)
+
+# both BEDs are single-base features (end = 1-based TSS position), one row per
+# gene; strip the ENSG version suffix so the two sources match
+read_tss_bed <- function(file) {
+  data.table::fread(file, header = FALSE, select = c(1, 3, 4),
+                    col.names = c("chr", "tss", "gene_id")) %>%
+    dplyr::mutate(gene_id = sub("\\..*$", "", gene_id))
+}
+
+cage_tss    <- read_tss_bed(cage_tss_file)
+gencode_tss <- read_tss_bed(gencode_tss_file)
+
+promoters <- genes %>%
+  dplyr::left_join(cage_tss,    by = "gene_id") %>%
+  dplyr::left_join(gencode_tss, by = "gene_id", suffix = c("_cage", "_gencode")) %>%
+  dplyr::mutate(
+    tss_source = ifelse(!is.na(tss_cage), "CAGE", "gencode"),
+    chr        = dplyr::coalesce(chr_cage, chr_gencode),
+    tss        = dplyr::coalesce(tss_cage, tss_gencode),
+    start      = tss - tss_flank,
+    end        = tss + tss_flank
+  ) %>%
+  dplyr::select(gene, chr, start, end, tss, tss_source)
+stopifnot(!any(is.na(promoters$tss)))
+
+# rs2836882 is a SNP locus, not a gene - no TSS; keep its explicit interval
+promoters <- dplyr::bind_rows(
+  promoters,
+  tibble::tibble(gene = "rs2836882", chr = "chr21", start = 39094468L,
+                 end = 39094712L, tss = NA_integer_, tss_source = "manual")
+)
+
+# save the resolved regions alongside the per-gene outputs
+write.table(promoters, file.path(output_dir, "promoter_table"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+promoters
+```
+
+# Per-region m6A topic modelling
+
+The m6A methylation flow (assemble -> filter -> fit -> plot -> cluster) is wrapped in `process_region_m6a()` and run once per region in the loop below.
+Per-region outputs (RDS fits + PDFs) are written under `output_dir/<outname>/`, where `outname = <gene>` (one folder per gene).
+
+
+`assemble_region_met_data(sample_names, ...)`: it loops over `sample_names` (the LPS timepoints), tags every read with its `sample_name`,
+and `rbind`s them into one pooled `metA_mat` fit by a single topic model - so the four timepoints are **jointly** modelled, not per-timepoint. Each pooled read's origin is `rids_df_filtered$sample_name`; join it to `sample_table` for the timepoint (e.g.`sample_table$timepoint[match(rids_df_filtered$sample_name, sample_table$sample_name)]`) to group reads by origin after topic modelling.
+
+```{r process-region-fn}
+process_region_m6a <- function(gene) {
+  region <- promoters %>% dplyr::filter(gene == !!gene)
+  region_chr <- region$chr
+  region_start <- region$start
+  region_end <- region$end
+  # original:
+  # outname <- paste0(gene, "_", region_chr, "_", region_start, "_", region_end)
+  outname <- gene
+  cat("=== ", gene, ": ", region_chr, ":", region_start, "-", region_end, " ===\n", sep = "")
+
+  dir.create(file.path(output_dir, outname), showWarnings = FALSE, recursive = TRUE)
+
+  ## Assemble m6A data
+  region_data <- assemble_region_met_data(sample_names, region_chr, region_start, region_end,
+                                          ft_result_dir = ft_result_dir,
+                                          verbose = TRUE)
+  saveRDS(region_data, file = file.path(output_dir, outname, paste0("region_met_data_", outname, ".rds")))
+  print(summary(region_data))
+
+  ## Filter the m6A matrix
+  metA_mat <- region_data$metA_mat
+  cat("Dimensions of the metA matrix:", nrow(metA_mat), "x", ncol(metA_mat), "\n")
+  metA_mat <- filter_met_mat(metA_mat, verbose = TRUE)
+  cat("Dimensions of the metA matrix after filtering:", nrow(metA_mat), "x", ncol(metA_mat), "\n")
+  keep_idx <- match(rownames(metA_mat), region_data$rids_df$RID)
+  rids_df_filtered <- region_data$rids_df[keep_idx, ]
+
+  ## Fit topic models
+  ## The multinomial fit is generated and saved for reference only - everything
+  ## downstream (plots, clustering, exports) uses the binomial fit.
+  fit_multinom_metA <- fit_topic_model(metA_mat, k = n_topics)
+  fit_binom_metA    <- fit_binomial_topic_model(metA_mat, k = n_topics, numem = 100)
+  saveRDS(fit_multinom_metA, file = file.path(output_dir, outname, paste0("fit_multinom_metA_", outname, ".rds")))
+  saveRDS(fit_binom_metA,    file = file.path(output_dir, outname, paste0("fit_binom_metA_",    outname, ".rds")))
+
+  ## Plot topic model
+  gg_binom <- plot_topic_model_result(
+    fit_binom_metA,
+    grouping = rids_df_filtered$sample_name,
+    region = list(start = region_start, end = region_end),
+    topic_colors = topic_colors,
+    color_by = "topic",
+    plot = "all",
+    title = paste0(gene, " (binomial, m6A)")
+  )
+  print(gg_binom)
+  ggsave(file.path(output_dir, outname, paste0("topic_model_binom_", outname, ".pdf")),
+         gg_binom, width = 8, height = 8)
+
+  ## Compare numbers of topics (k = 2-8)
+  k_values <- 2:8
+  gg_k_list <- lapply(k_values, function(k) {
+    set.seed(123)
+    fit_k <- fit_binomial_topic_model(metA_mat, k = k, numem = 100)
+    structure_plot(fit_k$L, colors = topic_colors[1:k], topics = 1:k, gap = 5,
+                   grouping = rids_df_filtered$sample_name) +
+      theme_cowplot(font_size = 10) +
+      ggtitle(paste0(gene, " (binomial, m6A), k = ", k)) +
+      theme(plot.title = element_text(hjust = 0.5),
+            axis.text.x  = element_blank(),
+            axis.ticks.x = element_blank(),
+            axis.title.x = element_blank())
+  })
+  gg_k_compare <- cowplot::plot_grid(plotlist = gg_k_list, ncol = 1)
+  print(gg_k_compare)
+  ggsave(file.path(output_dir, outname, paste0("topic_model_k_comparison_", outname, ".pdf")),
+         gg_k_compare, width = 8, height = 14)
+
+  ## Cluster reads by topic proportions (k = n_topics)
+  fit <- fit_binom_metA   # use the k = n_topics fit for clustering
+  set.seed(1)
+  pca <- prcomp(fit$L)$x
+  clusters <- kmeans(pca, centers = n_topics, iter.max = 100)$cluster
+  clusters <- factor(clusters)
+  levels(clusters) <- paste0("cluster", 1:n_topics)
+  rids_df_filtered$cluster <- clusters
+  cluster_colors <- colors_25[1:length(levels(clusters))]
+  rids_df_filtered$cluster_color <- factor(rids_df_filtered$cluster)
+  levels(rids_df_filtered$cluster_color) <- cluster_colors
+
+  ## Structure plot grouped by cluster
+  ## fastTopics' structure_plot()/pca_plot() only accept poisson_nmf_fit and
+  ## multinom_topic_model_fit objects, so pass the loadings matrix directly (as the
+  ## k-comparison block above does) and draw the PCA plot from `pca` by hand.
+  gg_cluster_structure <- structure_plot(fit$L, topics = 1:n_topics, colors = topic_colors, gap = 5,
+                                         grouping = clusters)
+  print(gg_cluster_structure)
+  ggsave(file.path(output_dir, outname, paste0("cluster_structure_", outname, ".pdf")),
+         gg_cluster_structure, width = 8, height = 3)
+
+  ## PCA plot colored by cluster
+  gg_cluster_pca <- ggplot(data.frame(PC1 = pca[, 1], PC2 = pca[, 2], cluster = clusters),
+                           aes(x = PC1, y = PC2, fill = cluster)) +
+    geom_point(shape = 21, size = 2, stroke = 0.2) +
+    scale_fill_manual(values = cluster_colors) +
+    ggtitle(paste0(gene, " (binomial, m6A)")) +
+    theme_cowplot(font_size = 10) +
+    theme(plot.title = element_text(hjust = 0.5))
+  print(gg_cluster_pca)
+  ggsave(file.path(output_dir, outname, paste0("cluster_pca_", outname, ".pdf")),
+         gg_cluster_pca, width = 5, height = 5)
+
+  ## Heatmap of the m6A matrix ordered by cluster
+  rows_idx <- order(clusters)
+  metA_mat_clustered <- as.matrix(metA_mat)[rows_idx, ]
+  rownames(metA_mat_clustered) <- paste0(rids_df_filtered$cluster, ".",
+                                         rids_df_filtered$sample_name)[rows_idx]
+  sample_colors <- as.character(rids_df_filtered$cluster_color[rows_idx])
+  draw_cluster_heatmap <- function() {
+    par(oma = c(1, 1, 1, 3))
+    par(mar = c(5, 4, 4, 2))
+    gplots::heatmap.2(x = metA_mat_clustered, Rowv = FALSE, Colv = FALSE,
+                      dendrogram = "none", scale = "none", col = c("darkgray", "blue"),
+                      RowSideColors = sample_colors,
+                      margins = c(3, 4),
+                      trace = "none", keysize = 0.5, key = FALSE)
+  }
+  draw_cluster_heatmap()
+  pdf(file.path(output_dir, outname, paste0("cluster_heatmap_", outname, ".pdf")),
+      width = 10, height = 8)
+  draw_cluster_heatmap()
+  dev.off()
+
+  ## Average m6A methylation proportion per cluster
+  stopifnot(identical(rownames(metA_mat), as.character(rids_df_filtered$RID)))
+  met_pos <- as.numeric(sub("^A_", "", colnames(metA_mat)))
+  p_list <- lapply(seq_along(levels(rids_df_filtered$cluster)), function(i) {
+    cl  <- levels(rids_df_filtered$cluster)[i]
+    idx <- which(rids_df_filtered$cluster == cl)
+    df  <- data.frame(pos = met_pos,
+                      met = Matrix::colMeans(metA_mat[idx, , drop = FALSE]))
+    ggplot(df, aes(x = pos, y = met)) +
+      geom_col(fill = cluster_colors[i]) +
+      ylab("met prop.") + xlab("pos") + ggtitle(cl) +
+      theme_cowplot(font_size = 10) +
+      theme(plot.title = element_text(hjust = 0.5))
+  })
+  gg_met_profiles <- cowplot::plot_grid(plotlist = p_list, ncol = 1)
+  print(gg_met_profiles)
+  ggsave(file.path(output_dir, outname, paste0("cluster_met_profiles_", outname, ".pdf")),
+         gg_met_profiles, width = 6, height = 10)
+
+  invisible(NULL)
+}
+```
+
+
+# examine the methylation matrix
+
+the original matrix (X) is approximated using two smaller matrices (X = L x F)
+- X: reads x genomic positions
+- L: reads x topics
+- F: genomic positions x topics
+
+
+
+**L**: loadings - which topics each read is made of = how much each read belongs to each topic
+
+         Topic 1   Topic 2   Topic 3
+read1      0.80      0.15      0.05
+read2      0.10      0.75      0.15
+read3      0.20      0.20      0.60
+read4      0.45      0.40      0.15
+
+
+**F**: what each topic looks like across genomic positions = topic specific probabilities of observing m6A
+ - biological pattern represented by each topic
+
+```{r examine-outputs}
+# original:
+# ex_metA_rds <- read_rds("/project/spott/cshan/fiber-seq/macrophage_project/topic_model/CXCL2_chr4_74098863_74099651/fit_binom_metA_CXCL2_chr4_74098863_74099651.rds")
+ex_metA_rds <- read_rds(file.path(output_dir, "CXCL2", "fit_binom_metA_CXCL2.rds"))
+
+# original:
+# ex_region_rds <- read_rds("/project/spott/cshan/fiber-seq/macrophage_project/topic_model/CXCL2_chr4_74098863_74099651/region_met_data_CXCL2_chr4_74098863_74099651.rds")
+ex_region_rds <- read_rds(file.path(output_dir, "CXCL2", "region_met_data_CXCL2.rds"))
+```
+
+region: all extracted methylation data for the region, pooled across 4 LPS timepoints before any modelling - read each sample's extracted results for the region, tags every read with its sample with its sample name, and binds them into one pooled dataset
+```{r region-rds}
+ex_region_rds[["reads"]]
+```
+
+
+```{r metA-rds}
+head(as.data.frame(ex_metA_rds[["F"]]))
+
+head(as.data.frame(ex_metA_rds[["L"]]))
+```
+
+Run the full flow for every region. Inline figures all share this chunk's
+`fig.*` size; the per-plot dimensions are preserved in the saved PDFs.
+
+```{r process-all-regions, fig.width=10, fig.height=10, message=FALSE, warning=FALSE}
+for (g in promoters$gene) {
+  process_region_m6a(g)
+}
+```
+
+# QC 
+- total number of reads 
+- number of reads by time point
+
+```{r QC-reads}
+# count number of reads
+count_num_of_reads <- function(region, gene) {
+  
+  # extract the read meta table
+  rids_df <- region[["rids_df"]]
+
+  # extract region coordinates
+  region_chr <- region[["chr"]]
+  region_start <- region[["start"]]
+  region_end <- region[["end"]]
+  
+  # count reads at each time point
+  reads_by_timepoint <- rids_df %>%
+    count(sample_name, name = "n_reads")
+  
+  # total number of reads in this region
+  total_reads <- nrow(rids_df)
+  
+  # add gene, region and total read information
+  reads_by_timepoint %>%
+    mutate(
+      gene = gene,
+      chr = region_chr,
+      start = region_start,
+      end = region_end,
+      total_reads = total_reads
+    )
+}
+
+
+# Store the QC results from all genes and regions
+qc_reads <- list()
+
+# original:
+# base_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model"
+base_dir <- output_dir
+region_dirs <- list.dirs(base_dir, recursive = FALSE)
+
+for (dir in region_dirs) {
+   # folder name
+  outname <- basename(dir)
+  
+  # find region RDS file
+  region_file <- list.files(dir, pattern = "^region_met_data.*\\.rds$", full.names = TRUE)
+  region <- readRDS(region_file)
+  
+  # gene name
+  gene <- strsplit(outname, "_")[[1]][1]
+  
+  cat("=====================")
+  cat("processing", outname, "\n")
+  cat("=====================")
+  
+  # count and save reads
+  qc_reads[[outname]] <- count_num_of_reads(region = region, gene = gene)
+}
+
+qc_reads <- bind_rows(qc_reads, .id = "region")
+
+```
+```{r plot-QC}
+color <- c("LPS_0" = "#0072B2", "LPS_5" = "#E69F00", "LPS_10" = "#009E73", "LPS_15" = "#D55E00")
+
+qcplot <- ggplot(qc_reads,
+       aes(x = gene,y = n_reads,fill = sample_name)) +
+  geom_col() +
+  geom_text(
+    aes(label = n_reads),
+    position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = color) +
+  labs(
+    y = "Number of reads",
+    fill = "Time point") +
+  theme_cowplot()
+
+qcplot
+
+ggsave(filename = file.path(base_dir,"QC_reads_by_timepoint.pdf"))
+
+```
+
+# Recapitulating timepoints from topics
+
+The topic model above pools all four LPS timepoints (0 = control, 5, 10, 15 min) into one `metA_mat` per gene and fits a single model, tagging every pooled read
+with its `sample_name` (hence timepoint). 
+
+The question here is whether them**topics recapitulate the timepoints** - i.e. whether any topic is used
+predominantly by reads from one timepoint. We answer it per gene by (1) buildingma per-read topic x timepoint table, (2) summarising topic usage by timepoint, and
+(3) testing whether that usage is timepoint-dependent.
+
+All three steps reuse the artifacts already written underm`output_dir/<outname>/` by `process_region_m6a()`
+
+For each gene we load the saved region data and binomia fit, recover `sample_name` row-aligned to `fit$L` by matching the filtered matrix's rownames (the RIDs) back into `region_data$rids_df`. Mapping `sample_name -> timepoint` via `sample_table` then labels each read. The result is one data frame per gene with `RID`, `timepoint`, the six topic proportions `L_topic1..L_topic6`, `frac_acc` ), and `dominant_topic = argmax(L)`
+
+
+**for each gene, does topic membership of individual reads change over time?**
+```{r recap-step1-fn}
+# Build the per-read topic x timepoint table for one gene from its saved
+# region-data + BINOMIAL fit. Rows are aligned to fit$L by construction
+
+######################################
+# creates one read level table per gene, then summarizes topic usage at each timepoint
+######################################
+
+
+per_read_topic_timepoint <- function(gene) {
+  # original:
+  # region <- promoters %>% dplyr::filter(gene == !!gene)
+  # outname <- paste0(gene, "_", region$chr, "_", region$start, "_", region$end)
+  outname <- gene
+
+  # read the assembled methylation data
+  region_data <- readRDS(file.path(output_dir, outname,
+                                   paste0("region_met_data_", outname, ".rds")))
+  # read the fitted topic model
+  fit <- readRDS(file.path(output_dir, outname,
+                           paste0("fit_binom_metA_", outname, ".rds")))
+
+  # refilter exactly as process_region_m6a() 
+  metA_filt <- filter_met_mat(region_data$metA_mat)
+  stopifnot(identical(rownames(metA_filt), rownames(fit$L)))
+
+  # for every read retained in metA, finds its row in the read metadata table
+  keep_idx     <- match(rownames(metA_filt), region_data$rids_df$RID)
+  # retrieve each read's sample
+  sample_name  <- region_data$rids_df$sample_name[keep_idx]
+  # map sample to timepoints
+  timepoint    <- sample_table$timepoint[match(sample_name, sample_table$sample_name)]
+
+  L <- as.matrix(fit$L)
+  colnames(L) <- paste0("L_topic", seq_len(ncol(L)))
+  df <- data.frame(
+    RID            = rownames(fit$L),
+    sample_name    = sample_name,
+    timepoint      = factor(timepoint, levels = sort(unique(sample_table$timepoint))),
+    L,
+    # average m6A fraction acorss positions for each read, and calculated directly from the binary matrix without using the topic model
+    frac_acc       = as.numeric(Matrix::rowMeans(metA_filt)),   
+    dominant_topic = factor(paste0("topic", max.col(L, ties.method = "first")),
+                            levels = paste0("topic", seq_len(ncol(L)))),
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+
+  # verifyf
+  stopifnot(nrow(df) == nrow(fit$L))
+  stopifnot(!any(is.na(df$timepoint)))
+  stopifnot(setequal(levels(droplevels(df$timepoint)), sort(unique(sample_table$timepoint))))
+
+  df
+}
+
+# Build for every gene; keep in a named list for the steps below.
+per_read_tables <- lapply(promoters$gene, per_read_topic_timepoint)
+names(per_read_tables) <- promoters$gene
+
+for (g in promoters$gene) {
+  cat("=== ", g, ": ", nrow(per_read_tables[[g]]), " reads ===\n", sep = "")
+  print(table(per_read_tables[[g]]$timepoint))
+}
+```
+
+# examine per read topics
+
+  RID sample_name timepoint          L_topic1
+1 m84241_260505_182714_s3/103682934/ccs      LPS_15        15 0.570525927968593
+2  m84241_260505_182714_s3/13174534/ccs       LPS_5         5 0.000000009389935
+3 m84241_260505_182714_s3/135791181/ccs       LPS_5         5 0.222503692486331
+4 m84241_260505_182714_s3/155125361/ccs      LPS_10        10 0.000000009099663
+5 m84241_260505_182714_s3/170986656/ccs      LPS_10        10 0.000000009333397
+6 m84241_260505_182714_s3/190712068/ccs      LPS_15        15 0.336899111321520
+           L_topic2          L_topic3          L_topic4          L_topic5
+1 0.000000009587537 0.259254589912311 0.163050429693455 0.000000008945988
+2 0.000000009341036 0.000000009331383 0.000000008479193 0.280149259250181
+3 0.000000009336609 0.103938640272882 0.000000008822323 0.673557639145690
+4 0.000000009587675 0.000000009354673 0.000000010539837 0.498890554216904
+5 0.000000009820599 0.016331815727685 0.000000009376147 0.000000010788898
+6 0.000000009498098 0.206074672101345 0.000000009019092 0.457026187469548
+           L_topic6   frac_acc dominant_topic
+1 0.007169033892115 0.24846626         topic1
+2 0.719850704208272 0.07975460         topic6
+3 0.000000009936166 0.10020450         topic5
+4 0.501109407201249 0.08691207         topic6
+5 0.983668144953274 0.07668712         topic6
+6 0.000000010590397 0.13087935         topic5
+
+```{r per-read-topics}
+head(as.data.frame(per_read_tables[["IL1B"]]))
+```
+
+## Step 2 - Topic-usage-by-timepoint matrix + plot (per gene)
+
+Two summaries per gene: (a) the **mean topic proportion per timepoint** (a
+6 x 4 matrix whose columns - the timepoints - each sum to 1), and (b) the
+**dominant-topic counts per timepoint** (a 6 x 4 contingency table). We plot the
+mean-proportion summary as a stacked bar (topic composition within each
+timepoint) so a timepoint-specific topic shows up as a band that swells at one
+timepoint.
+
+Verify: each timepoint column of the mean-proportion matrix sums to 1;
+`rowSums()` of the contingency table equal the per-topic read totals.
+
+```{r recap-step2-fn}
+
+####################################
+# (a) mean topic proportion per timepoint: topics (rows) x timepoints (cols)
+####################################
+
+topic_usage_by_timepoint <- function(df) {
+  # find the topic membership columns
+  L_cols <- grep("^L_topic", colnames(df), value = TRUE)
+  # split reads by time points into different tables
+  m <- sapply(split(df[, L_cols, drop = FALSE], df$timepoint),
+              # for each timepoint specific table, convert it to a numeric matrix and calculate the mean of every topic column
+              function(sub) colMeans(as.matrix(sub)))
+  rownames(m) <- sub("^L_", "", L_cols)
+  m
+}
+
+####################################
+# (b) dominant-topic counts per timepoint: topics (rows) x timepoints (cols)
+####################################
+
+# create a count table using each read's single dominant topic
+dominant_topic_contingency <- function(df) {
+  table(topic = df$dominant_topic, timepoint = df$timepoint)
+}
+
+# Stacked-bar plot of the mean-proportion matrix (topic composition per timepoint)
+plot_topic_usage_by_timepoint <- function(usage_mat, gene) {
+  dfp <- as.data.frame(as.table(usage_mat))
+  colnames(dfp) <- c("topic", "timepoint", "mean_prop")
+  ggplot(dfp, aes(x = timepoint, y = mean_prop, fill = topic)) +
+    geom_col() +
+    scale_fill_manual(values = topic_colors[seq_len(nrow(usage_mat))]) +
+    labs(x = "LPS timepoint (min)", y = "mean topic proportion",
+         title = paste0(gene, " - topic composition by timepoint")) +
+    theme_cowplot(font_size = 10) +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+
+```{r recap-step2-run, fig.width=6, fig.height=4, message=FALSE, warning=FALSE}
+usage_mats   <- list()
+contingencies <- list()
+for (g in promoters$gene) {
+  df <- per_read_tables[[g]]
+  usage_mats[[g]]    <- topic_usage_by_timepoint(df)
+  contingencies[[g]] <- dominant_topic_contingency(df)
+
+  # verify: columns of the mean-proportion matrix each sum to 1
+  stopifnot(all(abs(colSums(usage_mats[[g]]) - 1) < 1e-8))
+  # verify: contingency rowSums == per-topic read totals
+  stopifnot(all(rowSums(contingencies[[g]]) ==
+                as.integer(table(factor(df$dominant_topic,
+                                        levels = rownames(contingencies[[g]]))))))
+
+  cat("=== ", g, " : mean topic proportion by timepoint ===\n", sep = "")
+  print(round(usage_mats[[g]], 3))
+  cat("--- dominant-topic counts by timepoint ---\n")
+  print(contingencies[[g]])
+
+  gg <- plot_topic_usage_by_timepoint(usage_mats[[g]], g)
+  print(gg)
+  # original:
+  # outname <- paste0(g, "_", promoters$chr[promoters$gene == g], "_",
+  #                   promoters$start[promoters$gene == g], "_",
+  #                   promoters$end[promoters$gene == g])
+  outname <- g
+  ggsave(file.path(output_dir, outname,
+                   paste0("topic_usage_by_timepoint_", outname, ".pdf")),
+         gg, width = 6, height = 4)
+}
+```
+
+
+
+## Topic trajectories over time (per gene)
+
+The stacked bar above shows topic *composition* at each timepoint but makes it hard
+to follow a single topic that rises then falls. This line plot draws each topic's
+**mean proportion as a trajectory over the time course** (mean +/- SEM per
+timepoint), one line per topic, faceted by gene. Non-monotonic dynamics - a topic
+that peaks at 5 min then drops, or dips then rebounds - read directly as the shape of
+its line. Because topic proportions sum to 1 within each read the lines are coupled
+(one topic rising pushes others down), so read them together, not as six independent
+stories.
+
+```{r topic-trajectories, fig.width=11, fig.height=8, message=FALSE, warning=FALSE}
+traj <- dplyr::bind_rows(lapply(promoters$gene, function(g) {
+  per_read_tables[[g]] %>%
+    dplyr::select(timepoint, dplyr::starts_with("L_topic")) %>%
+    tidyr::pivot_longer(dplyr::starts_with("L_topic"),
+                        names_to = "topic", values_to = "prop") %>%
+    dplyr::group_by(timepoint, topic) %>%
+    dplyr::summarise(mean = mean(prop), sem = sd(prop) / sqrt(dplyr::n()),
+                     .groups = "drop") %>%
+    dplyr::mutate(gene = g, topic = sub("^L_", "", topic))
+}))
+traj$tp <- as.numeric(as.character(traj$timepoint))
+
+gg_traj <- ggplot(traj, aes(tp, mean, color = topic, group = topic)) +
+  geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), width = 1, linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ gene, scales = "free_y") +
+  scale_color_manual(values = topic_colors) +
+  scale_x_continuous(breaks = c(0, 5, 10, 15)) +
+  labs(x = "LPS timepoint (min)", y = "mean topic proportion (± SEM)", color = "topic",
+       title = "Topic trajectories over the LPS time course (per gene)") +
+  theme_cowplot(font_size = 10) +
+  theme(legend.position = "bottom")
+print(gg_traj)
+ggsave(file.path(output_dir, "topic_trajectories_by_gene.pdf"),
+       gg_traj, width = 11, height = 8)
+```
+
+
+
+## Empirical m6A methylation by timepoint (IL1A)
+
+The topic profiles `fit$F` are timepoint-invariant by construction - all four LPS
+timepoints are pooled into one `metA_mat` before fitting, so there is a single set of
+topic profiles for the whole time course, and the temporal signal lives entirely in the
+topic usage (`fit$L`, shown above). To ask directly whether the *observed* methylation
+footprint shifts over time, we bypass the model and compute the **empirical mean m6A
+fraction at each A position, split by timepoint**, from the same filtered `metA_mat`
+(same reads and positions as the fit). One line per timepoint, per base pair (no
+binning); the x-axis is genomic position, matching the topic-profile panels so the
+empirical profile lines up position-for-position with the fitted topics.
+
+```{r il1a-empirical-m6a-by-timepoint, fig.width=9, fig.height=8, message=FALSE, warning=FALSE}
+gene   <- "IL1A"
+region <- promoters %>% dplyr::filter(gene == !!gene)
+# original:
+# outname <- paste0(gene, "_", region$chr, "_", region$start, "_", region$end)
+outname <- gene
+
+# same loading + filtering as per_read_topic_timepoint(): reads/positions match the fit
+region_data <- readRDS(file.path(output_dir, outname,
+                                 paste0("region_met_data_", outname, ".rds")))
+metA_filt   <- filter_met_mat(region_data$metA_mat)
+
+keep_idx    <- match(rownames(metA_filt), region_data$rids_df$RID)
+sample_name <- region_data$rids_df$sample_name[keep_idx]
+timepoint   <- factor(sample_table$timepoint[match(sample_name, sample_table$sample_name)],
+                      levels = sort(unique(sample_table$timepoint)))
+
+# mean m6A fraction per A position (columns "A_<genomic_pos>"), per timepoint
+prof <- do.call(rbind, lapply(split(seq_len(nrow(metA_filt)), timepoint), function(i)
+          Matrix::colMeans(metA_filt[i, , drop = FALSE])))
+
+dfp <- tidyr::pivot_longer(
+  data.frame(timepoint = rownames(prof), as.data.frame(as.matrix(prof)), check.names = FALSE),
+  cols = -timepoint, names_to = "col", values_to = "mean_m6a")
+dfp$pos       <- as.numeric(sub("^A_", "", dfp$col))
+dfp$timepoint <- factor(dfp$timepoint, levels = levels(timepoint))
+
+# four contrasting, colourblind-friendly colours, one per timepoint panel
+tp_colors <- c("0" = "#0072B2", "5" = "#E69F00", "10" = "#009E73", "15" = "#D55E00")
+
+gg_prof <- ggplot(dfp, aes(pos, mean_m6a, color = timepoint)) +
+  geom_line(linewidth = 0.5) +
+  facet_wrap(~ timepoint, ncol = 1) +
+  scale_x_continuous(limits = c(region$start, region$end), expand = c(0, 0)) +
+  scale_color_manual(values = tp_colors) +
+  labs(x = paste0(region$chr, " position"), y = "mean m6A fraction",
+       color = "LPS timepoint (min)",
+       title = paste0(gene, " - per-bp m6A methylation by timepoint")) +
+  theme_cowplot(font_size = 10) +
+  theme(plot.title = element_text(hjust = 0.5))
+print(gg_prof)
+ggsave(file.path(output_dir, outname, paste0("empirical_m6a_by_timepoint_", outname, ".pdf")),
+       gg_prof, width = 9, height = 8)
+```
+
+
+
+# Export per-read topic assignments and topic profiles
+
+`process_region_m6a()` computes the k-means read clusters but only uses them for
+plotting - they are never written out. This section recovers them from the saved fits
+and exports two tables per gene:
+
+- `read_topic_assignments_<outname>.tsv`: one row per read - `RID`, read metadata,
+  `cluster` (k-means), `dominant_topic = argmax(L)`, `max_loading`, and the topic
+  proportions `k1..k6`.
+- `topic_profiles_F_<outname>.tsv`: `fit$F` in long format - one row per
+  (A position, topic) with the topic-specific m6A probability `prob`.
+
+Clustering uses the **binomial** fit with `seed = 1` and the same k-means-on-PCA recipe
+as `process_region_m6a()`, so the exported `cluster` labels are the ones drawn in the
+saved `cluster_*.pdf` files.
+
+```{r export-topic-assignments}
+export_topic_tables <- function(gene) {
+  # original:
+  # region  <- promoters %>% dplyr::filter(gene == !!gene)
+  # outname <- paste0(gene, "_", region$chr, "_", region$start, "_", region$end)
+  outname <- gene
+
+  region_data <- readRDS(file.path(output_dir, outname,
+                                   paste0("region_met_data_", outname, ".rds")))
+  fit <- readRDS(file.path(output_dir, outname,
+                           paste0("fit_binom_metA_", outname, ".rds")))
+
+  reads  <- read_topic_assignments(fit, region_data$rids_df, seed = 1)
+  topics <- topic_profiles_long(fit)
+
+  write.table(reads, file.path(output_dir, outname,
+                               paste0("read_topic_assignments_", outname, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(topics, file.path(output_dir, outname,
+                                paste0("topic_profiles_F_", outname, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  cat("=== ", gene, ": ", nrow(reads), " reads, k = ", ncol(fit$L), " ===\n", sep = "")
+  # clusters and dominant topics are not the same labelling - crosstab shows how far apart
+  print(table(reads$cluster, reads$dominant_topic))
+  cat("\n")
+
+  reads
+}
+
+topic_assignment_tables <- lapply(promoters$gene, export_topic_tables)
+names(topic_assignment_tables) <- promoters$gene
+```
+
+                                  RID sample_name  chr     start       end
+1 m84241_260505_182714_s3/103682934/ccs      LPS_15 chr2 112830678 112843009
+2  m84241_260505_182714_s3/13174534/ccs       LPS_5 chr2 112826359 112840099
+3 m84241_260505_182714_s3/135791181/ccs       LPS_5 chr2 112829972 112839548
+4 m84241_260505_182714_s3/155125361/ccs      LPS_10 chr2 112835314 112850315
+5 m84241_260505_182714_s3/170986656/ccs      LPS_10 chr2 112829278 112840187
+6 m84241_260505_182714_s3/190712068/ccs      LPS_15 chr2 112833049 112838564
+  strand  cluster dominant_topic max_loading                k1
+1      - cluster5             k1   0.5705259 0.570525927968593
+2      + cluster2             k6   0.7198507 0.000000009389935
+3      - cluster6             k5   0.6735576 0.222503692486331
+4      + cluster2             k6   0.5011094 0.000000009099663
+5      + cluster4             k6   0.9836681 0.000000009333397
+6      - cluster6             k5   0.4570262 0.336899111321520
+                 k2                k3                k4                k5
+1 0.000000009587537 0.259254589912311 0.163050429693455 0.000000008945988
+2 0.000000009341036 0.000000009331383 0.000000008479193 0.280149259250181
+3 0.000000009336609 0.103938640272882 0.000000008822323 0.673557639145690
+4 0.000000009587675 0.000000009354673 0.000000010539837 0.498890554216904
+5 0.000000009820599 0.016331815727685 0.000000009376147 0.000000010788898
+6 0.000000009498098 0.206074672101345 0.000000009019092 0.457026187469548
+                 k6
+1 0.007169033892115
+2 0.719850704208272
+3 0.000000009936166
+4 0.501109407201249
+5 0.983668144953274
+6 0.000000010590397
+
+```{r export-topic-assignments-head}
+  head(topic_assignment_tables[["IL1B"]])
+```
+
+
+<!-- # Topic modelling on footprints -->
+
+<!-- Same multi-class footprint occupancy as `cluster_by_footprint_class.ipynb` -->
+<!-- (merged classes `PPP_unknown`, `PIC`, `FIRE_nucleosome`; full-resolution binary; -->
+<!-- strand-aware TSS +/- 300 bp), but reads are clustered with **topic modelling** -->
+<!-- (fit a topic model, then k-means on the PCA of the topic proportions `L`) instead -->
+<!-- of Ward hierarchical clustering. -->
+
+<!-- Note: at full base-pair resolution, adjacent positions within a footprint are -->
+<!-- highly correlated, so topics tend to capture broad coverage blocks rather than -->
+<!-- fine structure - expected for contiguous footprints. -->
+
+<!-- ```{r fp-settings} -->
+<!-- fp_hw      <- 300 -->
+<!-- fp_strands <- c(ENO1 = "-", ZCWPW1 = "-")   # both genes are on the minus strand -->
+<!-- fp_classes <- names(FP_CLASS_COLORS) -->
+<!-- ``` -->
+
+<!-- ## ENO1 -->
+
+<!-- ### Assemble footprint matrix -->
+
+<!-- ```{r ENO1-fp-assemble} -->
+<!-- gene <- "ENO1" -->
+<!-- region <- promoters %>% dplyr::filter(gene == !!gene) -->
+<!-- region_chr <- region$chr -->
+<!-- tss <- region$tss -->
+<!-- strand <- fp_strands[[gene]] -->
+<!-- outname <- paste0(gene, "_", region_chr, "_", region$start, "_", region$end) -->
+
+<!-- fp_outdir <- file.path(output_dir, outname, "footprints") -->
+<!-- dir.create(fp_outdir, showWarnings = FALSE, recursive = TRUE) -->
+
+<!-- fp_data <- assemble_footprint_mat(gene, region_chr, tss, strand, hw = fp_hw, verbose = TRUE) -->
+<!-- occ_mat <- fp_data$occ_mat -->
+<!-- saveRDS(fp_data, file.path(fp_outdir, paste0("footprint_data_", outname, ".rds"))) -->
+<!-- ``` -->
+
+<!-- ### Fit topic models -->
+
+<!-- ```{r ENO1-fp-fit} -->
+<!-- fit_multinom_fp <- fit_topic_model(occ_mat, k = n_topics) -->
+<!-- fit_binom_fp    <- fit_binomial_topic_model(occ_mat, k = n_topics, numem = 100) -->
+
+<!-- saveRDS(fit_multinom_fp, file.path(fp_outdir, paste0("fit_multinom_fp_", outname, ".rds"))) -->
+<!-- saveRDS(fit_binom_fp,    file.path(fp_outdir, paste0("fit_binom_fp_",    outname, ".rds"))) -->
+<!-- ``` -->
+
+<!-- ### Plot -->
+
+<!-- ```{r ENO1-fp-plot, fig.width=8, fig.height=8} -->
+<!-- plot_fp_topic_model <- function(fit, title) { -->
+<!--   gg_struct <- structure_plot(fit$L, colors = topic_colors[1:n_topics], -->
+<!--                               topics = 1:n_topics, gap = 5) + -->
+<!--     theme_cowplot(font_size = 10) + ggtitle(title) + -->
+<!--     theme(plot.title = element_text(hjust = 0.5), -->
+<!--           axis.text.x = element_blank(), axis.ticks.x = element_blank(), -->
+<!--           axis.title.x = element_blank()) -->
+<!--   gg_factors <- plot_footprint_topic_factors(fit, region = list(start = -fp_hw, end = fp_hw)) -->
+<!--   cowplot::plot_grid(gg_struct, gg_factors, ncol = 1, rel_heights = c(1, 2)) -->
+<!-- } -->
+
+<!-- gg_multinom <- plot_fp_topic_model(fit_multinom_fp, paste0(gene, " (multinomial, footprints)")) -->
+<!-- print(gg_multinom) -->
+<!-- ggsave(file.path(fp_outdir, paste0("topic_model_multinom_", outname, ".pdf")), -->
+<!--        gg_multinom, width = 8, height = 8) -->
+
+<!-- gg_binom <- plot_fp_topic_model(fit_binom_fp, paste0(gene, " (binomial, footprints)")) -->
+<!-- print(gg_binom) -->
+<!-- ggsave(file.path(fp_outdir, paste0("topic_model_binom_", outname, ".pdf")), -->
+<!--        gg_binom, width = 8, height = 8) -->
+<!-- ``` -->
+
+<!-- ### Compare numbers of topics (k = 2-8) -->
+
+<!-- ```{r ENO1-fp-k-comparison, fig.width=8, fig.height=14, message=FALSE, warning=FALSE} -->
+<!-- k_values <- 2:8 -->
+<!-- gg_k_list <- lapply(k_values, function(k) { -->
+<!--   set.seed(123) -->
+<!--   fit_k <- fit_binomial_topic_model(occ_mat, k = k, numem = 100) -->
+<!--   structure_plot(fit_k$L, colors = topic_colors[1:k], topics = 1:k, gap = 5) + -->
+<!--     theme_cowplot(font_size = 10) + -->
+<!--     ggtitle(paste0(gene, " (binomial, footprints), k = ", k)) + -->
+<!--     theme(plot.title = element_text(hjust = 0.5), -->
+<!--           axis.text.x = element_blank(), axis.ticks.x = element_blank(), -->
+<!--           axis.title.x = element_blank()) -->
+<!-- }) -->
+<!-- gg_k_compare <- cowplot::plot_grid(plotlist = gg_k_list, ncol = 1) -->
+<!-- print(gg_k_compare) -->
+<!-- ggsave(file.path(fp_outdir, paste0("topic_model_k_comparison_", outname, ".pdf")), -->
+<!--        gg_k_compare, width = 8, height = 14) -->
+<!-- ``` -->
+
+<!-- ### Cluster reads by topic proportions (k = `r n_topics`) -->
+
+<!-- ```{r ENO1-fp-cluster} -->
+<!-- fit <- fit_multinom_fp   # use the k = n_topics fit for clustering -->
+
+<!-- set.seed(1) -->
+<!-- pca <- prcomp(fit$L)$x -->
+<!-- clusters <- kmeans(pca, centers = n_topics, iter.max = 100)$cluster -->
+
+<!-- clusters <- factor(clusters) -->
+<!-- levels(clusters) <- paste0("cluster", 1:n_topics) -->
+
+<!-- cluster_colors <- colors_25[1:length(levels(clusters))] -->
+<!-- ``` -->
+
+<!-- Structure plot with reads grouped according to the clusters: -->
+
+<!-- ```{r ENO1-fp-cluster-structure, fig.width=8, fig.height=3, message=FALSE} -->
+<!-- gg_cluster_structure <- structure_plot(fit, topics = 1:n_topics, colors = topic_colors, gap = 5, -->
+<!--                                        grouping = clusters) -->
+<!-- print(gg_cluster_structure) -->
+<!-- ggsave(file.path(fp_outdir, paste0("cluster_structure_", outname, ".pdf")), -->
+<!--        gg_cluster_structure, width = 8, height = 3) -->
+<!-- ``` -->
+
+<!-- PCA plot colored by cluster: -->
+
+<!-- ```{r ENO1-fp-cluster-pca, fig.width=5, fig.height=5, message=FALSE} -->
+<!-- pca_plot(fit, fill = clusters) + -->
+<!--   scale_fill_manual(values = cluster_colors) -->
+<!-- ``` -->
+
+<!-- Heatmap of the footprint occupancy matrix with reads ordered by cluster (color = -->
+<!-- footprint class, white = uncovered, row sidebar = cluster): -->
+
+<!-- ```{r ENO1-fp-cluster-heatmap, fig.width=10, fig.height=8} -->
+<!-- plot_footprint_cluster_heatmap(occ_mat, clusters, fp_classes, FP_CLASS_COLORS, cluster_colors) -->
+
+<!-- pdf(file.path(fp_outdir, paste0("cluster_heatmap_", outname, ".pdf")), -->
+<!--     width = 10, height = 8) -->
+<!-- plot_footprint_cluster_heatmap(occ_mat, clusters, fp_classes, FP_CLASS_COLORS, cluster_colors) -->
+<!-- dev.off() -->
+<!-- ``` -->
+
+<!-- ## ZCWPW1 -->
+
+<!-- ### Assemble footprint matrix -->
+
+<!-- ```{r ZCWPW1-fp-assemble} -->
+<!-- gene <- "ZCWPW1" -->
+<!-- region <- promoters %>% dplyr::filter(gene == !!gene) -->
+<!-- region_chr <- region$chr -->
+<!-- tss <- region$tss -->
+<!-- strand <- fp_strands[[gene]] -->
+<!-- outname <- paste0(gene, "_", region_chr, "_", region$start, "_", region$end) -->
+
+<!-- fp_outdir <- file.path(output_dir, outname, "footprints") -->
+<!-- dir.create(fp_outdir, showWarnings = FALSE, recursive = TRUE) -->
+
+<!-- fp_data <- assemble_footprint_mat(gene, region_chr, tss, strand, hw = fp_hw, verbose = TRUE) -->
+<!-- occ_mat <- fp_data$occ_mat -->
+<!-- saveRDS(fp_data, file.path(fp_outdir, paste0("footprint_data_", outname, ".rds"))) -->
+<!-- ``` -->
+
+<!-- ### Fit topic models -->
+
+<!-- ```{r ZCWPW1-fp-fit} -->
+<!-- fit_multinom_fp <- fit_topic_model(occ_mat, k = n_topics) -->
+<!-- fit_binom_fp    <- fit_binomial_topic_model(occ_mat, k = n_topics, numem = 100) -->
+
+<!-- saveRDS(fit_multinom_fp, file.path(fp_outdir, paste0("fit_multinom_fp_", outname, ".rds"))) -->
+<!-- saveRDS(fit_binom_fp,    file.path(fp_outdir, paste0("fit_binom_fp_",    outname, ".rds"))) -->
+<!-- ``` -->
+
+<!-- ### Plot -->
+
+<!-- ```{r ZCWPW1-fp-plot, fig.width=8, fig.height=8} -->
+<!-- gg_multinom <- plot_fp_topic_model(fit_multinom_fp, paste0(gene, " (multinomial, footprints)")) -->
+<!-- print(gg_multinom) -->
+<!-- ggsave(file.path(fp_outdir, paste0("topic_model_multinom_", outname, ".pdf")), -->
+<!--        gg_multinom, width = 8, height = 8) -->
+
+<!-- gg_binom <- plot_fp_topic_model(fit_binom_fp, paste0(gene, " (binomial, footprints)")) -->
+<!-- print(gg_binom) -->
+<!-- ggsave(file.path(fp_outdir, paste0("topic_model_binom_", outname, ".pdf")), -->
+<!--        gg_binom, width = 8, height = 8) -->
+<!-- ``` -->
+
+<!-- ### Compare numbers of topics (k = 2-8) -->
+
+<!-- ```{r ZCWPW1-fp-k-comparison, fig.width=8, fig.height=14, message=FALSE, warning=FALSE} -->
+<!-- k_values <- 2:8 -->
+<!-- gg_k_list <- lapply(k_values, function(k) { -->
+<!--   set.seed(123) -->
+<!--   fit_k <- fit_binomial_topic_model(occ_mat, k = k, numem = 100) -->
+<!--   structure_plot(fit_k$L, colors = topic_colors[1:k], topics = 1:k, gap = 5) + -->
+<!--     theme_cowplot(font_size = 10) + -->
+<!--     ggtitle(paste0(gene, " (binomial, footprints), k = ", k)) + -->
+<!--     theme(plot.title = element_text(hjust = 0.5), -->
+<!--           axis.text.x = element_blank(), axis.ticks.x = element_blank(), -->
+<!--           axis.title.x = element_blank()) -->
+<!-- }) -->
+<!-- gg_k_compare <- cowplot::plot_grid(plotlist = gg_k_list, ncol = 1) -->
+<!-- print(gg_k_compare) -->
+<!-- ggsave(file.path(fp_outdir, paste0("topic_model_k_comparison_", outname, ".pdf")), -->
+<!--        gg_k_compare, width = 8, height = 14) -->
+<!-- ``` -->
+
+<!-- ### Cluster reads by topic proportions (k = `r n_topics`) -->
+
+<!-- ```{r ZCWPW1-fp-cluster} -->
+<!-- fit <- fit_multinom_fp   # use the k = n_topics fit for clustering -->
+
+<!-- set.seed(1) -->
+<!-- pca <- prcomp(fit$L)$x -->
+<!-- clusters <- kmeans(pca, centers = n_topics, iter.max = 100)$cluster -->
+
+<!-- clusters <- factor(clusters) -->
+<!-- levels(clusters) <- paste0("cluster", 1:n_topics) -->
+
+<!-- cluster_colors <- colors_25[1:length(levels(clusters))] -->
+<!-- ``` -->
+
+<!-- Structure plot with reads grouped according to the clusters: -->
+
+<!-- ```{r ZCWPW1-fp-cluster-structure, fig.width=8, fig.height=3, message=FALSE} -->
+<!-- gg_cluster_structure <- structure_plot(fit, topics = 1:n_topics, colors = topic_colors, gap = 5, -->
+<!--                                        grouping = clusters) -->
+<!-- print(gg_cluster_structure) -->
+<!-- ggsave(file.path(fp_outdir, paste0("cluster_structure_", outname, ".pdf")), -->
+<!--        gg_cluster_structure, width = 8, height = 3) -->
+<!-- ``` -->
+
+<!-- PCA plot colored by cluster: -->
+
+<!-- ```{r ZCWPW1-fp-cluster-pca, fig.width=5, fig.height=5, message=FALSE} -->
+<!-- pca_plot(fit, fill = clusters) + -->
+<!--   scale_fill_manual(values = cluster_colors) -->
+<!-- ``` -->
+
+<!-- Heatmap of the footprint occupancy matrix with reads ordered by cluster (color = -->
+<!-- footprint class, white = uncovered, row sidebar = cluster): -->
+
+<!-- ```{r ZCWPW1-fp-cluster-heatmap, fig.width=10, fig.height=8} -->
+<!-- plot_footprint_cluster_heatmap(occ_mat, clusters, fp_classes, FP_CLASS_COLORS, cluster_colors) -->
+
+<!-- pdf(file.path(fp_outdir, paste0("cluster_heatmap_", outname, ".pdf")), -->
+<!--     width = 10, height = 8) -->
+<!-- plot_footprint_cluster_heatmap(occ_mat, clusters, fp_classes, FP_CLASS_COLORS, cluster_colors) -->
+<!-- dev.off() -->
+<!-- ``` -->
+
+<!-- # Footprints grouped by methylation cluster -->
+
+<!-- Reuse the read clusters identified by the **m6A methylation** topic model and plot -->
+<!-- the **footprints** of those same reads grouped by their methylation cluster. Reads -->
+<!-- are matched between the two analyses by read name (both use PacBio `ccs` read -->
+<!-- names). A read is kept only if it has both a methylation cluster and >=1 footprint -->
+<!-- in the window; reads without a methylation cluster are dropped. -->
+
+<!-- For each gene: a per-cluster aggregate footprint profile (mean per-class occupancy) -->
+<!-- and a per-read footprint class heatmap, both ordered/grouped by the methylation -->
+<!-- cluster. Each is drawn in two coordinate systems: **TSS-relative** (strand-oriented, -->
+<!-- as in the footprint section above) and **genomic** (absolute coordinates, not -->
+<!-- strand-flipped - the same coordinate system as the m6A methylation heatmap, so the -->
+<!-- two can be aligned directly). -->
+
+<!-- ```{r fp-by-met-helper} -->
+<!-- # Load the saved m6A fit + region data for a gene, recompute the methylation -->
+<!-- # clusters, and return a data.frame mapping RID -> methylation cluster. -->
+<!-- methylation_clusters_for_gene <- function(outname) { -->
+<!--   region_data <- readRDS(file.path(output_dir, outname, paste0("region_met_data_", outname, ".rds"))) -->
+<!--   fit_met     <- readRDS(file.path(output_dir, outname, paste0("fit_multinom_metA_", outname, ".rds"))) -->
+<!--   metA_filt   <- filter_met_mat(region_data$metA_mat) -->
+<!--   met_cl      <- cluster_reads_by_topics(fit_met, n_topics, seed = 1) -->
+<!--   data.frame(RID = rownames(metA_filt), met_cluster = met_cl, stringsAsFactors = FALSE) -->
+<!-- } -->
+
+<!-- # Draw a footprint heatmap to the screen and save it to PDF (base graphics must -->
+<!-- # be re-drawn for each device). -->
+<!-- save_fp_heatmap <- function(occ, clusters, file, main) { -->
+<!--   plot_footprint_cluster_heatmap(occ, clusters, fp_classes, FP_CLASS_COLORS, cluster_colors, main = main) -->
+<!--   pdf(file, width = 10, height = 8) -->
+<!--   plot_footprint_cluster_heatmap(occ, clusters, fp_classes, FP_CLASS_COLORS, cluster_colors, main = main) -->
+<!--   dev.off() -->
+<!-- } -->
+
+<!-- # Draw + save a per-cluster mean-occupancy profile plot. -->
+<!-- save_fp_profiles <- function(occ, clusters, file, title, xlab) { -->
+<!--   gg <- plot_footprint_cluster_profiles(occ, clusters, fp_classes, FP_CLASS_COLORS, -->
+<!--                                         title = title, xlab = xlab) -->
+<!--   print(gg) -->
+<!--   ggsave(file, gg, width = 8, height = 10) -->
+<!-- } -->
+<!-- ``` -->
+
+<!-- ## ENO1 -->
+
+<!-- ```{r ENO1-fp-by-met, fig.width=10, fig.height=8} -->
+<!-- gene <- "ENO1" -->
+<!-- region <- promoters %>% dplyr::filter(gene == !!gene) -->
+<!-- outname <- paste0(gene, "_", region$chr, "_", region$start, "_", region$end) -->
+<!-- fp_outdir <- file.path(output_dir, outname, "footprints") -->
+
+<!-- met_map <- methylation_clusters_for_gene(outname) -->
+<!-- fp_data <- readRDS(file.path(fp_outdir, paste0("footprint_data_", outname, ".rds"))) -->
+<!-- occ_mat <- fp_data$occ_mat -->
+
+<!-- # match footprint reads to methylation clusters, keep reads present in both -->
+<!-- met_clusters <- met_map$met_cluster[match(rownames(occ_mat), met_map$RID)] -->
+<!-- keep <- !is.na(met_clusters) -->
+<!-- cat(gene, ": ", sum(keep), " of ", nrow(occ_mat), -->
+<!--     " footprint reads have a methylation cluster\n", sep = "") -->
+
+<!-- occ_keep <- occ_mat[keep, , drop = FALSE] -->
+<!-- met_keep <- droplevels(met_clusters[keep]) -->
+<!-- cluster_colors <- colors_25[1:n_topics] -->
+
+<!-- # genomic-coordinate version (absolute, not strand-flipped; matches the m6A -->
+<!-- # methylation heatmap). occ_keep stays TSS-relative (strand-oriented). -->
+<!-- occ_genomic <- relabel_occ_to_genomic(occ_keep, region$tss, fp_strands[[gene]]) -->
+
+<!-- # per-cluster aggregate mean-occupancy profiles, in both coordinate systems -->
+<!-- save_fp_profiles(occ_keep, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_profiles_tssrel_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (TSS-relative)"), -->
+<!--   "Distance to TSS (bp, strand-oriented)") -->
+
+<!-- save_fp_profiles(occ_genomic, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_profiles_genomic_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (genomic coord)"), -->
+<!--   paste0(region$chr, " position (bp)")) -->
+
+<!-- # per-read footprint class heatmap, rows grouped by methylation cluster, in both -->
+<!-- # coordinate systems. -->
+<!-- save_fp_heatmap(occ_keep, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_heatmap_tssrel_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (TSS-relative)")) -->
+
+<!-- save_fp_heatmap(occ_genomic, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_heatmap_genomic_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (genomic coord)")) -->
+<!-- ``` -->
+
+<!-- ## ZCWPW1 -->
+
+<!-- ```{r ZCWPW1-fp-by-met, fig.width=10, fig.height=8} -->
+<!-- gene <- "ZCWPW1" -->
+<!-- region <- promoters %>% dplyr::filter(gene == !!gene) -->
+<!-- outname <- paste0(gene, "_", region$chr, "_", region$start, "_", region$end) -->
+<!-- fp_outdir <- file.path(output_dir, outname, "footprints") -->
+
+<!-- met_map <- methylation_clusters_for_gene(outname) -->
+<!-- fp_data <- readRDS(file.path(fp_outdir, paste0("footprint_data_", outname, ".rds"))) -->
+<!-- occ_mat <- fp_data$occ_mat -->
+
+<!-- met_clusters <- met_map$met_cluster[match(rownames(occ_mat), met_map$RID)] -->
+<!-- keep <- !is.na(met_clusters) -->
+<!-- cat(gene, ": ", sum(keep), " of ", nrow(occ_mat), -->
+<!--     " footprint reads have a methylation cluster\n", sep = "") -->
+
+<!-- occ_keep <- occ_mat[keep, , drop = FALSE] -->
+<!-- met_keep <- droplevels(met_clusters[keep]) -->
+<!-- cluster_colors <- colors_25[1:n_topics] -->
+
+<!-- # genomic-coordinate version (absolute, not strand-flipped; matches the m6A -->
+<!-- # methylation heatmap). occ_keep stays TSS-relative (strand-oriented). -->
+<!-- occ_genomic <- relabel_occ_to_genomic(occ_keep, region$tss, fp_strands[[gene]]) -->
+
+<!-- # per-cluster aggregate mean-occupancy profiles, in both coordinate systems -->
+<!-- save_fp_profiles(occ_keep, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_profiles_tssrel_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (TSS-relative)"), -->
+<!--   "Distance to TSS (bp, strand-oriented)") -->
+
+<!-- save_fp_profiles(occ_genomic, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_profiles_genomic_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (genomic coord)"), -->
+<!--   paste0(region$chr, " position (bp)")) -->
+
+<!-- # per-read footprint class heatmap, rows grouped by methylation cluster, in both -->
+<!-- # coordinate systems. -->
+<!-- save_fp_heatmap(occ_keep, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_heatmap_tssrel_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (TSS-relative)")) -->
+
+<!-- save_fp_heatmap(occ_genomic, met_keep, -->
+<!--   file.path(fp_outdir, paste0("footprints_by_met_cluster_heatmap_genomic_", outname, ".pdf")), -->
+<!--   paste0(gene, " - footprints by m6A cluster (genomic coord)")) -->
+<!-- ``` -->

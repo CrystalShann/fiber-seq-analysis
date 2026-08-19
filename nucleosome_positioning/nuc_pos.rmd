@@ -1,0 +1,326 @@
+# footprint profiles around selected genomic features
+
+FiberHMM footprints (LPS timecourse: 0 = control, 5, 10, 15 min) profiled around
+THP-1 CAGE TSS, plus nucleosome-to-nucleosome spacing over DHSs (section 6).
+Processing lives in `process_nuc_pos.R` (`main_nuc_pos()`, `main_nuc_spacing()`,
+or `main()` for both), plotting in `plot_nuc_pos.R` (`main_plots()`); this
+document only defines regions and renders figures.
+
+
+```{r source-functions}
+source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/process_nuc_pos.R")
+source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/plot_nuc_pos.R")
+```
+
+
+```{r fiberhmm-footprints}
+LPS_ft <- fread("/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/firehmm_footprint/LPS0/LPS0_hmm_extracted_footprint_chr1.bed.gz")
+```
+
+```{r}
+colnames(LPS_ft) <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                  "thickStart", "thickEnd", "itemRgb",
+                  "blockCount", "blockSizes", "blockStarts", "score")
+
+LPS_ft <- LPS_ft[, -13]
+```
+
+```{r}
+# subset for example
+LPS_ft_filtered <- LPS_ft[c(1:5),]
+head(LPS_ft_filtered)
+length(unlist(strsplit(LPS_ft_filtered[[12]][1], ",")))
+
+```
+
+### per read and aggregatefootprint extraction step by step example
+
+```{r extract-fp-function}
+# construct footprint midpoint, with one foorprint per row, with its assoicated read ID
+extract_footprints_per_read(LPS_ft_filtered)
+
+# convert read span bed12 to Granges
+LPS_gr <-  GRanges(
+    seqnames = LPS_ft_filtered$chrom,
+    ranges   = IRanges(LPS_ft_filtered$chromStart + 1L, LPS_ft_filtered$chromEnd)
+  )
+
+LPS_gr
+```
+```{r overlap-CAGE-TSS}
+# Convert FiberHMM read spans from BED coordinates to GRanges coordinates
+LPS_gr <- GRanges(
+  seqnames = LPS_ft$chrom,
+  ranges = IRanges(
+    start = LPS_ft$chromStart + 1L,
+    end   = LPS_ft$chromEnd
+  )
+)
+
+# Load the dominant CAGE TSS annotation
+CAGE_PATH <- paste0(
+  "/project/spott/cshan/fiber-seq/macrophage_project/annotations/",
+  "fantom5_thp1/THP1.consensus.CAGE_peaks.dominantPerGene.bed.gz"
+)
+
+CAGE_tss <- load_cage_tss(CAGE_PATH)
+
+# Make ±2 kb windows around each CAGE TSS
+WINDOW_BP <- 2000L
+
+CAGE_windows <- promoters(
+  CAGE_tss,
+  upstream = WINDOW_BP,
+  downstream = WINDOW_BP + 1L
+)
+
+# Find reads whose spans overlap at least one TSS window
+hits <- findOverlaps(LPS_gr, CAGE_windows)
+
+keep <- unique(queryHits(hits))
+
+# Keep both the genomic ranges and the original BED12 records
+LPS_gr_near_tss <- LPS_gr[keep]
+LPS_ft_near_tss <- LPS_ft[keep]
+
+length(LPS_gr_near_tss)
+nrow(LPS_ft_near_tss)
+
+LPS_gr_near_tss
+LPS_ft_near_tss
+
+# extract footprint midpoints for reads spanning TSS
+LPS_ft_tss_filtered <- extract_footprints_per_read(LPS_ft)
+LPS_ft_tss_filtered
+
+LPS_ft_tss_filtered_gr <- GRanges(
+  seqnames = LPS_ft_tss_filtered$chrom,
+  ranges = IRanges(LPS_ft_tss_filtered$fp_mid + 1L, LPS_ft_tss_filtered$fp_mid + 1L),
+  strand = "*"
+)
+
+# finds every footprint midpoint that lies inside a window
+hits <- findOverlaps(LPS_ft_tss_filtered_gr, CAGE_windows)
+hits
+
+# find the corresponding footprint and TSS window indices
+qi <- queryHits(hits) # extract footprint indices
+si <- subjectHits(hits) # corresponding TSS indices
+
+
+# per read table
+################################
+rtp <- data.table(
+  tss_idx    = si,
+  RID        = LPS_ft_tss_filtered$RID[qi],
+  fp_mid     = LPS_ft_tss_filtered$fp_mid[qi],
+  fp_size    = LPS_ft_tss_filtered$fp_size[qi],
+  tss_pos    = start(CAGE_tss)[si],
+  tss_strand = as.character(strand(CAGE_tss))[si],
+  gene_id    = as.character(mcols(CAGE_tss)$gene_id)[si])
+
+rtp
+
+n_ranks = 3
+# add new column with relative position to TSS
+rtp[, rel_pos := fifelse(tss_strand == "+", fp_mid - tss_pos, tss_pos - fp_mid)]
+rtp[, abs_dist := abs(rel_pos)]
+  
+# negative positive = upstream
+rtp[, direction := fifelse(rel_pos < 0L, "upstream", "downstream")]
+setorder(rtp, tss_idx, RID, direction, abs_dist)
+  
+# for each TSS, read, direction combination, sort by ascending order
+rtp[, rank := seq_len(.N), by = .(tss_idx, RID, direction)]
+# assign ranking in each group
+rtp <- rtp[rank <= n_ranks]
+# keep only the nearest 3 footprints in each direction
+rtp[, signed_rank := fifelse(direction == "upstream", -rank, rank)]
+rtp[]
+  
+
+# aggregate table
+################################
+dt <- data.table(
+    tss_idx    = si,
+    fp_mid     = LPS_ft_tss_filtered$fp_mid[qi],
+    fp_size    = LPS_ft_tss_filtered$fp_size[qi],
+    tss_pos    = start(CAGE_tss)[si],
+    tss_strand = as.character(strand(CAGE_tss))[si],
+    gene_id    = as.character(mcols(CAGE_tss)$gene_id)[si])
+
+dt
+
+dt[, rel_pos := fifelse(tss_strand == "+", fp_mid - tss_pos, tss_pos - fp_mid)]
+dt[]
+```
+
+### Aggregation across chromosomes for one sample
+
+```{r footprint-meta-profile}
+window_bp = 2000
+bin_size = 20
+# assign each footprint to a bin
+rtp_filtered <- rtp[c(1:5),]
+
+bins <- data.table(
+  bin = seq(-window_bp, window_bp, by = bin_size)
+)
+rtp_filtered[, bin := round(rel_pos / bin_size) * bin_size]
+
+meta_raw <- bin_metaprofile(
+  hits = rtp,
+  window_bp = 2000,
+  bin_size = 20,
+  normalize = "none"
+)
+
+meta_raw
+
+```
+
+
+## 1. Define genomic regions of interest
+```{r regions}
+promoters <- tibble::tribble(
+  ~gene,        ~chr,     ~start,      ~end,
+  "IL1B",       "chr2",   112836323,   112837385,
+  "TNF",        "chr6",   31575265,    31575824,
+  "IL1A",       "chr2",   112793233,   112794969,
+  "PTGS2",      "chr1",   186679985,   186681163,
+  "IL8",        "chr4",   73740006,    73741332,
+  "CXCL2",      "chr4",   74098863,    74099651,
+  "IL6",        "chr7",   22726376,    22727094,
+  "RELB",       "chr19",  45001011,    45002417,
+  "rs2836882",  "chr21",  39094468,    39094712
+)
+promoters
+```
+
+## 2. Build the THP-1 CAGE consensus TSS annotation
+
+Downloads the three FANTOM5 THP-1 hCAGE CTSS replicates, keeps CTSS present in
+all three (tag counts summed), and assigns the nearest gencode gene while keeping
+the CAGE strand. See `cage_consensus_thp1.sh`.
+
+```{bash cage_consensus, eval = FALSE}
+bash /project/spott/cshan/fiber-seq/code/nucleosome_positioning/cage_consensus_thp1.sh
+# -> /project/spott/cshan/fiber-seq/macrophage_project/annotations/fantom5_thp1/THP1.consensus.CAGE_peaks.dominantPerGene.bed.gz
+```
+
+## 3. Process footprints around TSS (all timepoints)
+
+Reads the per-chromosome FiberHMM footprint BEDs for LPS0/5/10/15, tallies
+strand-aware footprint offsets to CAGE TSS (genome-wide and for the selected
+promoters), and finds the nearest upstream/downstream footprint per (TSS, read).
+This is the heavy step; run once, then load the TSV outputs below.
+
+```{bash process, eval = FALSE}
+module load R/4.4.1
+# main_nuc_pos() = the TSS analysis only. Running the script bare instead calls
+# main(), which also runs the DHS spacing analysis of section 6.
+Rscript -e 'source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/process_nuc_pos.R"); main_nuc_pos()'
+# -> /project/spott/cshan/fiber-seq/macrophage_project/nucleosome_positioning/results/tables/*.tsv[.gz]
+```
+
+## 4. Figures
+
+```{r figures, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5}
+res_dir  <- "/project/spott/cshan/fiber-seq/macrophage_project/nucleosome_positioning/results/tables"
+meta_all  <- data.table::fread(file.path(res_dir, "metaprofile_genomewide_by_timepoint.tsv"))
+meta_sel  <- data.table::fread(file.path(res_dir, "metaprofile_selected_genes_by_timepoint.tsv"))
+meta_comb <- data.table::fread(file.path(res_dir, "metaprofile_combined_selected_by_timepoint.tsv"))
+nearest   <- data.table::fread(file.path(res_dir, "nearest_updown_footprint_by_timepoint.tsv.gz"))
+shift     <- data.table::fread(file.path(res_dir, "nearest_updown_shift_summary.tsv"))
+
+# Genome-wide metaprofile (footprints filtered to 130-160 bp), timepoints overlaid.
+# Aggregated (all midpoints counted once) and per-read.
+plot_genomewide_metaprofile(meta_all, "aggregated", "raw")
+plot_genomewide_metaprofile(meta_all, "aggregated", "per_tss")
+plot_genomewide_metaprofile(meta_all, "per_read", "raw")
+plot_genomewide_metaprofile(meta_all, "per_read", "per_read")
+
+# Combined selected genes (all pooled into one metaprofile), timepoints overlaid.
+plot_combined_selected_metaprofile(meta_comb, "aggregated", "raw")
+plot_combined_selected_metaprofile(meta_comb, "aggregated", "per_tss")
+plot_combined_selected_metaprofile(meta_comb, "per_read", "raw")
+plot_combined_selected_metaprofile(meta_comb, "per_read", "per_read")
+
+# Selected promoters: one plot per gene, timepoints as side-by-side panels
+# (aggregated raw and per-read raw)
+for (g in sort(unique(meta_sel$gene))) {
+  print(plot_gene_metaprofile(meta_sel, g, "aggregated", "raw"))
+  print(plot_gene_metaprofile(meta_sel, g, "per_read", "raw"))
+}
+
+# Nearest up/downstream footprint shift relative to TSS
+plot_nearest_updown(nearest)
+plot_nearest_shift(shift)
+
+# Nearest-footprint size distribution, split by up/downstream
+plot_footprint_size_hist(nearest)
+```
+
+## 5. Write figure PDFs
+
+```{r save_pdfs, eval = FALSE}
+# Regenerates all PDFs (TSS metaprofiles + DHS spacing) under results/plots/.
+main_plots()
+```
+
+## 6. Nucleosome-to-nucleosome spacing over DHSs (autocorrelation)
+
+Pooled pairwise distances between 130-160 bp nucleosome midpoints on the same
+read, within DHS windows (DNase summit +/- 2 kb, all DHSs genome-wide). Peaks at
+the nucleosome repeat length and its multiples indicate phased spacing.
+
+Prepare the DHS annotation (ENCFF359IAQ = ENCODE DNase peaks with a summit
+column). Build a summit BED, bgzip + tabix.
+
+```{bash dhs_prep, eval = FALSE}
+module load htslib/1.16
+ANN=/project/spott/cshan/fiber-seq/macrophage_project/nucleosome_positioning/results/annotations
+cd $ANN
+# already downloaded: ENCFF359IAQ.bed.gz
+zcat ENCFF359IAQ.bed.gz | awk 'BEGIN{OFS="\t"} /^#/{next} {print $1, $7-1, $7, $4, $8, "."}' \
+  | sort -k1,1 -k2,2n > ENCFF359IAQ.summits.bed
+bgzip -f ENCFF359IAQ.summits.bed
+tabix -p bed ENCFF359IAQ.summits.bed.gz
+```
+
+Processing lives in `process_nuc_pos.R` (`main_nuc_spacing()`), plotting in
+`plot_nuc_pos.R` -- both already sourced at the top of this document.
+
+```{bash spacing_process, eval = FALSE}
+module load R/4.4.1
+Rscript -e 'source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/process_nuc_pos.R"); main_nuc_spacing()'
+# -> results/tables/nuc_spacing_over_DHS_by_timepoint.tsv
+```
+
+```{r spacing_figures, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5}
+spacing <- data.table::fread(file.path(res_dir, "nuc_spacing_over_DHS_by_timepoint.tsv"))
+plot_nuc_spacing(spacing, "N_norm")   # depth-normalized (fraction of pairs)
+plot_nuc_spacing(spacing, "N")        # raw pair counts
+```
+
+## 7. Footprint size distribution (all footprints, NOT size-filtered)
+
+Every other section filters footprints to the 130-160 bp mono-nucleosome window.
+This one tallies **all** footprint sizes
+```{bash size_process, eval = FALSE}
+module load R/4.4.1
+Rscript -e 'source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/process_nuc_pos.R"); main_footprint_size_table()'
+# -> results/tables/footprint_size_distribution.tsv.gz
+# main_footprint_size_table(chroms = "chr21") restricts it to one chromosome.
+```
+
+```{r size_figure, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 9}
+fp_sizes <- data.table::fread(file.path(res_dir, "footprint_size_distribution.tsv.gz"))
+
+# One panel per timepoint, stacked vertically; shaded band = the 130-160 bp
+# mono-nucleosome filter used everywhere else.
+plot_footprint_size_distribution(fp_sizes)
+
+# Fractions instead of counts, so the four timepoints are directly comparable
+plot_footprint_size_distribution(fp_sizes, normalize = TRUE)
+```

@@ -1,0 +1,175 @@
+---
+title: "Read-level region plots: early response gene promoters"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Stacked read-level panels for the nine early-response promoter regions, with the SMF
+reads split by the topic-model read clusters.
+
+Inputs are whatever `run_extract_regions.sh` wrote under `extract_root`; nothing here
+reads a BAM or queries tabix.
+
+# Functions
+
+```{r functions}
+code_dir <- "/project/spott/cshan/fiber-seq/code/topic_model/read_region_extraction"
+source(file.path(code_dir, "region_data_utils.R"))
+source(file.path(code_dir, "region_plot_functions.R"))
+```
+
+# Settings
+
+```{r settings}
+options(scipen = 999)
+
+# original:
+# extract_root <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/region_plots/early_repsonse_genes"
+# topic_model_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model"
+# plot_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/region_plots/read_region_extraction/results/plots/region_examples"
+extract_root <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/region_plots/early_repsonse_genes/promoters"
+topic_model_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/promoters"
+plot_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/topic_model/region_plots/read_region_extraction/results/plots/region_examples/promoters"
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+sample_names <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
+
+# FiberHMM `tf` calls are already floored at score 50 by fiberhmm-extract.
+fiberHMM_feature      <- "tf"
+min_fiberHMM_fp_score <- 50
+fiberHMM_size_breaks  <- c(10, 30, 60, 80)
+fiberHMM_cols         <- c("purple", "magenta", "#41c4e1")
+```
+
+# Regions
+
+Same nine regions as the topic model
+(`code/topic_model/1_m6a_promoter_topic_modelling.Rmd`).
+
+```{r regions}
+# original (explicit genomic intervals):
+# promoters <- tibble::tribble(
+#   ~gene,        ~chr,     ~start,      ~end,
+#   "IL1B",       "chr2",   112836323,   112837385,
+#   "TNF",        "chr6",   31575265,    31575824,
+#   "IL1A",       "chr2",   112793233,   112794969,
+#   "PTGS2",      "chr1",   186679985,   186681163,
+#   "IL8",        "chr4",   73740006,    73741332,
+#   "CXCL2",      "chr4",   74098863,    74099651,
+#   "IL6",        "chr7",   22726376,    22727094,
+#   "RELB",       "chr19",  45001011,    45002417,
+#   "rs2836882",  "chr21",  39094468,    39094712
+# )
+
+# TSS +/- 1000 bp, matching the TSS-centered regions in
+# code/topic_model/1_m6a_promoter_topic_modelling.Rmd and run_extract_regions.sh
+# (dominant THP-1 CAGE peak: IL1B/TNF/IL8; GENCODE v49 TSS fallback:
+# IL1A/PTGS2/CXCL2/IL6/RELB). rs2836882 is a SNP locus with no TSS - it keeps
+# its explicit interval.
+promoters <- tibble::tribble(
+  ~gene,        ~chr,     ~start,      ~end,
+  "IL1B",       "chr2",   112835779,   112837779,
+  "TNF",        "chr6",   31574568,    31576568,
+  "IL1A",       "chr2",   112783493,   112785493,
+  "PTGS2",      "chr1",   186679922,   186681922,
+  "IL8",        "chr4",   73739569,    73741569,
+  "CXCL2",      "chr4",   74098196,    74100196,
+  "IL6",        "chr7",   22724884,    22726884,
+  "RELB",       "chr19",  45000461,    45002461,
+  "rs2836882",  "chr21",  39094468,    39094712
+)
+
+# original:
+# promoters$outname <- with(promoters, paste0(gene, "_", chr, "_", start, "_", end))
+promoters$outname <- promoters$gene
+promoters
+```
+
+# Plot one region
+
+`plot_promoter_region()` wires the three steps together. Set `use_clusters = FALSE` to
+get the same panels without the topic-model split.
+
+```{r plot-region-fn}
+plot_promoter_region <- function(gene, use_clusters = TRUE, peaks_df = NULL,
+                                 width = 10, height = 14) {
+  region  <- promoters %>% dplyr::filter(gene == !!gene)
+  outname <- region$outname
+  cat("=== ", gene, ": ", region$chr, ":", region$start, "-", region$end, " ===\n", sep = "")
+
+  result_dirs <- file.path(extract_root, outname, sample_names, "parsed")
+
+  res <- load_region_results(
+    region      = region[, c("chr", "start", "end")],
+    sample_names = sample_names,
+    result_dirs  = result_dirs,
+    fiberHMM_feature      = fiberHMM_feature,
+    min_fiberHMM_fp_score = min_fiberHMM_fp_score,
+    fiberHMM_size_breaks  = fiberHMM_size_breaks)
+
+  if (use_clusters) {
+    assignments_file <- file.path(topic_model_dir, outname,
+                                  paste0("read_topic_assignments_", outname, ".tsv"))
+    res <- add_topic_clusters(res, assignments_file, assignment_col = "cluster")
+  }
+
+  p <- plot_region_panels(res,
+                          plot_name = gene,
+                          peaks_df = peaks_df,
+                          fiberHMM_cols = fiberHMM_cols)
+
+  suffix <- if (use_clusters) "_by_cluster" else ""
+  ggsave(file.path(plot_dir, paste0("region_", outname, suffix, ".pdf")),
+         p$combined, width = width, height = height, limitsize = FALSE)
+
+  invisible(list(res = res, plot = p))
+}
+```
+
+# All regions
+
+```{r plot-all, fig.width=10, fig.height=14}
+out <- list()
+for (g in promoters$gene) {
+  out[[g]] <- plot_promoter_region(g, use_clusters = TRUE)
+  print(out[[g]]$plot$combined)
+}
+```
+
+# QC: reads per cluster and timepoint
+
+Compare against the counts in `read_topic_assignments_<outname>.tsv`; the difference is
+the reads dropped because `ft fire` produced no segmentation for them.
+
+```{r qc-counts}
+qc <- lapply(names(out), function(g) {
+  rids <- out[[g]]$res$rids_df
+  as.data.frame(table(cluster = rids$cluster, sample_name = rids$sample_name)) %>%
+    dplyr::mutate(gene = g, .before = 1)
+}) %>% dplyr::bind_rows()
+
+qc %>%
+  tidyr::pivot_wider(names_from = sample_name, values_from = Freq) %>%
+  knitr::kable()
+```
+
+```{r qc-footprint-sizes}
+# every drawn footprint must fall inside the outer size breaks
+sizes <- lapply(names(out), function(g) {
+  fps <- out[[g]]$res$fps_infire
+  fps <- fps[!is.na(fps$class), ]
+  data.frame(gene = g, n = nrow(fps),
+             min_size = min(fps$size), max_size = max(fps$size))
+}) %>% dplyr::bind_rows()
+sizes
+stopifnot(all(sizes$min_size >= min(fiberHMM_size_breaks)),
+          all(sizes$max_size <= max(fiberHMM_size_breaks)))
+```

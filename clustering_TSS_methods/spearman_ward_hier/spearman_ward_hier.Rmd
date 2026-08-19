@@ -1,0 +1,486 @@
+---
+title: "MATAC-seq-style Spearman + ward.D2 clustering of single molecules at early-response promoters"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Replicates the single-molecule clustering of Chanou et al. (2023), "Single
+molecule MATAC-seq reveals key determinants of DNA replication origin
+efficiency" (code: github.com/ScialdoneLab/MATACseq, branch matac-seq,
+`clustering_ARS305.ipynb` + `methylation_analysis_20220502_ARS305.ipynb`), on
+THP-1 Fiber-seq m6A at the early-response promoters instead of MATAC-seq GpC
+methylation at yeast replication origins. The procedure is the paper's:
+
+1. per-molecule methylation averaged in consecutive 30-bp windows across the
+   region ("features");
+2. `scale()` of the molecule x window matrix (column-wise z-score, i.e. each
+   window scaled across molecules - what their code does);
+3. molecule-molecule dissimilarity `sqrt((1 - rho) / 2)` with rho = Spearman
+   correlation of the scaled window profiles (their code takes the square
+   root, although the methods text only states (1 - rho)/2);
+4. `hclust(method = "ward.D2")` on that distance;
+5. Elbow plot (within-cluster sum of squares on the scaled matrix for
+   k = 1..10, reproducing `factoextra::fviz_nbclust(scaled, hcut,
+   diss = dist_mat, method = "wss")`, which is not installed here);
+6. `cutree()` at k = 5 (the paper's k at all four origins; per-gene elbow
+   plots are written so k can be revisited per gene).
+
+All four LPS timepoints are pooled and clustered jointly per gene; each
+molecule keeps its timepoint tag (`sample_name`), the analog of the paper's
+`condition` (wt / dies6 / disw2), so every read has both a cluster and a
+timepoint in the outputs, and the paper's condition-composition plots become
+timepoint-composition plots.
+
+Deviations from the paper (all forced by the data type, none by choice):
+
+* Fiber-seq m6A (1 = m6A call, 0 = covered/unmodified) instead of Nanopore
+  GpC methylation; a window's value is the fraction of its m6A-informative
+  positions methylated on that molecule, in [0, 1]. The paper additionally
+  divided by a nucleosomal-array spike-in mean (values up to ~3); Fiber-seq
+  has no spike-in, so heatmap color breaks are adapted to [0, 1] (raw) and
+  +/- 3 (scaled) instead of their (0, 1.5, 3) and (-4, 0, 3).
+* Molecules: the full-span read set (`filter_met_mat()`, the topic model's
+  and hamming analysis' row filter), pooled across LPS_0/5/10/15. Their
+  amplicon reads all span the whole locus, so this matches their data shape
+  (no NAs) and keeps the read universe identical to the other clusterings.
+* Windows: all consecutive 30-bp windows over the 2-kb promoter (the last
+  window is 21 bp), instead of their pre-selected significant windows (their
+  selection needed a wt-vs-mutant test that has no analog here). Windows with
+  no m6A-informative position or zero variance across molecules are dropped
+  (both would break `scale()` / Spearman) and logged.
+* Cluster labels are renumbered top-to-bottom in dendrogram order
+  programmatically (the paper relabeled them by hand per origin).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(Matrix)
+library(GenomicRanges)
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(cowplot)
+```
+
+# Functions
+
+`extract_ft_region_reads()`, `extract_ft_read_info()`, `get_sparse_met_mat()`
+and `filter_met_mat()` come from the topic model, as in the hamming analysis.
+
+```{r functions}
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+```
+
+# Settings
+
+```{r settings}
+options(scipen = 999)
+
+sample_table <- tibble::tribble(
+  ~sample_name, ~condition, ~timepoint,
+  "LPS_0",      "LPS",       0L,
+  "LPS_5",      "LPS",       5L,
+  "LPS_10",     "LPS",       10L,
+  "LPS_15",     "LPS",       15L
+)
+sample_names <- sample_table$sample_name[sample_table$condition == "LPS"]
+
+ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
+
+promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+
+output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/spearman_ward_hier"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+window_size <- 30   # bp, the paper's feature size
+k_clusters  <- 5    # the paper's k at all four origins
+k_max_elbow <- 10   # fviz_nbclust default k.max
+
+# cluster palette = the paper's (clustering_ARS305.ipynb cell 25)
+cluster_cols <- c("1" = "#377eb8", "2" = "#D95F02", "3" = "#7570B3",
+                  "4" = "#E7298A", "5" = "#1B9E77", "6" = "#e6ab02",
+                  "7" = "#a6761d")
+# timepoints (analog of their wt/dies6/disw2 condition colors): sequential
+timepoint_cols <- c("LPS_0" = "#bdbdbd", "LPS_5" = "#6baed6",
+                    "LPS_10" = "#2171b5", "LPS_15" = "#08306b")
+
+set.seed(123)
+```
+
+# Promoter regions
+
+Same table and genes as the hamming analysis: TSS +/- 1000 bp from GENCODE
+v49 (`make_promoter_table.R`).
+
+```{r regions}
+promoters <- read.delim(promoter_table)
+promoters
+```
+
+# m6A read x position matrix per promoter
+
+Identical to the hamming analysis: pooled across the four LPS timepoints,
+each read tagged with its sample of origin; `get_sparse_met_mat()` gives
+1 = m6A call, 0 = covered/unmodified, NA = not covered.
+
+```{r assemble-function}
+assemble_region_m6a <- function(sample_names, region_chr, region_start, region_end,
+                                ft_result_dir, verbose = TRUE) {
+  region_gr <- GRanges(region_chr, IRanges(region_start, region_end))
+  reads_list <- lapply(sample_names, function(sample_name) {
+    extracted_file <- file.path(
+      ft_result_dir, sample_name, "extracted_results", "m6a_by_chr",
+      paste0(sample_name, ".ft_extracted_m6a.", region_chr, ".bed.gz"))
+    sample_reads <- extract_ft_region_reads(extracted_file, region_gr,
+                                            keep_pos_in_region_only = TRUE,
+                                            verbose = verbose)
+    if (nrow(sample_reads) == 0) return(NULL)
+    dplyr::mutate(sample_reads, sample_name = sample_name, .before = 1)
+  })
+  reads <- dplyr::bind_rows(reads_list)
+  if (nrow(reads) == 0) stop("no reads in region")
+  rids_df <- extract_ft_read_info(reads, keep_columns = c("sample_name", "score"))
+  met_mat <- get_sparse_met_mat(reads, rids_df,
+                                window_start = region_start,
+                                window_end = region_end, base = "A")
+  list(reads = reads, rids_df = rids_df, met_mat = met_mat)
+}
+```
+
+# MATAC-seq clustering functions
+
+```{r matac-functions}
+# consecutive 30-bp windows over [region_start, region_end]; the last window
+# keeps the remainder (as in their ARS305_anno, whose last feature is partial)
+make_window_anno <- function(region_start, region_end, window_size) {
+  starts <- seq(region_start, region_end, by = window_size)
+  data.frame(feature = seq_along(starts),
+             win_start = starts,
+             win_end = pmin(starts + window_size - 1, region_end))
+}
+
+# molecule x window matrix of mean methylation (their condense_features());
+# met_mat must be NA-free (full-span reads)
+condense_features <- function(met_mat, window_anno) {
+  pos <- as.integer(colnames(met_mat))
+  win_of_pos <- findInterval(pos, window_anno$win_start)
+  n_sites <- tabulate(win_of_pos, nbins = nrow(window_anno))
+  win_sums <- t(rowsum(t(as.matrix(met_mat)), group = win_of_pos))
+  win_meth <- sweep(win_sums, 2, n_sites[as.integer(colnames(win_sums))], "/")
+  colnames(win_meth) <- window_anno$feature[as.integer(colnames(win_sums))]
+  list(win_meth = win_meth, n_sites = n_sites)
+}
+
+# WSS on the scaled matrix for cutree(hc, k) memberships - the numbers
+# fviz_nbclust(scaled, hcut, diss = dist_mat, method = "wss") would give,
+# since hcut's default is also hclust/ward.D2 on the supplied distance
+wss_curve <- function(scaled_meth, hc, k_max) {
+  sapply(seq_len(k_max), function(k) {
+    cl <- if (k == 1) rep(1L, nrow(scaled_meth)) else cutree(hc, k = k)
+    sum(sapply(split(seq_along(cl), cl), function(idx) {
+      x <- scaled_meth[idx, , drop = FALSE]
+      sum(sweep(x, 2, colMeans(x))^2)
+    }))
+  })
+}
+
+# the paper's full pipeline: scale -> Spearman -> sqrt((1-rho)/2) -> ward.D2
+# -> cutree(k); clusters renumbered top-to-bottom in dendrogram order (the
+# paper did this relabeling by hand)
+matac_cluster <- function(win_meth, k_clusters, k_max_elbow) {
+  win_sd <- apply(win_meth, 2, sd)
+  if (any(win_sd == 0)) {
+    cat("dropping", sum(win_sd == 0), "zero-variance window(s):",
+        colnames(win_meth)[win_sd == 0], "\n")
+  }
+  win_meth_used <- win_meth[, win_sd > 0, drop = FALSE]
+
+  scaled_meth <- scale(win_meth_used)
+
+  cor_mat <- cor(t(scaled_meth), method = "spearman")
+  if (any(is.na(cor_mat))) stop("NA in Spearman correlation matrix")
+  dissim_mat <- sqrt((1 - cor_mat) / 2)
+  dist_mat <- as.dist(dissim_mat)
+  corr_clust <- hclust(dist_mat, method = "ward.D2")
+
+  wss <- wss_curve(scaled_meth, corr_clust, k_max_elbow)
+
+  corr_groups <- cutree(corr_clust, k = k_clusters)
+  dend_order_of_cluster <- unique(corr_groups[corr_clust$order])
+  cluster <- factor(match(corr_groups, dend_order_of_cluster),
+                    levels = seq_len(k_clusters))
+
+  list(win_meth_used = win_meth_used, scaled_meth = scaled_meth,
+       dissim_mat = dissim_mat, corr_clust = corr_clust, wss = wss,
+       corr_groups = corr_groups, cluster = cluster)
+}
+```
+
+# Plotting functions
+
+The two single-molecule heatmaps are the paper's (cells 20 and 25 of
+`clustering_ARS305.ipynb`): rows = molecules, cut by the ward.D2 dendrogram
+into `row_split = k` slices, columns = 30-bp windows in genomic order,
+left annotation = cluster + timepoint; one heatmap of the scaled and one of
+the raw window methylation. Plus their simplified cluster x window mean
+heatmap (cell 33), condition-composition plots (cells 16/17) with timepoint
+in place of condition, and the PCA of the dissimilarity matrix (cell 39).
+
+```{r plot-functions}
+matac_heatmap <- function(mat, res, rids_df, col_fun, name, column_title) {
+  ha <- rowAnnotation(
+    cluster = res$cluster,
+    timepoint = factor(rids_df$sample_name, levels = names(timepoint_cols)),
+    col = list(cluster = cluster_cols[levels(res$cluster)],
+               timepoint = timepoint_cols))
+  Heatmap(mat, name = name,
+          row_title = "molecules",
+          show_row_names = FALSE, show_column_names = FALSE,
+          cluster_columns = FALSE,
+          row_split = nlevels(res$cluster),
+          cluster_rows = as.dendrogram(res$corr_clust),
+          row_dend_width = unit(3, "cm"),
+          width = unit(10, "cm"), height = unit(15, "cm"),
+          col = col_fun,
+          column_title = column_title,
+          column_title_gp = gpar(fontsize = 16, fontface = "bold"),
+          left_annotation = ha)
+}
+
+cluster_mean_heatmap <- function(res, gene) {
+  cl_means <- do.call(rbind, lapply(levels(res$cluster), function(cl) {
+    colMeans(res$win_meth_used[res$cluster == cl, , drop = FALSE])
+  }))
+  rownames(cl_means) <- levels(res$cluster)
+  color_func <- colorRamp2(c(0, 0.5, 1), c("#f7f7f7", "#969696", "#252525"))
+  Heatmap(cl_means, name = "mean methylation",
+          show_row_names = TRUE,
+          row_order = seq_len(nrow(cl_means)),
+          cluster_columns = FALSE, cluster_rows = FALSE,
+          row_split = seq_len(nrow(cl_means)),
+          column_split = seq_len(ncol(cl_means)),
+          width = unit(21, "cm"), height = unit(2.5, "cm"),
+          col = color_func,
+          na_col = "lightblue",
+          column_title = paste0("Average methylation by feature and cluster, ", gene),
+          column_title_gp = gpar(fontsize = 16))
+}
+
+composition_plots <- function(assignments, gene) {
+  p1 <- ggplot(assignments, aes(x = cluster, fill = sample_name)) +
+    geom_bar(position = "fill") +
+    scale_fill_manual(values = timepoint_cols, name = "timepoint") +
+    xlab("cluster") + ylab("proportion") +
+    ggtitle(paste0("Proportions of timepoints per cluster, ", gene)) +
+    theme_linedraw() + theme(text = element_text(size = 14))
+
+  summarise_proportions <- assignments %>%
+    dplyr::count(cluster, sample_name) %>%
+    dplyr::group_by(sample_name) %>%
+    dplyr::mutate(proportion = n / sum(n)) %>%
+    dplyr::ungroup()
+  p2 <- ggplot(summarise_proportions,
+               aes(x = cluster, y = proportion, fill = sample_name)) +
+    geom_col(position = "dodge", alpha = 0.6, width = 0.6) +
+    scale_fill_manual(values = timepoint_cols, name = "timepoint") +
+    xlab("cluster") + ylab("proportion of total reads per timepoint") +
+    ggtitle(paste0("Timepoints per cluster, ", gene)) +
+    theme_linedraw() +
+    theme(text = element_text(size = 14), plot.title = element_text(hjust = 0.5))
+
+  cowplot::plot_grid(p1, p2, ncol = 1)
+}
+
+pca_plots <- function(res, assignments, gene) {
+  pca_dissim <- prcomp(res$dissim_mat)
+  pc_df <- data.frame(PC1 = pca_dissim$x[, 1], PC2 = pca_dissim$x[, 2],
+                      cluster = res$cluster,
+                      timepoint = factor(assignments$sample_name,
+                                         levels = names(timepoint_cols)))
+  p1 <- ggplot(pc_df, aes(PC1, PC2, color = cluster)) +
+    theme_linedraw() + theme(text = element_text(size = 14)) +
+    geom_point() +
+    scale_color_manual(values = cluster_cols[levels(res$cluster)]) +
+    labs(title = paste0("PCA of dissimilarity matrix, ", gene))
+  p2 <- ggplot(pc_df, aes(PC1, PC2, color = timepoint)) +
+    theme_linedraw() + theme(text = element_text(size = 14)) +
+    geom_point() +
+    scale_color_manual(values = timepoint_cols) +
+    labs(title = paste0("PCA of dissimilarity matrix, ", gene))
+  cowplot::plot_grid(p1, p2, ncol = 1)
+}
+```
+
+# Clustering at each promoter
+
+Per gene: assemble the pooled m6A matrix, apply the full-span filter, build
+the 30-bp window matrix, run the paper's pipeline, and write assignments,
+matrices, the WSS elbow, dendrogram, heatmaps, composition and PCA plots.
+
+```{r cluster-promoters, fig.width=8, fig.height=8}
+all_results <- list()
+for (i in seq_len(nrow(promoters))) {
+  gene <- promoters$gene[i]
+  cat("\n=====", gene, "=====\n")
+  gene_dir <- file.path(output_dir, gene)
+  if (!dir.exists(gene_dir)) dir.create(gene_dir, recursive = TRUE)
+
+  dat <- assemble_region_m6a(sample_names, promoters$chr[i],
+                             promoters$start[i], promoters$end[i],
+                             ft_result_dir, verbose = FALSE)
+  cat(gene, ": ", nrow(dat$rids_df), " reads x ", ncol(dat$met_mat),
+      " m6A sites before filtering\n", sep = "")
+
+  met_mat <- filter_met_mat(dat$met_mat, verbose = TRUE)
+  rids_df <- dat$rids_df[match(rownames(met_mat), as.character(dat$rids_df$RID)), ]
+  cat(gene, ": ", nrow(met_mat), " full-span reads x ", ncol(met_mat),
+      " m6A sites\n", sep = "")
+
+  window_anno <- make_window_anno(promoters$start[i], promoters$end[i], window_size)
+  cf <- condense_features(met_mat, window_anno)
+  window_anno$n_sites <- cf$n_sites
+  if (any(cf$n_sites == 0)) {
+    cat("windows with no m6A-informative site (dropped):",
+        window_anno$feature[cf$n_sites == 0], "\n")
+  }
+
+  res <- matac_cluster(cf$win_meth, k_clusters, k_max_elbow)
+  cat("cluster sizes:\n")
+  print(table(res$cluster))
+
+  assignments <- data.frame(
+    RID = rownames(met_mat),
+    sample_name = factor(rids_df$sample_name, levels = sample_names),
+    read_start = rids_df$start, read_end = rids_df$end,
+    strand = rids_df$strand,
+    corr_group_raw = res$corr_groups,
+    cluster = res$cluster)
+  all_results[[gene]] <- list(res = res, assignments = assignments,
+                              window_anno = window_anno)
+
+  ## tables + rds
+  saveRDS(list(window_anno = window_anno, win_meth = cf$win_meth, res = res,
+               assignments = assignments),
+          file.path(gene_dir, paste0("spearman_ward_", gene, ".rds")))
+  write.table(assignments,
+              file.path(gene_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(window_anno,
+              file.path(gene_dir, paste0("window_annotation_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(data.frame(RID = rownames(cf$win_meth),
+                         sample_name = rids_df$sample_name,
+                         cluster = res$cluster,
+                         cf$win_meth, check.names = FALSE),
+              file.path(gene_dir, paste0("window_methylation_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(data.frame(k = seq_along(res$wss), wss = res$wss),
+              file.path(gene_dir, paste0("wss_values_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  ## elbow plot
+  gg <- ggplot(data.frame(k = seq_along(res$wss), wss = res$wss), aes(k, wss)) +
+    geom_line(color = "steelblue") + geom_point(color = "steelblue") +
+    scale_x_continuous(breaks = seq_along(res$wss)) +
+    labs(title = paste0("Optimal number of clusters, ", gene),
+         subtitle = "Elbow method",
+         x = "Number of clusters k",
+         y = "Total Within Sum of Square") +
+    theme_classic()
+  ggsave(file.path(gene_dir, paste0("wss_elbow_", gene, ".pdf")), gg,
+         width = 6, height = 4)
+
+  ## dendrogram
+  pdf(file.path(gene_dir, paste0("dendrogram_", gene, ".pdf")), width = 8, height = 5)
+  plot(res$corr_clust, cex = 0.5, labels = FALSE,
+       main = paste0("Dendrogram for correlation clustering, ", gene),
+       xlab = "molecules")
+  dev.off()
+
+  ## the paper's two single-molecule heatmaps
+  pdf(file.path(gene_dir, paste0("heatmap_scaled_", gene, ".pdf")),
+      width = 8, height = 9)
+  draw(matac_heatmap(res$scaled_meth, res, rids_df,
+                     colorRamp2(c(-3, 0, 3), c("#0b5394", "white", "#c53145")),
+                     "Scaled feature\nmethylation",
+                     paste0("Summarized feature methylation of ", gene)))
+  dev.off()
+
+  pdf(file.path(gene_dir, paste0("heatmap_raw_", gene, ".pdf")),
+      width = 8, height = 9)
+  draw(matac_heatmap(res$win_meth_used, res, rids_df,
+                     colorRamp2(c(0, 0.5, 1), brewer.pal(3, "Reds")),
+                     "Average feature\nmethylation",
+                     paste0("\nFeature methylation of ", gene)))
+  dev.off()
+
+  ## simplified cluster x window mean heatmap
+  pdf(file.path(gene_dir, paste0("heatmap_cluster_means_", gene, ".pdf")),
+      width = 12, height = 3)
+  draw(cluster_mean_heatmap(res, gene))
+  dev.off()
+
+  ## timepoint composition (the paper's condition-composition plots)
+  gg <- composition_plots(assignments, gene)
+  ggsave(file.path(gene_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
+         width = 7, height = 8)
+  write.table(assignments %>% dplyr::count(cluster, sample_name),
+              file.path(gene_dir, paste0("cluster_timepoint_counts_", gene, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  ## PCA of the dissimilarity matrix
+  gg <- pca_plots(res, assignments, gene)
+  ggsave(file.path(gene_dir, paste0("pca_dissim_", gene, ".pdf")), gg,
+         width = 7, height = 9)
+}
+```
+
+# Cluster sizes and timepoint composition across genes
+
+```{r cluster-summary}
+cluster_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
+  all_results[[g]]$assignments %>%
+    dplyr::count(cluster) %>%
+    dplyr::mutate(gene = g, .before = 1)
+}))
+write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cluster_summary %>% tidyr::pivot_wider(names_from = cluster, values_from = n)
+
+timepoint_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
+  all_results[[g]]$assignments %>%
+    dplyr::count(cluster, sample_name) %>%
+    dplyr::mutate(gene = g, .before = 1)
+}))
+write.table(timepoint_summary,
+            file.path(output_dir, "cluster_timepoint_summary_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+## mean total methylation per cluster (their cell 19)
+meth_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
+  res <- all_results[[g]]$res
+  data.frame(gene = g, cluster = levels(res$cluster),
+             mean_window_methylation = sapply(levels(res$cluster), function(cl) {
+               mean(res$win_meth_used[res$cluster == cl, , drop = FALSE])
+             }))
+}))
+write.table(meth_summary,
+            file.path(output_dir, "cluster_mean_methylation_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+meth_summary
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
