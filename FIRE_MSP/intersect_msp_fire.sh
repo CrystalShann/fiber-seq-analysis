@@ -19,12 +19,6 @@
 #   <s>.MSP_<LEN>_FIRE_intersect.vsLPS0peaks.bed.gz peak coords + read name, one row per
 #                                                   (MSP, peak) pair at >=50% overlap
 #   <s>.FIRE_read_intersect.vsLPS0peaks.bed.gz      BED12 reads fully containing a peak
-#   <s>.FIRE_peaks_canonicalTSS_250bp.bed.gz        peak coords + actuation + TSS info +
-#                                                   TSS center + strand + distance, one
-#                                                   row per (peak, canonical TSS) pair
-#                                                   within 250 bp of the TSS center
-#
-
 #
 # Usage:
 #   bash   intersect_msp_fire.sh LPS_0      # LPS_0 first, builds the peak universe
@@ -47,7 +41,6 @@ FIRE_ROOT="/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hi
 OUT_ROOT="/project/spott/cshan/fiber-seq/macrophage_project/FIRE_MSP"
 SORT_TMP="/scratch/midway3/cshan"
 REF="/project/spott/reference/human/GRCh38/hg38.fa"
-TSS_ALL="/project/spott/cshan/annotations/gencode.v46.annotation_all_tss.bed"  # 20 bp per transcript TSS, tags in col 4
 
 FT=/project/spott/cshan/envs/fire-env/bin/ft
 SAMTOOLS=/project/spott/cshan/envs/dimelo/bin/samtools
@@ -78,7 +71,6 @@ msp12="${out_dir}/${sample_name}.MSP_${LEN}.bed.gz"
 msp6="${out_dir}/${sample_name}.MSP_BED6_single_${LEN}.bed.gz"
 msp_x_fire="${out_dir}/${sample_name}.MSP_${LEN}_FIRE_intersect.vsLPS0peaks.bed.gz"
 read_x_fire="${out_dir}/${sample_name}.FIRE_read_intersect.vsLPS0peaks.bed.gz"
-peaks_tss="${out_dir}/${sample_name}.FIRE_peaks_canonicalTSS_250bp.bed.gz"
 
 echo "Sample     : ${sample_name}"
 echo "CRAM       : ${cram}"
@@ -130,8 +122,9 @@ echo "  ${n_peaks} peaks pass"
 
 # extract MSP from FIRE CRAM using fibertools extract -x MSP length > 150 bp, this creates a bed12 file
 ## this contains a read as a row, and MSP are blocks
-# convert BED12 block features to BED6 using bed12ToBed
-# now each row is a MSP block, and filter for MSP block > 100 bp
+# convert BED12 block features to BED6 using bed12ToBed6
+# now each row is a MSP block; the awk length check (> 100 bp) only drops malformed
+# blocks - the operative MSP length filter is len(msp) > LEN at ft extract above
 # sort, index and compress the file
 
 
@@ -145,7 +138,6 @@ else
 fi
 
 echo "Converting BED12 -> single-MSP BED6..."
-# length >150 
 
 "$BED12TOBED6" -i "$msp12" \
     | awk -F'\t' -v OFS='\t' '($3 - $2) > 100' \
@@ -158,7 +150,7 @@ echo "  ${n_msp} single MSPs"
 
 
 ###########################
-# Find MSP that overlaps FIRE peaks at LPS_0 with at least 50% of neither MSP or FIRE = numerator
+# Find MSP that overlaps FIRE peaks at LPS_0 with at least 50% of either the MSP or the peak = numerator
 ###########################
 
 
@@ -166,9 +158,10 @@ echo "  ${n_msp} single MSPs"
 ##    Output rows are peak coords + the MSP's read name (cols 4-6 of the MSP BED6),
 
 
-# intersect MSP BED6 with FIRE peaks, and require >=50% overlap relative to neither MSP or FIRE
-  ## incluce all columns in MSP BED6 and FIRE peaks in the output
-# rearrange and only keeps: FIRE_chr    FIRE_start    FIRE_end    read_name    score    strand
+# intersect MSP BED6 with the LPS_0 peak universe; -f 0.5 -F 0.5 -e = keep a match
+# when the overlap covers >=50% of the MSP OR >=50% of the peak (either is enough)
+  ## include all columns of the MSP BED6 and the peak in the output
+# rearrange and only keep: peak_chr    peak_start    peak_end    read_name    score    strand
 
 
 [ -s "$peaks_lps0" ] || die "LPS_0 peak universe not found (run LPS_0 first): $peaks_lps0"
@@ -182,14 +175,15 @@ echo "Intersecting MSPs with LPS_0 FIRE peaks..."
 echo "  $(zcat "$msp_x_fire" | wc -l) MSP-peak pairs"
 
 ###########################
-# Find all fibers thatspanning the FIRE peak = denominator
+# Find all fibers that fully span the FIRE peak = denominator
 ###########################
 
 ## 4. Reads fully containing a peak for per-peak fiber denominators
 
-# drop secondary and supplementary alignment using -F 0x900
+# drop secondary and supplementary alignments using -F 0x900, so only primary
+# alignments count (secondary/supplementary would fabricate distant co-occurrences)
   ## -u requests uncompressed BAM output that can be piped into BEDtools
-# intersect FIRE peaks at LPS_0 to reads from BAM files
+# intersect the reads from the FIRE CRAM with the LPS_0 peak universe
   ## LPS_0.FIRE_peaks_pass_coverage.autosomes.bed.gz
   ## -F 1 requires 100% of the FIRE peak to lie inside the read alignment
 
@@ -200,38 +194,6 @@ echo "Intersecting reads with LPS_0 FIRE peaks..."
     | "$BEDTOOLS" intersect -bed -F 1 -abam stdin -b "$peaks_lps0" \
     | "$BGZIP" > "$read_x_fire" || die "read x peak intersect failed"
 echo "  $(zcat "$read_x_fire" | wc -l) read-peak pairs"
-
-
-###########################
-# Find all fibers thatspanning the FIRE peak = denominator
-###########################
-
-## 5. Peaks near canonical TSSs - filter the
-##    all-transcript TSS bed to Ensembl_canonical, then map peaks to TSSs within
-##    range 240. The TSS records are 20 bp centered on the TSS, so 240 bp from the
-##    record edge = 250 bp from the TSS itself - one row per (peak, TSS) pair
-##    and peaks with no TSS in range are likewise absent).
-
-##    Output: peak chrom/start/end, actuation, TSS info (gene_id;transcript_id;
-##    gene_name;type;tags), TSS center, strand, distance (0 if inside the peak)
-
-# find FIRE peaks that overlap or lie within 240 bp up/downstream of canonical TSS
-# calculate exact TSS position
-  ## because LPS_0.FIRE_peaks_pass_coverage.autosomes.bed.gz contains 20 bp TSS interval, 
-  ## TSS exact start is TSS interval start + 10
-# calculate distance between the peak and TSS
-
-
-echo "Annotating peaks with canonical TSSs within 250 bp..."
-[ -s "$TSS_ALL" ] || die "TSS bed not found: $TSS_ALL"
-"$BEDTOOLS" window -w 240 -a "$peaks" -b <(grep Ensembl_canonical "$TSS_ALL") \
-    | awk -F'\t' -v OFS='\t' '{
-        p = $8 + 10
-        d = (p < $2) ? $2 - p : (p >= $3 ? p - $3 + 1 : 0)
-        print $1, $2, $3, $5, $10, p, $12, d }' \
-    | "$BGZIP" > "$peaks_tss" || die "TSS annotation failed"
-"$TABIX" -f -p bed "$peaks_tss" || die "tabix failed: $peaks_tss"
-echo "  $(zcat "$peaks_tss" | wc -l) peak-TSS pairs ($(zcat "$peaks_tss" | cut -f1-3 | sort -u | wc -l) distinct peaks)"
 
 echo "Done -> ${out_dir}"
 echo "Disk: $(du -sh "$out_dir" | cut -f1)"

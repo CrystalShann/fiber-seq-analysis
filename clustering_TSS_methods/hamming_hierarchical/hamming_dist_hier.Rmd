@@ -13,7 +13,8 @@ methylation. The procedure parameters are the paper's: 50-bp bins; reads
 < 10 bp or with < 10 methylated sites removed; fully methylated /
 unmethylated reads pre-assigned; sliding windows of 60 valid bins with
 >= 20-bin overlap; >= 30 valid bins per read per window; masked Hamming
-distance; average-linkage clustering to t clusters per window; Hungarian
+distance; hierarchical clustering to t clusters per window (the paper's
+average linkage replaced by Ward - see the deviations below); Hungarian
 stitching of adjacent windows; global reassignment of every read to its
 closest stitched profile. See `phasing_functions.r` for the step-by-step
 implementation.
@@ -22,18 +23,44 @@ Deviations from the paper (switches in the Settings chunk):
 
 * Data type: Fiber-seq m6A (1 = m6A / accessible, 0 = covered but
   unmodified, NA = not covered) instead of GpC methylation.
-* Binary 50-bp bins (`binarize_bins`, on): a read's bin value is 1 if the
+* Bin-size sweep (`bin_sizes`): each promoter is phased once per entry -
+  a bin size in bp (the paper: 50), or 0 for no binning, i.e. clustering
+  directly on the 0/1/NA m6A site matrix. The paper's window geometry
+  (60 valid bins, >= 20 overlapping bins, >= 30 valid bins per read, all at
+  50-bp bins) is held fixed in genomic bp (3000 / 1000 / 1500 bp) and
+  converted to bins per size, so bin size 50 reproduces the paper's numbers
+  exactly and the other sizes scale to the same genomic spans; the bin-0
+  (no-bin) run uses one window over all sites and >= 30 valid sites per
+  read. Outputs go to `<gene>/bin<size>/k<t>/` (t = the number of clusters
+  used for that run), each split into `results/` and `plots/`.
+* Binary bins (`binarize_bins`, on): a read's bin value is 1 if the
   read has any m6A call in the bin, instead of the mean site call.
   Fractional m6A bins are unimodal near zero, which compresses all masked
   Hamming distances and collapses the clustering into one cluster plus
-  outliers; binary bins are bimodal like the paper's GpC data.
+  outliers; binary bins are bimodal like the paper's GpC data. (No effect
+  on the no-bin run, whose site calls are already 0/1.)
 * Full-span reads only at the promoters (`full_span_only`, on): the topic
   model's filter_met_mat row filter, so both analyses cluster the same read
   set. Not applied at the wide locus (see below).
+* Ward linkage (`hclust` "ward.D2") instead of the paper's average linkage.
+  On this data average linkage peels off outlier reads, so any cut of the
+  tree gave one cluster holding ~90% of the reads plus tiny shards (worst
+  at fine bin sizes); Ward favors compact, more balanced clusters. Both the
+  t-selection tree and the per-window clustering use Ward, so they cut the
+  same tree.
 * t: the paper predefines t but does not state it for its Pol II analysis
-  (its Sox2 locus analyses used 9 and 7). The promoters use a predefined
-  t = 6; the wide-locus demo instead selects t by average silhouette width
-  (`choose_t()`).
+  (its Sox2 locus analyses used 9 and 7). With `choose_t_by_dispersion`
+  (on), t is selected per gene and bin setting from the within-cluster
+  Hamming dispersion curve (`choose_t_dispersion()`: for every cut
+  t = 1..10 of the Ward tree, the size-weighted average
+  within-cluster masked Hamming distance; t = the elbow of this monotone
+  non-increasing curve, i.e. the candidate maximizing its second
+  difference). This replaces two earlier criteria kept in
+  `phasing_functions.r` for reference: average silhouette width (monotone
+  decreasing in t at every one of these loci, so always t = 2) and
+  recursive bootstrap stability (no split was stable, so always t = 1).
+  Switched off, the manually set `t_clusters` (currently 6) is used
+  everywhere.
 
 The paper's Pol II analysis clusters single molecules in 2-kb regions centered
 on ChIP-seq-validated, Pol II-bound TSSs and annotates the clusters as Pol II
@@ -90,11 +117,21 @@ if (!dir.exists(output_dir)) {
   dir.create(output_dir, recursive = TRUE)
 }
 
-# Number of clusters for the 2-kb TSS regions: predefined t = 6 (the paper's
-# predefined-t behavior; its Sox2 locus analyses used 9 and 7, its Pol II t is
-# unstated). Data-driven selection (choose_t(), used by the wide demo below)
-# picks t = 2 at every one of these loci.
-t_clusters <- 6
+# Number of clusters for the 2-kb TSS regions.
+# choose_t_by_dispersion = TRUE: t is selected per gene and bin setting from
+# the within-cluster Hamming dispersion curve (choose_t_dispersion() inside
+# phase_reads(): for every cut t = 1..10 of the Ward tree, the
+# size-weighted average within-cluster masked Hamming distance, read-weight-
+# averaged across windows; the curve is monotone non-increasing, so t is the
+# elbow - the candidate maximizing the second difference W(t-1)-2W(t)+W(t+1)).
+# Replaces two earlier criteria kept in phasing_functions.r for reference:
+# silhouette (choose_t(), monotone decreasing at these loci -> always t = 2)
+# and recursive bootstrap stability (choose_t_stability(), no stable split
+# -> always t = 1). FALSE: the manually set t_clusters below is used
+# everywhere (the paper's predefined-t behavior; its Sox2 locus analyses
+# used 9 and 7, its Pol II t is unstated).
+choose_t_by_dispersion <- TRUE
+t_clusters <- 6   # used only when choose_t_by_dispersion = FALSE
 
 # Optional deviations from the paper, both on for now:
 # - full_span_only: keep only reads covering every m6A site in the region
@@ -110,6 +147,34 @@ t_clusters <- 6
 full_span_only <- TRUE
 binarize_bins  <- TRUE
 use_polII_chip <- FALSE
+
+# Bin-size sweep: one full phasing run per promoter per entry. Positive =
+# bin size in bp; 0 = no binning (cluster on the m6A site matrix directly).
+# Output folders: <gene>/bin<size>/k<t>/ (t = the number of clusters used
+# for that run), each with results/ and plots/ inside.
+bin_sizes <- c(0, 10, 20, 30, 50)
+
+# The paper's sliding-window geometry (60 valid bins, >= 20 overlapping bins,
+# >= 30 valid bins per read) is defined at 50-bp bins; keep it fixed in
+# genomic bp and convert per bin size, so bin size 50 gives exactly 60/20/30
+# and every other size scales to the same genomic spans. For the bin-0
+# (no-bin) run the thresholds count m6A site columns instead: a single window
+# over all sites, >= 30 valid sites per read (trivial for full-span reads).
+window_bp    <- 3000   # 60 bins x 50 bp
+overlap_bp   <- 1000   # 20 bins x 50 bp
+min_valid_bp <- 1500   # 30 bins x 50 bp
+
+bin_label <- function(b) paste0("bin", b)
+phase_params_for_bin <- function(b) {
+  if (b == 0) {
+    list(window_valid_bins = Inf, min_overlap_bins = 20,
+         min_valid_bins_per_read = 30)
+  } else {
+    list(window_valid_bins       = ceiling(window_bp / b),
+         min_overlap_bins        = ceiling(overlap_bp / b),
+         min_valid_bins_per_read = ceiling(min_valid_bp / b))
+  }
+}
 
 set.seed(123)
 ```
@@ -211,86 +276,136 @@ assemble_region_m6a <- function(sample_names, region_chr, region_start, region_e
 
 # Phasing at each promoter
 
-Per gene: `phase_reads()` with predefined t = 6, the full-span read filter
-(reads not covering every m6A site in the 2-kb window are dropped, matching
-the topic model's read set) and binary 50-bp bins. A 2-kb promoter has ~40
-valid bins, i.e. a single window, so clustering here is one average-linkage
-cut with no stitching. Outputs per gene: the phasing object (.rds), per-read
-cluster assignments, global cluster profiles and site coverage (.tsv), and
-five plots - 50-bp-bin heatmap, m6A-site heatmap, cluster profiles, cluster
-composition by timepoint, and per-cluster m6A methylation proportion at each
-site (`cluster_met_profiles`, the topic model's plot of the same name, so the
-two clusterings can be compared panel for panel). Heatmap rows are grouped by
-final cluster (side colors) and ordered by read start within cluster.
+Per gene and per `bin_sizes` entry: `phase_reads()` with t selected at the
+elbow of the within-cluster Hamming dispersion curve when
+`choose_t_by_dispersion` is on (`choose_t_dispersion()`; the printed
+"t = ... selected at the within-cluster dispersion elbow" line records the
+choice) or the manually set `t_clusters` when it is off, the
+full-span read filter (reads not covering every m6A site in the 2-kb
+window are dropped, matching the topic model's read set) and binary bins
+of the given size - or the raw m6A site matrix for the no-bin run. The window
+geometry scales with bin size (see Settings) and its 3000 bp always covers
+the whole 2-kb promoter, so clustering here is one Ward cut with
+no stitching at every bin size; the no-bin run is a single window over all
+sites by construction. The read x position matrix is assembled once per gene
+and reused across bin sizes. Outputs per gene x bin setting, under
+`<gene>/bin<size>/k<t>/` (t = the number of clusters used for that run):
+`results/` holds the phasing
+object (.rds), per-read cluster assignments, global cluster profiles, site
+coverage and - when `choose_t_by_dispersion` is on - the dispersion curve
+behind the t choice (one row per candidate t: the size-weighted average
+within-cluster Hamming distance, with the chosen elbow flagged) (.tsv);
+`plots/` holds the bin
+heatmap (skipped for the no-bin
+run, where it would just duplicate the site heatmap), m6A-site heatmap,
+cluster profiles, cluster composition by timepoint, and per-cluster m6A
+methylation proportion at each site (`cluster_met_profiles`, the topic
+model's plot of the same name, so the two clusterings can be compared panel
+for panel). Heatmap rows are grouped by final cluster (side colors) and
+ordered by read start within cluster.
 
 ```{r phase-promoters, fig.width=8, fig.height=8}
 phase_results <- list()
 for (i in seq_len(nrow(promoters))) {
   gene <- promoters$gene[i]
   cat("\n=====", gene, "=====\n")
-  gene_dir <- file.path(output_dir, gene)
-  if (!dir.exists(gene_dir)) dir.create(gene_dir, recursive = TRUE)
 
   dat <- assemble_region_m6a(sample_names, promoters$chr[i],
                              promoters$start[i], promoters$end[i],
                              ft_result_dir, verbose = FALSE)
   cat(gene, ": ", nrow(dat$rids_df), " reads x ", ncol(dat$met_mat), " m6A sites\n", sep = "")
 
-  res <- phase_reads(dat$met_mat, dat$rids_df, t = t_clusters,
-                     full_span_only = full_span_only,
-                     binarize_bins = binarize_bins)
-  res$assignments$sample_name <- factor(res$assignments$sample_name,
-                                        levels = sample_names)
-  phase_results[[gene]] <- res
+  for (bs in bin_sizes) {
+    lab      <- bin_label(bs)
+    bin_desc <- if (bs == 0) "m6A sites, no bins" else paste0(bs, "-bp bins")
+    cat("--- ", gene, ", ", bin_desc, " ---\n", sep = "")
 
-  saveRDS(res, file.path(gene_dir, paste0("phasing_", gene, ".rds")))
-  write.table(res$assignments,
-              file.path(gene_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  write.table(data.frame(cluster = rownames(res$profiles),
-                         res$profiles, check.names = FALSE),
-              file.path(gene_dir, paste0("global_cluster_profiles_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  write.table(res$site_cov,
-              file.path(gene_dir, paste0("site_coverage_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
+    pars <- phase_params_for_bin(bs)
+    res <- phase_reads(dat$met_mat, dat$rids_df,
+                       t = if (choose_t_by_dispersion) NULL else t_clusters,
+                       bin_size = if (bs == 0) NA else bs,
+                       window_valid_bins = pars$window_valid_bins,
+                       min_overlap_bins = pars$min_overlap_bins,
+                       min_valid_bins_per_read = pars$min_valid_bins_per_read,
+                       full_span_only = full_span_only,
+                       binarize_bins = binarize_bins)
+    res$assignments$sample_name <- factor(res$assignments$sample_name,
+                                          levels = sample_names)
+    phase_results[[gene]][[lab]] <- res
 
-  pdf(file.path(gene_dir, paste0("bin_heatmap_", gene, ".pdf")), width = 8, height = 8)
-  plot_phasing_bin_heatmap(res, zmax = if (binarize_bins) 1 else 0.5,
-                           main = paste0(gene, " (50-bp bins)"))
-  dev.off()
+    # k subfolder = the number of clusters used for this run (silhouette-
+    # selected or manual), so runs ending at different t sit side by side
+    res_dir  <- file.path(output_dir, gene, lab, paste0("k", res$params$t), "results")
+    plot_dir <- file.path(output_dir, gene, lab, paste0("k", res$params$t), "plots")
+    for (d in c(res_dir, plot_dir))
+      if (!dir.exists(d)) dir.create(d, recursive = TRUE)
 
-  pdf(file.path(gene_dir, paste0("site_heatmap_", gene, ".pdf")), width = 8, height = 8)
-  plot_phasing_site_heatmap(res, dat$met_mat, main = paste0(gene, " (m6A sites)"))
-  dev.off()
+    saveRDS(res, file.path(res_dir, paste0("phasing_", gene, ".rds")))
+    write.table(res$assignments,
+                file.path(res_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(data.frame(cluster = rownames(res$profiles),
+                           res$profiles, check.names = FALSE),
+                file.path(res_dir, paste0("global_cluster_profiles_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(res$site_cov,
+                file.path(res_dir, paste0("site_coverage_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    if (!is.null(res$t_selection)) {
+      write.table(data.frame(t = res$t_selection$t_candidates,
+                             within_dispersion = res$t_selection$score,
+                             chosen = res$t_selection$t_candidates == res$t_selection$t),
+                  file.path(res_dir, paste0("dispersion_t_selection_", gene, ".tsv")),
+                  sep = "\t", quote = FALSE, row.names = FALSE)
+    }
 
-  gg <- plot_global_profiles(res, tss = promoters$tss[i], main = gene)
-  ggsave(file.path(gene_dir, paste0("global_profiles_", gene, ".pdf")), gg,
-         width = 7, height = 1.4 * nrow(res$profiles) + 1)
+    if (bs != 0) {   # for the bin-0 (no-bin) run this would duplicate the site heatmap
+      pdf(file.path(plot_dir, paste0("bin_heatmap_", gene, ".pdf")), width = 8, height = 8)
+      plot_phasing_bin_heatmap(res, zmax = if (binarize_bins) 1 else 0.5,
+                               main = paste0(gene, " (", bin_desc, ")"))
+      dev.off()
+    }
 
-  gg <- plot_cluster_composition(res, main = gene)
-  ggsave(file.path(gene_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
-         width = 6, height = 4)
+    pdf(file.path(plot_dir, paste0("site_heatmap_", gene, ".pdf")), width = 8, height = 8)
+    plot_phasing_site_heatmap(res, dat$met_mat, main = paste0(gene, " (m6A sites)"))
+    dev.off()
 
-  gg <- plot_cluster_met_profiles(res, dat$met_mat, tss = promoters$tss[i],
-                                  main = gene)
-  n_panels <- length(unique(res$assignments$final_cluster[
-    grepl("^cluster|^fully", res$assignments$final_cluster)]))
-  ggsave(file.path(gene_dir, paste0("cluster_met_profiles_", gene, ".pdf")), gg,
-         width = 6, height = 1.4 * n_panels + 1)
+    gg <- plot_global_profiles(res, tss = promoters$tss[i],
+                               main = paste0(gene, " (", bin_desc, ")"))
+    ggsave(file.path(plot_dir, paste0("global_profiles_", gene, ".pdf")), gg,
+           width = 7, height = 1.4 * nrow(res$profiles) + 1)
+
+    gg <- plot_cluster_composition(res, main = paste0(gene, " (", bin_desc, ")"))
+    ggsave(file.path(plot_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
+           width = 6, height = 4)
+
+    gg <- plot_cluster_met_profiles(res, dat$met_mat, tss = promoters$tss[i],
+                                    main = paste0(gene, " (", bin_desc, ")"))
+    n_panels <- length(unique(res$assignments$final_cluster[
+      grepl("^cluster|^fully", res$assignments$final_cluster)]))
+    ggsave(file.path(plot_dir, paste0("cluster_met_profiles_", gene, ".pdf")), gg,
+           width = 6, height = 1.4 * n_panels + 1)
+  }
 }
 ```
 
 # Cluster sizes across genes
 
-Reads per final cluster and gene (t = 6 everywhere; `removed_*` columns
-count reads that failed the informative-read filters; reads dropped by the
-full-span filter are not in the table, as in the topic model).
+Reads per final cluster, gene and bin setting (`t_selected` is the t used
+for that gene x bin setting - dispersion-elbow-chosen when
+`choose_t_by_dispersion` is on, else the manual `t_clusters`; `removed_*`
+columns count reads that failed the informative-read filters; reads dropped
+by the full-span filter are not in the table, as in the topic model).
 
 ```{r cluster-summary}
 cluster_summary <- dplyr::bind_rows(lapply(names(phase_results), function(g) {
-  df <- phase_results[[g]]$assignments
-  df %>% dplyr::count(final_cluster) %>% dplyr::mutate(gene = g, .before = 1)
+  dplyr::bind_rows(lapply(names(phase_results[[g]]), function(lab) {
+    df <- phase_results[[g]][[lab]]$assignments
+    df %>% dplyr::count(final_cluster) %>%
+      dplyr::mutate(gene = g, bins = lab,
+                    t_selected = phase_results[[g]][[lab]]$params$t,
+                    .before = 1)
+  }))
 }))
 write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
@@ -305,7 +420,9 @@ bins, 10 overlapping windows) exercises the full stitching procedure.
 Unlike the promoter analysis it keeps partial reads - no full-span filter,
 since partial reads are what the stitching machinery is for, and requiring
 ~10-kb HiFi reads to span 20 kb would discard nearly all of them - and t is
-selected by silhouette (`choose_t()`, currently t = 2). Binary bins are used
+selected at the elbow of the within-cluster Hamming dispersion curve
+(`choose_t_dispersion()`; per-window curves are read-weight-averaged because
+the Hungarian stitching needs one t in every window). Binary bins are used
 as in the promoter analysis. The chunk also runs the paper's held-out
 long-read validation (>= 50 kb reads; with HiFi Fiber-seq read lengths the
 expected report is "not applicable").

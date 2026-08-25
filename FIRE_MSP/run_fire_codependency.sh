@@ -22,5 +22,4 @@ set -uo pipefail
 
 PYTHON=/project/spott/cshan/envs/Jupyter-notebook/bin/python3
 
-"$PYTHON" /project/spott/cshan/fiber-seq/code/FIRE_MSP/fire_codependency.py \
-    --shuffle-control "$@"
+"$PYTHON" /project/spott/cshan/fiber-seq/code/FIRE_MSP/fire_codependency.py "$@"

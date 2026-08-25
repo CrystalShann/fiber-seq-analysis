@@ -6,11 +6,14 @@
 # long-range interactions" (bioRxiv 2025.09.08.674887), with the GpC methylation
 # calls replaced by m6A calls (1 = m6A / accessible, 0 = covered but unmodified,
 # NA = position not covered by the read). All parameters are the paper's; by
-# default t is selected from the data instead of predefined (see notes), and
+# default t is selected from the data instead of predefined (see notes), the
+# clustering uses Ward instead of the paper's average linkage (see notes), and
 # two optional deviations are off by default: full_span_only (keep only reads
 # covering every m6A site column - the topic model's filter_met_mat row
 # filter) and binarize_bins (bin value = any m6A call in the bin instead of
-# the mean site call):
+# the mean site call). bin_size = NA skips binning entirely and clusters on
+# the m6A site matrix itself, in which case the window / valid-column
+# parameters count site columns instead of bins:
 #
 #   50 bp bins; reads < 10 bp or with < 10 methylated sites removed; fully
 #   methylated / fully unmethylated reads pre-assigned and excluded from
@@ -34,12 +37,23 @@
 #     mean profiles during stitching.
 #   * "Fully methylated" = every observed site on the read is methylated;
 #     "fully unmethylated" = no observed site is methylated.
+#   * The clustering linkage is Ward ("ward.D2"), not the paper's average
+#     linkage: on this data average linkage peels off outlier reads, so any
+#     cut gave one ~90% cluster plus tiny shards (worst at fine bin sizes);
+#     Ward favors compact, more balanced clusters. The unused reference
+#     functions choose_t() / choose_t_stability() still build average-linkage
+#     trees, as run historically.
 #   * The paper stops merging at a predefined t but never states how t was
-#     chosen. Here t is not predefined: choose_t() cuts every window's
-#     average-linkage tree at each candidate t (2..t_max) and picks the t
-#     maximizing the read-weighted mean silhouette width across windows. A
-#     single t is used in every window because the paper's one-to-one
-#     Hungarian stitching requires equal cluster counts in adjacent windows.
+#     chosen. Here t is not predefined: choose_t_dispersion() computes, for
+#     every cut t = 1..t_max of each window's Ward tree, the
+#     size-weighted average within-cluster masked Hamming distance, and picks
+#     t at the elbow of the (read-weight-averaged, monotone non-increasing)
+#     curve - the candidate maximizing its second difference. A single t is
+#     used in every window because the paper's one-to-one Hungarian stitching
+#     requires equal cluster counts in adjacent windows. (choose_t(), the
+#     earlier silhouette criterion - always t = 2 on this data - and
+#     choose_t_stability(), the bootstrap-stability criterion - always t = 1
+#     here - are kept for reference.)
 
 suppressMessages({
   requireNamespace("clue")
@@ -179,13 +193,13 @@ make_windows <- function(valid_cols, window_valid_bins = 60, min_overlap_bins = 
 
 
 # ---------------------------------------------------------------------------
-# Data-driven choice of t (the paper predefines t; here it is found instead).
-# For every window, reads are filtered and clustered exactly as in
-# cluster_window(); each candidate t in 2..t_max cuts the average-linkage tree
-# at t and is scored by the average silhouette width on the window's masked
-# Hamming distances. The t maximizing the read-weighted mean score across
-# windows is returned and used in every window (the one-to-one Hungarian
-# stitching requires the same t in adjacent windows).
+# Earlier data-driven choice of t, kept for reference but no longer called by
+# phase_reads() (see choose_t_stability() below). For every window, reads are
+# filtered and clustered exactly as in cluster_window(); each candidate t in
+# 2..t_max cuts the average-linkage tree at t and is scored by the average
+# silhouette width on the window's masked Hamming distances. The t maximizing
+# the read-weighted mean score across windows is returned. On this data the
+# score is monotone decreasing in t, so this always picked t = 2.
 # ---------------------------------------------------------------------------
 choose_t <- function(bin_mat, windows, min_valid_bins = 30, t_max = 10) {
   per_win <- lapply(windows, function(w) {
@@ -217,12 +231,175 @@ choose_t <- function(bin_mat, windows, min_valid_bins = 30, t_max = 10) {
 
 
 # ---------------------------------------------------------------------------
+# Earlier data-driven choice of t by recursive bootstrap stability, kept for
+# reference but no longer called by phase_reads() (see choose_t_dispersion()
+# below; at these promoters no split was bootstrap-stable, so this always
+# returned t = 1). Within each window the reads are split top-down: cut the window's
+# average-linkage tree at k = 2, keep the split only if both halves are
+# reproducible under bootstrap resampling of the reads - the mean maximum
+# Jaccard similarity between each original half and the clusters recomputed
+# on n_boot resamples must reach min_jaccard (the clusterwise stability
+# criterion of Hennig 2007, as in fpc::clusterboot) - then recurse into each
+# accepted half. A window's t is its number of leaves (1 if even the first
+# split is unstable); splitting stops early below 2 * min_cluster_size reads
+# or at t_max leaves. The single t used everywhere (the one-to-one Hungarian
+# stitching requires equal cluster counts in adjacent windows) is the
+# read-weighted median of the per-window leaf counts.
+# ---------------------------------------------------------------------------
+choose_t_stability <- function(bin_mat, windows, min_valid_bins = 30,
+                               t_max = 10, n_boot = 100, min_jaccard = 0.75,
+                               min_cluster_size = 5) {
+  # mean (over bootstraps) max Jaccard similarity of each half of a k = 2 cut
+  # of D to the halves recomputed on a resample of the rows of D
+  split_stability <- function(D, labels) {
+    jac <- matrix(NA_real_, n_boot, 2)
+    for (b in seq_len(n_boot)) {
+      s  <- sample.int(nrow(D), replace = TRUE)
+      lb <- cutree(hclust(as.dist(D[s, s, drop = FALSE]), method = "average"),
+                   k = 2)
+      for (ci in 1:2) {
+        orig <- intersect(which(labels == ci), s)
+        jac[b, ci] <- max(vapply(1:2, function(cb) {
+          boot <- unique(s[lb == cb])
+          length(intersect(orig, boot)) / length(union(orig, boot))
+        }, numeric(1)))
+      }
+    }
+    colMeans(jac)
+  }
+
+  per_win <- lapply(seq_along(windows), function(wi) {
+    sub  <- bin_mat[, windows[[wi]], drop = FALSE]
+    keep <- rowSums(!is.na(sub)) >= min_valid_bins
+    if (sum(keep) < 3) return(NULL)
+    sub <- sub[keep, , drop = FALSE]
+    D   <- masked_hamming(sub)
+
+    n_leaves <- 0L
+    splits   <- list()
+    note <- function(idx, lab, jac, accepted, reason) {
+      splits[[length(splits) + 1L]] <<- data.frame(
+        window = wi, n_reads = length(idx),
+        n1 = sum(lab == 1), n2 = sum(lab == 2),
+        jaccard1 = jac[1], jaccard2 = jac[2],
+        accepted = accepted, reason = reason)
+    }
+    recurse <- function(idx) {
+      # a split is only attempted if its two leaves fit under t_max
+      # (n_leaves counts leaves already finalized by the depth-first walk)
+      if (length(idx) < 2 * min_cluster_size || n_leaves + 2L > t_max) {
+        n_leaves <<- n_leaves + 1L
+        return(invisible(NULL))
+      }
+      Dn  <- D[idx, idx, drop = FALSE]
+      lab <- cutree(hclust(as.dist(Dn), method = "average"), k = 2)
+      if (min(tabulate(lab, 2)) < min_cluster_size) {
+        note(idx, lab, c(NA_real_, NA_real_), FALSE, "half_too_small")
+        n_leaves <<- n_leaves + 1L
+        return(invisible(NULL))
+      }
+      jac <- split_stability(Dn, lab)
+      ok  <- all(jac >= min_jaccard)
+      note(idx, lab, jac, ok, if (ok) "stable" else "unstable")
+      if (!ok) {
+        n_leaves <<- n_leaves + 1L
+        return(invisible(NULL))
+      }
+      recurse(idx[lab == 1])
+      recurse(idx[lab == 2])
+    }
+    recurse(seq_len(nrow(sub)))
+    list(win = wi, n = nrow(sub), t = n_leaves,
+         splits = do.call(rbind, splits))
+  })
+  per_win <- per_win[!vapply(per_win, is.null, logical(1))]
+  if (length(per_win) == 0) stop("no window has enough reads to choose t")
+
+  ts <- vapply(per_win, `[[`, integer(1), "t")
+  ns <- vapply(per_win, function(x) as.numeric(x$n), numeric(1))
+  ord <- order(ts)
+  t   <- ts[ord][which(cumsum(ns[ord]) >= sum(ns) / 2)[1]]  # weighted median
+
+  splits <- do.call(rbind, lapply(per_win, `[[`, "splits"))
+  if (is.null(splits))
+    splits <- data.frame(window = integer(), n_reads = integer(),
+                         n1 = integer(), n2 = integer(),
+                         jaccard1 = numeric(), jaccard2 = numeric(),
+                         accepted = logical(), reason = character())
+
+  list(t = t,
+       per_window = data.frame(window = vapply(per_win, `[[`, integer(1), "win"),
+                               n_reads = ns, t = ts),
+       splits = splits)
+}
+
+
+# ---------------------------------------------------------------------------
+# Data-driven choice of t by within-cluster Hamming dispersion (the default;
+# replaces choose_t_stability()). For every cut t = 1..t_max of each window's
+# Ward tree (the same tree cluster_window() cuts), the dispersion W(t) is the
+# size-weighted average
+# within-cluster masked Hamming distance: sum over clusters of
+# n_c * mean(pairwise D within the cluster) / n, with singletons contributing
+# 0. W(t) is read-weight-averaged across windows (as in choose_t()) and is
+# monotone non-increasing in t, so t is chosen at the elbow of the curve -
+# the interior candidate maximizing the second difference
+# W(t-1) - 2 W(t) + W(t+1), i.e. where the marginal drop in dispersion falls
+# off most sharply. The full curve is returned so the choice can be
+# overridden by eye.
+# ---------------------------------------------------------------------------
+choose_t_dispersion <- function(bin_mat, windows, min_valid_bins = 30,
+                                t_max = 10) {
+  per_win <- lapply(windows, function(w) {
+    sub  <- bin_mat[, w, drop = FALSE]
+    keep <- rowSums(!is.na(sub)) >= min_valid_bins
+    if (sum(keep) < 3) return(NULL)
+    sub <- sub[keep, , drop = FALSE]
+    D   <- masked_hamming(sub)
+    hc  <- hclust(as.dist(D), method = "ward.D2")
+    ts  <- 1:min(t_max, nrow(sub) - 1)
+    W   <- vapply(ts, function(t) {
+      cl <- cutree(hc, k = t)
+      sum(vapply(unique(cl), function(g) {
+        i <- which(cl == g)
+        if (length(i) < 2) return(0)
+        length(i) * mean(D[i, i][lower.tri(D[i, i, drop = FALSE])])
+      }, numeric(1))) / nrow(sub)
+    }, numeric(1))
+    list(n = nrow(sub), ts = ts, W = W)
+  })
+  per_win <- per_win[!vapply(per_win, is.null, logical(1))]
+  if (length(per_win) == 0) stop("no window has enough reads to choose t")
+
+  ts_all <- sort(unique(unlist(lapply(per_win, `[[`, "ts"))))
+  W_all  <- vapply(ts_all, function(t) {
+    W  <- vapply(per_win, function(x) x$W[match(t, x$ts)], numeric(1))
+    n  <- vapply(per_win, `[[`, numeric(1), "n")
+    ok <- !is.na(W)
+    sum(W[ok] * n[ok]) / sum(n[ok])
+  }, numeric(1))
+
+  K <- length(ts_all)
+  if (K >= 3) {
+    d2 <- W_all[1:(K - 2)] - 2 * W_all[2:(K - 1)] + W_all[3:K]
+    t  <- ts_all[1 + which.max(d2)]
+  } else {
+    t <- ts_all[K]   # 1 or 2 candidates only: take the deepest cut available
+  }
+  list(t = t, t_candidates = ts_all, score = W_all)
+}
+
+
+# ---------------------------------------------------------------------------
 # Steps 7-14: cluster one window. Reads with < min_valid_bins observed bins in
-# the window are excluded; the rest are clustered by average-linkage
-# agglomerative clustering (hclust "average" implements exactly the
-# size-weighted Lance-Williams update in the paper) on the masked Hamming
-# distance, cut at t clusters. Returns the per-read labels and the cluster
-# mean profiles over the window's bins.
+# the window are excluded; the rest are clustered by Ward-linkage
+# agglomerative clustering (hclust "ward.D2") on the masked Hamming distance,
+# cut at t clusters. A deviation from the paper, whose average linkage
+# (hclust "average" implements exactly its size-weighted Lance-Williams
+# update) peels off outlier reads on this data - one ~90% cluster plus tiny
+# shards at fine bin sizes; Ward favors compact, more balanced clusters.
+# Returns the per-read labels and the cluster mean profiles over the
+# window's bins.
 # ---------------------------------------------------------------------------
 cluster_window <- function(bin_mat, window_cols, t, min_valid_bins = 30) {
   sub  <- bin_mat[, window_cols, drop = FALSE]
@@ -232,7 +409,7 @@ cluster_window <- function(bin_mat, window_cols, t, min_valid_bins = 30) {
 
   t_eff  <- min(t, nrow(sub))
   D      <- masked_hamming(sub)
-  hc     <- hclust(as.dist(D), method = "average")
+  hc     <- hclust(as.dist(D), method = "ward.D2")
   labels <- cutree(hc, k = t_eff)
 
   means <- t(sapply(seq_len(t_eff), function(cl) {
@@ -360,6 +537,11 @@ assign_reads_to_profiles <- function(bin_mat, profiles) {
 #          into the returned assignment table.
 # t:       number of clusters per window; NULL (the default) selects t from
 #          the data via choose_t().
+# bin_size: bp per bin of the smoothed read x bin matrix (paper: 50). NA (or
+#          NULL) skips binning and clusters on the site-level matrix itself;
+#          window_valid_bins / min_overlap_bins / min_valid_bins_per_read
+#          then count site columns, and binarize_bins has no effect (site
+#          calls are already 0/1).
 # full_span_only: drop reads that do not cover every m6A site column (the
 #          topic model's filter_met_mat row filter); dropped reads are
 #          omitted from the output, as in the topic model.
@@ -409,24 +591,33 @@ phase_reads <- function(met_mat, rids_df, t = NULL,
   if (length(cluster_rids) < 2) stop("fewer than 2 heterogeneous reads to cluster")
 
   # -- steps 3-4: binned matrix (grid over all informative reads) ---------
-  binned  <- bin_met_matrix(M_f, rids_df, bin_size)
-  if (binarize_bins)
-    binned$bin_mat[which(binned$bin_mat > 0)] <- 1
+  # bin_size = NA: no binning - the site-level matrix is used as-is (its
+  # 0/1 site calls make binarize_bins a no-op)
+  if (is.null(bin_size) || is.na(bin_size)) {
+    bin_size <- NA_real_
+    binned   <- list(bin_mat = M_f, bin_size = NA_real_)
+  } else {
+    binned <- bin_met_matrix(M_f, rids_df, bin_size)
+    if (binarize_bins)
+      binned$bin_mat[which(binned$bin_mat > 0)] <- 1
+  }
   bin_mat <- binned$bin_mat[cluster_rids, , drop = FALSE]
 
   # -- step 6: windows over valid bins ------------------------------------
   valid_cols <- which(colSums(!is.na(bin_mat)) > 0)
   if (verbose)
-    cat(sprintf("bins: %d with sites, %d valid\n", ncol(bin_mat), length(valid_cols)))
+    cat(sprintf(if (is.na(bin_size)) "site columns (no binning): %d, %d valid\n"
+                else "bins: %d with sites, %d valid\n",
+                ncol(bin_mat), length(valid_cols)))
   windows <- make_windows(valid_cols, window_valid_bins, min_overlap_bins)
 
   # -- t: selected from the data unless supplied --------------------------
   t_selection <- NULL
   if (is.null(t)) {
-    t_selection <- choose_t(bin_mat, windows, min_valid_bins_per_read)
+    t_selection <- choose_t_dispersion(bin_mat, windows, min_valid_bins_per_read)
     t <- t_selection$t
     if (verbose)
-      cat(sprintf("t = %d selected by silhouette (candidates %d..%d)\n",
+      cat(sprintf("t = %d selected at the within-cluster dispersion elbow (candidates %d..%d)\n",
                   t, min(t_selection$t_candidates),
                   max(t_selection$t_candidates)))
   }
@@ -516,11 +707,15 @@ holdout_long_read_accuracy <- function(met_mat, rids_df, t = NULL,
                      rids_df[!rids_df$RID %in% long_ids, ], t = t,
                      binarize_bins = binarize_bins, ...)
 
-  binned_long <- bin_met_matrix(M[long_ids, , drop = FALSE],
-                                rids_df[rids_df$RID %in% long_ids, ],
-                                res$bin_size)
-  if (binarize_bins)
-    binned_long$bin_mat[which(binned_long$bin_mat > 0)] <- 1
+  if (is.na(res$bin_size)) {
+    binned_long <- list(bin_mat = M[long_ids, , drop = FALSE])
+  } else {
+    binned_long <- bin_met_matrix(M[long_ids, , drop = FALSE],
+                                  rids_df[rids_df$RID %in% long_ids, ],
+                                  res$bin_size)
+    if (binarize_bins)
+      binned_long$bin_mat[which(binned_long$bin_mat > 0)] <- 1
+  }
   # align the held-out reads' bins to the profile grid on genomic bin start
   common <- intersect(colnames(binned_long$bin_mat), colnames(res$profiles))
   if (length(common) == 0) {
@@ -611,9 +806,10 @@ plot_phasing_site_heatmap <- function(res, met_mat, main = NULL) {
 # Global stitched cluster profiles, one facet per cluster.
 plot_global_profiles <- function(res, tss = NULL, main = NULL) {
   P <- res$profiles
+  half_bin <- if (is.na(res$bin_size)) 0 else res$bin_size / 2
   df <- data.frame(
     cluster = rep(rownames(P), times = ncol(P)),
-    pos     = rep(as.numeric(colnames(P)) + res$bin_size / 2, each = nrow(P)),
+    pos     = rep(as.numeric(colnames(P)) + half_bin, each = nrow(P)),
     value   = as.vector(P)
   )
   n <- table(res$assignments$final_cluster)
@@ -621,7 +817,9 @@ plot_global_profiles <- function(res, tss = NULL, main = NULL) {
                        labels = sprintf("%s (n=%d)", rownames(P),
                                         ifelse(is.na(n[rownames(P)]), 0L,
                                                as.integer(n[rownames(P)]))))
-  ylab <- if (isTRUE(res$params$binarize_bins))
+  ylab <- if (is.na(res$bin_size))
+    "mean m6A per site"
+  else if (isTRUE(res$params$binarize_bins))
     sprintf("fraction of reads with m6A per %d-bp bin", res$bin_size)
   else
     sprintf("mean m6A per %d-bp bin", res$bin_size)

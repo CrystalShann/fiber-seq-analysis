@@ -12,19 +12,26 @@ efficiency" (code: github.com/ScialdoneLab/MATACseq, branch matac-seq,
 THP-1 Fiber-seq m6A at the early-response promoters instead of MATAC-seq GpC
 methylation at yeast replication origins. The procedure is the paper's:
 
-1. per-molecule methylation averaged in consecutive 30-bp windows across the
-   region ("features");
+1. per-molecule methylation averaged in consecutive windows across the
+   region ("features"; the window size is swept via `window_sizes`, the
+   paper's 30 bp among them - 0 = no windowing, each m6A site its own
+   feature);
 2. `scale()` of the molecule x window matrix (column-wise z-score, i.e. each
    window scaled across molecules - what their code does);
 3. molecule-molecule dissimilarity `sqrt((1 - rho) / 2)` with rho = Spearman
    correlation of the scaled window profiles (their code takes the square
    root, although the methods text only states (1 - rho)/2);
 4. `hclust(method = "ward.D2")` on that distance;
-5. Elbow plot (within-cluster sum of squares on the scaled matrix for
-   k = 1..10, reproducing `factoextra::fviz_nbclust(scaled, hcut,
-   diss = dist_mat, method = "wss")`, which is not installed here);
-6. `cutree()` at k = 5 (the paper's k at all four origins; per-gene elbow
-   plots are written so k can be revisited per gene).
+5. Elbow method: within-cluster sum of squares on the scaled matrix for
+   k = 1..10 (reproducing `factoextra::fviz_nbclust(scaled, hcut,
+   diss = dist_mat, method = "wss")`, which is not installed here); with
+   `choose_k_by_elbow` on, the optimal k is read off this curve
+   programmatically as its elbow point (`choose_k_elbow()`: the k farthest
+   below the straight line joining the curve's endpoints); the per-gene
+   elbow plots and WSS tables are still written;
+6. `cutree()` at the elbow k - or at the manually set `k_clusters`
+   (currently 5, the paper's k at all four origins) when
+   `choose_k_by_elbow` is off.
 
 All four LPS timepoints are pooled and clustered jointly per gene; each
 molecule keeps its timepoint tag (`sample_name`), the analog of the paper's
@@ -32,7 +39,8 @@ molecule keeps its timepoint tag (`sample_name`), the analog of the paper's
 timepoint in the outputs, and the paper's condition-composition plots become
 timepoint-composition plots.
 
-Deviations from the paper (all forced by the data type, none by choice):
+Deviations from the paper (the first three forced by the data type; the
+window-size sweep and the automatic elbow k are switches by choice):
 
 * Fiber-seq m6A (1 = m6A call, 0 = covered/unmodified) instead of Nanopore
   GpC methylation; a window's value is the fraction of its m6A-informative
@@ -44,11 +52,15 @@ Deviations from the paper (all forced by the data type, none by choice):
   and hamming analysis' row filter), pooled across LPS_0/5/10/15. Their
   amplicon reads all span the whole locus, so this matches their data shape
   (no NAs) and keeps the read universe identical to the other clusterings.
-* Windows: all consecutive 30-bp windows over the 2-kb promoter (the last
-  window is 21 bp), instead of their pre-selected significant windows (their
-  selection needed a wt-vs-mutant test that has no analog here). Windows with
-  no m6A-informative position or zero variance across molecules are dropped
-  (both would break `scale()` / Spearman) and logged.
+* Windows: all consecutive windows of the swept size over the 2-kb promoter
+  (the last window keeps the remainder), instead of their pre-selected
+  significant windows (their selection needed a wt-vs-mutant test that has
+  no analog here). Window-size sweep (`window_sizes`): each promoter is
+  clustered once per entry - a window size in bp (the paper: 30), or 0 for
+  no windowing, i.e. each m6A site is its own feature. Windows with no
+  m6A-informative position or zero variance across molecules are dropped
+  (both would break `scale()` / Spearman) and logged. Outputs go to
+  `<gene>/bin<size>/k<k>/` (k = the number of clusters used for that run).
 * Cluster labels are renumbered top-to-bottom in dendrogram order
   programmatically (the paper relabeled them by hand per origin).
 
@@ -101,14 +113,26 @@ if (!dir.exists(output_dir)) {
   dir.create(output_dir, recursive = TRUE)
 }
 
-window_size <- 30   # bp, the paper's feature size
-k_clusters  <- 5    # the paper's k at all four origins
+# Window ("feature") size sweep: one full clustering run per promoter per
+# entry. Positive = window size in bp (the paper: 30); 0 = no windowing,
+# i.e. each m6A site is its own feature. Output folders:
+# <gene>/bin<size>/k<k>/ (k = the number of clusters used for that run).
+window_sizes <- c(0, 10, 20, 30, 50)
+
+# Number of clusters. choose_k_by_elbow = TRUE: k is selected per gene and
+# window size as the elbow point of the WSS curve (choose_k_elbow(),
+# candidates k = 1..k_max_elbow). FALSE: the manually set k_clusters below
+# is used everywhere (the paper's k at all four origins).
+choose_k_by_elbow <- TRUE
+k_clusters  <- 5    # used only when choose_k_by_elbow = FALSE
 k_max_elbow <- 10   # fviz_nbclust default k.max
 
-# cluster palette = the paper's (clustering_ARS305.ipynb cell 25)
+# cluster palette = the paper's (clustering_ARS305.ipynb cell 25), extended
+# beyond their 7 so any k up to k_max_elbow has a color
 cluster_cols <- c("1" = "#377eb8", "2" = "#D95F02", "3" = "#7570B3",
                   "4" = "#E7298A", "5" = "#1B9E77", "6" = "#e6ab02",
-                  "7" = "#a6761d")
+                  "7" = "#a6761d", "8" = "#66a61e", "9" = "#e41a1c",
+                  "10" = "#999999")
 # timepoints (analog of their wt/dies6/disw2 condition colors): sequential
 timepoint_cols <- c("LPS_0" = "#bdbdbd", "LPS_5" = "#6baed6",
                     "LPS_10" = "#2171b5", "LPS_15" = "#08306b")
@@ -193,10 +217,21 @@ wss_curve <- function(scaled_meth, hc, k_max) {
   })
 }
 
+# Elbow point of the WSS curve: normalize k and WSS to [0, 1] and take the k
+# farthest below the straight line joining (1, WSS[1]) and (k_max,
+# WSS[k_max]) - the point a reader would call the elbow of the
+# fviz_nbclust-style plot
+choose_k_elbow <- function(wss) {
+  x <- (seq_along(wss) - 1) / (length(wss) - 1)
+  y <- (wss - wss[length(wss)]) / (wss[1] - wss[length(wss)])
+  which.max(1 - x - y)
+}
+
 # the paper's full pipeline: scale -> Spearman -> sqrt((1-rho)/2) -> ward.D2
-# -> cutree(k); clusters renumbered top-to-bottom in dendrogram order (the
-# paper did this relabeling by hand)
-matac_cluster <- function(win_meth, k_clusters, k_max_elbow) {
+# -> cutree(k); k_clusters = NULL selects k as the elbow point of the WSS
+# curve (choose_k_elbow()); clusters renumbered top-to-bottom in dendrogram
+# order (the paper did this relabeling by hand)
+matac_cluster <- function(win_meth, k_clusters = NULL, k_max_elbow) {
   win_sd <- apply(win_meth, 2, sd)
   if (any(win_sd == 0)) {
     cat("dropping", sum(win_sd == 0), "zero-variance window(s):",
@@ -214,14 +249,19 @@ matac_cluster <- function(win_meth, k_clusters, k_max_elbow) {
 
   wss <- wss_curve(scaled_meth, corr_clust, k_max_elbow)
 
-  corr_groups <- cutree(corr_clust, k = k_clusters)
+  k_used <- if (is.null(k_clusters)) choose_k_elbow(wss) else k_clusters
+  if (is.null(k_clusters))
+    cat(sprintf("k = %d selected by the WSS elbow (candidates 1..%d)\n",
+                k_used, k_max_elbow))
+
+  corr_groups <- cutree(corr_clust, k = k_used)
   dend_order_of_cluster <- unique(corr_groups[corr_clust$order])
   cluster <- factor(match(corr_groups, dend_order_of_cluster),
-                    levels = seq_len(k_clusters))
+                    levels = seq_len(k_used))
 
   list(win_meth_used = win_meth_used, scaled_meth = scaled_meth,
        dissim_mat = dissim_mat, corr_clust = corr_clust, wss = wss,
-       corr_groups = corr_groups, cluster = cluster)
+       k_used = k_used, corr_groups = corr_groups, cluster = cluster)
 }
 ```
 
@@ -229,7 +269,8 @@ matac_cluster <- function(win_meth, k_clusters, k_max_elbow) {
 
 The two single-molecule heatmaps are the paper's (cells 20 and 25 of
 `clustering_ARS305.ipynb`): rows = molecules, cut by the ward.D2 dendrogram
-into `row_split = k` slices, columns = 30-bp windows in genomic order,
+into `row_split = k` slices, columns = the windows ("features") in genomic
+order,
 left annotation = cluster + timepoint; one heatmap of the scaled and one of
 the raw window methylation. Plus their simplified cluster x window mean
 heatmap (cell 33), condition-composition plots (cells 16/17) with timepoint
@@ -267,7 +308,9 @@ cluster_mean_heatmap <- function(res, gene) {
           row_order = seq_len(nrow(cl_means)),
           cluster_columns = FALSE, cluster_rows = FALSE,
           row_split = seq_len(nrow(cl_means)),
-          column_split = seq_len(ncol(cl_means)),
+          # the paper's per-feature column gaps, dropped when there are too
+          # many features for the gaps to render (small windows / per-site)
+          column_split = if (ncol(cl_means) <= 100) seq_len(ncol(cl_means)),
           width = unit(21, "cm"), height = unit(2.5, "cm"),
           col = color_func,
           na_col = "lightblue",
@@ -322,17 +365,18 @@ pca_plots <- function(res, assignments, gene) {
 
 # Clustering at each promoter
 
-Per gene: assemble the pooled m6A matrix, apply the full-span filter, build
-the 30-bp window matrix, run the paper's pipeline, and write assignments,
-matrices, the WSS elbow, dendrogram, heatmaps, composition and PCA plots.
+Per gene and per `window_sizes` entry: assemble the pooled m6A matrix once
+per gene, apply the full-span filter, build the window matrix (window size
+0 uses the m6A site matrix directly), run the paper's pipeline with k from
+the WSS elbow (or the manual `k_clusters` when `choose_k_by_elbow` is off),
+and write assignments, matrices, the WSS elbow, dendrogram, heatmaps,
+composition and PCA plots under `<gene>/bin<size>/k<k>/`.
 
 ```{r cluster-promoters, fig.width=8, fig.height=8}
 all_results <- list()
 for (i in seq_len(nrow(promoters))) {
   gene <- promoters$gene[i]
   cat("\n=====", gene, "=====\n")
-  gene_dir <- file.path(output_dir, gene)
-  if (!dir.exists(gene_dir)) dir.create(gene_dir, recursive = TRUE)
 
   dat <- assemble_region_m6a(sample_names, promoters$chr[i],
                              promoters$start[i], promoters$end[i],
@@ -345,121 +389,155 @@ for (i in seq_len(nrow(promoters))) {
   cat(gene, ": ", nrow(met_mat), " full-span reads x ", ncol(met_mat),
       " m6A sites\n", sep = "")
 
-  window_anno <- make_window_anno(promoters$start[i], promoters$end[i], window_size)
-  cf <- condense_features(met_mat, window_anno)
-  window_anno$n_sites <- cf$n_sites
-  if (any(cf$n_sites == 0)) {
-    cat("windows with no m6A-informative site (dropped):",
-        window_anno$feature[cf$n_sites == 0], "\n")
+  for (ws in window_sizes) {
+    lab      <- paste0("bin", ws)
+    win_desc <- if (ws == 0) "per-site, no windows" else paste0(ws, "-bp windows")
+    gene_lab <- paste0(gene, " (", win_desc, ")")
+    cat("--- ", gene, ", ", win_desc, " ---\n", sep = "")
+
+    if (ws == 0) {   # no windowing: each m6A site is its own feature
+      window_anno <- data.frame(feature   = seq_len(ncol(met_mat)),
+                                win_start = as.integer(colnames(met_mat)),
+                                win_end   = as.integer(colnames(met_mat)),
+                                n_sites   = 1L)
+      win_meth <- as.matrix(met_mat)
+      colnames(win_meth) <- window_anno$feature
+    } else {
+      window_anno <- make_window_anno(promoters$start[i], promoters$end[i], ws)
+      cf <- condense_features(met_mat, window_anno)
+      window_anno$n_sites <- cf$n_sites
+      if (any(cf$n_sites == 0)) {
+        cat("windows with no m6A-informative site (dropped):",
+            window_anno$feature[cf$n_sites == 0], "\n")
+      }
+      win_meth <- cf$win_meth
+    }
+
+    res <- matac_cluster(win_meth,
+                         k_clusters = if (choose_k_by_elbow) NULL else k_clusters,
+                         k_max_elbow = k_max_elbow)
+    cat("cluster sizes:\n")
+    print(table(res$cluster))
+
+    assignments <- data.frame(
+      RID = rownames(met_mat),
+      sample_name = factor(rids_df$sample_name, levels = sample_names),
+      read_start = rids_df$start, read_end = rids_df$end,
+      strand = rids_df$strand,
+      corr_group_raw = res$corr_groups,
+      cluster = res$cluster)
+    all_results[[gene]][[lab]] <- list(res = res, assignments = assignments,
+                                       window_anno = window_anno)
+
+    # k subfolder = the number of clusters used for this run (elbow-selected
+    # or manual), so runs ending at different k sit side by side
+    k_dir <- file.path(output_dir, gene, lab, paste0("k", res$k_used))
+    if (!dir.exists(k_dir)) dir.create(k_dir, recursive = TRUE)
+
+    ## tables + rds
+    saveRDS(list(window_anno = window_anno, win_meth = win_meth, res = res,
+                 assignments = assignments),
+            file.path(k_dir, paste0("spearman_ward_", gene, ".rds")))
+    write.table(assignments,
+                file.path(k_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(window_anno,
+                file.path(k_dir, paste0("window_annotation_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(data.frame(RID = rownames(win_meth),
+                           sample_name = rids_df$sample_name,
+                           cluster = res$cluster,
+                           win_meth, check.names = FALSE),
+                file.path(k_dir, paste0("window_methylation_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(data.frame(k = seq_along(res$wss), wss = res$wss),
+                file.path(k_dir, paste0("wss_values_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+
+    ## elbow plot (the k actually used is the dashed line)
+    gg <- ggplot(data.frame(k = seq_along(res$wss), wss = res$wss), aes(k, wss)) +
+      geom_line(color = "steelblue") + geom_point(color = "steelblue") +
+      geom_vline(xintercept = res$k_used, linetype = "dashed", color = "grey40") +
+      scale_x_continuous(breaks = seq_along(res$wss)) +
+      labs(title = paste0("Optimal number of clusters, ", gene_lab),
+           subtitle = paste0("Elbow method; k used = ", res$k_used),
+           x = "Number of clusters k",
+           y = "Total Within Sum of Square") +
+      theme_classic()
+    ggsave(file.path(k_dir, paste0("wss_elbow_", gene, ".pdf")), gg,
+           width = 6, height = 4)
+
+    ## dendrogram
+    pdf(file.path(k_dir, paste0("dendrogram_", gene, ".pdf")), width = 8, height = 5)
+    plot(res$corr_clust, cex = 0.5, labels = FALSE,
+         main = paste0("Dendrogram for correlation clustering, ", gene_lab),
+         xlab = "molecules")
+    dev.off()
+
+    ## the paper's two single-molecule heatmaps
+    pdf(file.path(k_dir, paste0("heatmap_scaled_", gene, ".pdf")),
+        width = 8, height = 9)
+    draw(matac_heatmap(res$scaled_meth, res, rids_df,
+                       colorRamp2(c(-3, 0, 3), c("#0b5394", "white", "#c53145")),
+                       "Scaled feature\nmethylation",
+                       paste0("Summarized feature methylation of ", gene_lab)))
+    dev.off()
+
+    pdf(file.path(k_dir, paste0("heatmap_raw_", gene, ".pdf")),
+        width = 8, height = 9)
+    draw(matac_heatmap(res$win_meth_used, res, rids_df,
+                       colorRamp2(c(0, 0.5, 1), brewer.pal(3, "Reds")),
+                       "Average feature\nmethylation",
+                       paste0("\nFeature methylation of ", gene_lab)))
+    dev.off()
+
+    ## simplified cluster x window mean heatmap
+    pdf(file.path(k_dir, paste0("heatmap_cluster_means_", gene, ".pdf")),
+        width = 12, height = 3)
+    draw(cluster_mean_heatmap(res, gene_lab))
+    dev.off()
+
+    ## timepoint composition (the paper's condition-composition plots)
+    gg <- composition_plots(assignments, gene_lab)
+    ggsave(file.path(k_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
+           width = 7, height = 8)
+    write.table(assignments %>% dplyr::count(cluster, sample_name),
+                file.path(k_dir, paste0("cluster_timepoint_counts_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+
+    ## PCA of the dissimilarity matrix
+    gg <- pca_plots(res, assignments, gene_lab)
+    ggsave(file.path(k_dir, paste0("pca_dissim_", gene, ".pdf")), gg,
+           width = 7, height = 9)
   }
-
-  res <- matac_cluster(cf$win_meth, k_clusters, k_max_elbow)
-  cat("cluster sizes:\n")
-  print(table(res$cluster))
-
-  assignments <- data.frame(
-    RID = rownames(met_mat),
-    sample_name = factor(rids_df$sample_name, levels = sample_names),
-    read_start = rids_df$start, read_end = rids_df$end,
-    strand = rids_df$strand,
-    corr_group_raw = res$corr_groups,
-    cluster = res$cluster)
-  all_results[[gene]] <- list(res = res, assignments = assignments,
-                              window_anno = window_anno)
-
-  ## tables + rds
-  saveRDS(list(window_anno = window_anno, win_meth = cf$win_meth, res = res,
-               assignments = assignments),
-          file.path(gene_dir, paste0("spearman_ward_", gene, ".rds")))
-  write.table(assignments,
-              file.path(gene_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  write.table(window_anno,
-              file.path(gene_dir, paste0("window_annotation_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  write.table(data.frame(RID = rownames(cf$win_meth),
-                         sample_name = rids_df$sample_name,
-                         cluster = res$cluster,
-                         cf$win_meth, check.names = FALSE),
-              file.path(gene_dir, paste0("window_methylation_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  write.table(data.frame(k = seq_along(res$wss), wss = res$wss),
-              file.path(gene_dir, paste0("wss_values_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-
-  ## elbow plot
-  gg <- ggplot(data.frame(k = seq_along(res$wss), wss = res$wss), aes(k, wss)) +
-    geom_line(color = "steelblue") + geom_point(color = "steelblue") +
-    scale_x_continuous(breaks = seq_along(res$wss)) +
-    labs(title = paste0("Optimal number of clusters, ", gene),
-         subtitle = "Elbow method",
-         x = "Number of clusters k",
-         y = "Total Within Sum of Square") +
-    theme_classic()
-  ggsave(file.path(gene_dir, paste0("wss_elbow_", gene, ".pdf")), gg,
-         width = 6, height = 4)
-
-  ## dendrogram
-  pdf(file.path(gene_dir, paste0("dendrogram_", gene, ".pdf")), width = 8, height = 5)
-  plot(res$corr_clust, cex = 0.5, labels = FALSE,
-       main = paste0("Dendrogram for correlation clustering, ", gene),
-       xlab = "molecules")
-  dev.off()
-
-  ## the paper's two single-molecule heatmaps
-  pdf(file.path(gene_dir, paste0("heatmap_scaled_", gene, ".pdf")),
-      width = 8, height = 9)
-  draw(matac_heatmap(res$scaled_meth, res, rids_df,
-                     colorRamp2(c(-3, 0, 3), c("#0b5394", "white", "#c53145")),
-                     "Scaled feature\nmethylation",
-                     paste0("Summarized feature methylation of ", gene)))
-  dev.off()
-
-  pdf(file.path(gene_dir, paste0("heatmap_raw_", gene, ".pdf")),
-      width = 8, height = 9)
-  draw(matac_heatmap(res$win_meth_used, res, rids_df,
-                     colorRamp2(c(0, 0.5, 1), brewer.pal(3, "Reds")),
-                     "Average feature\nmethylation",
-                     paste0("\nFeature methylation of ", gene)))
-  dev.off()
-
-  ## simplified cluster x window mean heatmap
-  pdf(file.path(gene_dir, paste0("heatmap_cluster_means_", gene, ".pdf")),
-      width = 12, height = 3)
-  draw(cluster_mean_heatmap(res, gene))
-  dev.off()
-
-  ## timepoint composition (the paper's condition-composition plots)
-  gg <- composition_plots(assignments, gene)
-  ggsave(file.path(gene_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
-         width = 7, height = 8)
-  write.table(assignments %>% dplyr::count(cluster, sample_name),
-              file.path(gene_dir, paste0("cluster_timepoint_counts_", gene, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-
-  ## PCA of the dissimilarity matrix
-  gg <- pca_plots(res, assignments, gene)
-  ggsave(file.path(gene_dir, paste0("pca_dissim_", gene, ".pdf")), gg,
-         width = 7, height = 9)
 }
 ```
 
 # Cluster sizes and timepoint composition across genes
 
+`k_selected` is the k used for that gene x window size (elbow-chosen when
+`choose_k_by_elbow` is on, else the manual `k_clusters`).
+
 ```{r cluster-summary}
 cluster_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
-  all_results[[g]]$assignments %>%
-    dplyr::count(cluster) %>%
-    dplyr::mutate(gene = g, .before = 1)
+  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
+    all_results[[g]][[lab]]$assignments %>%
+      dplyr::count(cluster) %>%
+      dplyr::mutate(gene = g, bins = lab,
+                    k_selected = all_results[[g]][[lab]]$res$k_used,
+                    .before = 1)
+  }))
 }))
 write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
 cluster_summary %>% tidyr::pivot_wider(names_from = cluster, values_from = n)
 
 timepoint_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
-  all_results[[g]]$assignments %>%
-    dplyr::count(cluster, sample_name) %>%
-    dplyr::mutate(gene = g, .before = 1)
+  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
+    all_results[[g]][[lab]]$assignments %>%
+      dplyr::count(cluster, sample_name) %>%
+      dplyr::mutate(gene = g, bins = lab, .before = 1)
+  }))
 }))
 write.table(timepoint_summary,
             file.path(output_dir, "cluster_timepoint_summary_all_genes.tsv"),
@@ -467,11 +545,13 @@ write.table(timepoint_summary,
 
 ## mean total methylation per cluster (their cell 19)
 meth_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
-  res <- all_results[[g]]$res
-  data.frame(gene = g, cluster = levels(res$cluster),
-             mean_window_methylation = sapply(levels(res$cluster), function(cl) {
-               mean(res$win_meth_used[res$cluster == cl, , drop = FALSE])
-             }))
+  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
+    res <- all_results[[g]][[lab]]$res
+    data.frame(gene = g, bins = lab, cluster = levels(res$cluster),
+               mean_window_methylation = sapply(levels(res$cluster), function(cl) {
+                 mean(res$win_meth_used[res$cluster == cl, , drop = FALSE])
+               }))
+  }))
 }))
 write.table(meth_summary,
             file.path(output_dir, "cluster_mean_methylation_all_genes.tsv"),
