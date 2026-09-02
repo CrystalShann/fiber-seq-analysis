@@ -16,7 +16,7 @@
 #   plot_cluster_heatmap()       read x feature methylation heatmap, rows split
 #                                by cluster, with cluster and timepoint
 #                                annotations
-#   plot_met_fraction_lines()    m6A fraction per feature, one line per cluster
+#   plot_met_fraction_lines()    m6A fraction per feature, one panel per cluster
 #
 # The bar panels are drawn on a fixed 0-1 axis so clusters and genes stay
 # comparable; the line plot uses the data range, since that is the plot for
@@ -24,7 +24,6 @@
 
 suppressMessages({
   requireNamespace("ComplexHeatmap")
-  requireNamespace("circlize")
 })
 
 # 25-colour cluster palette (the topic model's colors_25 / the hamming
@@ -60,11 +59,13 @@ as_timepoint_factor <- function(x, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
 
 
 # ---------------------------------------------------------------------------
-# 1. Per-cluster m6A methylation proportion at each m6A site (site resolution,
-# straight from met_mat; only the cluster labels come from the clustering).
+# 1. Per-cluster m6A methylation proportion at each m6A site 
+
 # One panel per cluster, x = genomic coordinate, y = methylation proportion.
 # ---------------------------------------------------------------------------
 plot_cluster_met_profiles <- function(res, met_mat, tss = NULL, main = NULL) {
+  # cluster_site_profiles() takes cluster labels and computes mean m6a value at every 
+  # position for each cluster
   prof <- cluster_site_profiles(res, met_mat)
   lv   <- levels(res$assignments$cluster)
   pal  <- cluster_palette(lv)
@@ -151,31 +152,41 @@ plot_cluster_structure <- function(res, main = NULL,
 
 
 # ---------------------------------------------------------------------------
-# 3. Read x feature methylation heatmap: rows = reads split by cluster (each
-# slice labelled with its cluster) and ordered by read start within cluster,
+# 3. Read x feature methylation heatmap: 
+
+# rows = reads split by cluster (each and ordered by read start within cluster,
 # columns = features in genomic order, left annotation = cluster + timepoint.
-# Values are the read's mean m6A call per feature (0/1 site calls when
-# window_size = 0).
-# Returns a Heatmap object - wrap in draw() to render.
+# No colour gradient: a feature with any m6A call is black, none is white,
+
 # ---------------------------------------------------------------------------
 plot_cluster_heatmap <- function(res, main = NULL,
                                  timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
+  # takes per read assignment from the clustering result
   df <- res$assignments
   df$sample_name <- as_timepoint_factor(df$sample_name, timepoint_cols)
+  # sort by cluster
+  # within each cluster, sort by read start position
   o  <- order(df$cluster, df$start)
   df <- df[o, ]
+  # Takes the feature matrix used for  clustering 
+  # and puts its rows in exactly the same order as df
   mat <- res$feat_mat[df$RID, , drop = FALSE]
+  mat <- matrix(ifelse(is.na(mat), NA, ifelse(mat > 0, "m6A", "no m6A")),
+                nrow(mat), ncol(mat), dimnames = dimnames(mat))
 
+  # create row annotations
   ha <- ComplexHeatmap::rowAnnotation(
     cluster   = df$cluster,
     timepoint = df$sample_name,
     col = list(cluster   = cluster_palette(levels(df$cluster)),
                timepoint = timepoint_cols[levels(df$sample_name)]))
 
+  # rows are reads, columns are m6a sites
   ComplexHeatmap::Heatmap(
     mat,
-    name = if (res$params$window_size == 0) "m6A call" else "mean m6A\nper window",
-    col  = circlize::colorRamp2(c(0, 0.5, 1), c("white", "#6baed6", "#08306B")),
+    name = "m6A call",
+    col  = c("m6A" = "black", "no m6A" = "white"),
+    na_col = "grey85",
     show_row_names = FALSE, show_column_names = FALSE,
     cluster_rows = FALSE, cluster_columns = FALSE,
     row_split = df$cluster, row_gap = unit(0.6, "mm"),
@@ -189,10 +200,7 @@ plot_cluster_heatmap <- function(res, main = NULL,
 
 
 # ---------------------------------------------------------------------------
-# 4. m6A fraction per feature, one line per cluster (the cluster profiles of
-# step 8). smooth_k > 1 draws a centred rolling mean over smooth_k features,
-# which is what makes the window_size = 0 profiles readable (raw site calls are
-# 0/1, so the unsmoothed cluster mean is spiky).
+# 4. m6A fraction per feature, one panel per cluster 
 # ---------------------------------------------------------------------------
 plot_met_fraction_lines <- function(res, tss = NULL, main = NULL, smooth_k = 1) {
   P   <- res$profiles
@@ -215,7 +223,9 @@ plot_met_fraction_lines <- function(res, tss = NULL, main = NULL, smooth_k = 1) 
 
   gg <- ggplot(df[!is.na(df$value), ], aes(x = pos, y = value, color = cluster)) +
     geom_line(linewidth = 0.5) +
-    scale_color_manual(values = setNames(cluster_palette(rownames(P)), levels(df$cluster))) +
+    scale_color_manual(values = setNames(cluster_palette(rownames(P)), levels(df$cluster)),
+                       guide = "none") +
+    facet_wrap(~ cluster, ncol = 1, strip.position = "right") +
     labs(x = "genomic position", y = ylab, title = main, subtitle = sub) +
     theme_cowplot(font_size = 10)
   if (!is.null(tss))

@@ -1,96 +1,31 @@
 ---
-title: "Leiden + Manhattan clustering of single molecules at early-response promoters"
+title: "Leiden + Manhattan clustering of single molecules at custom regions"
 author: "Crystal Shan"
 date: "`r Sys.Date()`"
 output: html_document
 ---
 
-Replicates the single-molecule read clustering of Raviram, Jiang, Schippke,
-Cova & Skok (2026), "Cohesin collisions maintain ordered nucleosome
-architecture at boundaries and promoters" (bioRxiv 2026.05.22.727261, Methods /
-"Clustering reads"), on THP-1 Fiber-seq m6A at the early-response promoters
-instead of nano-NOMe GpC (GCH) accessibility at CTCF sites and TSSs. The
-procedure is the paper's:
-
-1. per-read accessibility binned into windows across the 2-kb region, each
-   window summarised by the mean methylation call;
-2. remaining missing bins filled by KNN imputation (k = 5);
-3. conditions balanced by sampling an equal number of reads per condition,
-   then pooled;
-4. read-read similarity = Manhattan distance over the bins,
-   `d(i,j) = sum_b |x_ib - x_jb|`;
-5. a KNN graph over reads (k = 50 nearest neighbours);
-6. Manhattan distances turned into edge weights ("affinities") by an
-   exponential kernel;
-7. Leiden community detection (`RBConfigurationVertexPartition`) at a set
-   resolution, each cluster a recurring single-molecule accessibility pattern;
-8. cluster profiles = the mean accessibility profile of each cluster's reads.
-
-Deviations from the paper (all switches in the Settings chunk):
-
-* Data type: Fiber-seq m6A (1 = m6A / accessible, 0 = covered but unmodified)
-  instead of nano-NOMe GpC methylation.
-* Molecules: the full-span read set (`filter_met_mat()`, the topic model's row
-  filter, also used by the hamming and spearman clusterings), so all four
-  clusterings share one read universe.
-* No condition balancing (step 3, `balance_conditions` is not implemented -
-  the paper subsamples each condition to equal depth). All four LPS timepoints
-  are pooled and clustered jointly, as in the topic model, at their observed
-  depths. Every read keeps its timepoint (`sample_name` / `timepoint`) next to
-  its cluster in `read_cluster_assignments_<gene>.tsv`, so for any read both
-  its cluster and its timepoint are recoverable, and the paper's
-  condition-composition plots become timepoint-composition plots.
-* Window-size sweep (`window_sizes`) instead of the paper's fixed 50 bp: each
-  promoter is clustered once per entry - a window size in bp, or 0 for no
-  windowing at all, i.e. each m6A site is its own feature. 0 is the default and
-  the first entry of the sweep. Outputs go to `<gene>/bin<size>/k<k>/`, where
-  k is the number of Leiden clusters that run produced.
-* KNN imputation (step 2, `impute_missing`) is optional and **off** for now.
-  With full-span reads it is a no-op: every read covers every m6A site, so the
-  only missing bins are windows containing no m6A site at all, and those are
-  dropped as features (they inform no read) rather than imputed.
-* No meta-clustering: the paper groups Leiden clusters into meta-clusters by
-  FFT + hierarchical clustering for display; here the Leiden clusters are used
-  directly. Clusters are renumbered largest-first so the labels are
-  deterministic.
-* Graph and resolution (`k_neighbors`, `leiden_resolution`): the paper's
-  k = 50 neighbours and resolution 2.1-3 are set on read sets orders of
-  magnitude larger than these promoters (~150-250 full-span reads each), where
-  k = 50 connects a quarter of all reads and those resolutions shatter the
-  graph into dozens of tiny clusters. Here k = 10 and resolution 1 (standard
-  modularity); both are the knobs to turn if the clusters look too coarse or
-  too fine.
-
-See `leiden_manhattan_functions.r` for the step-by-step implementation
-(including the two details the Methods leave open - the kernel width and the
-symmetrisation of the KNN graph) and `leiden_manhattan_plots.r` for the plots.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ```{r libraries, message=FALSE, warning=FALSE}
-# igraph needs libglpk at load time; if library(igraph) fails with
-# "libglpk.so.40: cannot open shared object file", add glpk's lib directory
-# (/software/glpk-5.0-el8-x86_64/lib on this cluster) to LD_LIBRARY_PATH before
-# starting R.
 library(tidyverse)
 library(ggplot2)
 library(Matrix)
 library(GenomicRanges)
 library(data.table)
-library(Rsamtools)   # extract_ft_region_reads() reads the tabix-indexed beds
+library(Rsamtools)   
 library(igraph)
 library(ComplexHeatmap)
-library(circlize)
 library(cowplot)
 ```
 
 # Functions
 
 `extract_ft_region_reads()`, `extract_ft_read_info()`, `get_sparse_met_mat()`
-and `filter_met_mat()` come from the topic model, as in the hamming and
-spearman analyses.
+and `filter_met_mat()` come from the topic model
 
 ```{r functions}
 source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
@@ -114,28 +49,24 @@ sample_names <- sample_table$sample_name[sample_table$condition == "LPS"]
 
 ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
 
-promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+# promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
 
 output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/Leiden_Manhattan"
 if (!dir.exists(output_dir)) {
   dir.create(output_dir, recursive = TRUE)
 }
 
-# Window ("feature") size sweep: one full clustering run per promoter per
-# entry. Positive = window size in bp (the paper: 50); 0 = no windowing, i.e.
-# each m6A site is its own feature (the default, and the first entry here).
-# Output folders: <gene>/bin<size>/k<k>/, k = the number of Leiden clusters.
-window_sizes <- c(0, 10, 20, 30, 50)
+# Window ("feature") size used for the custom-region run. The previous window
+# sweep is kept below as a comment for reference.
+# window_sizes <- c(0, 10, 20, 30, 50)
+window_size <- 0L
 
-# Leiden / graph parameters (the paper's steps 5-7).
-# k_neighbors: the paper's k = 50 would connect ~25% of the read set at these
-# promoters (~150-250 full-span reads each) instead of the tiny fraction it
-# connects in the paper, giving a densely connected graph and coarse clusters,
-# so k = 10 is used here.
-# leiden_resolution: the paper used 2.1-3, but on read sets orders of magnitude
-# larger, where those values shatter a graph this size; 1 is standard
-# modularity. Raise it for finer clusters, lower it for coarser ones.
+# Leiden / graph parameters
+
+# k_neighbors: 
 k_neighbors       <- 10
+
+# leiden_resolution: Raise it for finer clusters, lower it for coarser ones
 leiden_resolution <- 1
 leiden_seed       <- 1
 
@@ -148,6 +79,16 @@ kernel_sigma <- NULL
 impute_missing <- FALSE
 impute_k       <- 5
 
+# Sweep grids for the "KNN graph colored by Leiden cluster" figures: one pdf
+# per bin size x k x resolution combination under <region_id>/bin<size>/.
+# Ranges come from a pilot sweep (k 5-50, resolution 0.1-5, both regions, all
+# bin sizes, ~200 full-span reads each): k = 5 fragments the graph and k = 50
+# merges everything below resolution 0.5 then shatters above 1; resolution 0.1
+# gives one cluster almost everywhere and > 2 over-splits (> 15 clusters).
+sweep_window_sizes <- c(0L, 10L, 20L, 30L, 50L)
+sweep_k_neighbors  <- c(10, 15, 20, 30)
+sweep_resolutions  <- c(0.25, 0.5, 1, 1.5, 2)
+
 # Rolling-mean width for the m6A fraction line plot only (1 = raw profiles).
 # At window size 0 the per-site cluster means are spiky; e.g. 25 makes the
 # nucleosome-scale structure readable without changing any clustering input.
@@ -156,168 +97,298 @@ line_smooth_k <- 1
 set.seed(123)
 ```
 
-# Promoter regions
+# Regions
 
-Same table and genes as the hamming and spearman analyses: TSS +/- 1000 bp
-from GENCODE v49 (`make_promoter_table.R`).
+Custom regions for the Leiden + Manhattan run.
 
 ```{r regions}
-promoters <- read.delim(promoter_table)
-promoters
+# promoters <- read.delim(promoter_table)
+# promoters
+regions <- data.frame(
+  chr = c("chr4", "chr5"),
+  start = c(112284963, 150068577),
+  end = c(112285236, 150068792)
+)
+regions$region_id <- paste(regions$chr, regions$start, regions$end, sep = "_")
+regions
 ```
 
-# Clustering at each promoter
 
-Per gene and per `window_sizes` entry: assemble the pooled m6A matrix once per
-gene, apply the full-span filter, build the read x feature matrix (window size
-0 uses the m6A site matrix directly), then run the paper's Manhattan / KNN /
-exponential-kernel / Leiden pipeline. Outputs per gene x window size, under
-`<gene>/bin<size>/k<k>/`: the result object (.rds), per-read cluster
-assignments **with the read's timepoint**, cluster profiles, the feature
-matrix, the window annotation, cluster x timepoint counts, the run parameters
-(.tsv), and the five plots.
+## Testing functions
 
-```{r cluster-promoters, fig.width=9, fig.height=9}
-all_results <- list()
-for (i in seq_len(nrow(promoters))) {
-  gene <- promoters$gene[i]
-  cat("\n=====", gene, "=====\n")
+### 1. assemble_region_m6
+```{r assemble_region_m6}
+# Pick one region to test
+i <- 1
 
-  dat <- assemble_region_m6a(sample_names, promoters$chr[i],
-                             promoters$start[i], promoters$end[i],
-                             ft_result_dir, verbose = FALSE)
-  cat(gene, ": ", nrow(dat$rids_df), " reads x ", ncol(dat$met_mat),
-      " m6A sites before filtering\n", sep = "")
+region_id    <- regions$region_id[i]
+region_chr   <- regions$chr[i]
+region_start <- regions$start[i]
+region_end   <- regions$end[i]
 
-  met_mat <- filter_met_mat(dat$met_mat, verbose = TRUE)
-  rids_df <- dat$rids_df[match(rownames(met_mat), as.character(dat$rids_df$RID)), ]
-  cat(gene, ": ", nrow(met_mat), " full-span reads x ", ncol(met_mat),
-      " m6A sites\n", sep = "")
+cat(
+  "Testing:", region_id, "\n",
+  "Region:", region_chr, region_start, region_end, "\n"
+)
 
-  for (ws in window_sizes) {
-    lab      <- paste0("bin", ws)
-    win_desc <- if (ws == 0) "per-site, no windows" else paste0(ws, "-bp windows")
-    gene_lab <- paste0(gene, " (", win_desc, ")")
-    cat("--- ", gene, ", ", win_desc, " ---\n", sep = "")
+dat <- assemble_region_m6a(
+  sample_names = sample_names,
+  region_chr   = region_chr,
+  region_start = region_start,
+  region_end   = region_end,
+  ft_result_dir = ft_result_dir,
+  verbose = TRUE
+)
 
-    res <- leiden_manhattan_cluster(met_mat, rids_df,
-                                    region_start = promoters$start[i],
-                                    region_end   = promoters$end[i],
-                                    window_size  = ws,
-                                    k_neighbors  = k_neighbors,
-                                    resolution   = leiden_resolution,
-                                    impute_missing = impute_missing,
-                                    impute_k     = impute_k,
-                                    sigma        = kernel_sigma,
-                                    seed         = leiden_seed)
+head(dat$reads)
+dim(dat$reads)
+colnames(dat$reads)
+```
 
-    # every read keeps its timepoint alongside its cluster
-    res$assignments$sample_name <- factor(res$assignments$sample_name,
-                                          levels = sample_names)
-    res$assignments$timepoint <- sample_table$timepoint[
-      match(res$assignments$sample_name, sample_table$sample_name)]
-    all_results[[gene]][[lab]] <- res
+### 2. bin_read_matrix
 
-    # k subfolder = the number of Leiden clusters this run produced
-    k_dir <- file.path(output_dir, gene, lab, paste0("k", res$n_clusters))
-    if (!dir.exists(k_dir)) dir.create(k_dir, recursive = TRUE)
+```{r bin_read_matrix}
+binned50 <- bin_read_matrix(
+  met_mat      = dat$met_mat,
+  region_start = region_start,
+  region_end   = region_end,
+  window_size  = window_size
+)
 
-    ## tables + rds
-    saveRDS(res, file.path(k_dir, paste0("leiden_manhattan_", gene, ".rds")))
-    write.table(res$assignments,
-                file.path(k_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
-                sep = "\t", quote = FALSE, row.names = FALSE)
-    write.table(data.frame(cluster = rownames(res$profiles), res$profiles,
-                           check.names = FALSE),
-                file.path(k_dir, paste0("cluster_profiles_", gene, ".tsv")),
-                sep = "\t", quote = FALSE, row.names = FALSE)
-    write.table(res$window_anno,
-                file.path(k_dir, paste0("window_annotation_", gene, ".tsv")),
-                sep = "\t", quote = FALSE, row.names = FALSE)
-    write.table(data.frame(RID = rownames(res$feat_mat),
-                           sample_name = res$assignments$sample_name,
-                           cluster = res$assignments$cluster,
-                           res$feat_mat, check.names = FALSE),
-                file.path(k_dir, paste0("feature_matrix_", gene, ".tsv")),
-                sep = "\t", quote = FALSE, row.names = FALSE)
-    write.table(res$assignments %>% dplyr::count(cluster, sample_name, timepoint),
-                file.path(k_dir, paste0("cluster_timepoint_counts_", gene, ".tsv")),
-                sep = "\t", quote = FALSE, row.names = FALSE)
-    write.table(data.frame(parameter = names(res$params),
-                           value = vapply(res$params, as.character, character(1))),
-                file.path(k_dir, paste0("run_parameters_", gene, ".tsv")),
-                sep = "\t", quote = FALSE, row.names = FALSE)
+names(binned50)
 
-    ## 1. per-cluster m6A methylation profiles (topic-model style)
-    gg <- plot_cluster_met_profiles(res, met_mat, tss = promoters$tss[i],
-                                    main = gene_lab)
-    ggsave(file.path(k_dir, paste0("cluster_met_profiles_", gene, ".pdf")), gg,
-           width = 6, height = 1.4 * res$n_clusters + 1.4, limitsize = FALSE)
+head(binned50)
+```
 
-    ## 2. cluster composition by timepoint, and cluster structure
-    gg <- plot_cluster_composition(res, main = gene_lab)
-    ggsave(file.path(k_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
-           width = 7, height = 8)
-    gg <- plot_cluster_structure(res, main = gene_lab)
-    ggsave(file.path(k_dir, paste0("cluster_structure_", gene, ".pdf")), gg,
-           width = 9, height = 3)
 
-    ## 3. read x feature methylation heatmap
-    pdf(file.path(k_dir, paste0("heatmap_", gene, ".pdf")), width = 8, height = 9)
-    ComplexHeatmap::draw(plot_cluster_heatmap(res, main = gene_lab))
-    dev.off()
+### 3. manhattan_knn_graph
 
-    ## 4. m6A fraction line plot
-    gg <- plot_met_fraction_lines(res, tss = promoters$tss[i], main = gene_lab,
-                                  smooth_k = line_smooth_k)
-    ggsave(file.path(k_dir, paste0("met_fraction_lines_", gene, ".pdf")), gg,
-           width = 8, height = 4)
+```{r manhattan_knn_graph}
+feat <- binned50$mat
+
+knn <- manhattan_knn_graph(
+  mat         = feat,
+  k_neighbors = k_neighbors,   # 10
+  sigma       = kernel_sigma,  
+  verbose     = TRUE
+)
+
+knn$dist[1:5, 1:5]
+
+edge_df <- igraph::as_data_frame(knn$graph, what = "edges")
+head(edge_df)
+```
+
+### 4. leiden_partition
+```{r leiden_partition}
+part <- leiden_partition(
+  knn$graph,
+  resolution = leiden_resolution,
+  seed = leiden_seed
+)
+
+# Leiden cluster for each read
+membership <- part$membership
+
+table(membership)
+
+set.seed(1)
+
+plot(
+  knn$graph,
+  vertex.color = membership,
+  vertex.size = 4,
+  vertex.label = NA,
+  edge.width = 0.3,
+  layout = layout_with_fr(knn$graph),
+  main = "KNN graph colored by Leiden cluster"
+)
+```
+
+
+
+# Parameter sweep: KNN graph colored by Leiden cluster
+
+For each region and bin size, the KNN graph is built once per k (with a single
+Fruchterman-Reingold layout per graph, so the plots for different resolutions
+differ only in the coloring) and Leiden is re-run across the resolutions. One
+pdf per k x resolution combination is saved in the region's `bin<size>` folder.
+
+```{r knn-graph-sweep}
+sweep_summary <- list()
+
+for (i in seq_len(nrow(regions))) {
+  region_id <- regions$region_id[i]
+  dat <- assemble_region_m6a(
+    sample_names = sample_names,
+    region_chr   = regions$chr[i],
+    region_start = regions$start[i],
+    region_end   = regions$end[i],
+    ft_result_dir = ft_result_dir,
+    verbose = FALSE
+  )
+  met_mat_sweep <- filter_met_mat(dat$met_mat, verbose = FALSE)
+
+  for (ws in sweep_window_sizes) {
+    binned <- bin_read_matrix(met_mat_sweep, regions$start[i], regions$end[i], ws)
+    bin_dir <- file.path(output_dir, region_id, paste0("bin", ws))
+    if (!dir.exists(bin_dir)) dir.create(bin_dir, recursive = TRUE)
+
+    for (k in sweep_k_neighbors) {
+      knn <- manhattan_knn_graph(binned$mat, k_neighbors = k,
+                                 sigma = kernel_sigma, verbose = FALSE)
+      set.seed(1)
+      lay <- layout_with_fr(knn$graph)
+
+      for (r in sweep_resolutions) {
+        part <- leiden_partition(knn$graph, resolution = r, seed = leiden_seed)
+        membership <- part$membership
+        n_cl <- length(unique(membership))
+
+        pdf(file.path(bin_dir, sprintf("knn_graph_leiden_k%d_res%g_%s.pdf",
+                                       k, r, region_id)),
+            width = 7, height = 7)
+        plot(knn$graph,
+             vertex.color = membership,
+             vertex.size = 4,
+             vertex.label = NA,
+             edge.width = 0.3,
+             layout = lay,
+             main = sprintf("%s bin%d k=%d res=%g: %d clusters",
+                            region_id, ws, k, r, n_cl))
+        dev.off()
+
+        sweep_summary[[length(sweep_summary) + 1]] <- data.frame(
+          region_id = region_id, bin = ws, k_neighbors = k, resolution = r,
+          n_reads = nrow(binned$mat), n_clusters = n_cl)
+      }
+    }
   }
 }
+
+sweep_summary <- dplyr::bind_rows(sweep_summary)
+write.table(sweep_summary, file.path(output_dir, "knn_graph_sweep_summary.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+sweep_summary %>%
+  tidyr::pivot_wider(names_from = resolution, values_from = n_clusters,
+                     names_prefix = "res") %>%
+  as.data.frame()
 ```
 
-# Cluster sizes and timepoint composition across genes
+# Clustering at each region
 
-`n_clusters` is the number of Leiden clusters for that gene x window size at
-`leiden_resolution`; `n` counts reads.
+Run the same Leiden + Manhattan workflow on the explicit regions above, keeping
+the same single `window_size` throughout. Outputs per region are written under
+`<region_id>/bin<size>/k<k>/`.
+
+```{r cluster-regions, fig.width=9, fig.height=9}
+res <- leiden_manhattan_cluster_regions(
+  sample_names = sample_names,
+  regions = regions,
+  ft_result_dir = ft_result_dir,
+  window_size = window_size
+)
+
+for (region_id in names(res)) {
+  region_res <- res[[region_id]]
+  lab <- paste0("bin", window_size)
+  k_dir <- file.path(output_dir, region_id, lab, paste0("k", region_res$n_clusters))
+  if (!dir.exists(k_dir)) dir.create(k_dir, recursive = TRUE)
+
+  region_res$assignments$timepoint <- sample_table$timepoint[
+    match(region_res$assignments$sample_name, sample_table$sample_name)
+  ]
+  res[[region_id]] <- region_res
+
+  saveRDS(region_res, file.path(k_dir, paste0("leiden_manhattan_", region_id, ".rds")))
+  write.table(region_res$assignments,
+              file.path(k_dir, paste0("read_cluster_assignments_", region_id, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(data.frame(cluster = rownames(region_res$profiles), region_res$profiles,
+                         check.names = FALSE),
+              file.path(k_dir, paste0("cluster_profiles_", region_id, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(region_res$window_anno,
+              file.path(k_dir, paste0("window_annotation_", region_id, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(data.frame(RID = rownames(region_res$feat_mat),
+                         sample_name = region_res$assignments$sample_name,
+                         cluster = region_res$assignments$cluster,
+                         region_res$feat_mat, check.names = FALSE),
+              file.path(k_dir, paste0("feature_matrix_", region_id, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(region_res$assignments %>% dplyr::count(cluster, sample_name, timepoint),
+              file.path(k_dir, paste0("cluster_timepoint_counts_", region_id, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  write.table(data.frame(parameter = names(region_res$params),
+                         value = vapply(region_res$params, as.character, character(1))),
+              file.path(k_dir, paste0("run_parameters_", region_id, ".tsv")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+
+  gg <- plot_cluster_met_profiles(region_res, region_res$site_met_mat, main = region_id)
+  ggsave(file.path(k_dir, paste0("cluster_met_profiles_", region_id, ".pdf")), gg,
+         width = 6, height = 1.4 * region_res$n_clusters + 1.4, limitsize = FALSE)
+
+  gg <- plot_cluster_composition(region_res, main = region_id)
+  ggsave(file.path(k_dir, paste0("cluster_composition_", region_id, ".pdf")), gg,
+         width = 7, height = 8)
+  gg <- plot_cluster_structure(region_res, main = region_id)
+  ggsave(file.path(k_dir, paste0("cluster_structure_", region_id, ".pdf")), gg,
+         width = 9, height = 3)
+
+  pdf(file.path(k_dir, paste0("heatmap_", region_id, ".pdf")), width = 8, height = 9)
+  ComplexHeatmap::draw(plot_cluster_heatmap(region_res, main = region_id))
+  dev.off()
+
+  gg <- plot_met_fraction_lines(region_res, main = region_id, smooth_k = line_smooth_k)
+  ggsave(file.path(k_dir, paste0("met_fraction_lines_", region_id, ".pdf")), gg,
+         width = 8, height = 1.4 * region_res$n_clusters + 1, limitsize = FALSE)
+}
+
+names(res)
+```
+
+# Cluster sizes and timepoint composition across regions
+
+`n_clusters` is the number of Leiden clusters for that region at the current
+`window_size`; `n` counts reads.
 
 ```{r cluster-summary}
-cluster_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
-  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
-    all_results[[g]][[lab]]$assignments %>%
-      dplyr::count(cluster) %>%
-      dplyr::mutate(gene = g, bins = lab,
-                    n_clusters = all_results[[g]][[lab]]$n_clusters,
-                    .before = 1)
-  }))
+cluster_summary <- dplyr::bind_rows(lapply(names(res), function(region_id) {
+  region_res <- res[[region_id]]
+  region_res$assignments %>%
+    dplyr::count(cluster) %>%
+    dplyr::mutate(region_id = region_id,
+                  bins = paste0("bin", window_size),
+                  n_clusters = region_res$n_clusters,
+                  .before = 1)
 }))
-write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.tsv"),
+write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_regions.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
 cluster_summary %>% tidyr::pivot_wider(names_from = cluster, values_from = n)
 
-timepoint_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
-  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
-    all_results[[g]][[lab]]$assignments %>%
-      dplyr::count(cluster, sample_name, timepoint) %>%
-      dplyr::mutate(gene = g, bins = lab, .before = 1)
-  }))
+timepoint_summary <- dplyr::bind_rows(lapply(names(res), function(region_id) {
+  region_res <- res[[region_id]]
+  region_res$assignments %>%
+    dplyr::count(cluster, sample_name, timepoint) %>%
+    dplyr::mutate(region_id = region_id,
+                  bins = paste0("bin", window_size),
+                  .before = 1)
 }))
 write.table(timepoint_summary,
-            file.path(output_dir, "cluster_timepoint_summary_all_genes.tsv"),
+            file.path(output_dir, "cluster_timepoint_summary_all_regions.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
 
-## run parameters per gene x window size (resolution, kernel width, graph size)
-run_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
-  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
-    p <- all_results[[g]][[lab]]$params
-    data.frame(gene = g, bins = lab, n_reads = p$n_reads,
-               n_features = p$n_features, k_eff = p$k_eff,
-               resolution = p$resolution, sigma = p$sigma,
-               mean_knn_dist = p$mean_knn_dist, quality = p$quality,
-               n_clusters = all_results[[g]][[lab]]$n_clusters)
-  }))
+run_summary <- dplyr::bind_rows(lapply(names(res), function(region_id) {
+  p <- res[[region_id]]$params
+  data.frame(region_id = region_id, bins = paste0("bin", window_size),
+             chr = p$region_chr, start = p$region_start, end = p$region_end,
+             n_reads = p$n_reads, n_features = p$n_features, k_eff = p$k_eff,
+             resolution = p$resolution, sigma = p$sigma,
+             mean_knn_dist = p$mean_knn_dist, quality = p$quality,
+             n_clusters = res[[region_id]]$n_clusters)
 }))
-write.table(run_summary, file.path(output_dir, "run_summary_all_genes.tsv"),
+write.table(run_summary, file.path(output_dir, "run_summary_all_regions.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
 run_summary
 ```
