@@ -14,10 +14,12 @@ methylation. The procedure parameters are the paper's: 50-bp bins; reads
 unmethylated reads pre-assigned; sliding windows of 60 valid bins with
 >= 20-bin overlap; >= 30 valid bins per read per window; masked Hamming
 distance; hierarchical clustering to t clusters per window (the paper's
-average linkage replaced by Ward - see the deviations below); Hungarian
-stitching of adjacent windows; global reassignment of every read to its
-closest stitched profile. See `phasing_functions.r` for the step-by-step
-implementation.
+average linkage replaced by Ward - see the deviations below); global
+reassignment of every read to its closest cluster profile. The paper's
+Hungarian stitching of adjacent windows is commented out in
+`phasing_functions.r` - every run here is a single window, whose cluster
+means serve as the profiles directly. See `phasing_functions.r` for the
+step-by-step implementation.
 
 Deviations from the paper (switches in the Settings chunk):
 
@@ -412,6 +414,10 @@ write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.ts
 cluster_summary %>% tidyr::pivot_wider(names_from = final_cluster, values_from = n)
 ```
 
+<!-- Wide-locus demo commented out with the stitching (stitch_windows() /
+global_cluster_profiles() in phasing_functions.r are commented out, and
+phase_reads() now stops on multi-window input); re-enable both together.
+
 # Wide-locus demo: IL1B TSS +/- 10 kb
 
 A 2-kb promoter gives at most ~40 valid bins, i.e. a single window, so the
@@ -426,6 +432,8 @@ the Hungarian stitching needs one t in every window). Binary bins are used
 as in the promoter analysis. The chunk also runs the paper's held-out
 long-read validation (>= 50 kb reads; with HiFi Fiber-seq read lengths the
 expected report is "not applicable").
+-->
+
 
 ```{r wide-demo, fig.width=10, fig.height=8}
 # wide_i <- match("IL1B", promoters$gene)

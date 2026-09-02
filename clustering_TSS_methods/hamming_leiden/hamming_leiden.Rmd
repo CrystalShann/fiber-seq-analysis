@@ -1,0 +1,312 @@
+---
+title: "Hamming + Leiden clustering of single molecules at early-response promoters"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+A hybrid of the two existing single-molecule clusterings, on THP-1 Fiber-seq
+m6A at the early-response promoters:
+
+* **Distance**: the masked Hamming distance of the hamming_hierarchical
+  analysis (Bellini, Do & Skok 2025; `masked_hamming()` in
+  `phasing_functions.r`), computed on the same binary-bin feature matrices
+  that analysis clusters (a read's bin value is 1 if the read has any m6A
+  call in the bin - fractional bins compress all masked Hamming distances,
+  see that notebook's deviations).
+* **Clustering and number of clusters**: the Leiden_Manhattan analysis's
+  graph pipeline (Raviram et al. 2026, Methods steps 5-7): a KNN graph over
+  reads (k = 10 nearest neighbours), Manhattan/Hamming distances turned into
+  edge weights by an exponential kernel `exp(-d / sigma)`, and Leiden
+  community detection (`RBConfigurationVertexPartition`) at resolution 1.
+  As there, the number of clusters is whatever Leiden returns at the set
+  resolution - not the hamming analysis's within-cluster dispersion elbow -
+  and clusters are renumbered largest-first.
+
+Shared with both parents: the full-span read set (`filter_met_mat()`, the
+topic model's row filter), all four LPS timepoints pooled at their observed
+depths with each read keeping its timepoint tag, the TSS +/- 1000 bp
+promoter table, and the bin-size sweep (`bin_sizes`: 0 = no binning, i.e.
+the 0/1 m6A site matrix itself, where binarization is a no-op).
+
+No KNN imputation step: masking is the masked Hamming distance's own way of
+handling missing features (each pair is compared over co-observed features
+only), so nothing needs imputing even off the full-span read set.
+
+Note: on full-span reads the feature matrices have no missing values, so the
+masked Hamming distance is exactly the Manhattan distance divided by the
+number of features, and the default kernel width (mean retained KNN distance)
+is scale-free - with `binarize_bins = FALSE` this pipeline would reproduce
+Leiden_Manhattan exactly. The binary bins are what make it different at
+bin_sizes > 0; the bin-0 run differs from Leiden_Manhattan's bin-0 run only
+through the (scale-free) distance normalisation, i.e. not at all.
+
+Outputs go to `<gene>/bin<size>/k<k>/` (k = the number of Leiden clusters
+that run produced) under the output directory, with the same tables and the
+same five plots as the Leiden_Manhattan notebook
+(`leiden_manhattan_plots.r`).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+# igraph needs libglpk at load time; if library(igraph) fails with
+# "libglpk.so.40: cannot open shared object file", add glpk's lib directory
+# (/software/glpk-5.0-el8-x86_64/lib on this cluster) to LD_LIBRARY_PATH before
+# starting R.
+library(tidyverse)
+library(ggplot2)
+library(Matrix)
+library(GenomicRanges)
+library(data.table)
+library(Rsamtools)   # extract_ft_region_reads() reads the tabix-indexed beds
+library(igraph)
+library(ComplexHeatmap)
+library(cowplot)
+```
+
+# Functions
+
+`masked_hamming()` comes from the hamming analysis; `bin_read_matrix()`,
+`leiden_partition()`, `assemble_region_m6a()`, `cluster_site_profiles()` and
+the plots come from the Leiden_Manhattan analysis. Source order matters:
+`phasing_functions.r` also defines `plot_cluster_met_profiles()` /
+`plot_cluster_composition()`, so it is sourced before
+`leiden_manhattan_plots.r` and the Leiden versions (which take this
+notebook's result objects) win.
+
+```{r functions}
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_TSS_methods/hamming_hierarchical/phasing_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_TSS_methods/Leiden_Manhattan/leiden_manhattan_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_TSS_methods/Leiden_Manhattan/leiden_manhattan_plots.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_TSS_methods/hamming_leiden/hamming_leiden_functions.r")
+```
+
+# Settings
+
+```{r settings}
+options(scipen = 999)
+
+sample_table <- tibble::tribble(
+  ~sample_name, ~condition, ~timepoint,
+  "LPS_0",      "LPS",       0L,
+  "LPS_5",      "LPS",       5L,
+  "LPS_10",     "LPS",       10L,
+  "LPS_15",     "LPS",       15L
+)
+sample_names <- sample_table$sample_name[sample_table$condition == "LPS"]
+
+ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
+
+promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+
+output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_leiden"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Bin-size sweep: one full clustering run per promoter per entry. Positive =
+# bin size in bp; 0 = no binning, i.e. each m6A site is its own feature (the
+# default, and the first entry here). Output folders: <gene>/bin<size>/k<k>/,
+# k = the number of Leiden clusters.
+bin_sizes <- c(0, 10, 20, 30, 50)
+
+# Binary bins (the hamming analysis's binarize_bins, on): a read's bin value
+# is 1 if the read has any m6A call in the bin, instead of the mean site call.
+# No effect on the bin-0 run, whose site calls are already 0/1.
+binarize_bins <- TRUE
+
+# Leiden / graph parameters - identical to the Leiden_Manhattan notebook, so
+# any clustering difference comes from the distance/features, not the graph:
+# k = 10 neighbours (the paper's k = 50 would connect ~25% of these ~150-250
+# full-span read sets) and resolution 1 (standard modularity; the paper's
+# 2.1-3 shatters graphs this size). Raise the resolution for finer clusters.
+k_neighbors       <- 10
+leiden_resolution <- 1
+leiden_seed       <- 1
+
+# Exponential-kernel width for the affinities: NULL = mean of the retained KNN
+# distances (scale-free across bin sizes). Set to the number of features to
+# reproduce scikit-learn's laplacian_kernel default (gamma = 1 / n_features).
+kernel_sigma <- NULL
+
+# Rolling-mean width for the m6A fraction line plot only (1 = raw profiles).
+line_smooth_k <- 1
+
+set.seed(123)
+```
+
+# Promoter regions
+
+Same table and genes as the hamming, spearman and Leiden_Manhattan analyses:
+TSS +/- 1000 bp from GENCODE v49 (`make_promoter_table.R`).
+
+```{r regions}
+promoters <- read.delim(promoter_table)
+promoters
+```
+
+# Clustering at each promoter
+
+Per gene and per `bin_sizes` entry: assemble the pooled m6A matrix once per
+gene, apply the full-span filter, build the read x feature matrix (binary
+bins; bin size 0 uses the m6A site matrix directly), then masked Hamming
+distances, the KNN graph with exponential-kernel affinities, and Leiden.
+Outputs per gene x bin size, under `<gene>/bin<size>/k<k>/`: the result
+object (.rds), per-read cluster assignments **with the read's timepoint**,
+cluster profiles, the feature matrix, the window annotation, cluster x
+timepoint counts, the run parameters (.tsv), and the five plots.
+
+```{r cluster-promoters, fig.width=9, fig.height=9}
+all_results <- list()
+for (i in seq_len(nrow(promoters))) {
+  gene <- promoters$gene[i]
+  cat("\n=====", gene, "=====\n")
+
+  dat <- assemble_region_m6a(sample_names, promoters$chr[i],
+                             promoters$start[i], promoters$end[i],
+                             ft_result_dir, verbose = FALSE)
+  cat(gene, ": ", nrow(dat$rids_df), " reads x ", ncol(dat$met_mat),
+      " m6A sites before filtering\n", sep = "")
+
+  met_mat <- filter_met_mat(dat$met_mat, verbose = TRUE)
+  rids_df <- dat$rids_df[match(rownames(met_mat), as.character(dat$rids_df$RID)), ]
+  cat(gene, ": ", nrow(met_mat), " full-span reads x ", ncol(met_mat),
+      " m6A sites\n", sep = "")
+
+  for (bs in bin_sizes) {
+    lab      <- paste0("bin", bs)
+    bin_desc <- if (bs == 0) "per-site, no bins" else paste0(bs, "-bp binary bins")
+    gene_lab <- paste0(gene, " (", bin_desc, ")")
+    cat("--- ", gene, ", ", bin_desc, " ---\n", sep = "")
+
+    res <- hamming_leiden_cluster(met_mat, rids_df,
+                                  region_start  = promoters$start[i],
+                                  region_end    = promoters$end[i],
+                                  bin_size      = bs,
+                                  binarize_bins = binarize_bins,
+                                  k_neighbors   = k_neighbors,
+                                  resolution    = leiden_resolution,
+                                  sigma         = kernel_sigma,
+                                  seed          = leiden_seed)
+
+    # every read keeps its timepoint alongside its cluster
+    res$assignments$sample_name <- factor(res$assignments$sample_name,
+                                          levels = sample_names)
+    res$assignments$timepoint <- sample_table$timepoint[
+      match(res$assignments$sample_name, sample_table$sample_name)]
+    all_results[[gene]][[lab]] <- res
+
+    # k subfolder = the number of Leiden clusters this run produced
+    k_dir <- file.path(output_dir, gene, lab, paste0("k", res$n_clusters))
+    if (!dir.exists(k_dir)) dir.create(k_dir, recursive = TRUE)
+
+    ## tables + rds
+    saveRDS(res, file.path(k_dir, paste0("hamming_leiden_", gene, ".rds")))
+    write.table(res$assignments,
+                file.path(k_dir, paste0("read_cluster_assignments_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(data.frame(cluster = rownames(res$profiles), res$profiles,
+                           check.names = FALSE),
+                file.path(k_dir, paste0("cluster_profiles_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(res$window_anno,
+                file.path(k_dir, paste0("window_annotation_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(data.frame(RID = rownames(res$feat_mat),
+                           sample_name = res$assignments$sample_name,
+                           cluster = res$assignments$cluster,
+                           res$feat_mat, check.names = FALSE),
+                file.path(k_dir, paste0("feature_matrix_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(res$assignments %>% dplyr::count(cluster, sample_name, timepoint),
+                file.path(k_dir, paste0("cluster_timepoint_counts_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+    write.table(data.frame(parameter = names(res$params),
+                           value = vapply(res$params, as.character, character(1))),
+                file.path(k_dir, paste0("run_parameters_", gene, ".tsv")),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+
+    ## 1. per-cluster m6A methylation profiles (topic-model style)
+    gg <- plot_cluster_met_profiles(res, met_mat, tss = promoters$tss[i],
+                                    main = gene_lab)
+    ggsave(file.path(k_dir, paste0("cluster_met_profiles_", gene, ".pdf")), gg,
+           width = 6, height = 1.4 * res$n_clusters + 1.4, limitsize = FALSE)
+
+    ## 2. cluster composition by timepoint, and cluster structure
+    gg <- plot_cluster_composition(res, main = gene_lab)
+    ggsave(file.path(k_dir, paste0("cluster_composition_", gene, ".pdf")), gg,
+           width = 7, height = 8)
+    gg <- plot_cluster_structure(res, main = gene_lab)
+    ggsave(file.path(k_dir, paste0("cluster_structure_", gene, ".pdf")), gg,
+           width = 9, height = 3)
+
+    ## 3. read x feature methylation heatmap
+    pdf(file.path(k_dir, paste0("heatmap_", gene, ".pdf")), width = 8, height = 9)
+    ComplexHeatmap::draw(plot_cluster_heatmap(res, main = gene_lab))
+    dev.off()
+
+    ## 4. m6A fraction line plot (one panel per cluster)
+    gg <- plot_met_fraction_lines(res, tss = promoters$tss[i], main = gene_lab,
+                                  smooth_k = line_smooth_k)
+    if (binarize_bins && bs > 0)   # binary bins: the mean is a read fraction
+      gg <- gg + ylab(sprintf("fraction of reads with m6A per %d-bp bin", bs))
+    ggsave(file.path(k_dir, paste0("met_fraction_lines_", gene, ".pdf")), gg,
+           width = 8, height = 1.4 * res$n_clusters + 1, limitsize = FALSE)
+  }
+}
+```
+
+# Cluster sizes and timepoint composition across genes
+
+`n_clusters` is the number of Leiden clusters for that gene x bin size at
+`leiden_resolution`; `n` counts reads.
+
+```{r cluster-summary}
+cluster_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
+  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
+    all_results[[g]][[lab]]$assignments %>%
+      dplyr::count(cluster) %>%
+      dplyr::mutate(gene = g, bins = lab,
+                    n_clusters = all_results[[g]][[lab]]$n_clusters,
+                    .before = 1)
+  }))
+}))
+write.table(cluster_summary, file.path(output_dir, "cluster_summary_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cluster_summary %>% tidyr::pivot_wider(names_from = cluster, values_from = n)
+
+timepoint_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
+  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
+    all_results[[g]][[lab]]$assignments %>%
+      dplyr::count(cluster, sample_name, timepoint) %>%
+      dplyr::mutate(gene = g, bins = lab, .before = 1)
+  }))
+}))
+write.table(timepoint_summary,
+            file.path(output_dir, "cluster_timepoint_summary_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+## run parameters per gene x bin size (resolution, kernel width, graph size)
+run_summary <- dplyr::bind_rows(lapply(names(all_results), function(g) {
+  dplyr::bind_rows(lapply(names(all_results[[g]]), function(lab) {
+    p <- all_results[[g]][[lab]]$params
+    data.frame(gene = g, bins = lab, n_reads = p$n_reads,
+               n_features = p$n_features, k_eff = p$k_eff,
+               resolution = p$resolution, sigma = p$sigma,
+               mean_knn_dist = p$mean_knn_dist, quality = p$quality,
+               n_clusters = all_results[[g]][[lab]]$n_clusters)
+  }))
+}))
+write.table(run_summary, file.path(output_dir, "run_summary_all_genes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+run_summary
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,297 @@
+---
+title: "Co-accessible cCRE pairs across the LPS timecourse"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Picks ENCODE cCRE pairs where **one partner is a CA-CTCF element** and
+co-accessibility is **low at baseline (LPS_0) and rises as the LPS timecourse
+progresses** — a weighted upward trend of the fiber-level odds ratio over the
+four timepoints — and draws them at single-fiber resolution across all four.
+
+The tables come from `03_coaccess_cres.py`, which reimplements
+`coaccess_fire_CREs_combined_samples_around_genes.R`: cCREs overlapping a FIRE
+peak, paired within TSS ± 10 kb gene windows at 500 < gap < 20,000 bp, scored on
+the fibers that overlap both, with accessibility called by FIRE-element overlap
+and tested by `fisher.test(table + 1)`. The one structural difference from Kevin
+is that **each timepoint is tested by itself** where he pools 17 LCL samples.
+
+Plotting is `coaccess_plot_functions.R` in this directory — an independent
+implementation of his panel semantics that reads only the two tabix-indexed BEDs.
+Nothing here sources his code.
+
+# Functions
+
+```{r functions}
+code_dir <- "/project/spott/cshan/fiber-seq/code/co-accessibility"
+source(file.path(code_dir, "coaccess_plot_functions.R"))
+
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(ggplot2); library(patchwork)
+})
+```
+
+# Settings
+
+```{r settings}
+options(scipen = 999)
+
+root       <- "/project/spott/cshan/fiber-seq/macrophage_project/co-accessibility"
+coaccess   <- file.path(root, "coaccess")
+uni_dir    <- file.path(root, "universe")
+fire_root  <- "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE"
+plot_dir   <- file.path(coaccess, "plots")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+samples <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
+t_sel   <- "LPS_15"      # reference table for pair coords/labels/gene anchors
+
+n_top <- 5
+flank <- 1000            # bp either side of the pair for the plot window
+
+# selection knobs for the timecourse ranking: pairs with weak/no coupling at
+# baseline whose odds ratio RISES over the timecourse (one-sided weighted trend
+# on the log-OR over minutes), restricted to pairs where one partner is a
+# CA-CTCF cCRE. Only ~2.3K CTCF-partnered pairs are testable (vs ~139K overall)
+# so the evidence and fiber floors are relaxed relative to the unrestricted
+# screen; the floors still keep every facet legible.
+mins            <- c(0, 5, 10, 15)  # LPS timepoints in minutes, aligned to samples
+label_filter    <- "CTCF"   # regex on CRE_pair_labels; "" disables the restriction
+max_p_trend     <- 0.05     # one-sided weighted trend p (increase)
+max_or_baseline <- 1.5      # OR cap at LPS_0: coupling absent/weak at baseline
+min_delta_lor   <- log(2)   # logOR(late) - logOR(0): >= 2-fold OR rise
+min_dist_sel    <- 200
+min_shared_all  <- 15       # n_shared_reads floor in EVERY timepoint
+min_co_acc_late <- 5        # co_access floor at the last timepoint
+
+# the read rule the tables were computed under; the figure must match or the
+# fibers drawn and the 2x2 will disagree
+read_rule <- "any"
+
+min_locus_sep <- 1e6     # keep the picks on different loci
+```
+
+# Candidates
+
+Only pairs anchored to at least one **protein-coding** gene are considered, and
+pair labels name the protein-coding genes only. The selection is further
+restricted to pairs with a **CA-CTCF partner** (`label_filter` on
+`CRE_pair_labels`) — only ~2.3K such pairs are testable across all four
+timepoints, which is why the evidence and fiber floors below are looser than an
+unrestricted screen would use. Pairs are selected for a
+**gain of coupling from baseline**: the odds ratio at LPS_0 must be ≤
+`r max_or_baseline` *and* the minimum of the series (coupling starts absent or
+weak), and the Haldane log-OR must show a significant one-sided **weighted
+upward trend over minutes** (weighted least squares with Woolf weights;
+z = slope/SE). Survivors are ranked by the log-OR gain from LPS_0 to LPS_15 —
+the visual size of the change. Because the OR conditions on each cCRE's own
+marginal accessibility, this is not fooled by both cCREs independently becoming
+more accessible after LPS — the *coordination* itself has to grow.
+
+```{r select}
+cre_uni <- fread(file.path(uni_dir, "cre_universe.bed"),
+                 col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
+
+# per-timepoint 2x2 cells for every pair. Cell identities checked once:
+# co_closed == co_inaccess, and the four cells sum to n_shared_reads.
+tp_cells <- rbindlist(lapply(seq_along(samples), function(i) {
+  d <- fread(file.path(coaccess, paste0(samples[i], "_coaccess_pairs.tsv.gz")),
+             select = c("CRE_pair", "co_access", "CRE1_access", "CRE2_access",
+                        "co_inaccess", "n_shared_reads", "or_haldane"))
+  d[, `:=`(timepoint = samples[i], min_lps = mins[i])]
+  d
+}))
+
+# one-sided weighted trend of the Haldane log odds ratio on minutes: weighted
+# least-squares slope with Woolf weights (+0.5 per cell so empty cells stay
+# finite), z = slope / SE, p_trend = P(increase | constant OR). Only pairs
+# observed in all four timepoints are tested.
+tp_cells[, `:=`(a = co_access + 0.5, b = CRE1_access + 0.5,
+                c = CRE2_access + 0.5, d = co_inaccess + 0.5)]
+tp_cells[, `:=`(lor = log(a * d / (b * c)), w = 1 / (1/a + 1/b + 1/c + 1/d))]
+
+trend <- tp_cells[, {
+  if (.N == length(samples)) {
+    xb    <- sum(w * min_lps) / sum(w)
+    yb    <- sum(w * lor) / sum(w)
+    sxx   <- sum(w * (min_lps - xb)^2)
+    slope <- sum(w * (min_lps - xb) * (lor - yb)) / sxx
+    z     <- slope / sqrt(1 / sxx)
+    .(z = z, p_trend = pnorm(z, lower.tail = FALSE),
+      or0 = or_haldane[min_lps == 0],
+      delta_logOR = lor[min_lps == max(min_lps)] - lor[min_lps == 0],
+      lor_min_at0 = which.min(lor) == which(min_lps == 0),
+      or_series = paste(sprintf("%.1f", or_haldane[order(min_lps)]),
+                        collapse = "/"),
+      min_shared = min(n_shared_reads),
+      co_access_late = co_access[min_lps == max(min_lps)])
+  }
+}, by = CRE_pair]
+trend[, fdr_trend := p.adjust(p_trend, "BH")]
+
+# coords/labels/gene anchors from the reference timepoint's table
+pairs_dt <- fread(file.path(coaccess, paste0(t_sel, "_coaccess_pairs.tsv.gz")))
+cat(nrow(pairs_dt), "distinct cCRE pairs;", nrow(trend), "present in all four timepoints\n")
+
+# restrict to pairs anchored to >= 1 protein-coding gene. transcript_type lives
+# only in the gene-anchored stat table (the pair-level dedup drops it), so the
+# protein-coding pairs are read off that table, and gene_names is relabelled to
+# the protein-coding genes only so titles/filenames name the genes that kept it.
+stat_dt <- fread(file.path(coaccess, paste0(t_sel, "_coaccess_stat.tsv.gz")))
+pc_map  <- stat_dt[transcript_type == "protein_coding",
+                   .(gene_names = paste(sort(unique(gene_name)), collapse = ";")),
+                   by = CRE_pair]
+pairs_dt <- pairs_dt[CRE_pair %in% pc_map$CRE_pair]
+pairs_dt[, gene_names := pc_map[match(CRE_pair, pc_map$CRE_pair), gene_names]]
+cat(nrow(pairs_dt), "pairs anchored to a protein-coding gene\n")
+
+pairs_dt <- merge(pairs_dt, trend, by = "CRE_pair")
+
+sig <- pairs_dt[(label_filter == "" | grepl(label_filter, CRE_pair_labels)) &
+                p_trend < max_p_trend & or0 <= max_or_baseline & lor_min_at0 &
+                delta_logOR >= min_delta_lor & dist > min_dist_sel &
+                min_shared >= min_shared_all & co_access_late > min_co_acc_late]
+
+data.table(tested_pairs = nrow(pairs_dt),
+           gain_filter = nrow(sig),
+           fdr_trend_lt_0.05 = sum(pairs_dt$fdr_trend < 0.05)) |>
+  knitr::kable(caption = "co-accessibility gain from baseline across the timecourse")
+
+# rank by the log-OR gain from baseline, then spread the picks across loci
+setorder(sig, -delta_logOR)
+sel <- sig[0]
+for (i in seq_len(nrow(sig))) {
+  r <- sig[i]
+  clash <- nrow(sel) > 0 &&
+    any(sel$chrom == r$chrom & abs(sel$cre1_start - r$cre1_start) < min_locus_sep)
+  if (!clash) sel <- rbind(sel, r)
+  if (nrow(sel) == n_top) break
+}
+
+sel[, pair_id := paste0("pair", seq_len(.N), "_", gsub("[^A-Za-z0-9]+", "-", gene_names),
+                        "_", chrom, "_", cre1_start)]
+
+sel[, .(pair_id, gene_names, CRE_pair_labels, dist,
+        `OR 0/5/10/15` = or_series, min_shared,
+        delta_logOR = round(delta_logOR, 2), z = round(z, 2),
+        p_trend = signif(p_trend, 2), fdr_trend = signif(fdr_trend, 2))] |>
+  knitr::kable(caption = paste("top", n_top,
+                               "CTCF-partnered cCRE pairs gaining co-accessibility after LPS"))
+```
+
+`p_trend` is the one-sided weighted trend test on the Haldane-corrected (+0.5)
+cells and `fdr_trend` is BH over every pair observed in all four timepoints —
+this is a raw-p example screen, not a discovery set, with the cell floors doing
+the legibility work. The per-timepoint ORs shown are `or_haldane` from the
+tables. As a sanity check: a genuine rising trend implies the ORs are not
+homogeneous, so the standard Breslow-Day heterogeneity test on the selected
+pairs should also be small:
+
+```{r breslow-day}
+bd <- vapply(sel$CRE_pair, function(cp) {
+  d <- tp_cells[CRE_pair == cp][match(samples, timepoint)]
+  arr <- array(0, dim = c(2, 2, length(samples)))
+  for (i in seq_along(samples))
+    arr[, , i] <- matrix(c(d$co_access[i], d$CRE1_access[i],
+                           d$CRE2_access[i], d$co_inaccess[i]), 2, byrow = TRUE)
+  DescTools::BreslowDayTest(arr)$p.value
+}, numeric(1))
+data.table(pair_id = sel$pair_id, p_trend = signif(sel$p_trend, 2),
+           breslow_day_p = signif(bd, 2)) |> knitr::kable()
+```
+
+# Read-level figures
+
+One facet per timepoint. Fibers are sorted within each facet by their
+configuration at the pair — both accessible, CRE1 only, CRE2 only, neither —
+which is the visual counterpart of the 2×2 and what Kevin's
+`cluster = "fire_configs"` achieves. The tested pair is shaded on every panel.
+
+Four panels: the **m6A fraction** (fraction of covering fibers methylated at
+each A position, computed the way the topic model's empirical profile is), the
+cCRE track, the **m6A** raster (the raw footprinting signal, one mark per
+methylated adenine), and the **FiberHMM footprints** panel with a class legend
+in Kevin's `fire_fiberHMM` colour scheme — **linker** backbone, FiberHMM
+**nucleosome** calls (`FiberHMM/extract/firehmm_footprint`), **FIRE elements**,
+and the **size-binned footprints** (`firehmm_tf/ft_by_size`, size10-30 /
+size40-60 / size60-80) on top, smallest last. m6A comes from the existing
+`ft extract` run under `FiberHMM/extract/ft_result_dir`; the FIRE elements,
+which are what the 2×2 is actually built from, come from `lizarraga_FIRE`.
+
+```{r plot-fn}
+plot_one <- function(r, width = 11, height = 16) {
+  region <- list(chrom = r$chrom,
+                 start = max(0, r$cre1_start - flank),
+                 end   = r$cre2_end + flank)
+  cre1 <- list(start = r$cre1_start, end = r$cre1_end)
+  cre2 <- list(start = r$cre2_start, end = r$cre2_end)
+
+  res <- load_region(region, samples, root, fire_root)
+  labs <- label_reads(res, cre1, cre2, read_rule = read_rule)
+  # m6A and nucleosome tracks, restricted to the fibers actually drawn (the m6A
+  # track runs ~240 blocks per fiber, so expanding all of them is wasteful)
+  res <- load_ft_tracks(res, keys = labs[!is.na(config), key])
+
+  cres_here <- cre_uni[chrom == region$chrom & end > region$start & start < region$end]
+
+  sub <- sprintf("%s:%d-%d  |  gap %d bp  |  OR(0/5/10/15)=%s  |  trend p=%.2g",
+                 region$chrom, region$start, region$end, r$dist,
+                 r$or_series, r$p_trend)
+
+  p <- plot_pair_panels(res, cre1, cre2, labs, cres = cres_here,
+                        plot_name = paste0(r$gene_names, "  (", r$CRE_pair_labels, ")"),
+                        subtitle = sub)
+  bars <- plot_config_bars(labs, samples,
+                           title = paste0(r$gene_names, ": configuration by timepoint"))
+
+  ggsave(file.path(plot_dir, paste0(r$pair_id, "_reads.pdf")), p$combined,
+         width = width, height = height, limitsize = FALSE)
+  ggsave(file.path(plot_dir, paste0(r$pair_id, "_config_bars.pdf")), bars,
+         width = 6, height = 4)
+
+  list(res = res, labels = labs, panels = p, bars = bars)
+}
+```
+
+```{r plot-all, fig.width=11, fig.height=16, results="asis"}
+out <- list()
+for (i in seq_len(nrow(sel))) {
+  r <- sel[i]
+  cat("\n\n## ", r$gene_names, "  (", r$pair_id, ")\n\n", sep = "")
+  out[[r$pair_id]] <- tryCatch(plot_one(r), error = function(e) {
+    cat("skipped:", conditionMessage(e), "\n"); NULL })
+  if (!is.null(out[[r$pair_id]])) {
+    print(out[[r$pair_id]]$panels$combined)
+    print(out[[r$pair_id]]$bars)
+  }
+}
+```
+
+# Configuration counts
+
+Read straight off the fibers. These must reproduce the
+`co_closed / CRE1_access / CRE2_access / co_access` columns above — the figure and
+the table are computed from the same two BEDs under the same rules, so any
+disagreement means the plot window or the read rule has drifted.
+
+```{r qc}
+if (length(out) > 0 && !all(vapply(out, is.null, logical(1)))) {
+  qc <- rbindlist(lapply(names(out), function(nm) {
+    if (is.null(out[[nm]])) return(NULL)
+    d <- out[[nm]]$labels[!is.na(config)]
+    d[, .(n = .N), by = .(sample_name, config)][, pair_id := nm]
+  }))
+  dcast(qc, pair_id + sample_name ~ config, value.var = "n", fill = 0) |>
+    knitr::kable()
+} else {
+  cat("No figures produced.\n")
+}
+```

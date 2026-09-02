@@ -60,41 +60,40 @@ echo "Building ${all_tss}..."
 # 4. annotation information: gene_id;transcript_id;gene_name;transcript_type;tags
 # 5. score .
 # 6. strand
-    
 
 # output: /project/spott/cshan/annotation/gencode.v46.annotation_all_tss.bed
 
-# decompress the gzipped GTF 
+# decompress the gzipped GTF
+# input fields are separated by tabs
+# when awk prints multiple fields, separate them using tabs
+#
+# if column 3 is not a transcript, skip this row and proceed to the next row
+#
+##############################
+# calculate strand aware TSS
+##############################
+# converts GTF 1 based to BED 0 based
+# for + strand: TSS is at GTF start ----> TSS = start -1
+# for - strand, TSS is at the GTF end --> TSS = end - 1
+# create 20 bp TSS window: TSS window start = TSS start - 10; TSS window end = TSS start + 10
+#
+##############################
+# initialize annotation variables
+##############################
+# split column9 of GTF to create an array
+# loop through every attribute
+# collect all tags: a transcript can have multiple tags, and concataenates all tag
+# if no tag is present, use NA
+#   tag "basic";
+#   tag "Ensembl_canonical";
+#   tag "MANE_Select";
+# remove attribute name and quotation marks
+# sort by the bed6 file
+#   -k1,1 - sort by chr
+#   -k2,2n - numerically by BED start
+#   -k3,3n - numerically by BED end
+
 zcat "$GTF" \
-    # input fields are separated by tabs
-    # when awk prints multiple fields, separate them using tabs
-    
-    # if column 3 is not a transcript, skip this row and proceed to the next row
-    
-    ##############################
-    # calculate strand aware TSS
-    ##############################
-    # converts GTF 1 based to BED 0 based
-    # for + strand: TSS is at GTF start ----> TSS = start -1
-    # for - strand, TSS is at the GTF end --> TSS = end - 1
-    # create 20 bp TSS window: TSS window start = TSS start - 10; TSS window end = TSS start + 10
-    
-    ##############################
-    # initialize annotation variables
-    ##############################
-    # split column9 of GTF to create an array
-    # loop through every attribute 
-    # collect all tags: a transcript can have multiple tags, and concataenates all tag
-    # if no tag is present, use NA
-      # tag "basic";
-      # tag "Ensembl_canonical";
-      #tag "MANE_Select";
-    # remove attribute name and quotation marks
-    # sort by the bed6 file
-      # -k1,1 - sort by chr
-      # -k2,2n - numerically by BED start
-      # -k3,3n - numerically by BED end
-    
     | awk -F'\t' -v OFS='\t' '
         $3 != "transcript" { next }
         {
@@ -128,7 +127,7 @@ zcat "$GTF" \
 ##############################
 
 # output: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
-  
+
 echo "Filtering to Ensembl_canonical -> ${canonical}..."
 grep Ensembl_canonical "$all_tss" > "$canonical"
 

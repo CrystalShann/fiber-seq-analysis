@@ -325,13 +325,17 @@ add_haplotype_groups <- function(res, group_col = "haplotype",
 #'   NULL for no faceting.
 #' @param peaks_df optional intervals (chr, start, end, optionally group/score) to draw
 #'   as a track under the methylation panel - e.g. motifs or footprints of interest.
-#'   NULL (default) omits the panel entirely.
+#'   One row per interval, labelled on the left by its `group`. NULL (default) omits
+#'   the panel entirely.
+#' @param highlight optional c(start, end) drawn as a yellow band behind every panel,
+#'   e.g. the region a test was run on.
 #' @return list(panels = <named list of ggplots>, combined = <patchwork>).
 plot_region_panels <- function(res,
                                plot_name = NULL,
                                subtitle = NULL,
                                group_col = res$group_col,
                                peaks_df = NULL,
+                               highlight = NULL,
                                fiberHMM_cols = c("purple", "magenta", "#41c4e1"),
                                nucleosome_col = "darkblue",
                                linewidth = 0.5,
@@ -375,17 +379,19 @@ plot_region_panels <- function(res,
     pk <- dplyr::filter(pk, as.character(chr) == region$chr,
                         end >= region$start, start <= region$end)
     if (nrow(pk) > 0) {
+      # one row per interval, labelled on the left by its group (e.g. the cCRE class)
       if (is.null(pk$group)) pk$group <- "Peaks"
-      pk$group <- factor(pk$group, levels = rev(unique(pk$group)))
-      pk$y <- as.numeric(pk$group)
+      pk$group <- factor(pk$group, levels = unique(pk$group))
+      pk <- pk[order(pk$group, pk$start), , drop = FALSE]
+      pk$y <- rev(seq_len(nrow(pk)))
       gg$peaks <- ggplot(pk, aes(x = start, xend = end, y = y, yend = y)) +
-        geom_segment(linewidth = 1) +
+        geom_segment(linewidth = 1.5, colour = "black") +
         theme_bw() +
         labs(x = NULL, y = NULL) +
-        scale_y_continuous(breaks = sort(unique(pk$y)), labels = levels(pk$group),
-                           expand = expansion(mult = c(.1, .1))) +
+        scale_y_continuous(breaks = pk$y, labels = as.character(pk$group),
+                           expand = expansion(mult = c(.15, .15))) +
         theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
-              axis.text.y = element_text(size = 5), panel.grid.minor = element_blank()) +
+              axis.text.y = element_text(size = 7), panel.grid.minor = element_blank()) +
         coord_cartesian(xlim = xlims, expand = TRUE)
     }
   }
@@ -466,6 +472,16 @@ plot_region_panels <- function(res,
       gg$fire_fiberHMM <- gg$fire_fiberHMM + theme(axis.text.y = element_blank())
     gg$fire_fiberHMM <- add_facet(gg$fire_fiberHMM) +
       coord_cartesian(xlim = xlims, expand = expand)
+  }
+
+  ## Highlight band ------------------------------------------------------------
+  ## Prepended to each panel's layers so it sits behind the data.
+  if (!is.null(highlight)) {
+    hl <- as.numeric(highlight)
+    if (length(hl) != 2) stop("highlight must be c(start, end)")
+    hl_layer <- annotate("rect", xmin = hl[1], xmax = hl[2], ymin = -Inf, ymax = Inf,
+                         fill = "yellow", alpha = 0.3)
+    gg <- lapply(gg, function(p) { p$layers <- c(list(hl_layer), p$layers); p })
   }
 
   ## Assemble, dropping any panel that is not available -----------------------

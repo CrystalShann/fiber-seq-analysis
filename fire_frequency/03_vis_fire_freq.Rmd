@@ -1,0 +1,574 @@
+---
+title: "vis_fire_freq"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggpubr)
+library(ggrepel)
+library(tidyverse)
+library(DT)
+```
+
+# FIRE frequency
+
+chrom start   end        region_id timepoint n_reads n_fire     freq
+1  chr1 11261 11486 chr1:11261-11486     LPS_0      12      2 0.166667
+2  chr1 21178 21359 chr1:21178-21359     LPS_0      72      9 0.125000
+3  chr1 28997 29166 chr1:28997-29166     LPS_0      26     12 0.461538
+4  chr1 29283 29478 chr1:29283-29478     LPS_0      25     23 0.920000
+5  chr1 29964 30121 chr1:29964-30121     LPS_0      24      6 0.250000
+6  chr1 38601 38804 chr1:38601-38804     LPS_0      19      5 0.263158
+
+region represents universe FIRE regions across all timepoints
+```{r load_data}
+input_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency"
+plot_dir  <- file.path(input_dir, "plots")
+dir.create(plot_dir, showWarnings = FALSE)
+
+fire_freq <- read.csv(file.path(input_dir, "fire_frequency_long.tsv.gz"), sep = "\t")
+head(fire_freq)
+
+# group by region_id and timepoint, and calculate the mean frequency
+fire_freq_summary <- fire_freq %>%
+  group_by(region_id, timepoint) %>%
+  summarise(mean_freq = mean(freq, na.rm = TRUE)) %>%
+  ungroup()
+
+
+# rank region by mean frequency for each timepoint
+fire_freq_summary <- fire_freq_summary %>%
+  group_by(timepoint) %>%
+  mutate(rank = rank(-mean_freq, ties.method = "first")) %>%
+  ungroup()
+
+head(fire_freq_summary)
+
+```
+
+
+# cumulative distribution of FIRE frequency for each timepoint
+for a given frequency x, what fraction of FIRE-universe regions have frequency ≤ x?
+
+Left-shifted curve = more regions accumulate at lower x values → overall lower FIRE frequencies
+```{r CDF_fire_freq}
+
+fire_freq_cdf <- fire_freq_summary %>%
+  filter(!is.na(mean_freq)) %>%
+  group_by(timepoint) %>%
+  arrange(mean_freq, .by_group = TRUE) %>%
+  mutate(
+    cdf = row_number() / n()
+  ) %>%
+  ungroup()
+
+head(fire_freq_cdf)
+
+
+
+p_freq_cdf <- ggplot(fire_freq_cdf, aes(x = mean_freq, color = timepoint)) +
+  stat_ecdf(na.rm = TRUE) +
+  labs(
+    x = "FIRE frequency",
+    y = "Cumulative fraction of regions",
+    color = "Timepoint"
+  ) +
+  theme_classic()
+p_freq_cdf
+ggsave(file.path(plot_dir, "fire_freq_cdf.pdf"), p_freq_cdf, width = 7, height = 4)
+```
+
+
+# Pairwise differential FIRE frequency: top 100 regions
+
+Top 100 regions per comparison, ranked by Fisher exact p-value among
+coverage-passing regions (6 comparisons x 100 rows).
+
+```{r load_pairwise}
+pairwise <- read_tsv(file.path(input_dir, "pairwise_fisher.tsv.gz"),
+                     show_col_types = FALSE)
+
+comparison_levels <- c("LPS_0_vs_LPS_5", "LPS_0_vs_LPS_10", "LPS_0_vs_LPS_15",
+                       "LPS_5_vs_LPS_10", "LPS_5_vs_LPS_15", "LPS_10_vs_LPS_15")
+pairwise <- pairwise %>%
+  mutate(comparison = factor(comparison, levels = comparison_levels))
+
+# only coverage-passing regions were ranked in 02_pairwise_differential.R
+passing <- pairwise %>% filter(pass_coverage)
+
+# top 100 per comparison by raw p
+top100 <- passing %>%
+  group_by(comparison) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  slice_head(n = 100) %>%
+  ungroup() %>%
+  mutate(direction = ifelse(delta_freq > 0, "gain", "loss"))
+
+# gain = higher FIRE frequency at the later timepoint
+table(top100$comparison, top100$direction)
+```
+
+
+# Regions tested vs significant
+
+Tested = coverage-passing regions in that comparison; significant = unadjusted
+Fisher p < 0.05. "any comparison" is the union across the 6 comparisons, i.e.
+the definition used in the cCRE section below.
+
+```{r tested_vs_signif_bar, fig.width=8, fig.height=4.5}
+p_sig <- 0.05
+
+counts_by_comparison <- passing %>%
+  group_by(comparison) %>%
+  summarise(tested      = n(),
+            significant = sum(p_value < p_sig),
+            .groups = "drop") %>%
+  mutate(group = as.character(comparison))
+
+counts_union <- tibble(
+  group       = "any comparison",
+  tested      = n_distinct(passing$region_id),
+  significant = n_distinct(passing$region_id[passing$p_value < p_sig]))
+
+region_counts <- bind_rows(counts_by_comparison %>% select(group, tested, significant),
+                           counts_union) %>%
+  mutate(group = factor(group, levels = c(comparison_levels, "any comparison")))
+
+region_counts_long <- region_counts %>%
+  pivot_longer(c(tested, significant), names_to = "category", values_to = "n") %>%
+  mutate(category = factor(category, levels = c("tested", "significant")))
+
+p_region_counts <- ggplot(region_counts_long, aes(x = group, y = n, fill = category)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7,
+           color = "grey30", linewidth = 0.2) +
+  geom_text(aes(label = scales::comma(n)), position = position_dodge(width = 0.8),
+            vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c(tested = "grey70", significant = "firebrick")) +
+  scale_y_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "FIRE regions", fill = NULL,
+       subtitle = paste0("FIRE universe: ", n_distinct(pairwise$region_id),
+                         " regions; significant = p < ", p_sig)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_region_counts
+ggsave(file.path(plot_dir, "regions_tested_vs_signif.pdf"), p_region_counts,
+       width = 8, height = 4.5)
+
+region_counts %>% mutate(frac_signif = round(significant / tested, 3))
+```
+
+
+# P-value distribution per comparison
+
+Histogram of the unadjusted Fisher p-values 
+
+```{r pvalue_hist, fig.width=12, fig.height=6}
+expected_bin <- passing %>%
+  count(comparison) %>%
+  mutate(expected = n * 0.025)
+
+p_pval_hist <- ggplot(passing, aes(x = p_value)) +
+  geom_histogram(binwidth = 0.025, boundary = 0,
+                 fill = "grey70", color = "grey30", linewidth = 0.2) +
+  geom_hline(data = expected_bin, aes(yintercept = expected),
+             linetype = "dashed", color = "red") +
+  facet_wrap(~ comparison, nrow = 2) +
+  labs(x = "Fisher exact p (unadjusted)", y = "Regions") +
+  theme_classic()
+p_pval_hist
+ggsave(file.path(plot_dir, "pvalue_histogram.pdf"), p_pval_hist, width = 12, height = 6)
+```
+
+
+# Volcano: effect size vs significance
+
+Effect size = delta_freq (later - earlier FIRE frequency); significance =
+-log10 of the unadjusted Fisher p. Coverage-passing regions only. Points are
+coloured by direction among the regions with p < 0.05.
+
+```{r volcano_all, fig.width=12, fig.height=6}
+volcano <- passing %>%
+  mutate(neglog10_p = -log10(p_value),
+         status = case_when(p_value >= p_sig  ~ "n.s.",
+                            delta_freq > 0    ~ "gain (up in later)",
+                            TRUE              ~ "loss (down in later)"),
+         status = factor(status, levels = c("n.s.", "gain (up in later)",
+                                            "loss (down in later)")))
+
+status_cols <- c("n.s." = "grey75",
+                 "gain (up in later)" = "firebrick",
+                 "loss (down in later)" = "steelblue")
+
+p_volcano <- ggplot(volcano, aes(x = delta_freq, y = neglog10_p, color = status)) +
+  geom_point(size = 0.4, alpha = 0.4) +
+  geom_hline(yintercept = -log10(p_sig), linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ comparison, nrow = 2) +
+  scale_color_manual(values = status_cols) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(x = expression(Delta ~ "FIRE frequency (later - earlier)"),
+       y = expression(-log[10] ~ "Fisher p (unadjusted)"), color = NULL) +
+  theme_classic() +
+  theme(legend.position = "top")
+p_volcano
+ggsave(file.path(plot_dir, "volcano_all_comparisons.pdf"), p_volcano,
+       width = 12, height = 6)
+```
+
+## LPS_0 vs LPS_15: regions gained and lost at 15 min
+
+Same volcano restricted to the 0 vs 15 min comparison. Labelled points are the
+top 10 in each direction: p < 0.05 and the largest |delta_freq|, i.e. the
+regions with the highest FIRE frequency at 15 min relative to 0 (gains) and the
+lowest at 15 min relative to 0 (losses).
+
+```{r volcano_0_vs_15, fig.width=8.5, fig.height=6}
+n_label <- 10
+
+v15 <- volcano %>% filter(comparison == "LPS_0_vs_LPS_15")
+
+top_gain_15 <- v15 %>%
+  filter(p_value < p_sig, delta_freq > 0) %>%
+  arrange(desc(delta_freq), p_value) %>%
+  mutate(rank = row_number(), direction = "gain")
+
+top_loss_15 <- v15 %>%
+  filter(p_value < p_sig, delta_freq < 0) %>%
+  arrange(delta_freq, p_value) %>%
+  mutate(rank = row_number(), direction = "loss")
+
+labelled_15 <- bind_rows(head(top_gain_15, n_label), head(top_loss_15, n_label))
+
+p_volcano_15 <- ggplot(v15, aes(x = delta_freq, y = neglog10_p, color = status)) +
+  geom_point(size = 0.5, alpha = 0.4) +
+  geom_hline(yintercept = -log10(p_sig), linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(data = labelled_15, color = "black", size = 1.4) +
+  geom_text_repel(data = labelled_15, aes(label = region_id),
+                  color = "black", size = 2.6, min.segment.length = 0,
+                  max.overlaps = Inf, box.padding = 0.4) +
+  scale_color_manual(values = status_cols) +
+  # extra room on both sides so the repelled labels clear the point cloud
+  scale_x_continuous(expand = expansion(mult = c(0.35, 0.35))) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  labs(x = expression(Delta ~ "FIRE frequency (15 min - 0 min)"),
+       y = expression(-log[10] ~ "Fisher p (unadjusted)"), color = NULL,
+       subtitle = paste0(nrow(top_gain_15), " gains / ", nrow(top_loss_15),
+                         " losses at p < ", p_sig,
+                         "; top ", n_label, " each labelled")) +
+  theme_classic() +
+  theme(legend.position = "top")
+p_volcano_15
+ggsave(file.path(plot_dir, "volcano_LPS_0_vs_LPS_15.pdf"), p_volcano_15,
+       width = 8.5, height = 6)
+```
+
+```{r top_15_tables}
+top_15 <- bind_rows(top_gain_15, top_loss_15)
+write_tsv(top_15, file.path(input_dir, "top_changed_LPS_0_vs_LPS_15.tsv"))
+
+# shared column layout for the two direction tables
+format_top15 <- function(d) {
+  d %>%
+    transmute(rank, region_id,
+              n_reads_0 = n_reads_A, freq_0 = round(freq_A, 3),
+              n_reads_15 = n_reads_B, freq_15 = round(freq_B, 3),
+              delta_freq = round(delta_freq, 3), log2_or = round(log2_or, 2),
+              p_value = signif(p_value, 3))
+}
+```
+
+Gains: higher FIRE frequency at 15 min than at 0, ranked by delta_freq.
+
+```{r top_gain_15_table}
+datatable(format_top15(top_gain_15), filter = "top", rownames = FALSE,
+          caption = paste0("LPS_0 vs LPS_15 gains (p < ", p_sig, "): ",
+                           nrow(top_gain_15), " regions"),
+          options = list(pageLength = 10))
+```
+
+Losses: lower FIRE frequency at 15 min than at 0, ranked by the most negative
+delta_freq.
+
+```{r top_loss_15_table}
+datatable(format_top15(top_loss_15), filter = "top", rownames = FALSE,
+          caption = paste0("LPS_0 vs LPS_15 losses (p < ", p_sig, "): ",
+                           nrow(top_loss_15), " regions"),
+          options = list(pageLength = 10))
+```
+
+
+# QQ plot: observed vs null p-values
+
+Observed -log10 p against the value expected under the null of no change,
+one point per coverage-passing region. The diagonal is the null; points above
+it in the upper right are the excess of small p-values that no-effect cannot
+account for.
+
+Caveat: the uniform null is only approximate here. Fisher's exact test on small
+read counts is discrete and conservative, so even with no real effect the bulk
+of the curve is expected to sit slightly *below* the diagonal. Departure in the
+tail is still interpretable; mild deflation in the body is not evidence of
+anything.
+
+`pi0` is a Storey-style estimate of the fraction of regions with no true change
+(from the density of p > 0.5); `excess` is the number of p < 0.05 regions
+beyond what that null fraction predicts.
+
+```{r pvalue_qq, fig.width=12, fig.height=6}
+qq <- passing %>%
+  group_by(comparison) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  mutate(observed = -log10(p_value),
+         expected = -log10((row_number() - 0.5) / n())) %>%
+  ungroup()
+
+pi0_tab <- passing %>%
+  group_by(comparison) %>%
+  summarise(tested = n(),
+            # capped at 1: discreteness piles null p-values up against 1
+            pi0    = min(1, mean(p_value > 0.5) / 0.5),
+            signif = sum(p_value < p_sig),
+            .groups = "drop") %>%
+  mutate(expected_null_signif = round(pi0 * tested * p_sig),
+         excess               = signif - expected_null_signif)
+
+# all of the tail, a 1-in-20 subsample of the bulk, so the pdf stays small
+qq_thin <- qq %>%
+  group_by(comparison) %>%
+  filter(row_number() <= 5000 | row_number() %% 20 == 0) %>%
+  ungroup()
+
+pi0_lab <- pi0_tab %>%
+  mutate(label = paste0("pi0 = ", round(pi0, 2),
+                        "\nexcess p<", p_sig, ": ", scales::comma(excess)))
+
+p_qq <- ggplot(qq_thin, aes(x = expected, y = observed)) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_point(size = 0.4, alpha = 0.4, color = "grey30") +
+  geom_text(data = pi0_lab, aes(x = 0, y = max(qq$observed), label = label),
+            hjust = 0, vjust = 1, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ comparison, nrow = 2) +
+  labs(x = expression("Expected" ~ -log[10] ~ "p (uniform null)"),
+       y = expression("Observed" ~ -log[10] ~ "Fisher p")) +
+  theme_classic()
+p_qq
+ggsave(file.path(plot_dir, "pvalue_qq.pdf"), p_qq, width = 12, height = 6)
+
+pi0_tab %>% mutate(pi0 = round(pi0, 3))
+```
+
+
+# Significant regions vs ENCODE cCREs
+
+Significant = unadjusted Fisher p < 0.05 in at least one of the 6 pairwise
+comparisons
+
+`ccre_class` / `ccre_id` report that best cCRE.
+
+```{r ccre_overlap}
+suppressPackageStartupMessages(library(GenomicRanges))
+
+ccre_file <- "/project/spott/cshan/annotations/GRCh38-cCREs.bed"
+p_sig <- 0.05
+
+signif_rows <- passing %>% filter(p_value < p_sig)
+
+# region level: keep the samllest p comparison for ranking
+signif_regions <- signif_rows %>%
+  group_by(region_id, chrom, start, end) %>%
+  summarise(n_signif_comparisons = n(),
+            min_p           = min(p_value),
+            best_comparison = comparison[which.min(p_value)],
+            delta_freq_best = delta_freq[which.min(p_value)],
+            .groups = "drop")
+
+ccre <- data.table::fread(ccre_file, header = FALSE,
+                          col.names = c("chr", "start", "end",
+                                        "ccre_dcc", "ccre_id", "ccre_class"))
+
+reg.gr  <- GRanges(signif_regions$chrom,
+                   IRanges(signif_regions$start + 1L, signif_regions$end))
+ccre.gr <- GRanges(ccre$chr, IRanges(ccre$start + 1L, ccre$end))
+hits <- findOverlaps(reg.gr, ccre.gr)
+ov_frac <- width(pintersect(reg.gr[queryHits(hits)], ccre.gr[subjectHits(hits)])) /
+  width(reg.gr)[queryHits(hits)]
+
+# best cCRE per region (largest covered fraction)
+best <- data.frame(ri = queryHits(hits), frac = ov_frac,
+                   ccre_id = ccre$ccre_id[subjectHits(hits)],
+                   ccre_class = ccre$ccre_class[subjectHits(hits)]) %>%
+  group_by(ri) %>%
+  slice_max(frac, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+signif_regions <- signif_regions %>%
+  mutate(ccre_frac = 0, ccre_id = NA_character_, ccre_class = NA_character_)
+signif_regions$ccre_frac[best$ri]  <- best$frac
+signif_regions$ccre_id[best$ri]    <- best$ccre_id
+signif_regions$ccre_class[best$ri] <- best$ccre_class
+
+signif_ccre <- signif_regions %>% filter(ccre_frac >= 0.5)
+
+tibble(n_signif_regions = nrow(signif_regions),
+       any_ccre_overlap = sum(signif_regions$ccre_frac > 0),
+       ccre_50          = nrow(signif_ccre),
+       frac_ccre_50     = round(nrow(signif_ccre) / nrow(signif_regions), 3))
+```
+
+Nearest gencode v46 gene for the cCRE-supported regions (distance 0 =
+overlapping the gene body).
+
+```{r ccre_nearest_gene}
+gtf_file <- "/project/spott/cshan/annotations/gencode.v46.annotation.gtf.gz"
+gtf <- data.table::fread(cmd = paste("zcat", gtf_file, "| awk -F'\\t' '$3==\"gene\"'"),
+                         header = FALSE, sep = "\t")
+genes.gr <- GRanges(gtf$V1, IRanges(gtf$V4, gtf$V5),
+                    gene_name = sub('.*gene_name "([^"]+)".*', "\\1", gtf$V9),
+                    gene_type = sub('.*gene_type "([^"]+)".*', "\\1", gtf$V9))
+
+sc.gr <- GRanges(signif_ccre$chrom, IRanges(signif_ccre$start + 1L, signif_ccre$end))
+d <- distanceToNearest(sc.gr, genes.gr)
+signif_ccre$nearest_gene  <- NA_character_
+signif_ccre$nearest_gene_type <- NA_character_
+signif_ccre$gene_distance <- NA_integer_
+signif_ccre$nearest_gene[queryHits(d)]      <- genes.gr$gene_name[subjectHits(d)]
+signif_ccre$nearest_gene_type[queryHits(d)] <- genes.gr$gene_type[subjectHits(d)]
+signif_ccre$gene_distance[queryHits(d)] <- mcols(d)$distance
+
+write_tsv(signif_ccre %>% arrange(min_p),
+          file.path(input_dir, "signif_ccre_regions.tsv"))
+```
+
+```{r ccre_class_dist, fig.width=6, fig.height=4}
+p_ccre_class <- signif_ccre %>%
+  count(ccre_class) %>%
+  ggplot(aes(x = reorder(ccre_class, -n), y = n)) +
+  geom_col(fill = "grey70", color = "grey30") +
+  labs(x = "ENCODE cCRE class",
+       y = "Significant regions (>= 50% cCRE overlap)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_ccre_class
+ggsave(file.path(plot_dir, "signif_ccre_class_dist.pdf"), p_ccre_class,
+       width = 6, height = 4)
+```
+
+Top 100 cCRE-supported significant regions by best p (full table in
+`signif_ccre_regions.tsv`).
+
+```{r ccre_table}
+signif_ccre %>%
+  arrange(min_p) %>%
+  head(100) %>%
+  transmute(region_id, best_comparison, n_signif_comparisons,
+            min_p = signif(min_p, 3),
+            delta_freq_best = round(delta_freq_best, 3),
+            ccre_id, ccre_class, ccre_frac = round(ccre_frac, 2),
+            nearest_gene, gene_distance) %>%
+  datatable(filter = "top", rownames = FALSE, options = list(pageLength = 20))
+```
+
+
+# Read-level plots: top 5 cCRE-supported differential regions
+
+The 5 cCRE-supported significant regions with the smallest p-value and are assoicated with protein coding genes
+
+```{r region_functions}
+code_dir <- "/project/spott/cshan/fiber-seq/code/topic_model/read_region_extraction"
+source(file.path(code_dir, "region_data_utils.R"))
+source(file.path(code_dir, "region_plot_functions.R"))
+```
+
+Extraction (tabix/BAM slices per region x sample) runs
+`extract_region_result_macrophage.sh` and is skipped when the parsed output
+already exists, so re-knits are cheap.
+
+```{r top5_extract}
+options(scipen = 999)
+
+extract_script <- file.path(code_dir, "extract_region_result_macrophage.sh")
+extract_root <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency/region_plots"
+sample_names <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
+pad <- 1000
+
+# only regions whose nearest gene is protein-coding; all five turn out to be
+# intronic (gene_distance 0), so no distance is drawn on the plots
+top5 <- signif_ccre %>%
+  filter(nearest_gene_type == "protein_coding") %>%
+  arrange(min_p) %>%
+  head(5) %>%
+  mutate(outname = paste(chrom, start, end, sep = "_"),
+         window_start = as.integer(start - pad),
+         window_end   = as.integer(end + pad))
+top5 %>% select(region_id, best_comparison, min_p, delta_freq_best,
+                ccre_class, ccre_frac, nearest_gene, gene_distance)
+
+for (i in seq_len(nrow(top5))) {
+  for (s in sample_names) {
+    parsed <- file.path(extract_root, top5$outname[i], s, "parsed")
+    if (file.exists(file.path(parsed, "fire.bed"))) next
+    region_str <- paste0(top5$chrom[i], ":", top5$window_start[i], "-",
+                         top5$window_end[i])
+    cat("extracting", top5$outname[i], s, "\n")
+    rc <- system2("bash", c(extract_script, s, region_str, top5$outname[i],
+                            extract_root))
+    if (rc != 0) stop("extraction failed for ", top5$outname[i], " ", s)
+  }
+}
+```
+
+```{r top5_region_plots, fig.width=10, fig.height=16}
+for (i in seq_len(nrow(top5))) {
+  row <- top5[i, ]
+  cat("=== ", row$region_id, " (", row$ccre_class, ", nearest gene: ",
+      row$nearest_gene, ") ===\n", sep = "")
+
+  res <- load_region_results(
+    region       = data.frame(chr = row$chrom, start = row$window_start,
+                              end = row$window_end),
+    sample_names = sample_names,
+    result_dirs  = file.path(extract_root, row$outname, sample_names, "parsed"),
+    fiberHMM_feature      = "tf",
+    min_fiberHMM_fp_score = 50,
+    fiberHMM_size_breaks  = c(10, 30, 60, 80))
+
+  # facet the read-level panels and the pileup by timepoint
+  res <- add_read_groups(res,
+                         labels = setNames(as.character(res$rids_df$sample_name),
+                                           as.character(res$rids_df$RID)),
+                         group_col = "timepoint",
+                         group_levels = sample_names)
+
+  # cCREs in the window, one row per cCRE labelled with its class; the tested region
+  # itself is the yellow band behind every panel
+  peaks_df <- ccre %>%
+    filter(chr == row$chrom, end > row$window_start, start < row$window_end) %>%
+    arrange(ccre_class, start) %>%
+    transmute(chr, start, end, group = ccre_class)
+
+  p <- plot_region_panels(res,
+                          plot_name = paste0(row$region_id, "  (", row$ccre_class,
+                                             ", nearest gene: ", row$nearest_gene, ")"),
+                          peaks_df = peaks_df,
+                          highlight = c(row$start, row$end),
+                          fiberHMM_cols = c("purple", "magenta", "#41c4e1"),
+                          heights = c(pileup = 10, peaks = 2, fire_peaks = 1,
+                                      reads = 8, fire_fiberHMM = 8))
+  print(p$combined)
+  ggsave(file.path(plot_dir, paste0("region_", row$outname, "_by_timepoint.pdf")),
+         p$combined, width = 10, height = 16, limitsize = FALSE)
+}
+```

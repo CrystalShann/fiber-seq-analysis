@@ -1,0 +1,267 @@
+---
+title: "vis_m6a"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(DT)
+```
+
+# Average m6A level at the union FIRE regions
+
+Region-level table from 04_m6a_binned.py: for each union FIRE region and
+timepoint, n_cov = read x A/T-site events, n_mod = called m6A events,
+m6a = n_mod / n_cov, n_reads = distinct reads overlapping the region.
+
+```{r load_data}
+input_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency/methylation"
+fire_dir  <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency"
+plot_dir  <- file.path(input_dir, "plots")
+dir.create(plot_dir, showWarnings = FALSE)
+
+m6a_region <- fread(file.path(input_dir, "m6a_region_long.tsv.gz"))
+head(m6a_region)
+
+# one timepoint -> color mapping shared by every plot
+timepoint_levels <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
+timepoint_colors <- setNames(scales::hue_pal()(4), timepoint_levels)
+m6a_region$timepoint <- factor(m6a_region$timepoint, levels = timepoint_levels)
+```
+
+
+# Cumulative distribution of region m6A level for each timepoint
+
+for a given m6A level x, what fraction of FIRE-universe regions have level <= x?
+Left-shifted curve = overall lower m6A (less accessible) at that timepoint.
+
+```{r CDF_m6a}
+p_m6a_cdf <- ggplot(m6a_region, aes(x = m6a, color = timepoint)) +
+  stat_ecdf(na.rm = TRUE) +
+  scale_color_manual(values = timepoint_colors) +
+  labs(
+    x = "Average m6A level (n_mod / n_cov)",
+    y = "Cumulative fraction of regions",
+    color = "Timepoint"
+  ) +
+  theme_classic()
+p_m6a_cdf
+ggsave(file.path(plot_dir, "m6a_level_cdf.pdf"), p_m6a_cdf, width = 7, height = 4)
+```
+
+
+# Pairwise differential m6A level
+
+Wilcoxon rank-sum test on per-read m6A fractions (05): reads are the
+independent unit, so the p-values are calibrated at read level (unlike a
+Fisher test on pooled read x site events, which within-read correlation
+inflates).
+
+```{r load_pairwise}
+pairwise_m6a <- read_tsv(file.path(input_dir, "pairwise_wilcoxon_m6a.tsv.gz"),
+                         show_col_types = FALSE)
+
+comparison_levels <- c("LPS_0_vs_LPS_5", "LPS_0_vs_LPS_10", "LPS_0_vs_LPS_15",
+                       "LPS_5_vs_LPS_10", "LPS_5_vs_LPS_15", "LPS_10_vs_LPS_15")
+pairwise_m6a <- pairwise_m6a %>%
+  mutate(comparison = factor(comparison, levels = comparison_levels))
+
+passing <- pairwise_m6a %>% filter(pass_coverage, !is.na(p_value))
+
+# top 100 per comparison by raw p; head(100) instead of rank_p <= 100 because
+# rank_p uses ties.method = "min" and can return != 100 rows at tie boundaries
+top100 <- passing %>%
+  group_by(comparison) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  slice_head(n = 100) %>%
+  ungroup() %>%
+  mutate(direction = ifelse(delta_m6a > 0, "gain", "loss"))
+
+# gain = higher m6A level at the later timepoint
+table(top100$comparison, top100$direction)
+write_tsv(top100, file.path(input_dir, "pairwise_m6a_top100.tsv"))
+```
+
+
+# P-value distribution per comparison
+
+Histogram of the unadjusted Wilcoxon p-values over coverage-passing regions.
+The dashed red line is the count expected per bin if all p-values were uniform
+(no signal). An excess in the leftmost bins = real differential signal (the
+remaining caveat is biological: merged pools, no replication).
+
+```{r pvalue_hist, fig.width=12, fig.height=6}
+expected_bin <- passing %>%
+  count(comparison) %>%
+  mutate(expected = n * 0.025)
+
+p_pval_hist <- ggplot(passing, aes(x = p_value)) +
+  geom_histogram(binwidth = 0.025, boundary = 0,
+                 fill = "grey70", color = "grey30", linewidth = 0.2) +
+  geom_hline(data = expected_bin, aes(yintercept = expected),
+             linetype = "dashed", color = "red") +
+  facet_wrap(~ comparison, nrow = 2) +
+  labs(x = "Wilcoxon rank-sum p (unadjusted)", y = "Regions") +
+  theme_classic()
+p_pval_hist
+ggsave(file.path(plot_dir, "pvalue_histogram_m6a.pdf"), p_pval_hist, width = 12, height = 6)
+```
+
+
+# Distribution of m6A level changes
+
+```{r delta_violin, fig.width=10, fig.height=5}
+p_delta_violin <- ggplot(passing, aes(x = comparison, y = delta_m6a)) +
+  geom_violin(fill = "grey80") +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = NULL, y = "delta m6A (later - earlier)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_delta_violin
+ggsave(file.path(plot_dir, "delta_m6a_violin.pdf"), p_delta_violin, width = 10, height = 5)
+```
+
+```{r volcano, fig.width=12, fig.height=6}
+p_volcano <- ggplot(passing, aes(x = delta_m6a, y = -log10(p_value))) +
+  geom_point(size = 0.3, alpha = 0.3) +
+  facet_wrap(~ comparison, nrow = 2) +
+  labs(x = "delta m6A (later - earlier)", y = "-log10 Wilcoxon p") +
+  theme_classic()
+p_volcano
+ggsave(file.path(plot_dir, "volcano_pairwise_m6a.pdf"), p_volcano, width = 12, height = 6)
+```
+
+
+# Does m6A change where FIRE frequency changes?
+
+Join with the FIRE-frequency Fisher results by region x comparison. FIRE
+elements are called from m6A density, so a positive delta_freq / delta_m6a
+correlation is expected by construction; the informative regions are the
+discordant ones.
+
+```{r fire_overlay, fig.width=12, fig.height=6}
+pairwise_fire <- read_tsv(file.path(fire_dir, "pairwise_fisher.tsv.gz"),
+                          show_col_types = FALSE) %>%
+  select(region_id, comparison, delta_freq, p_fire = p_value,
+         pass_coverage_fire = pass_coverage)
+
+both <- passing %>%
+  inner_join(pairwise_fire, by = c("region_id", "comparison")) %>%
+  filter(pass_coverage_fire) %>%
+  mutate(fire_signif = p_fire < 0.05)
+
+# delta_freq vs delta_m6a (binned 2D counts; ~90k regions x 6 facets)
+p_dd <- ggplot(both, aes(x = delta_freq, y = delta_m6a)) +
+  geom_bin2d(bins = 80) +
+  scale_fill_viridis_c(trans = "log10") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.3) +
+  facet_wrap(~ comparison, nrow = 2) +
+  labs(x = "delta FIRE frequency", y = "delta m6A", fill = "Regions") +
+  theme_classic()
+p_dd
+ggsave(file.path(plot_dir, "delta_freq_vs_delta_m6a.pdf"), p_dd, width = 12, height = 6)
+
+both %>%
+  group_by(comparison) %>%
+  summarise(spearman = cor(delta_freq, delta_m6a, method = "spearman",
+                           use = "complete.obs"))
+```
+
+```{r fire_signif_violin, fig.width=12, fig.height=5}
+# |delta_m6a| at FIRE-significant regions (raw Fisher p < 0.05 in that same
+# comparison) vs the rest of the coverage-passing universe
+p_sig <- ggplot(both, aes(x = fire_signif, y = delta_m6a, fill = fire_signif)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ comparison, nrow = 1) +
+  labs(x = "FIRE frequency change significant (raw p < 0.05)", y = "delta m6A") +
+  theme_classic() +
+  theme(legend.position = "none")
+p_sig
+ggsave(file.path(plot_dir, "delta_m6a_by_fire_sig.pdf"), p_sig, width = 12, height = 5)
+
+# regions significant in both tests (raw p < 0.05, per comparison)
+both %>%
+  group_by(comparison) %>%
+  summarise(n_pass = n(),
+            fire_sig = sum(fire_signif),
+            m6a_sig = sum(p_value < 0.05),
+            both_sig = sum(fire_signif & p_value < 0.05))
+```
+
+
+# 10 bp binned profiles of the top differential regions
+
+Per-bin m6A level across the region, one line per timepoint, for the 5 regions
+with the smallest Fisher p over all comparisons.
+
+```{r top5_profiles, fig.width=10, fig.height=8}
+m6a_bins <- fread(file.path(input_dir, "m6a_bins_long.tsv.gz"))
+
+top5_ids <- passing %>%
+  arrange(p_value) %>%
+  distinct(region_id) %>%
+  slice_head(n = 5) %>%
+  pull(region_id)
+top5_ids
+
+p_top5 <- m6a_bins %>%
+  filter(region_id %in% top5_ids) %>%
+  mutate(bin_mid = (bin_start + bin_end) / 2,
+         timepoint = factor(timepoint, levels = timepoint_levels)) %>%
+  ggplot(aes(x = bin_mid, y = m6a, color = timepoint)) +
+  geom_line(na.rm = TRUE) +
+  geom_point(size = 0.6, na.rm = TRUE) +
+  scale_color_manual(values = timepoint_colors) +
+  facet_wrap(~ region_id, ncol = 1, scales = "free_x") +
+  labs(x = "Position (10 bp bin midpoint)", y = "m6A level", color = "Timepoint") +
+  theme_classic()
+p_top5
+ggsave(file.path(plot_dir, "top5_m6a_profiles.pdf"), p_top5, width = 10, height = 8)
+```
+
+
+# Meta-profile across scaled region positions
+
+Bins mapped to their relative position within the region (0 = region start,
+1 = region end), n_cov-weighted mean m6A per position bin per timepoint.
+Flat separation between timepoints = a uniform shift; edge-vs-center
+differences = shape changes at the accessible region.
+
+```{r metaprofile, fig.width=7, fig.height=4}
+region_coords <- m6a_region %>%
+  distinct(region_id, start, end)
+
+meta <- m6a_bins %>%
+  inner_join(region_coords, by = "region_id") %>%
+  mutate(rel_pos = ((bin_start + bin_end) / 2 - start) / (end - start),
+         pos_bin = cut(rel_pos, breaks = seq(0, 1, 0.05), include.lowest = TRUE)) %>%
+  group_by(timepoint, pos_bin) %>%
+  summarise(m6a = sum(n_mod) / sum(n_cov), .groups = "drop") %>%
+  mutate(pos_mid = (as.integer(pos_bin) - 0.5) * 0.05,
+         timepoint = factor(timepoint, levels = timepoint_levels))
+
+p_meta <- ggplot(meta, aes(x = pos_mid, y = m6a, color = timepoint)) +
+  geom_line() +
+  scale_color_manual(values = timepoint_colors) +
+  labs(x = "Relative position in region", y = "Mean m6A level (pooled)",
+       color = "Timepoint") +
+  theme_classic()
+p_meta
+ggsave(file.path(plot_dir, "m6a_metaprofile.pdf"), p_meta, width = 7, height = 4)
+```
