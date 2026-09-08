@@ -168,7 +168,7 @@ plot_cluster_heatmap <- function(res, main = NULL,
   # within each cluster, sort by read start position
   o  <- order(df$cluster, df$start)
   df <- df[o, ]
-  # Takes the feature matrix used for  clustering 
+  # Takes the feature matrix used for  clustering
   # and puts its rows in exactly the same order as df
   mat <- res$feat_mat[df$RID, , drop = FALSE]
   mat <- matrix(ifelse(is.na(mat), NA, ifelse(mat > 0, "m6A", "no m6A")),

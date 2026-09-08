@@ -1,0 +1,210 @@
+---
+title: "LCL m6A clustering and footprint profiles"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    self_contained: true
+params:
+  plots_only: false
+  regenerate_plots: true
+---
+
+<style>
+.main-container { max-width: 100%; padding: 0 24px; }
+.lcl-gallery { overflow-x: auto; margin-bottom: 2em; }
+.lcl-gallery table { width: 100%; table-layout: fixed; min-width: 1250px; }
+.lcl-gallery th, .lcl-gallery td { padding: 8px; border: 1px solid #ddd; vertical-align: top; overflow-wrap: anywhere; }
+.lcl-gallery th:first-child { width: 160px; }
+.lcl-preview { padding: 0; border: 0; background: white; width: 100%; cursor: zoom-in; }
+.lcl-preview img { width: 100%; height: auto; }
+#lcl-zoom { max-width: 96vw; max-height: 96vh; overflow: auto; }
+#lcl-zoom img { display: block; width: auto; max-width: 90vw; height: auto; }
+#lcl-zoom::backdrop { background: rgba(0,0,0,.65); }
+</style>
+<dialog id="lcl-zoom"><form method="dialog"><button>Close preview</button></form><img alt="Enlarged plot preview"></dialog>
+
+## Setup and code organization
+
+1. `leiden_LCL_functions.R`: construct genomic windows, m6A matrices
+2. `process_LCL_footprints.R` computes occupancy and aggregate profiles
+3. `plot_clustering_LCL.R`: plot heatmap and aggregate profiles for footprints and nucleosomes
+4. `leiden_manhattan_functions.r`:  calculate manhattan distance and run leiden clustering
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+options(scipen = 999)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(Matrix)
+  library(GenomicRanges)
+  library(Rsamtools)
+  library(igraph)
+  library(ComplexHeatmap)
+  library(ggplot2)
+  library(cowplot)
+})
+code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_TSS_methods/Leiden_Manhattan/LCL"
+source(file.path(code_dir, "leiden_LCL_functions.R"))
+source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/LCL/process_LCL_footprints.R")
+source(file.path(code_dir, "plot_clustering_LCL.R"))
+data.table::setDTthreads(2L)
+```
+
+## Regions and samples and parameters
+
+Heatmaps are in genomic coordinates, footprint and profile plots use TSS relative coordinates
+
+```{r settings}
+sample_csv <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+tss_bed <- "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
+tracks_dir <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks"
+matrix_dir <- "/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan/m6a_matrix"
+output_dir <- "/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan/results"
+include_haplotype <- TRUE
+haplotype_output_dir <- "/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan/haplotype"
+phasing_root <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+tss_flank <- 1000L
+window_size <- 0L
+k_neighbors <- 10L
+leiden_resolution <- 1
+leiden_seed <- 1L
+kernel_sigma <- NULL
+footprint_workers <- 2L
+reuse_cache <- TRUE
+promoter_genes <- c("EIF4A2", "RPS17", "NPM1")
+coordinate_regions <- tibble::tribble(
+  ~region_id, ~chr, ~start, ~end, ~annotation,
+  "rs4953223", "chr2", 45289157L, 45291257L, "dsQTL: rs4953223; NFKB example",
+  "rs1530562", "chr2", 119291054L, 119291154L, "dsQTL: rs1530562",
+  "rs6513945", "chr20", 44683645L, 44683745L, "dsQTL: rs6513945; CTCF example 1",
+  "rs749579", "chr2", 86220700L, 86221700L, "dsQTL: rs749579",
+  "rs7603346", "chr2", 212990848L, 212991848L, "dsQTL: rs7603346",
+  "chr3_102233378_102238378", "chr3", 102233378L, 102238378L, "chr3:102233378-102238378 region"
+)
+regions <- construct_lcl_windows(coordinate_regions, promoter_genes, tss_bed, tss_flank)
+sample_table <- read.csv(sample_csv, stringsAsFactors = FALSE)
+stopifnot(nrow(sample_table) == 31L, !anyDuplicated(sample_table$sample_name),
+          all(grepl("^AL[0-9]+(AL[0-9]+)*_", sample_table$sample_name)))
+sample_table$sample_label <- sub("_.*$", "", sample_table$sample_name)
+sample_colors <- lcl_sample_palette(sample_table$sample_name)
+dir.create(file.path(output_dir, "summary tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(matrix_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(haplotype_output_dir, "summary tables"), recursive = TRUE, showWarnings = FALSE)
+data.table::fwrite(regions, file.path(output_dir, "summary tables", "regions.tsv"), sep = "\t")
+data.table::fwrite(sample_table, file.path(output_dir, "summary tables", "samples.tsv"), sep = "\t")
+data.table::fwrite(data.frame(sample = names(sample_colors), color = unname(sample_colors)),
+                   file.path(output_dir, "summary tables", "sample_colors.tsv"), sep = "\t")
+input_paths <- unlist(lapply(unique(regions$chr), function(chromosome) {
+  unlist(lapply(c("m6a", "nuc"), function(feature) {
+    paths <- lcl_extracted_path(sample_table, chromosome, feature)
+    c(paths, paste0(paths, ".tbi"))
+  }))
+}))
+data.table::fwrite(lcl_source_signature(c(sample_csv, tss_bed, input_paths)),
+                   file.path(output_dir, "summary tables", "input_manifest.tsv"), sep = "\t")
+regions
+```
+
+## Pooled m6A clustering
+
+All 31 samples are pooled with fully spanning reads
+
+  * bin = 0, k = 10, resolution = 1
+
+```{r clustering}
+if (params$plots_only) {
+  result_paths <- readRDS(file.path(output_dir, "summary tables", "result_paths.rds"))
+} else {
+  result_paths <- run_lcl_clustering(regions, sample_table, matrix_dir, output_dir,
+    window_size, k_neighbors, leiden_resolution, leiden_seed, kernel_sigma, reuse_cache)
+}
+data.table::fread(file.path(output_dir, "summary tables", "run_summary.tsv"))
+```
+
+## Footprint processing
+
+130-160 bp nucleosomes and TF footprints of 10-30, 40-60 and 60-80 bp
+
+```{r footprints}
+if (!params$plots_only) process_lcl_footprints(result_paths, sample_table, regions,
+  tracks_dir, output_dir, workers = footprint_workers, reuse = reuse_cache)
+```
+
+## Pooled plots
+
+- `heatmap_m6a.pdf`: m6A only
+- `fig1_read_footprints.pdf`: nucleosomes and the selected TF sizes, with the same m6A-defined clusters 
+- `aggregate_profile.pdf`: all features combined barplot
+- `methylation_proportion_by_cluster.pdf`: m6A calls divided by the number of reads times the number of observed sites,
+
+```{r pooled-plots, include=FALSE}
+if (params$regenerate_plots) for (path in result_paths) {
+  result <- readRDS(path)
+  message("Plotting pooled region: ", result$region$region_id)
+  footprints <- data.table::fread(file.path(dirname(path), "footprint_positions.tsv.gz"), data.table = FALSE)
+  save_lcl_plots(result, footprints, sample_colors, dirname(dirname(path)))
+}
+```
+
+
+```{r pooled-gallery, results='asis', echo=FALSE}
+lcl_report_gallery(result_paths)
+```
+
+<!--
+## Haplotype annotation and plots
+
+Haplotype computation and display are temporarily disabled in this report.
+
+HP1, HP2 and unphased reads retain the pooled m6A assignments and ordering.
+Haplotype identifiers are local to each sample/phase block. HP1 is light blue,
+HP2 light yellow. VCF SNP positions, REF/ALT bases and per-cluster m6A profiles
+annotate `heatmap_m6a_footprints.pdf`; despite its filename, its matrix contains
+only m6A. Fig 1 contains only protected footprints. Fig 2 uses lines for all
+five tracks; `aggregate_profile.pdf` uses footprint bars with an m6A line.
+The methylation summary barplot is also written for each annotated region.
+
+```{r haplotype-plots, eval=FALSE, echo=FALSE}
+if (include_haplotype) {
+  if (params$plots_only) {
+    haplotype_paths <- setNames(vapply(result_paths, function(path) {
+      result <- readRDS(path)
+      file.path(haplotype_output_dir, result$region$region_id, "pooled",
+        paste0("bin", result$params$window_size), paste0("k", result$params$k_neighbors),
+        paste0("resolution", result$params$resolution), "tables", "clustering.rds")
+    }, character(1)), names(result_paths))
+  } else {
+    haplotype_paths <- annotate_lcl_results(result_paths, sample_table, phasing_root,
+      haplotype_output_dir, reuse_cache)
+  }
+  if (params$regenerate_plots) for (rid in names(haplotype_paths)) {
+    result <- readRDS(haplotype_paths[[rid]])
+    message("Plotting haplotype annotations: ", rid)
+    footprints <- data.table::fread(file.path(dirname(result_paths[[rid]]), "footprint_positions.tsv.gz"), data.table = FALSE)
+    save_lcl_plots(result, footprints, sample_colors, dirname(dirname(haplotype_paths[[rid]])), include_haplotype = TRUE)
+  }
+}
+```
+
+```{r haplotype-gallery, eval=FALSE, echo=FALSE}
+if (include_haplotype) lcl_report_gallery(haplotype_paths, include_haplotype = TRUE)
+```
+
+-->
+
+## Output index and session
+
+Each region/run contains `plots/` for PDFs and `tables/` for tabular outputs
+and saved clustering objects. Shared tables and file-location indexes are in
+`summary tables/` under both `results/` and `haplotype/`.
+
+```{r output-index, include=FALSE}
+write_lcl_result_index(output_dir, include_haplotype = FALSE)
+```
+
+```{r session}
+sessionInfo()
+```

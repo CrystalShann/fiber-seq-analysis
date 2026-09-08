@@ -260,7 +260,7 @@ p_volcano_15 <- ggplot(v15, aes(x = delta_freq, y = neglog10_p, color = status))
                   color = "black", size = 2.6, min.segment.length = 0,
                   max.overlaps = Inf, box.padding = 0.4) +
   scale_color_manual(values = status_cols) +
-  # extra room on both sides so the repelled labels clear the point cloud
+
   scale_x_continuous(expand = expansion(mult = c(0.35, 0.35))) +
   guides(color = guide_legend(override.aes = list(size = 2, alpha = 1))) +
   labs(x = expression(Delta ~ "FIRE frequency (15 min - 0 min)"),
@@ -312,49 +312,51 @@ datatable(format_top15(top_loss_15), filter = "top", rownames = FALSE,
 
 # QQ plot: observed vs null p-values
 
-Observed -log10 p against the value expected under the null of no change,
-one point per coverage-passing region. The diagonal is the null; points above
-it in the upper right are the excess of small p-values that no-effect cannot
-account for.
+Do Fisher's p values from FIRE frequency comparisons contain more small p values than expected if there were no real differences between timepoints?
 
-Caveat: the uniform null is only approximate here. Fisher's exact test on small
-read counts is discrete and conservative, so even with no real effect the bulk
-of the curve is expected to sit slightly *below* the diagonal. Departure in the
-tail is still interpretable; mild deflation in the body is not evidence of
-anything.
-
-`pi0` is a Storey-style estimate of the fraction of regions with no true change
-(from the density of p > 0.5); `excess` is the number of p < 0.05 regions
-beyond what that null fraction predicts.
-
+  1. For each pairwise comparison, all coverage passing regions are ranked from smallest to largest p values, the observed fisher p-vlaue for each region is converted to
+  -log10(p), and is plotted against the -log10(p) expected at the same rank if all p values follow a unifomr (0,1) null distribution
+  
+  2. Points above the diagonal means there are more very small p values than expected
+  
+  
 ```{r pvalue_qq, fig.width=12, fig.height=6}
 qq <- passing %>%
   group_by(comparison) %>%
   arrange(p_value, .by_group = TRUE) %>%
+  # convert to -log(10) based p value
   mutate(observed = -log10(p_value),
+         # expected p value at the same rank if all regions are null
          expected = -log10((row_number() - 0.5) / n())) %>%
   ungroup()
 
 pi0_tab <- passing %>%
   group_by(comparison) %>%
+  # count how many regions are tested in each pairwise comparison
   summarise(tested = n(),
-            # capped at 1: discreteness piles null p-values up against 1
+            # fraction of tests behave like null hypothesis 
             pi0    = min(1, mean(p_value > 0.5) / 0.5),
+            # number of regions with fisher p value < 0.05
             signif = sum(p_value < p_sig),
             .groups = "drop") %>%
+  # estimated number of sig regions from the null hypothesis alone
   mutate(expected_null_signif = round(pi0 * tested * p_sig),
          excess               = signif - expected_null_signif)
 
-# all of the tail, a 1-in-20 subsample of the bulk, so the pdf stays small
+# keeps the 5000 smallest p values
 qq_thin <- qq %>%
   group_by(comparison) %>%
   filter(row_number() <= 5000 | row_number() %% 20 == 0) %>%
   ungroup()
 
+# summary table
 pi0_lab <- pi0_tab %>%
   mutate(label = paste0("pi0 = ", round(pi0, 2),
                         "\nexcess p<", p_sig, ": ", scales::comma(excess)))
 
+# qq plot
+  # x = expected -log10(p)
+  # y = observed -log10(fisher p)
 p_qq <- ggplot(qq_thin, aes(x = expected, y = observed)) +
   geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
   geom_point(size = 0.4, alpha = 0.4, color = "grey30") +

@@ -49,7 +49,11 @@ sample_names <- sample_table$sample_name[sample_table$condition == "LPS"]
 
 ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
 
-# promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+
+# GENCODE v46 Ensembl-canonical TSS: promoter windows are canonical TSS +/- tss_flank
+gencode_tss_bed <- "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
+tss_flank <- 1000L
 
 output_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/Leiden_Manhattan"
 if (!dir.exists(output_dir)) {
@@ -79,16 +83,6 @@ kernel_sigma <- NULL
 impute_missing <- FALSE
 impute_k       <- 5
 
-# Sweep grids for the "KNN graph colored by Leiden cluster" figures: one pdf
-# per bin size x k x resolution combination under <region_id>/bin<size>/.
-# Ranges come from a pilot sweep (k 5-50, resolution 0.1-5, both regions, all
-# bin sizes, ~200 full-span reads each): k = 5 fragments the graph and k = 50
-# merges everything below resolution 0.5 then shatters above 1; resolution 0.1
-# gives one cluster almost everywhere and > 2 over-splits (> 15 clusters).
-sweep_window_sizes <- c(0L, 10L, 20L, 30L, 50L)
-sweep_k_neighbors  <- c(10, 15, 20, 30)
-sweep_resolutions  <- c(0.25, 0.5, 1, 1.5, 2)
-
 # Rolling-mean width for the m6A fraction line plot only (1 = raw profiles).
 # At window size 0 the per-site cluster means are spiky; e.g. 25 makes the
 # nucleosome-scale structure readable without changing any clustering input.
@@ -99,17 +93,43 @@ set.seed(123)
 
 # Regions
 
-Custom regions for the Leiden + Manhattan run.
+The 8 early-response promoters (genes and ENSG from the GENCODE v49 promoter
+table, window = GENCODE v46 canonical TSS +/- 1000 bp, region_id = gene) plus
+the two custom coordinate regions. The nucleosome-positioning notebook
+(`code/nucleosome_positioning/nuc_pos.rmd`) reads the assignments written
+below and plots footprints on these exact windows.
 
 ```{r regions}
-# promoters <- read.delim(promoter_table)
-# promoters
-regions <- data.frame(
+promoters <- read.delim(promoter_table)
+
+# Promoter windows = canonical TSS +/- tss_flank, matched to the promoter table
+# by version-stripped ENSG. The BED holds a 20-bp interval per gene,
+# [TSS - 10, TSS + 10) in 0-based coordinates, so the 1-based TSS is start + 11.
+# The table's own tss (GENCODE v49 gene 5' end) is kept for reference.
+gencode_tss <- read.delim(gencode_tss_bed, header = FALSE,
+                          col.names = c("chr", "start", "end", "annotation", "score", "strand"))
+gencode_tss$ensg <- sub("\\..*$", "", sub(";.*$", "", gencode_tss$annotation))
+gencode_tss$tss  <- gencode_tss$start + 11L
+idx <- match(sub("\\..*$", "", promoters$ensg), gencode_tss$ensg)
+stopifnot(!anyNA(idx), promoters$chr == gencode_tss$chr[idx])
+promoters$canonical_tss <- gencode_tss$tss[idx]
+promoters$start <- promoters$canonical_tss - tss_flank
+promoters$end   <- promoters$canonical_tss + tss_flank
+promoters[, c("gene", "gencode_name", "ensg", "chr", "gene_strand", "tss", "canonical_tss",
+              "start", "end")]
+
+custom <- data.frame(
   chr = c("chr4", "chr5"),
   start = c(112284963, 150068577),
   end = c(112285236, 150068792)
 )
-regions$region_id <- paste(regions$chr, regions$start, regions$end, sep = "_")
+custom$region_id <- paste(custom$chr, custom$start, custom$end, sep = "_")
+
+regions <- rbind(
+  data.frame(chr = promoters$chr, start = promoters$start, end = promoters$end,
+             region_id = promoters$gene),
+  custom
+)
 regions
 ```
 
@@ -203,76 +223,6 @@ plot(
   layout = layout_with_fr(knn$graph),
   main = "KNN graph colored by Leiden cluster"
 )
-```
-
-
-
-# Parameter sweep: KNN graph colored by Leiden cluster
-
-For each region and bin size, the KNN graph is built once per k (with a single
-Fruchterman-Reingold layout per graph, so the plots for different resolutions
-differ only in the coloring) and Leiden is re-run across the resolutions. One
-pdf per k x resolution combination is saved in the region's `bin<size>` folder.
-
-```{r knn-graph-sweep}
-sweep_summary <- list()
-
-for (i in seq_len(nrow(regions))) {
-  region_id <- regions$region_id[i]
-  dat <- assemble_region_m6a(
-    sample_names = sample_names,
-    region_chr   = regions$chr[i],
-    region_start = regions$start[i],
-    region_end   = regions$end[i],
-    ft_result_dir = ft_result_dir,
-    verbose = FALSE
-  )
-  met_mat_sweep <- filter_met_mat(dat$met_mat, verbose = FALSE)
-
-  for (ws in sweep_window_sizes) {
-    binned <- bin_read_matrix(met_mat_sweep, regions$start[i], regions$end[i], ws)
-    bin_dir <- file.path(output_dir, region_id, paste0("bin", ws))
-    if (!dir.exists(bin_dir)) dir.create(bin_dir, recursive = TRUE)
-
-    for (k in sweep_k_neighbors) {
-      knn <- manhattan_knn_graph(binned$mat, k_neighbors = k,
-                                 sigma = kernel_sigma, verbose = FALSE)
-      set.seed(1)
-      lay <- layout_with_fr(knn$graph)
-
-      for (r in sweep_resolutions) {
-        part <- leiden_partition(knn$graph, resolution = r, seed = leiden_seed)
-        membership <- part$membership
-        n_cl <- length(unique(membership))
-
-        pdf(file.path(bin_dir, sprintf("knn_graph_leiden_k%d_res%g_%s.pdf",
-                                       k, r, region_id)),
-            width = 7, height = 7)
-        plot(knn$graph,
-             vertex.color = membership,
-             vertex.size = 4,
-             vertex.label = NA,
-             edge.width = 0.3,
-             layout = lay,
-             main = sprintf("%s bin%d k=%d res=%g: %d clusters",
-                            region_id, ws, k, r, n_cl))
-        dev.off()
-
-        sweep_summary[[length(sweep_summary) + 1]] <- data.frame(
-          region_id = region_id, bin = ws, k_neighbors = k, resolution = r,
-          n_reads = nrow(binned$mat), n_clusters = n_cl)
-      }
-    }
-  }
-}
-
-sweep_summary <- dplyr::bind_rows(sweep_summary)
-write.table(sweep_summary, file.path(output_dir, "knn_graph_sweep_summary.tsv"),
-            sep = "\t", quote = FALSE, row.names = FALSE)
-sweep_summary %>%
-  tidyr::pivot_wider(names_from = resolution, values_from = n_clusters,
-                     names_prefix = "res") %>%
-  as.data.frame()
 ```
 
 # Clustering at each region
