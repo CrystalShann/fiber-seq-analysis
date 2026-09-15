@@ -1,98 +1,12 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-  <title>Fiber-seq Analysis</title>
-
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      max-width: 1000px;
-      margin: 60px auto;
-      padding: 0 30px;
-      line-height: 1.6;
-    }
-
-    h1 {
-      margin-bottom: 10px;
-    }
-
-    .subtitle {
-      color: #666;
-      margin-bottom: 40px;
-    }
-
-    .section {
-      margin-top: 40px;
-    }
-
-    .analysis {
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      padding: 20px;
-      margin-bottom: 15px;
-    }
-
-    .analysis h3 {
-      margin-top: 0;
-    }
-
-    a {
-      text-decoration: none;
-    }
-  </style>
-</head>
-
-<body>
-
-  <h1>Fiber-seq Analysis</h1>
-
-  <p class="subtitle">
-    Single-molecule chromatin accessibility and regulatory analysis.
-  </p>
-
-
-  <div class="section">
-
-    <h2>LCL Fiber-seq</h2>
-
     <div class="analysis">
-      <h3>AS-FIRE Manhattan-Leiden Clustering</h3>
+      <h3>Fourier Transform Analysis</h3>
 
       <p>
-        Manhattan-distance and Leiden clustering of Fiber-seq reads
-        at the top allele-specific FIRE regions.
+        Fourier analysis of single-molecule m6A patterns to characterize
+        chromatin periodicity, nucleosome repeat length, and Fourier-based clustering.
       </p>
 
-      <a href="LCL_top10_AS-FIRE_2kb_Manhattan_Leiden.html">
+      <a href="fourier_transformation.html">
         View analysis →
       </a>
     </div>
-
-  </div>
-
-
-  <div class="section">
-
-    <h2>Macrophage LPS Fiber-seq</h2>
-
-    <div class="analysis">
-      <h3>FIRE Frequency Analysis</h3>
-
-      <p>
-        Analysis and visualization of dynamic FIRE frequencies
-        during the LPS time course.
-      </p>
-
-      <a href="03_vis_fire_freq.html">
-        View analysis →
-      </a>
-    </div>
-
-  </div>
-
-
-</body>
-</html>
