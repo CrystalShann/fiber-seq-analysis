@@ -12,7 +12,7 @@
 
 # Average m6A level in 10 bp bins across the union FIRE regions.
 # Requires the ft extract m6a_by_chr files (FiberHMM/extract) and
-# fire_peaks_union.bed (co-accessibility 01) to exist.
+# fire_peaks_union.bed from 01_make_fire_universe.sh to exist.
 #
 # Usage:
 #   sbatch run_m6a_binned.sh
@@ -22,4 +22,4 @@ set -uo pipefail
 
 PYTHON=/project/spott/cshan/envs/Jupyter-notebook/bin/python3
 
-"$PYTHON" /project/spott/cshan/fiber-seq/code/fire_frequency/04_m6a_binned.py "$@"
+"$PYTHON" /project/spott/cshan/fiber-seq/code/fire_frequency/06_m6a_binned.py "$@"

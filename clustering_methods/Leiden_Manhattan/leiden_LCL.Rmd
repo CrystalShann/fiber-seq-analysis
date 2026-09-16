@@ -1,0 +1,321 @@
+---
+title: "LCL Fiber-seq: top 10 heterozygous AS-FIRE regions"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    self_contained: true
+params:
+  regenerate_plots: true
+---
+
+```{r lcl-knit}
+knit_report <- function(inputFile, encoding = "UTF-8") {
+  lines <- readLines(inputFile, warn = FALSE)
+  start <- which(trimws(lines) == "```{r lcl-output-loader}")
+  stopifnot(length(start) == 1L)
+  end <- which(seq_along(lines) > start & trimws(lines) == "```")[1L]
+  stopifnot(!is.na(end), end > start + 1L)
+  eval(parse(text = lines[seq.int(start + 1L, end - 1L)]))
+  source_lcl_output_config(inputFile)
+  source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r", local = TRUE)
+  source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", local = TRUE)
+  source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r", local = TRUE)
+  render_report(inputFile, encoding = encoding)
+}
+```
+
+```{r manual-render, eval=FALSE}
+knit_report("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_LCL.Rmd")
+```
+
+```{r lcl-output-loader}
+source_lcl_output_config <- function(notebook, envir = parent.frame()) {
+  lines <- readLines(notebook, warn = FALSE)
+  start <- which(trimws(lines) == "```{r lcl-output-config}")
+  if (length(start) != 1L) stop("Expected one LCL output configuration chunk")
+  end <- which(seq_along(lines) > start & trimws(lines) == "```")[1L]
+  if (is.na(end) || end <= start + 1L) stop("Missing LCL output configuration code")
+  eval(parse(text = lines[seq.int(start + 1L, end - 1L)]), envir = envir)
+  invisible(NULL)
+}
+```
+
+```{r lcl-output-config}
+LCL_OUTPUT_ROOT <- "/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan"
+LCL_TOP10_ROOT <- Sys.getenv("LCL_REPORT_ROOT", unset = LCL_OUTPUT_ROOT)
+lcl_output_path <- function(path) {
+  if (any(strsplit(path, "/", fixed = TRUE)[[1]] %in% c(".", "..")))
+    stop("Output path must not contain dot components")
+  root <- normalizePath(LCL_OUTPUT_ROOT, mustWork = TRUE)
+  ancestor <- path
+  suffix <- character()
+  while (!file.exists(ancestor)) {
+    suffix <- c(basename(ancestor), suffix)
+    parent <- dirname(ancestor)
+    if (identical(parent, ancestor)) stop("Cannot resolve output path")
+    ancestor <- parent
+  }
+  resolved <- do.call(file.path, as.list(c(normalizePath(ancestor), suffix)))
+  if (!(identical(resolved, root) || startsWith(resolved, paste0(root, "/"))))
+    stop("Output must be inside ", root, ": ", path)
+  resolved
+}
+```
+
+```{r setup, include=FALSE}
+code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
+suppressPackageStartupMessages(library(dplyr))
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
+output_dir <- lcl_output_path(LCL_TOP10_ROOT)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  fig.path = file.path(output_dir, "report_figures/"), dev = "pdf", cache = FALSE)
+options(scipen = 999)
+data.table::setDTthreads(2L)
+```
+
+
+<style>
+.main-container { max-width: 1700px; padding: 0 24px; }
+table { display: block; overflow-x: auto; }
+</style>
+
+# Select the top 10 AS-FIRE regions
+
+*Definition of AS-FIRE and how it is selected:*
+
+1. AS-FIRE: whehther a FIRE peak is accessible at different frequencies on reads carrying  a SNP's reference vs alternate allele
+2. retains genotypes 0|1 or 1|0, retains reads tagged H1/H2, and pairs peaks with nearby variants using a 2,000-bp distance setting
+  - Each SNP is associated with a set of contributing samples based on its phase and the phase of the reads
+  - Different SNPs can therefore have different contributing samples
+3. Counts are combined across contributing samples for each SNP–peak pair 
+  - Fisher’s exact test compares reference/alternate alleles against FIRE/non-FIRE observations
+4. Significance filters
+  - combined coverage >= 20 reads
+  - reference and alternate alleles each have >= 0 reads
+  - q value < 0.1
+  - FIRE frequency >= 0.1
+  
+  
+AS-FIRE from kevin:
+  - /project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds
+  
+| peak_name | rsID | snp_pos | ref | alt | coverage_ref | coverage_alt | fisher_pvalue |
+|---|---|---:|---|---|---:|---:|---:|
+| chr1_11161_11494 | rs180734498 | 13302 | C | T | 2 | 3 | 0.5238095 |
+| chr1_28837_29482 | rs140337953 | 30923 | G | T | 19 | 25 | 0.6412728 |
+| chr1_88661_88783 | rs146836579 | 87647 | T | C | 15 | 5 | 0.6286665 |
+| chr1_88661_88783 | rs1524602 | 87190 | G | A | 15 | 5 | 0.6286665 |
+| chr1_88661_88783 | rs59529791 | 88136 | G | A | 15 | 5 | 0.6286665 |
+
+
+*Selection of top 10 regions:*
+Only biallelic A/C/G/T SNPs with a valid rsID and a complete 2 kb reference window
+are eligible. Each region is defined by the lead SNP's position and the FIRE peak, 
+in this case, it is the SNP with the smallest Fisher p-value within the peak
+
+  - allele label: each phased read is assigned to H1 or H2 based on the focal SNP's
+  phased genotype in the sample
+  - lowest p-value: the SNP with the lowest Fisher p-value within the peak is selected as the focal SNP for that region
+  - before clustering, homozygous and unphased reads are removed
+
+example block table:
+  - `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL10_bc2178_19130/blocks.tsv`
+
+
+| source_block_index | sample_name | phase_block_id | chrom | start | end | num_variants |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | NA19130 | 52238 | chr1 | 52238 | 103905 | 16 |
+| 1 | NA19130 | 126108 | chr1 | 126108 | 135032 | 2 |
+| 4 | NA19130 | 591460 | chr1 | 591460 | 599165 | 5 |
+| 5 | NA19130 | 638771 | chr1 | 638771 | 638771 | 1 |
+| 5 | NA19130 | 665098 | chr1 | 665098 | 683083 | 3 |
+| 6 | NA19130 | 779825 | chr1 | 779825 | 1190918 | 437 |
+| 8 | NA19130 | 1285767 | chr1 | 1285767 | 1290261 | 2 |
+| 9 | NA19130 | 1339884 | chr1 | 1339884 | 1339911 | 2 |
+| 12 | NA19130 | 1427454 | chr1 | 1427454 | 1427474 | 3 |
+| 14 | NA19130 | 1457071 | chr1 | 1457071 | 1457071 | 1 |
+| 15 | NA19130 | 1483249 | chr1 | 1483249 | 1492007 | 3 |
+| 16 | NA19130 | 1514366 | chr1 | 1514366 | 1516323 | 2 |
+| 17 | NA19130 | 1543702 | chr1 | 1543702 | 1922424 | 259 |
+
+example read level haplotype file:
+  - `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL10_bc2178_19130/read-level-phasing.tsv`
+  - haplotag 1 = first allele in GT
+  
+| source_block_index | sample_name | chrom | phase_block_id | read_name | haplotag |
+|---:|---|---|---:|---|---:|
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/81201882/ccs | 1 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/219218451/ccs | 1 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/65275399/ccs | 2 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/7869529/ccs | 1 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/56759899/ccs | 1 |
+
+example vcf file:
+  - `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL10_bc2178_19130/AL10_bc2178_19130.5mC.6mA.aligned.phased.vcf.gz`
+    - GT = 0|1 means HP1 carries reference allele and HP2 carries alternate allele
+    - PS =  a cluster of phased genotypes that belong to the same local chromosome block
+    - GT:PS = 0|1:100 with A and T, and GT:PS = 0|1:100 with C and G means haplotype A reads A-C and haplotype B reads T-G
+  
+  
+The block file and vcf file are used to determine the phased genotype of each read at the focal SNP
+  - they are matched based on the sample name, chr, and phase_block_id - groups of variants whose alleles
+  have been assgned to the same haplotype (H1 or H2) based on the phased genotype of the sample
+
+
+example RDS file produced by cache_lcl_haplotags
+  - finds the block containing the focal SNP, then matches its ID to the VCF and read haplotags to determine each read’s allele
+  - `/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan/phase_summary/AL10_bc2178_19130_haplotags.rds`: a list contain the blocks file and the tags file with haplotype label for each read
+
+
+
+```{r settings}
+asfire_file <- "/project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds"
+sample_csv <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+sample_table <- read.csv(sample_csv, stringsAsFactors = FALSE)
+stopifnot(!anyDuplicated(sample_table$sample_name),
+          !anyDuplicated(sub("_.*$", "", sample_table$sample_name)))
+phasing_root <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+signature_file <- file.path(output_dir, "summary tables", "selection_signature.rds")
+if (file.exists(signature_file)) {
+  signature <- readRDS(signature_file)
+  regions <- signature$regions
+  sample_table <- signature$sample_table
+} else {
+  asfire_results <- readRDS(asfire_file)
+  regions <- select_lcl_top_asfire_regions(asfire_results, top_n = 10L, width_bp = 2000L)
+  rm(asfire_results)
+}
+knitr::kable(regions[, c("rank", "region_id", "peak_name", "focal_snp", "focal_pos",
+  "fisher_pvalue", "fisher_qvalue", "coverage", "coverage_ref", "coverage_alt",
+  "n_listed_samples", "analysis_start", "analysis_end", "overlapping_selected_windows",
+  "overlapping_selected_peaks", "nearest_selected_snp_distance_bp", "same_focal_snp_as_another_peak")])
+```
+
+
+# Main results and haplotype examples
+
+```{r generate-results}
+if (params$regenerate_plots) {
+  if (file.exists(file.path(output_dir, "summary tables", "fiberseq_result_paths.rds"))) {
+    result_paths <- refresh_saved_plots(output_dir)
+  } else {
+    result_paths <- run_fiberseq_report(regions, asfire_file, sample_table, phasing_root,
+      output_dir = output_dir)
+  }
+} else {
+  result_paths <- readRDS(file.path(output_dir, "summary tables", "fiberseq_result_paths.rds"))
+}
+stopifnot(all(regions$region_id %in% names(result_paths)))
+result_paths <- result_paths[regions$region_id]
+main_paths <- readRDS(file.path(output_dir, "summary tables", "result_paths.rds"))
+knitr::kable(data.table::fread(file.path(output_dir, "summary tables", "run_summary.tsv")))
+validation_file <- file.path(output_dir, "summary tables", "plot_reproduction_validation.tsv")
+if (!file.exists(validation_file)) validation_file <- file.path(output_dir, "summary tables", "fiberseq_validation.tsv")
+knitr::kable(data.table::fread(validation_file))
+```
+
+# Visualization of results
+- Accessibility is the fraction of retained cluster reads with an m6A call at an observed site over all the reads in the cluster
+- Nucleosome occupancy is the fraction covered by a 130–160 bp footprint at each base, counting overlapping footprints on a read once
+
+```{r gallery-helper, include = FALSE}
+pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
+xpdfrc <- tempfile("xpdfrc-")
+sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
+mono <- "/usr/share/fonts/dejavu/DejaVuSansMono"
+writeLines(c(
+  paste0("fontFile Helvetica ", sans, "Regular.ttf"),
+  paste0("fontFile Helvetica-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Helvetica-Oblique ", sans, "Italic.ttf"),
+  paste0("fontFile Helvetica-BoldOblique ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Times-Roman ", sans, "Regular.ttf"),
+  paste0("fontFile Times-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Times-Italic ", sans, "Italic.ttf"),
+  paste0("fontFile Times-BoldItalic ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Courier ", mono, ".ttf"),
+  paste0("fontFile Courier-Bold ", mono, "-Bold.ttf"),
+  paste0("fontFile Courier-Oblique ", mono, "-Oblique.ttf"),
+  paste0("fontFile Courier-BoldOblique ", mono, "-BoldOblique.ttf"),
+  "fontFile Symbol /usr/share/fonts/dejavu/DejaVuSans.ttf",
+  "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
+
+inline_png <- function(path, label, dpi = 120) {
+  stopifnot(file.exists(path), file.info(path)$size > 0)
+  prefix <- tempfile("fig-")
+  status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
+    shQuote(path), shQuote(prefix)))
+  png <- paste0(prefix, "-000001.png")
+  stopifnot(status == 0, file.exists(png))
+  on.exit(unlink(png))
+  cat(as.character(htmltools::tags$figure(
+    htmltools::tags$img(
+      src = base64enc::dataURI(file = png, mime = "image/png"),
+      alt = label, loading = "lazy",
+      style = "display:block;max-width:100%;height:auto;"),
+    htmltools::tags$figcaption(label))), "\n\n")
+  invisible(NULL)
+}
+
+figure_gallery <- function(name, title) {
+  cat("\n## ", title, "\n\n", sep = "")
+  for (rid in names(result_paths)) {
+    cat("\n### ", rid, "\n\n", sep = "")
+    plot_dir <- file.path(dirname(dirname(result_paths[[rid]])), "plots")
+    pdf <- lcl_output_path(file.path(plot_dir, paste0(name, ".pdf")))
+    stopifnot(file.exists(pdf))
+    inline_png(pdf, paste(rid, title, sep = " — "))
+    cat(as.character(htmltools::tags$p(htmltools::tags$a(
+      href = report_url(pdf), paste("Download original PDF:", name)))), "\n\n")
+  }
+}
+```
+
+```{r gallery-haplotype-example, results='asis'}
+figure_gallery("fiberseq_haplotype_example", "Haplotype overview")
+```
+
+```{r gallery-read-footprints, results='asis'}
+figure_gallery("fig1_read_footprints", "Read-level footprints")
+```
+
+```{r gallery-occupancy-profiles, results='asis'}
+figure_gallery("fig2_occupancy_by_cluster", "Occupancy profiles by cluster")
+```
+
+```{r gallery-m6a-footprint-heatmap, results='asis'}
+figure_gallery("heatmap_m6a_footprints", "m6A and footprint heatmaps")
+```
+
+```{r gallery-knn-graph, results='asis'}
+for (rid in names(result_paths)) {
+  plot_dir <- lcl_output_path(file.path(dirname(dirname(result_paths[[rid]])), "plots"))
+  graph_pdf <- file.path(plot_dir, "knn_graph.pdf")
+  if (!file.exists(graph_pdf)) {
+    result <- readRDS(result_paths[[rid]])
+    dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+    ggplot2::ggsave(graph_pdf, plot_knn_graph(result), width = 12, height = 9, bg = "white")
+  }
+}
+figure_gallery("knn_graph", "Manhattan KNN graphs colored by Leiden cluster")
+```
+
+
+#### Outputs
+
+The final output location is
+`/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan`.
+Each of the ten region folders contains `bin0/k10/resolution1/plots` and `tables`
+
+`tables` has saved clustering objects (`clustering.rds` and
+`fiberseq_annotated_clustering.rds`)
+
+Selection follows [Kevin's heterozygous AS-FIRE examples](https://kevinlkx.github.io/fiber-seq-analysis/example_figures_with_merged_samples.html#AS-fire_results).
+
+```{r session}
+sessionInfo()
+```

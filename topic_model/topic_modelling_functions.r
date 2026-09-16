@@ -14,8 +14,8 @@
 # =============================================================================
 
 read_tabix_region <- function(ft_extracted_file, region_gr) {
-  tabix_index <- TabixFile(ft_extracted_file)
-  compressed_records <- scanTabix(tabix_index, param = region_gr)
+  tabix_index <- Rsamtools::TabixFile(ft_extracted_file)
+  compressed_records <- Rsamtools::scanTabix(tabix_index, param = region_gr)
   raw_text <- unlist(compressed_records, use.names = FALSE)
 
   if (length(raw_text) == 0) {
@@ -30,9 +30,21 @@ read_tabix_region <- function(ft_extracted_file, region_gr) {
   )
 }
 
-read_ft_bed12 <- function(bed_file) {
-  df <- data.table::fread(bed_file)
+read_ft_bed12 <- function(bed_file, region = NULL, longest_alignment = FALSE) {
+  if (is.null(region)) {
+    df <- data.table::fread(bed_file, header = FALSE)
+  } else {
+    if (!file.exists(paste0(bed_file, ".tbi"))) stop("Missing tabix index for ", bed_file)
+    df <- read_tabix_region(bed_file, region)
+  }
+  if (!nrow(df)) return(as.data.frame(df))
+  if (ncol(df) != 12L) stop("Expected fibertools BED12 in ", bed_file)
   names(df) <- c('chr','start','end','RID','score','strand','x1','x2','rgb','blockCount','blockSizes','blockStarts')
+  if (longest_alignment) {
+    df <- as.data.frame(df)
+    df <- df[order(df$RID, -(df$end - df$start)), , drop = FALSE]
+    df <- df[!duplicated(df$RID), , drop = FALSE]
+  }
   return(df)
 }
 
@@ -52,14 +64,19 @@ convert_ft_bed12_to_bed6 <- function(bed12_df, include_read_start_end = FALSE) {
   if (nrow(bed12_df) == 0) {
     return(data.frame())
   }
+  if (ncol(bed12_df) != 12L) stop("Expected 12 BED columns")
   colnames(bed12_df) <- c('chr','start','end','RID','score','strand','read_start','read_end','rgb','blockCount','blockSizes','blockStarts')
 
   # expand BED12 into one row per block
   block_sizes_list  <- strsplit(sub(",$", "", bed12_df$blockSizes),  ",", fixed = TRUE)
   block_starts_list <- strsplit(sub(",$", "", bed12_df$blockStarts), ",", fixed = TRUE)
   n_blocks <- lengths(block_sizes_list)
-  starts <- rep(bed12_df$start, n_blocks) + as.integer(unlist(block_starts_list))
-  sizes  <- as.integer(unlist(block_sizes_list))
+  offsets <- suppressWarnings(as.integer(unlist(block_starts_list)))
+  sizes <- suppressWarnings(as.integer(unlist(block_sizes_list)))
+  if (anyNA(bed12_df$blockCount) || any(n_blocks != bed12_df$blockCount) ||
+      any(lengths(block_starts_list) != n_blocks) || anyNA(offsets) || anyNA(sizes))
+    stop("Invalid BED12 blocks")
+  starts <- rep(bed12_df$start, n_blocks) + offsets
   bed6_df <- data.frame(
     chr    = rep(bed12_df$chr,    n_blocks),
     start  = starts,
@@ -228,7 +245,8 @@ extract_ft_read_info <- function(reads, ft_extracted_file, region, keep_columns 
 # 0 = no modified call
 # NA = the read does not cover that position
 ################################################
-get_sparse_met_mat <- function(reads, rids_df, window_start = NULL, window_end = NULL, all_met_pos = NULL, base = c("A", "CG")) {
+get_sparse_met_mat <- function(reads, rids_df, window_start = NULL, window_end = NULL, all_met_pos = NULL,
+                               base = c("A", "CG"), require_full_span = FALSE) {
   base <- match.arg(base)
 
   if ("base" %in% colnames(reads))
@@ -253,6 +271,18 @@ get_sparse_met_mat <- function(reads, rids_df, window_start = NULL, window_end =
 
   n_rids <- nrow(rids_df)
   n_pos <- length(all_met_pos)
+  if (require_full_span) {
+    stopifnot(length(window_start) == 1L, length(window_end) == 1L,
+      !anyDuplicated(rids_df$RID), !anyNA(rids_df$RID),
+      all(rids_df$start <= window_start), all(rids_df$end >= window_end))
+    pairs <- unique(data.frame(
+      read_index = match(as.character(reads$RID), as.character(rids_df$RID)),
+      site_index = match(reads$pos, all_met_pos)))
+    pairs <- pairs[!is.na(pairs$read_index) & !is.na(pairs$site_index), , drop = FALSE]
+    return(Matrix::sparseMatrix(i = pairs$read_index, j = pairs$site_index,
+      x = rep(1, nrow(pairs)), dims = c(n_rids, n_pos),
+      dimnames = list(as.character(rids_df$RID), as.character(all_met_pos))))
+  }
   met_mat <- matrix(NA, nrow = n_rids, ncol = n_pos)
   rownames(met_mat) <- as.character(rids_df$RID)
   colnames(met_mat) <- all_met_pos

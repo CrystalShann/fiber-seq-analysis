@@ -10,8 +10,9 @@
 #SBATCH --output=/project/spott/cshan/fiber-seq/results/logs/fire_freq_%j.out
 #SBATCH --error=/project/spott/cshan/fiber-seq/results/logs/fire_freq_%j.err
 
-# Per-region FIRE frequency across the LPS timecourse.
-# Requires 01_make_cre_universe.sh and 02_read_spans.sh (co-accessibility) to have
+# Per-region FIRE frequency across the LPS timecourse. Denominators are reads that
+# fully span each union region; FIRE-positive reads have an element covering >= 50%.
+# Requires 01_make_fire_universe.sh and 02_read_spans.sh to have
 # finished: uses their fire_peaks_union.bed and <s>.read_spans.bed.gz.
 #
 # Usage:
@@ -22,4 +23,4 @@ set -uo pipefail
 
 PYTHON=/project/spott/cshan/envs/Jupyter-notebook/bin/python3
 
-"$PYTHON" /project/spott/cshan/fiber-seq/code/fire_frequency/01_fire_frequency.py "$@"
+"$PYTHON" /project/spott/cshan/fiber-seq/code/fire_frequency/03_fire_frequency.py "$@"

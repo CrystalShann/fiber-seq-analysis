@@ -25,7 +25,7 @@ his table(fire_region1, fire_region2) with levels forced to c(FALSE, TRUE):
     elem1 FALSE  co_closed        CRE2_access
     elem1 TRUE   CRE1_access      co_access
 
-Inputs (from 01_make_cre_universe.sh and 02_read_spans.sh):
+Inputs (from 01_make_fire_universe.sh and 02_read_spans.sh):
     <root>/universe/cre_universe.bed              chrom start end CRE_ID CRE_label
     <root>/universe/cre_gene_map.tsv.gz           CRE_ID -> gene windows
     <root>/universe/cre_in_timepoint_peaks.tsv.gz per-timepoint peak membership
@@ -206,7 +206,7 @@ def main():
     cre_bed = uni / "cre_universe.bed"
     for f in (cre_bed, uni / "cre_gene_map.tsv.gz", uni / "cre_in_timepoint_peaks.tsv.gz"):
         if not f.is_file():
-            sys.exit(f"ERROR: missing input {f} (run 01_make_cre_universe.sh first)")
+            sys.exit(f"ERROR: missing input {f} (run 01_make_fire_universe.sh first)")
 
     cre = pd.read_csv(cre_bed, sep="\t", header=None,
                       names=["chrom", "start", "end", "CRE_ID", "CRE_label"])

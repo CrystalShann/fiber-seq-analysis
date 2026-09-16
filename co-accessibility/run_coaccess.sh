@@ -11,7 +11,7 @@
 #SBATCH --error=/project/spott/cshan/fiber-seq/results/logs/coaccess_%j.err
 
 # cCRE co-accessibility across the LPS timecourse.
-# Requires 01_make_cre_universe.sh and 02_read_spans.sh to have finished.
+# Requires 01_make_fire_universe.sh and 02_read_spans.sh to have finished.
 #
 # Usage:
 #   sbatch run_coaccess.sh

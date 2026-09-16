@@ -4,7 +4,7 @@
 #' Data preparation only. Plotting lives in plot_nuc_pos.R; region selection,
 #' function calls and interpretation live in nuc_pos.rmd. The cluster
 #' assignments come from
-#' code/clustering_TSS_methods/Leiden_Manhattan/leiden_manhattan.Rmd, whose
+#' code/clustering_methods/Leiden_Manhattan/leiden_manhattan.Rmd, whose
 #' promoter windows are the same canonical TSS +/- VIEW_HALF_WIDTH used here;
 #' the loader accepts only the run computed on exactly the plotted window.
 #'

@@ -19,7 +19,7 @@ Questions:
    time course? (positional summaries, timepoint bars in the tracks)
 
 Processing functions: `process_nuc_pos.R`; plots: `plot_nuc_pos.R`; cluster
-assignments: `clustering_TSS_methods/Leiden_Manhattan/leiden_manhattan.Rmd`
+assignments: `clustering_methods/Leiden_Manhattan/marcophage_leiden_manhattan.Rmd`
 (window_size = 0, Manhattan distance, k = 10, resolution = 1, seed = 1).
 Nucleosome positions are never used for clustering: accessibility defines the
 states, the footprints describe them.
@@ -44,12 +44,12 @@ source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/plot_nuc_pos.
 ```{r settings}
 options(scipen = 999)
 
-promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
 
 # Leiden + Manhattan outputs (leiden_manhattan.Rmd): the run to use is the one
 # whose run_parameters match these values and the region's window -- unbinned
 # m6A sites, k = 10, resolution = 1, all four timepoints pooled.
-leiden_dir    <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/Leiden_Manhattan"
+leiden_dir    <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_methods/Leiden_Manhattan"
 leiden_params <- list(window_size = 0L, k_neighbors = 10, resolution = 1, seed = 1)
 
 out_dir   <- "/project/spott/cshan/fiber-seq/macrophage_project/nucleosome_positioning/results"

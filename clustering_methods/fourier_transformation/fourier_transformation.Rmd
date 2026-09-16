@@ -1,0 +1,1885 @@
+---
+title: "Fourier transformation on m6a"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+    mathjax: null
+    pandoc_args: ["--mathml"]
+    toc: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r load-functions}
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")
+source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r")
+```
+
+```{r report-output}
+report_writer <- create_report_plot_writer(
+  file.path(getwd(), "fourier_transformation_files", "report-figures")
+)
+save_report_plot <- report_writer$save
+```
+
+
+**extract reads from a specific genomic to converting it a read by position binary m6a matrix**
+
+  1. extract_ft_region_reads(ft_extracted_file, region): pulls the reads for one window. Given a per-chromosome ft extract file and a GRanges of one region, it fetches the overlapping BED12 records, keeps the longest alignment per read, and expands each read into one row per m6A call. Output columns are chrom, pos, read_start, read_end, RID, score, strand, with 1-based positions
+  
+  2. extract_ft_read_info(reads): collapses to one row per read: RID, chr, start, end, strand -> which positions each read actually covers
+  
+  3. get_sparse_met_mat(reads, rids_df, window_start, window_end, base = "A"): builds the read by position matrix. Rows are reads, columns are genomic positions. 1 is an m6A call, a 0 is a covered position with no call, and NA means the read does not span that position
+  
+  4. filter_met_mat(met_mat): filter for fully spanning reads 
+  
+  5. assemble_region_met_data(sample_names, chr, start, end, ft_result_dir)
+  
+
+**region selection**
+
+  1. select_lcl_top_asfire_regions(asfire_results, top_n = 10L, width_bp = 2000L)
+
+
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(Matrix)
+library(GenomicRanges)
+library(data.table)
+library(Rsamtools)
+library(cowplot)
+```
+
+
+# Inputs and outputs
+```{r settings}
+# FFT preprocessing: mean-center every read, then optionally apply a Hann window.
+use_hann <- FALSE
+preprocessing_label <- if (use_hann) "Mean-centered + Hann window" else "Mean-centered only"
+
+# inputs 
+ft_result_dir <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+sample_meta <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+sample_dirs <- list.dirs(ft_result_dir, full.names = T, recursive = F)
+sample_dirs <- sample_dirs[
+  grepl("^AL", basename(sample_dirs))
+]
+sample_names <- basename(sample_dirs)
+asfire_file <- "/project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds"
+
+# outputs
+output_dir <- "/project/spott/cshan/fiber-seq/LCL_project/fourier_transformation"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+```
+
+# Region selection 
+```{r region-selection}
+
+lcl_selection_file <- "/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan/summary tables/selection_signature.rds"
+selected_regions <- if (file.exists(lcl_selection_file)) {
+  readRDS(lcl_selection_file)$regions
+} else {
+  select_lcl_top_asfire_regions(readRDS(asfire_file), top_n = 10L, width_bp = 2000L)
+}
+stopifnot(nrow(selected_regions) == 10L, !anyDuplicated(selected_regions$region_id),
+          all(selected_regions$analysis_start == selected_regions$start + 1L),
+          all(selected_regions$analysis_end == selected_regions$end),
+          all(selected_regions$analysis_end - selected_regions$analysis_start + 1L == 2000L))
+
+selected_regions
+```
+
+```{r convert-to-GRanges}
+
+gr_input <- as.data.frame(selected_regions)
+if ("seqnames" %in% names(gr_input)) {
+  stopifnot(identical(as.character(gr_input$seqnames), as.character(gr_input$chr)))
+  gr_input$seqnames <- NULL
+}
+gr <- makeGRangesFromDataFrame(
+  gr_input,
+  keep.extra.columns = TRUE,
+  seqnames.field = "chr",
+  start.field = "start",
+  end.field = "end",
+  strand.field = "strand",
+  starts.in.df.are.0based = TRUE
+)
+names(gr) <- selected_regions$region_id
+stopifnot(all(start(gr) == selected_regions$analysis_start),
+          all(end(gr) == selected_regions$analysis_end), all(width(gr) == 2000L))
+
+```
+
+
+# extract individual reads and build the binary matrix
+
+1. all reads fully spanning and window are kept, and all the positions are retained, including the ones without As
+
+2. removes the mean methylation signal from the reads
+
+```{r build-m6a-binary-matrix, message=FALSE, results="hide"}
+region_met_mats <- list()
+
+# Store one combined read x position matrix per region
+region_met_mats <- list()
+
+for (i in seq_along(gr)) {
+
+  # -----------------------------
+  # Get region information
+  # -----------------------------
+  region <- gr[i]
+
+  chr <- as.character(seqnames(region))
+  window_start <- start(region)
+  window_end   <- end(region)
+
+  # Use the same rank/SNP/peak identifier as the LCL output directories.
+  region_id <- names(gr)[i]
+
+  message("================================")
+  message("Region: ", region_id)
+  message("================================")
+
+  # Store reads / read boundaries from individual samples
+  sample_reads <- list()
+  sample_rids  <- list()
+
+  # -----------------------------
+  # Loop over all AL samples: extract reads
+  # -----------------------------
+  for (sample_name in sample_names) {
+
+    message("  Processing: ", sample_name)
+
+    # -----------------------------
+    # Construct chr-specific m6A file
+    # -----------------------------
+    ft_extracted_file <- file.path(
+      ft_result_dir,
+      sample_name,
+      "extracted_results",
+      "m6a_by_chr",
+      paste0(
+        sample_name,
+        ".ft_extracted_m6a.",
+        chr,
+        ".bed.gz"
+      )
+    )
+
+    if (!file.exists(ft_extracted_file)) {
+      message("    Missing m6A file")
+      next
+    }
+
+    # -----------------------------
+    # Extract m6A reads for region
+    # -----------------------------
+    reads <- extract_ft_region_reads(
+      ft_extracted_file,
+      region
+    )
+
+    if (is.null(reads) || nrow(reads) == 0) {
+      message("    No reads")
+      next
+    }
+
+    # -----------------------------
+    # Get read boundaries
+    # -----------------------------
+    rids_df <- extract_ft_read_info(reads)
+
+    if (is.null(rids_df) || nrow(rids_df) == 0) {
+      next
+    }
+
+    sample_reads[[sample_name]] <- reads
+    sample_rids[[sample_name]]  <- rids_df
+  }
+
+  if (length(sample_reads) == 0) {
+    next
+  }
+
+  # -----------------------------
+  # extract base of the window -> binary vector, m6A call = 1, no call = 0
+  # -----------------------------
+  all_met_pos <- seq.int(window_start, window_end)
+
+  # -----------------------------
+  # Build binary read x base matrix per sample on the shared columns
+  # -----------------------------
+  sample_met_mats <- list()
+
+  for (sample_name in names(sample_reads)) {
+
+    met_mat <- get_sparse_met_mat(
+      reads = sample_reads[[sample_name]],
+      rids_df = sample_rids[[sample_name]],
+      window_start = window_start,
+      window_end = window_end,
+      all_met_pos = all_met_pos,
+      base = "A"
+    )
+
+    if (is.null(met_mat) || nrow(met_mat) == 0) {
+      next
+    }
+
+    # -----------------------------
+    # Keep fully spanning reads 
+    # -----------------------------
+    met_mat <- met_mat[rowSums(is.na(met_mat)) == 0, , drop = FALSE]
+
+    if (nrow(met_mat) == 0) {
+      message("    ", sample_name, ": no fully spanning reads")
+      next
+    }
+
+    message("    ", sample_name, ": fully spanning reads: ", nrow(met_mat))
+
+    # -----------------------------
+    # Make read IDs unique across samples
+    # -----------------------------
+    rownames(met_mat) <- paste0(
+      sample_name,
+      "__",
+      rownames(met_mat)
+    )
+
+    # Save sample matrix
+    sample_met_mats[[sample_name]] <- met_mat
+  }
+
+  # -----------------------------
+  # Combine samples for this region, columns containing 0 are kept so every
+  # matrix spans the full window 
+  # -----------------------------
+  if (length(sample_met_mats) > 0) {
+
+    combined_met_mat <- do.call(
+      rbind,
+      sample_met_mats
+    )
+    stopifnot(ncol(combined_met_mat) == window_end - window_start + 1)
+
+    # -----------------------------
+    # Per-read metadata: which sample each row comes from
+    # -----------------------------
+    parts <- strsplit(rownames(combined_met_mat), "__", fixed = TRUE)
+    read_meta <- data.frame(
+      row_id      = rownames(combined_met_mat),
+      sample_name = vapply(parts, `[`, character(1), 1),
+      RID         = vapply(parts, `[`, character(1), 2),
+      stringsAsFactors = FALSE
+    )
+
+    region_met_mats[[region_id]] <- list(
+      region_id = region_id,
+      chr       = chr,
+      start     = window_start,
+      end       = window_end,
+      met_mat   = combined_met_mat,
+      read_meta = read_meta
+    )
+
+    message(
+      "Combined matrix: ",
+      nrow(combined_met_mat),
+      " reads x ",
+      ncol(combined_met_mat),
+      " bases from ",
+      length(unique(read_meta$sample_name)),
+      " samples"
+    )
+  }
+}
+```
+
+
+# Fourier transformation
+
+Each read is mean-centered before FFT
+  - `use_hann` in the global settings to enable or disable the Hann window
+
+For each complex coefficient X, amplitude = |X| and phase = Arg(X). The real
+and imaginary components jointly encode both: Re(X) = amplitude * cos(phase)
+and Im(X) = amplitude * sin(phase)
+
+Hann window is a smooth weighting function that gradually reduces the signal toward zero at both ends
+
+Test the all posssible cycles across the region
+  - k = 0 -> direct current = mean -> removed
+  - k = number of cycles, period = length / k 
+  - each period gets a complex number
+
+```{r Hann-preprocessing}
+hann_window <- function(n) {
+  stopifnot(length(n) == 1L, n >= 2L)
+  0.5 * (1 - cos(2 * pi * (seq_len(n) - 1) / (n - 1)))
+}
+```
+
+```{r FFT-set-up}
+
+# ============================================================
+# FFT for every read in one binary m6A matrix
+#
+# Input:
+#   met_mat
+#     rows    = reads
+#     columns = consecutive genomic positions at 1-bp spacing
+#     values  = 0/1
+#
+# Output:
+#   raw_power       = read x period power matrix
+#   relative_power  = read x period relative-power matrix
+#   periods_bp      = period represented by each column
+#   frequency       = frequency represented by each column
+# ============================================================
+
+get_fft_power_matrix <- function(met_mat, use_hann = TRUE) {
+
+  # ----------------------------------------------------------
+  # 1. Check that genomic positions are consecutive
+  # ----------------------------------------------------------
+  pos <- as.integer(colnames(met_mat))
+
+  stopifnot(all(diff(pos) == 1))
+
+  # Check that there are no missing values
+  stopifnot(!anyNA(met_mat))
+
+  # Number of genomic positions
+  N <- ncol(met_mat)
+  stopifnot(N >= 2L, is.logical(use_hann), length(use_hann) == 1L, !is.na(use_hann))
+
+  # Optional preprocessing window; applied only after mean-centering below.
+  if (use_hann) window <- hann_window(N)
+
+  # ----------------------------------------------------------
+  # 2. Define all positive Fourier frequencies
+  #
+  # k = 0 is excluded because it represents the mean of
+  # the signal, not a repeating spatial pattern.
+  #
+  # For N = 2000:
+  # k = 1, 2, ..., 1000
+  # ----------------------------------------------------------
+  k <- 1:floor(N / 2)
+
+  # Frequency in cycles per bp
+  # because genomic positions are spaced exactly 1 bp apart
+  frequency <- k / N
+
+  # Convert frequency to spatial period in bp
+  #
+  # period = 1 / frequency = N / k
+  # ----------------------------------------------------------
+  periods_bp <- 1 / frequency
+
+  # Equivalent:
+  # periods_bp <- N / k
+
+  # ----------------------------------------------------------
+  # 3. Prepare output matrices
+  # ----------------------------------------------------------
+  period_names <- paste0(
+    "period_",
+    round(periods_bp, 3),
+    "bp"
+  )
+
+  raw_power <- matrix(
+    NA_real_,
+    nrow = nrow(met_mat),
+    ncol = length(k),
+    dimnames = list(
+      rownames(met_mat),
+      period_names
+    )
+  )
+
+  relative_power <- matrix(
+    NA_real_,
+    nrow = nrow(met_mat),
+    ncol = length(k),
+    dimnames = list(
+      rownames(met_mat),
+      period_names
+    )
+  )
+
+  # ----------------------------------------------------------
+  # 4. Run FFT independently for every read
+  # ----------------------------------------------------------
+  for (i in seq_len(nrow(met_mat))) {
+
+    # Extract one binary read
+    signal <- as.numeric(met_mat[i, ])
+
+    # --------------------------------------------------------
+    # Remove mean signal
+    # --------------------------------------------------------
+    signal <- signal - mean(signal)
+
+    # --------------------------------------------------------
+    # Optional Hann preprocessing (no change to power definitions)
+    # --------------------------------------------------------
+    if (use_hann) {
+      signal <- signal * window
+    }
+
+    # --------------------------------------------------------
+    # Fast Fourier Transform
+    # --------------------------------------------------------
+    ft <- fft(signal)
+
+    # --------------------------------------------------------
+    # Keep positive-frequency Fourier coefficients
+    #
+    # ft[1] = k = 0
+    # ft[2] = k = 1
+    # ft[3] = k = 2
+    #
+    # therefore positive k values correspond to k + 1
+    # --------------------------------------------------------
+    ft_half <- ft[k + 1]
+
+    # --------------------------------------------------------
+    # Calculate periodogram power
+    # --------------------------------------------------------
+    power <- Mod(ft_half)^2 / N
+
+    # --------------------------------------------------------
+    # One-sided spectrum correction
+    #
+    # The FFT  has symmetric positive
+    # and negative frequency components.
+    #
+    # Because we keep only the positive half, multiply power
+    # by 2 to account for the discarded negative-frequency
+    # copy.
+    #
+    # Exception:
+    # For even N, the Nyquist frequency (k = N/2) has no
+    # separate negative-frequency partner, so do NOT double it.
+    # --------------------------------------------------------
+    if (N %% 2 == 0) {
+
+      double_idx <- k < N / 2
+
+    } else {
+
+      # For odd N, every retained positive frequency has a
+      # negative-frequency partner
+      double_idx <- rep(TRUE, length(k))
+    }
+
+    power[double_idx] <- 2 * power[double_idx]
+
+    # --------------------------------------------------------
+    # Save absolute/raw spectral power
+    # --------------------------------------------------------
+    raw_power[i, ] <- power
+
+    # --------------------------------------------------------
+    # Calculate relative power
+    #
+    # Divide every frequency by total power in this
+    # read so the values sum to 1
+    #
+    # --------------------------------------------------------
+    total_power <- sum(power)
+
+    if (total_power > 0) {
+
+      relative_power[i, ] <-
+        power / total_power
+    }
+  }
+
+  # ----------------------------------------------------------
+  # 5. Return results
+  # ----------------------------------------------------------
+  list(
+    raw_power = raw_power,
+    relative_power = relative_power,
+    periods_bp = periods_bp,
+    frequency = frequency
+  )
+}
+
+```
+
+### run FFT on selected regions
+
+```{r run-FFT}
+# ============================================================
+# Run FFT for every read in every region
+# ============================================================
+
+fft_results <- list()
+
+for (region_id in names(region_met_mats)) {
+
+  message("==============================")
+  message("FFT region: ", region_id)
+  message("==============================")
+
+  x <- region_met_mats[[region_id]]
+
+  combined_met_mat <- x$met_mat
+
+  # ----------------------------------------------------------
+  # Confirm that matrix contains every genomic position
+  # ----------------------------------------------------------
+  expected_pos <- seq.int(
+    x$start,
+    x$end
+  )
+
+  actual_pos <- as.integer(
+    colnames(combined_met_mat)
+  )
+
+  stopifnot(
+    identical(
+      actual_pos,
+      expected_pos
+    )
+  )
+
+  message(
+    "  Input: ",
+    nrow(combined_met_mat),
+    " reads x ",
+    ncol(combined_met_mat),
+    " genomic positions"
+  )
+
+  # ----------------------------------------------------------
+  # FFT / periodogram
+  # ----------------------------------------------------------
+  fft_out <- get_fft_power_matrix(
+    combined_met_mat, use_hann = use_hann
+  )
+
+  # ----------------------------------------------------------
+  # Store result
+  # ----------------------------------------------------------
+  fft_results[[region_id]] <- list(
+    region_id = region_id,
+    chr = x$chr,
+    start = x$start,
+    end = x$end,
+    use_hann = use_hann,
+
+    frequency = fft_out$frequency,
+    periods_bp = fft_out$periods_bp,
+
+    raw_power = fft_out$raw_power,
+    relative_power = fft_out$relative_power,
+
+    read_meta = x$read_meta
+  )
+
+  message(
+    "  Output: ",
+    nrow(fft_out$raw_power),
+    " reads x ",
+    ncol(fft_out$raw_power),
+    " Fourier frequencies"
+  )
+}
+
+```
+
+# FFT results
+
+
+### define output directories
+
+```{r FFT-outputs, echo=TRUE, eval=TRUE}
+
+fft_plot_dir <- file.path(output_dir, "fft_plots")
+
+# one directory per output type
+periodogram_dir     <- file.path(fft_plot_dir, "periodograms_all_reads")
+aggregate_dir       <- file.path(fft_plot_dir, "aggregate_spectra")
+heatmap_dir         <- file.path(fft_plot_dir, "power_heatmaps")
+dominant_period_dir <- file.path(fft_plot_dir, "dominant_periods")
+example_dir         <- file.path(fft_plot_dir, "hann_example")
+repeat_length_dir   <- file.path(fft_plot_dir, "chromatin_repeat_length")
+
+for (d in c(periodogram_dir, aggregate_dir, heatmap_dir, dominant_period_dir, example_dir,
+            repeat_length_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+## 1. Periodogram for every read, for every region
+```{r periodogram, results="asis", echo=TRUE, eval=TRUE}
+# ============================================================
+# 1. Periodogram for ALL reads in each region
+# ============================================================
+
+for (region_id in names(fft_results)) {
+
+  message("Plotting periodograms: ", region_id)
+
+  x <- fft_results[[region_id]]
+
+  power_mat <- x$raw_power
+
+  # Lookup between matrix column and actual period
+  period_lookup <- data.frame(
+    period_name = colnames(power_mat),
+    period_bp   = x$periods_bp
+  )
+
+  # Convert to long format
+  periodogram_long <- as.data.frame(power_mat) %>%
+    rownames_to_column("RID") %>%
+    pivot_longer(
+      cols = -RID,
+      names_to = "period_name",
+      values_to = "power"
+    ) %>%
+    left_join(period_lookup, by = "period_name"
+    )
+
+  # Plot every read
+  p <- ggplot(
+    periodogram_long,
+    aes(x = period_bp, y = power,group = RID)
+  ) +
+    geom_line(alpha = 0.08, linewidth = 0.2) +
+    scale_x_continuous(breaks = seq(0, 2000, by = 250)) +
+    theme_classic() +
+    labs(title = region_id,
+      subtitle = paste(nrow(power_mat), "individual reads;", preprocessing_label),
+      x = "Spatial period (bp)",
+      y = "Periodogram power")
+
+  save_report_plot(
+    filename = file.path(
+      periodogram_dir,
+      paste0(region_id, "_all_read_periodograms.pdf")
+    ),
+    plot = p,
+    width = 8,
+    height = 5
+  )
+
+  rm(periodogram_long)
+  invisible(gc())
+}
+```
+
+## 2. aggregate spectrum across all reads
+
+```{r aggregate-periodgram, results="asis", echo=TRUE, eval=TRUE}
+# ============================================================
+# 2. Aggregate spectrum per region
+# ============================================================
+
+aggregate_spectra <- list()
+
+for (region_id in names(fft_results)) {
+
+  message("Aggregate spectrum: ", region_id)
+
+  x <- fft_results[[region_id]]
+
+  power_mat <- x$relative_power
+
+  aggregate_df <- data.frame(
+    region_id = region_id,
+
+    period_bp = x$periods_bp,
+
+    median_power = apply(power_mat,2,median,na.rm = TRUE),
+    q25 = apply(power_mat,2,quantile, probs = 0.25, na.rm = TRUE),
+    q75 = apply(power_mat,2,quantile, probs = 0.75, na.rm = TRUE))
+
+  aggregate_spectra[[region_id]] <- aggregate_df
+
+  p <- ggplot(
+    aggregate_df,
+    aes(x = period_bp, y = median_power)) +
+    geom_ribbon(
+      aes(ymin = q25, ymax = q75),
+      alpha = 0.2) +
+    geom_line(linewidth = 0.6) +
+    scale_x_continuous(breaks = seq(0, 2000, by = 250)) +
+    theme_classic() +
+    labs(
+      title = region_id,
+      subtitle = paste(preprocessing_label, "| Median across reads; ribbon = IQR"),
+      x = "Spatial period (bp)",
+      y = "Median relative power")
+
+  save_report_plot(
+    file.path(aggregate_dir, paste0(region_id, "_aggregate_spectrum.pdf")),
+    p, width = 8, height = 5)
+}
+
+aggregate_spectra <- bind_rows(
+  aggregate_spectra
+)
+```
+
+## 3. Heatmap: all reads x all periods, one plot per region
+
+```{r power-heatmap, results="asis", echo=TRUE, eval=TRUE}
+# ============================================================
+# 3. Heatmap of relative power: rows = reads, columns = periods
+#
+# Rows are ordered by each read's dominant period
+# ============================================================
+
+heatmap_period_breaks <- seq(0, 2000, by = 250)
+heatmap_n_bins <- 400
+combined_heatmaps <- list()
+
+for (region_id in names(fft_results)) {
+
+  message("Power heatmap: ", region_id)
+
+  x <- fft_results[[region_id]]
+  power_mat <- x$relative_power
+  if (nrow(power_mat) == 0) next
+
+  # order reads by dominant period (longest period at the top)
+  # Undefined spectra remain in the heatmap as grey rows, at the bottom.
+  dominant_k <- apply(power_mat, 1, function(p) {
+    if (all(is.na(p))) NA_integer_ else which.max(p)
+  })
+  row_order <- order(dominant_k, na.last = TRUE)
+
+  # uniform grid of periods (bp, linear); each grid point takes the nearest FFT column
+  grid <- seq(min(x$periods_bp), max(x$periods_bp), length.out = heatmap_n_bins)
+  nearest_col <- vapply(grid, function(g) which.min(abs(x$periods_bp - g)), integer(1))
+  heat_mat <- power_mat[row_order, nearest_col, drop = FALSE]
+
+  heat_long <- data.frame(
+    read_rank  = rep(rev(seq_len(nrow(heat_mat))), times = ncol(heat_mat)),
+    period_bp = rep(grid, each = nrow(heat_mat)),
+    power      = as.vector(heat_mat)
+  )
+  combined_heatmaps[[region_id]] <- transform(heat_long, region_id = region_id)
+
+  cap <- quantile(heat_long$power, 0.99, na.rm = TRUE)
+  if (!is.finite(cap) || cap <= 0) cap <- 1
+  heat_long$power_capped <- pmin(heat_long$power, cap)
+
+  breaks <- heatmap_period_breaks[
+    heatmap_period_breaks >= min(x$periods_bp) & heatmap_period_breaks <= max(x$periods_bp)]
+
+  p <- ggplot(heat_long, aes(x = period_bp, y = read_rank, fill = power_capped)) +
+    geom_raster() +
+    scale_fill_viridis_c(name = "Relative power", limits = c(0, cap), na.value = "grey85") +
+    scale_x_continuous(breaks = breaks, expand = c(0, 0)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme_classic() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+    labs(
+      title = region_id,
+      subtitle = paste(nrow(power_mat), "reads;", preprocessing_label,
+                       "\nRows ordered by dominant period; color capped at 99th percentile"),
+      x = "Spatial period (bp)",
+      y = "Reads"
+    )
+
+  save_report_plot(
+    file.path(heatmap_dir, paste0(region_id, "_power_heatmap.pdf")),
+    p, width = 10, height = 7
+  )
+
+  rm(heat_long, heat_mat)
+  invisible(gc())
+}
+```
+
+## 4. Combined reads x periods heatmap across all regions
+
+
+
+```{r combined-power-heatmap, results="asis", echo=TRUE, eval=TRUE}
+combined_heatmap_data <- bind_rows(combined_heatmaps)
+combined_heatmap_data$region_id <- factor(
+  combined_heatmap_data$region_id, levels = names(fft_results)
+)
+combined_cap <- quantile(combined_heatmap_data$power, 0.99, na.rm = TRUE)
+if (!is.finite(combined_cap) || combined_cap <= 0) combined_cap <- 1
+combined_heatmap_data$power_capped <- pmin(combined_heatmap_data$power, combined_cap)
+
+p_combined_heatmap <- ggplot(
+  combined_heatmap_data, aes(x = period_bp, y = read_rank, fill = power_capped)
+) +
+  geom_raster() +
+  facet_grid(region_id ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_viridis_c(name = "Relative power", limits = c(0, combined_cap),
+                       na.value = "grey85") +
+  scale_x_continuous(breaks = heatmap_period_breaks, expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_classic() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        strip.text.y = element_text(angle = 0, size = 8)) +
+  labs(title = "Per-read Fourier spectra across all regions",
+       subtitle = paste(preprocessing_label,
+                        "\nRows ordered within region by dominant period; color capped at 99th percentile"),
+       x = "Spatial period (bp)", y = "Reads grouped by genomic region")
+save_report_plot(file.path(heatmap_dir, "all_regions_power_heatmap.pdf"),
+       p_combined_heatmap, width = 12, height = 16)
+rm(combined_heatmaps, combined_heatmap_data)
+invisible(gc())
+```
+
+## 5. Dominant periods and repeat-length boxplots across regions
+
+For each read, the dominant period is the Fourier bin with the greatest
+per-read spectral power without aggregation
+
+```{r dominant-period, results="asis", echo=TRUE, eval=TRUE}
+get_dominant_periods <- function(fft_results) {
+  bind_rows(lapply(names(fft_results), function(region_id) {
+    x <- fft_results[[region_id]]
+    power_mat <- x$raw_power
+    stopifnot(ncol(power_mat) > 0L, ncol(power_mat) == length(x$periods_bp))
+    idx <- apply(power_mat, 1, function(p) {
+      if (all(is.finite(p)) && max(p) > 0) which.max(p) else NA_integer_
+    })
+    meta_idx <- match(rownames(power_mat), x$read_meta$row_id)
+    stopifnot(!anyNA(meta_idx), !anyDuplicated(x$read_meta$row_id))
+    meta <- x$read_meta[meta_idx, , drop = FALSE]
+    matrix_idx <- cbind(seq_len(nrow(power_mat)), idx)
+    data.frame(
+      region_id = region_id,
+      row_id = rownames(power_mat),
+      RID = meta$RID,
+      sample_name = meta$sample_name,
+      dominant_period_bp = x$periods_bp[idx],
+      dominant_spectral_power = power_mat[matrix_idx],
+      dominant_relative_power = x$relative_power[matrix_idx],
+      dominant_power = x$relative_power[matrix_idx],
+      analysis = "complete_spectrum",
+      use_hann = x$use_hann,
+      stringsAsFactors = FALSE
+    )
+  })) %>%
+    mutate(region_id = factor(region_id, levels = names(fft_results)))
+}
+
+dominant_periods <- get_dominant_periods(fft_results)
+
+
+summarize_dominant_periods <- function(df) {
+  df %>% group_by(region_id) %>% summarise(
+    n_reads = n(),
+    n_defined = sum(!is.na(dominant_period_bp)),
+    median_period_bp = median(dominant_period_bp, na.rm = TRUE),
+    q25_period_bp = quantile(dominant_period_bp, 0.25, na.rm = TRUE),
+    q75_period_bp = quantile(dominant_period_bp, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+}
+dominant_summary <- summarize_dominant_periods(dominant_periods)
+knitr::kable(dominant_summary)
+
+p_hist <- ggplot(dominant_periods, aes(x = dominant_period_bp)) +
+  geom_histogram(bins = 60, fill = "grey30", na.rm = TRUE) +
+  scale_x_continuous(breaks = seq(0, 2000, by = 250)) +
+  facet_wrap(~ region_id, ncol = 2, scales = "free_y", drop = FALSE) +
+  theme_classic() +
+  labs(title = "Dominant spatial period per read",
+       subtitle = paste(preprocessing_label, "| Complete positive-frequency spectrum"),
+       x = "Dominant period (bp)", y = "Number of reads")
+save_report_plot(file.path(dominant_period_dir, "dominant_period_histograms_by_region.pdf"),
+       p_hist, width = 10, height = 12)
+
+p_points <- ggplot(dominant_periods, aes(x = region_id, y = dominant_period_bp)) +
+  geom_point(position = position_jitter(width = 0.25, height = 0, seed = 1),
+             size = 0.4, alpha = 0.3, na.rm = TRUE) +
+  geom_boxplot(outlier.shape = NA, fill = NA, colour = "firebrick", width = 0.5,
+               na.rm = TRUE) +
+  scale_y_continuous(breaks = seq(0, 2000, by = 250)) +
+  scale_x_discrete(drop = FALSE) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Dominant spatial period per read, all regions",
+       subtitle = paste(preprocessing_label, "| Complete positive-frequency spectrum"),
+       x = NULL, y = "Dominant period (bp)")
+save_report_plot(file.path(dominant_period_dir, "dominant_period_per_read_all_regions.pdf"),
+       p_points, width = 10, height = 6)
+```
+
+```{r repeat-length-boxplots, results="asis", echo=TRUE, eval=TRUE}
+plot_repeat_length <- function(df) {
+  ggplot(df, aes(x = region_id, y = dominant_period_bp)) +
+    geom_boxplot(fill = "#80B1D3", width = 0.6, outlier.size = 0.6,
+                 outlier.alpha = 0.4, na.rm = TRUE) +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(breaks = seq(0, 2000, 250)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = "Dominant Fourier period by region: complete spectrum",
+      subtitle = paste(preprocessing_label,
+        "\nPer-read maximum across all positive frequencies; long periods need not be nucleosome repeats"),
+      x = "Genomic region",
+      y = "Dominant period (bp)"
+    )
+}
+p_box_full <- plot_repeat_length(dominant_periods)
+save_report_plot(file.path(dominant_period_dir, "dominant_period_boxplot_complete_spectrum.pdf"),
+       p_box_full, width = 12, height = 6)
+```
+
+## 6. One example region with and without Hann
+
+```{r hann-example, results="asis", echo=TRUE, eval=TRUE}
+example_region_id <- names(region_met_mats)[1]
+example_mat <- region_met_mats[[example_region_id]]$met_mat
+example_spectra <- bind_rows(lapply(c(FALSE, TRUE), function(hann_enabled) {
+  res <- get_fft_power_matrix(example_mat, use_hann = hann_enabled)
+  data.frame(
+    region_id = example_region_id,
+    preprocessing = if (hann_enabled) "With Hann" else "Without Hann",
+    use_hann = hann_enabled,
+    period_bp = res$periods_bp,
+    median_power = apply(res$relative_power, 2, median, na.rm = TRUE),
+    q25 = apply(res$relative_power, 2, quantile, probs = 0.25, na.rm = TRUE),
+    q75 = apply(res$relative_power, 2, quantile, probs = 0.75, na.rm = TRUE)
+  )
+}))
+example_spectra$preprocessing <- factor(example_spectra$preprocessing,
+                                      levels = c("Without Hann", "With Hann"))
+
+plot_hann_example <- function() {
+  ggplot(example_spectra,
+         aes(x = period_bp, y = median_power, colour = preprocessing, fill = preprocessing)) +
+    geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.2, colour = NA) +
+    geom_line(linewidth = 0.6) +
+    facet_wrap(~ preprocessing, nrow = 1) +
+    scale_colour_manual(values = c("Without Hann" = "#555555", "With Hann" = "#0072B2")) +
+    scale_fill_manual(values = c("Without Hann" = "#555555", "With Hann" = "#0072B2")) +
+    scale_x_continuous(breaks = seq(0, ncol(example_mat), 250)) +
+    theme_classic() +
+    theme(legend.position = "none") +
+    labs(title = "Complete spectrum",
+         subtitle = paste(nrow(example_mat), "reads; mean-centered; median and IQR"),
+         x = "Spatial period (bp)", y = "Relative power")
+}
+p_example_full <- plot_hann_example()
+p_hann_example <- cowplot::plot_grid(
+  cowplot::ggdraw() + cowplot::draw_label(example_region_id, fontface = "bold"),
+  p_example_full, ncol = 1, rel_heights = c(0.12, 1)
+)
+save_report_plot(file.path(example_dir, paste0(example_region_id, "_with_without_hann.pdf")),
+                 p_hann_example, width = 12, height = 5)
+ggplot2::ggsave(file.path(example_dir, paste0(example_region_id, "_with_without_hann.png")),
+               p_hann_example, width = 12, height = 5, dpi = 160, bg = "white")
+```
+
+## 7. Heatmap of median spectral density by repeat length, with peak repeat length
+
+the per-molecule spectral and the fill is the median spectral density across the region's fibers 
+
+```{r spectral-density-heatmap, results="asis", echo=TRUE, eval=TRUE}
+spectral_density_type  <- "raw_power"      # one-sided periodogram power; or "relative_power"
+spectral_density_label <- if (spectral_density_type == "raw_power") "Spectral density" else "Relative spectral density"
+
+# Per-fiber spectral density at every Fourier bin, all regions.
+spectral_density_long <- bind_rows(lapply(names(fft_results), function(region_id) {
+  x <- fft_results[[region_id]]
+  sd_mat <- x[[spectral_density_type]]
+  keep_rows <- rowSums(is.na(sd_mat)) == 0
+  sd_mat <- sd_mat[keep_rows, , drop = FALSE]
+  data.frame(
+    region_id        = region_id,
+    row_id           = rep(rownames(sd_mat), times = ncol(sd_mat)),
+    repeat_length_bp = rep(x$periods_bp, each = nrow(sd_mat)),
+    spectral_density = as.vector(sd_mat),
+    stringsAsFactors = FALSE
+  )
+}))
+spectral_density_long$region_id <- factor(spectral_density_long$region_id, levels = names(fft_results))
+
+median_spectral_density <- spectral_density_long %>%
+  group_by(region_id, repeat_length_bp) %>%
+  summarise(median_density = median(spectral_density), n_fibers = n(), .groups = "drop") %>%
+  arrange(region_id, repeat_length_bp)
+
+# tile edges at the midpoints between neighbouring Fourier bins
+rl <- sort(unique(median_spectral_density$repeat_length_bp))
+rl_edges <- c(rl[1] - (rl[2] - rl[1]) / 2,
+              (rl[-1] + rl[-length(rl)]) / 2,
+              rl[length(rl)] + (rl[length(rl)] - rl[length(rl) - 1]) / 2)
+rl_idx <- match(median_spectral_density$repeat_length_bp, rl)
+median_spectral_density$xmin <- rl_edges[rl_idx]
+median_spectral_density$xmax <- rl_edges[rl_idx + 1]
+
+# peak repeat length per region = bin with the largest median (ties: longest period)
+repeat_length_peaks <- median_spectral_density %>%
+  group_by(region_id) %>%
+  filter(median_density == max(median_density)) %>%
+  slice_max(repeat_length_bp, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+peak_repeat_lengths <- repeat_length_peaks %>%
+  select(region_id, repeat_length_bp, median_density) %>%
+  arrange(region_id)
+knitr::kable(peak_repeat_lengths)
+
+
+# regions top-to-bottom in selection order
+region_levels <- rev(names(fft_results))
+median_spectral_density$region_y <- match(as.character(median_spectral_density$region_id), region_levels)
+repeat_length_peaks$region_y     <- match(as.character(repeat_length_peaks$region_id), region_levels)
+
+p_sd_heatmap <- ggplot(median_spectral_density) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = region_y - 0.5, ymax = region_y + 0.5,
+                fill = median_density)) +
+  geom_point(data = repeat_length_peaks,
+             aes(x = repeat_length_bp, y = region_y),
+             shape = 21, size = 2.4, colour = "white", fill = "black", stroke = 0.7) +
+  scale_fill_viridis_c(name = paste("Median", tolower(spectral_density_label))) +
+  scale_x_continuous(breaks = seq(0, max(median_spectral_density$repeat_length_bp), by = 250),
+                     expand = c(0, 0)) +
+  scale_y_continuous(breaks = seq_along(region_levels), labels = region_levels, expand = c(0, 0)) +
+  theme_classic() +
+  labs(title = "Median spectral density by chromatin repeat length",
+       subtitle = preprocessing_label,
+       x = "1 / m6A spectral frequency (bp)", y = NULL)
+
+save_report_plot(file.path(repeat_length_dir, "median_spectral_density_heatmap.pdf"),
+       p_sd_heatmap, width = 11, height = 6)
+```
+
+# Fourier amplitude and phase features for  clustering
+
+Fourier bins are defined by k and period -> Re_k1_period_2000bp
+
+1. Calculate mean centered value from the methylation binary vector -> deviation from he read's average m6a
+  - mean centered value = original value - mean
+  - position with an m6A call = 1 - mean
+  - position without m6a call = 0 - mean
+  
+  
+2. Calculate amplitude and phase using complex coefficients from FFT
+  - amplitude = how strongly the repeat length is, magnitude of complex number
+  - phase = where the repeating pattern is shifted, angle of complex number
+  - fourier index k = how many cycles fit across the window = period = length / k
+      - k = 1, one cycle
+      - k = 11, 11 cyles of 182 bp
+
+
+3. Normalization
+  - each read's features are divided the read overall spectral strength
+    1) squares all real and imaginary values
+    2) add the values together and takes the square root
+    3) divides every real and imaginary value by the same number
+    
+*Note*: only normalization per read is performed, but no z score normalization is performed across all reads for one feature at a time
+    
+    
+Re and Im are real and imaginary features of each Fourier coefficient for every Fourier period
+X_200 (200 bp period) = 3 + 4i
+  - Re = 3
+  - Im = 4
+  
+real and imaginary features are converted in to a vector to represent each read
+
+Phase is defined relative to the starting position of the read
+
+```{r Fourier-complex-feature-setup}
+get_fft_complex_features <- function(met_mat, use_hann) {
+  pos <- as.integer(colnames(met_mat))
+  N <- ncol(met_mat)
+  stopifnot(N >= 2L, length(pos) == N, !anyNA(pos), all(diff(pos) == 1L),
+            !anyNA(met_mat), !is.null(rownames(met_mat)),
+            !anyDuplicated(rownames(met_mat)),
+            is.logical(use_hann), length(use_hann) == 1L, !is.na(use_hann))
+
+  # define fourier indices
+  k <- seq_len(floor(N / 2))
+  # convert index to frequency
+  frequency <- k / N
+  # convert frequency to bp
+  periods_bp <- 1 / frequency
+
+  bin_names <- paste0("k", k, "_period_", round(periods_bp, 6), "bp")
+  
+  # matrix of FFT coefficients
+  coefficients <- matrix(NA_complex_, nrow(met_mat), length(k),
+                         dimnames = list(rownames(met_mat), bin_names))
+
+  if (use_hann) window <- hann_window(N)
+  
+  # loop over every read in the methylation matrix
+  for (i in seq_len(nrow(met_mat))) {
+    # convert per read methylation signal into a vector
+    signal <- as.numeric(met_mat[i, ])
+    # remove mean methylation sginal
+    signal <- signal - mean(signal)
+    
+    if (use_hann) {
+      # positions near the center are preserved, near the edges are downweighted
+      signal <- signal * window
+    }
+    
+    # FFT calculation
+    coefficients[i, ] <- fft(signal)[k + 1L]
+  }
+
+  # amplitude
+  amplitude <- Mod(coefficients)
+  # phase
+  phase_radians <- Arg(coefficients)
+  
+  # if amplitude is zero, the read contains none of Fourier component, replace phase with NA
+  phase_radians[amplitude == 0] <- NA_real_
+
+  # annotation table for clustering features
+    # feature, component, k, period
+  
+  feature_annotation <- data.frame(
+    feature_name = as.vector(rbind(paste0("Re_", bin_names), paste0("Im_", bin_names))),
+    # for each period, there are two features
+      # 1. Re
+      # 2. Im
+    component = rep(c("Re", "Im"), times = length(k)),
+    k = rep(k, each = 2L),
+    frequency = rep(frequency, each = 2L),
+    period_bp = rep(periods_bp, each = 2L),
+    stringsAsFactors = FALSE
+  )
+  
+  
+  # create Re/Im clustering matrix
+  
+  # two features per period
+  re_im_features <- matrix(NA_real_, nrow(met_mat), 2L * length(k),
+    dimnames = list(rownames(met_mat), feature_annotation$feature_name))
+  
+  # fill in Re and Im features
+  re_im_features[, 2L * seq_along(k) - 1L] <- Re(coefficients)
+  re_im_features[, 2L * seq_along(k)] <- Im(coefficients)
+  
+  # ----------------
+  # Normalization
+  # ----------------
+  
+  # squares every amplitude and add them across all frequencies
+  coefficient_energy <- rowSums(amplitude^2)
+  # square root of the sum -> one number per read for overall Fourier magnitude
+  normalization_denominator <- sqrt(coefficient_energy)
+  
+  valid_energy <- is.finite(normalization_denominator) & normalization_denominator > 0
+  normalized_re_im_features <- re_im_features
+  normalized_re_im_features[,] <- NA_real_
+  
+  # normalization for each row
+  # divide every Re and Im value in one read by the squared root sum
+  normalized_re_im_features[valid_energy, ] <- sweep(
+    re_im_features[valid_energy, , drop = FALSE], 1L,
+    normalization_denominator[valid_energy], "/"
+  )
+
+  # ----------------
+  # all outputs
+  # ----------------
+  # 
+  # 1. FFT complex number
+  # 2. matrix shape = read x periods
+  # 3. Raw re and lm feaures
+  # 4. feature annotation
+  # 5. normalized re/lm matrix
+  
+  
+  list(
+    complex_coefficients = coefficients,
+    amplitude = amplitude,
+    phase_radians = phase_radians,
+    re_im_features = re_im_features,
+    feature_annotation = feature_annotation,
+    normalized_re_im_features = normalized_re_im_features,
+    normalization_denominator = normalization_denominator,
+    normalization = "L2 norm of all retained positive-frequency complex coefficients",
+    standardized = FALSE,
+    frequency = frequency,
+    periods_bp = periods_bp,
+    use_hann = use_hann,
+    phase_origin_bp = pos[1],
+    phase_coordinate_order = "ascending reference genomic position"
+  )
+}
+```
+
+# Get Re/lm features from FFT
+
+```{r prepare-Fourier-complex-features}
+fourier_complex_results <- list()
+
+for (region_id in names(region_met_mats)) {
+  x <- region_met_mats[[region_id]]
+  message("Preparing Fourier Re/Im features: ", region_id)
+  feature_result <- get_fft_complex_features(
+    x$met_mat, use_hann = use_hann
+  )
+  meta_idx <- match(rownames(x$met_mat), x$read_meta$row_id)
+  stopifnot(!anyNA(meta_idx), !anyDuplicated(x$read_meta$row_id))
+  feature_result$read_meta <- x$read_meta[meta_idx, , drop = FALSE]
+  feature_result$region_id <- region_id
+  feature_result$chr <- x$chr
+  feature_result$start <- x$start
+  feature_result$end <- x$end
+  fourier_complex_results[[region_id]] <- feature_result
+}
+
+fourier_feature_summary <- bind_rows(lapply(fourier_complex_results, function(x) {
+  data.frame(
+    region_id = x$region_id,
+    n_reads = nrow(x$complex_coefficients),
+    n_positive_frequencies = ncol(x$complex_coefficients),
+    n_fourier_features = ncol(x$re_im_features),
+    n_zero_energy_reads = sum(x$normalization_denominator == 0),
+    use_hann = x$use_hann
+  )
+}))
+fourier_feature_summary
+```
+
+Inspect the first region, each element is a list of per read matrices
+
+*Fourier bins*: bin k means k cycles across the window, for k from 1 to 1000
+  - bin 1 is one cycle per window, period 2001 bp. Bin 2 is two cycles, 1000.5 bp. Bin 10 is 200.1 bp, bin 11 is 181.9 bp, and bin 1000 is 2.001 bp
+  - bins above N/2 are mirror images of the ones below, so
+  only the first half carries information. Bin 0 would be the signal's mean, which is removed before the transformation
+  - all the bins are used for FFT (1 to 1000)
+  
+```{r example-FFT-features}
+x_fft <- fourier_complex_results[[1]]
+cat("Region:", x_fft$region_id, "\n")
+str(x_fft, max.level = 1, give.attr = FALSE)
+
+n_show_reads <- 4
+n_show_bins  <- 5
+show_bins <- seq_len(n_show_bins)
+
+cat("\nFourier bins shown (k, period in bp):\n")
+print(data.frame(k = show_bins, period_bp = round(x_fft$periods_bp[show_bins], 2)))
+
+cat("\ncomplex_coefficients (reads x bins):\n")
+print(x_fft$complex_coefficients[seq_len(n_show_reads), show_bins])
+
+cat("\namplitude = Mod(coefficient):\n")
+print(round(x_fft$amplitude[seq_len(n_show_reads), show_bins], 4))
+
+cat("\nphase_radians = Arg(coefficient):\n")
+print(round(x_fft$phase_radians[seq_len(n_show_reads), show_bins], 4))
+
+cat("\nre_im_features (Re and Im interleaved; first", 2 * n_show_bins, "columns = first", n_show_bins, "bins):\n")
+print(round(x_fft$re_im_features[seq_len(n_show_reads), seq_len(2 * n_show_bins)], 4))
+
+cat("\nnormalized_re_im_features (same columns, divided by each read's L2 norm):\n")
+print(round(x_fft$normalized_re_im_features[seq_len(n_show_reads), seq_len(2 * n_show_bins)], 6))
+
+cat("\nnormalization_denominator (per read):\n")
+print(round(x_fft$normalization_denominator[seq_len(n_show_reads)], 4))
+
+cat("\nfeature_annotation (one row per Re/Im feature):\n")
+print(head(x_fft$feature_annotation, 2 * n_show_bins))
+
+cat("\nread_meta (rows align with the matrices):\n")
+print(head(x_fft$read_meta, n_show_reads))
+```
+
+
+
+# Manhattan / Leiden clustering on Fourier features
+
+```{r Fourier-Leiden-settings}
+leiden_code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
+fourier_lcl_helpers <- new.env(parent = environment())
+sys.source(file.path(leiden_code_dir, "leiden_manhattan_functions.r"), envir = fourier_lcl_helpers)
+sys.source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", envir = fourier_lcl_helpers)
+sys.source(file.path(leiden_code_dir, "leiden_manhattan_plots.r"), envir = fourier_lcl_helpers)
+local({
+  notebook <- file.path(leiden_code_dir, "leiden_LCL.Rmd")
+  lines <- readLines(notebook, warn = FALSE)
+  start <- which(trimws(lines) == "```{r lcl-output-loader}")
+  stopifnot(length(start) == 1L)
+  end <- which(seq_along(lines) > start & trimws(lines) == "```")[1L]
+  stopifnot(!is.na(end), end > start + 1L)
+  eval(parse(text = lines[seq.int(start + 1L, end - 1L)]), envir = fourier_lcl_helpers)
+  fourier_lcl_helpers$source_lcl_output_config(notebook, envir = fourier_lcl_helpers)
+})
+fourier_lcl_helpers$LCL_OUTPUT_ROOT <- normalizePath(output_dir, mustWork = TRUE)
+fourier_lcl_helpers$LCL_TOP10_ROOT <- fourier_lcl_helpers$LCL_OUTPUT_ROOT
+
+k_neighbors <- 10L
+resolution <- 1
+clustering_seed <- 1L
+umap_neighbors <- 15L
+
+fourier_clustering_dir <- file.path(output_dir, "manhattan_leiden_clustering")
+fourier_phasing_root <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+fourier_haplotag_cache_dir <- file.path(fourier_clustering_dir, "phase_summary")
+fourier_sample_table <- read.csv(sample_meta, stringsAsFactors = FALSE)
+stopifnot(!anyDuplicated(fourier_sample_table$sample_name),
+          k_neighbors >= 1L, k_neighbors == as.integer(k_neighbors),
+          is.finite(resolution), resolution > 0, umap_neighbors >= 2L)
+for (package in c("igraph", "uwot", "Rsamtools", "GenomicRanges", "cowplot")) {
+  if (!requireNamespace(package, quietly = TRUE)) stop("Required package unavailable: ", package)
+}
+```
+
+```{r Fourier-Leiden-phasing-helpers}
+
+fourier_match_lcl_region <- function(x, selected_regions) {
+
+  regions <- as.data.frame(selected_regions)
+  required <- c("region_id", "chr", "start", "analysis_start", "analysis_end",
+                "focal_pos", "focal_snp", "ref", "alt", "contributing_samples")
+  stopifnot(all(required %in% names(regions)))
+  hit <- which(regions$chr == x$chr & regions$analysis_end == x$end &
+                 regions$analysis_start == x$start & regions$region_id == x$region_id)
+  if (length(hit) != 1L) stop("Cannot uniquely match Fourier region to the LCL focal SNP: ", x$region_id)
+  regions[hit, , drop = FALSE]
+}
+```
+
+```{r run-Fourier-Manhattan-Leiden}
+fourier_phase_datasets <- lapply(fourier_complex_results, function(result) {
+  region <- fourier_match_lcl_region(result, selected_regions)
+  samples <- lcl_region_samples(region, fourier_sample_table)
+  metadata <- result$read_meta
+  metadata$original_RID <- metadata$RID
+  metadata$RID <- metadata$row_id
+  list(rids_df = metadata[metadata$sample_name %in% samples$sample_name, , drop = FALSE])
+})
+fourier_used_samples <- unique(dplyr::bind_rows(lapply(fourier_phase_datasets,
+  function(dataset) dataset$rids_df))$sample_name)
+fourier_phases <- fourier_lcl_helpers$cache_lcl_haplotags(
+  fourier_sample_table[match(fourier_used_samples, fourier_sample_table$sample_name), , drop = FALSE],
+  fourier_phase_datasets, fourier_phasing_root, fourier_haplotag_cache_dir)
+rm(fourier_phase_datasets)
+fourier_leiden_results <- list()
+fourier_clustering_audits <- list()
+
+for (region_id in names(fourier_complex_results)) {
+  x <- fourier_complex_results[[region_id]]
+  message("Fourier Manhattan / Leiden: ", region_id)
+  stopifnot(identical(x$use_hann, use_hann), !isTRUE(x$standardized))
+  region <- fourier_match_lcl_region(x, selected_regions)
+  positions <- as.integer(colnames(region_met_mats[[region_id]]$met_mat))
+  stopifnot(identical(positions, seq.int(region$analysis_start, region$analysis_end)),
+            length(positions) == 2000L, x$phase_origin_bp == region$analysis_start)
+  selected_samples <- lcl_region_samples(region, fourier_sample_table)
+  meta <- x$read_meta
+  meta$original_RID <- meta$RID
+  meta$RID <- meta$row_id                 
+  stopifnot(!anyDuplicated(meta$RID), identical(meta$RID, rownames(x$normalized_re_im_features)))
+  meta$region_id <- region_id
+  eligible <- meta$sample_name %in% selected_samples$sample_name
+  phases <- fourier_phases[selected_samples$sample_name]
+  dataset <- list(rids_df = meta[eligible, , drop = FALSE],
+                  met_mat = region_met_mats[[region_id]]$met_mat[meta$RID[eligible], , drop = FALSE])
+  phased <- lcl_filter_focal_heterozygotes(dataset, region, selected_samples, phases)
+
+  assignments <- phased$rids_df
+  finite_features <- rowSums(!is.finite(x$normalized_re_im_features[assignments$RID, , drop = FALSE])) == 0L
+  assignments <- assignments[finite_features, , drop = FALSE]
+  if (nrow(assignments) < 3L || length(unique(assignments$allele_label)) != 2L)
+    stop("Insufficient finite Fourier features or missing focal allele: ", region_id)
+  features <- x$normalized_re_im_features[assignments$RID, , drop = FALSE]
+  stopifnot(ncol(features) == 2L * length(x$frequency))
+
+  knn <- manhattan_knn_graph(features, k_neighbors = k_neighbors, sigma = NULL)
+  partition <- leiden_partition(knn$graph, resolution = resolution, seed = clustering_seed)
+  membership <- partition$membership[rownames(features)]
+  stopifnot(!anyNA(membership))
+  labels_by_size <- names(sort(table(membership), decreasing = TRUE))
+  assignments$cluster <- factor(paste0("cluster", match(as.character(membership), labels_by_size)),
+                                levels = paste0("cluster", seq_along(labels_by_size)))
+  assignments$sample_label <- sub("_.*$", "", assignments$sample_name)
+  stopifnot(identical(assignments$RID, rownames(features)))
+
+  audit <- meta
+  audit$exclusion_reason <- ifelse(eligible, "Unresolved focal genotype / haplotype", "Outside contributing LCLs")
+  audit$exclusion_reason[audit$RID %in% phased$rids_df$RID[!finite_features]] <- "Nonfinite Fourier features"
+  audit$exclusion_reason[audit$RID %in% assignments$RID] <- "Clustered"
+  audit$retained_for_clustering <- audit$exclusion_reason == "Clustered"
+  fourier_clustering_audits[[region_id]] <- audit
+  distances <- knn$dist
+  diag(distances) <- 0                  
+  result <- list(region_id = region_id, region = region, assignments = assignments,
+    feat_mat = features, feature_annotation = x$feature_annotation,
+    distance_matrix = distances, graph = knn$graph,
+    knn_edges = igraph::as_data_frame(knn$graph, what = "edges"),
+    n_clusters = nlevels(assignments$cluster), read_filter_audit = audit,
+    phasing_audit = phased$read_filter_audit, variants = phased$variants, focal = phased$focal,
+    phasing_sources = lapply(phases, function(z) z[c("available", "reason", "paths", "signature")]),
+    params = list(k_neighbors = k_neighbors, k_eff = knn$k_eff, resolution = resolution,
+      sigma = knn$sigma, seed = clustering_seed, umap_neighbors = umap_neighbors,
+      use_hann = x$use_hann, normalization = x$normalization, standardized = FALSE,
+      frequency_range = range(x$frequency), phase_origin_bp = x$phase_origin_bp,
+      fft_start = x$start, fft_end = x$end, quality = partition$quality))
+  result <- fiberseq_display_result(result)
+  result$embedding <- fiberseq_umap(result, seed = clustering_seed, n_neighbors = umap_neighbors)
+  fourier_leiden_results[[region_id]] <- result
+  message("  ", nrow(assignments), "/", nrow(meta), " reads retained; ", result$n_clusters, " clusters")
+}
+```
+
+```{r Fourier-Leiden-plot-helpers}
+fourier_save_plot <- function(plot, region_id, filename, width = 12, height = 7,
+                              draw = NULL, label = NULL) {
+  directory <- file.path(fourier_clustering_dir, region_id)
+  dir.create(directory, recursive = TRUE, showWarnings = FALSE)
+  if (is.null(label)) label <- paste(region_id, filename)
+  save_report_plot(file.path(directory, paste0(filename, ".pdf")), plot,
+                  width = width, height = height, limitsize = FALSE, bg = "white",
+                  draw = draw, label = label)
+}
+
+fourier_m6a_plot_view <- function(result, original_m6a) {
+  view <- result
+  a <- result$assignments
+  region <- result$region
+  samples <- fourier_sample_table[match(unique(a$sample_name), fourier_sample_table$sample_name), , drop = FALSE]
+  stopifnot(!anyNA(samples$sample_name), region$analysis_start == region$start + 1L,
+            region$width == region$analysis_end - region$analysis_start + 1L)
+
+  paths <- extracted_path(samples, region$chr, "m6a")
+  bounds <- dplyr::bind_rows(lapply(seq_len(nrow(samples)), function(i) {
+    query <- GenomicRanges::GRanges(region$chr, IRanges::IRanges(region$analysis_start, region$analysis_end))
+    bed <- read_ft_bed12(paths[i], query, longest_alignment = TRUE)
+    if (!nrow(bed)) return(NULL)
+    selected <- a[a$sample_name == samples$sample_name[i], , drop = FALSE]
+    matched <- match(bed$RID, selected$original_RID)
+    data.frame(RID = selected$RID[matched], start = bed$start + 1L,
+               end = bed$end)[!is.na(matched), , drop = FALSE]
+  }))
+  matched <- match(a$RID, bounds$RID)
+  stopifnot(!anyDuplicated(bounds$RID), !anyNA(matched))
+  view$assignments$start <- bounds$start[matched]
+  view$assignments$end <- bounds$end[matched]
+  stopifnot(all(view$assignments$start <= region$analysis_start),
+            all(view$assignments$end >= region$analysis_end))
+  view <- fiberseq_display_result(view)
+  positions <- as.integer(colnames(original_m6a))
+  stopifnot(identical(positions, seq.int(region$analysis_start, region$analysis_end)))
+  view$met_mat <- original_m6a[a$RID, , drop = FALSE]
+  view$site_met_mat <- view$met_mat[, Matrix::colSums(view$met_mat) > 0, drop = FALSE]
+  view
+}
+
+
+fourier_save_m6a_heatmap <- function(view, split_alleles = FALSE) {
+  filename <- if (split_alleles) "m6a_heatmap_split_by_haplotype" else "m6a_heatmap_by_fourier_cluster"
+  heatmap <- plot_genomic_cluster_heatmap(view, view$region,
+    sample_palette(view$assignments$sample_name), include_haplotype = TRUE,
+    variants = view$variants, show_cluster_profiles = TRUE, split_alleles = split_alleles,
+    cluster_label = "Fourier-derived clusters")
+  fourier_save_plot(heatmap, view$region_id, filename,
+    width = 14, height = 11 + .55 * view$n_clusters,
+    draw = function(x) ComplexHeatmap::draw(x, newpage = FALSE),
+    label = paste(view$region_id, filename))
+}
+
+
+fourier_matrix_plot <- function(mat, result, matrix_type = c("features", "m6a"), split_alleles = FALSE) {
+  matrix_type <- match.arg(matrix_type)
+  a <- result$assignments
+  a <- a[if (split_alleles) order(a$allele_display, a$cluster, a$sample_name, a$RID)
+           else order(a$cluster, a$allele_display, a$sample_name, a$RID), , drop = FALSE]
+  a$read_rank <- rev(seq_len(nrow(a)))
+  a$panel <- if (split_alleles) as.character(a$allele_display) else "All retained reads"
+  values <- as.matrix(mat[a$RID, , drop = FALSE])
+  coordinates <- if (matrix_type == "m6a") as.numeric(colnames(values)) else seq_len(ncol(values))
+  long <- data.frame(read_rank = rep(a$read_rank, times = ncol(values)),
+    coordinate = rep(coordinates, each = nrow(values)), value = as.vector(values),
+    panel = rep(a$panel, times = ncol(values)))
+  base_theme <- theme_classic(base_size = 10) +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          strip.background = element_blank(), strip.text.y = element_text(angle = 0))
+  heat <- ggplot(long, aes(coordinate, read_rank, fill = value)) + geom_raster() +
+    facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+    scale_y_continuous(expand = c(0, 0)) + base_theme + labs(y = NULL)
+  if (matrix_type == "features") {
+    cap <- unname(quantile(abs(values), 0.99))
+    if (!is.finite(cap) || cap <= 0) cap <- 1
+    tick_k <- unique(round(seq(1, ncol(values) / 2, length.out = 6)))
+    heat <- heat + scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+      midpoint = 0, limits = c(-cap, cap), oob = scales::squish, name = "Normalized Re/Im") +
+      scale_x_continuous(breaks = 2 * tick_k - 0.5, labels = tick_k, expand = c(0, 0)) +
+      labs(x = "Fourier index k (adjacent Re/Im columns; period = window length / k)",
+           caption = "Color clipped at the 99th percentile of absolute feature values; clustering uses unclipped features.")
+  } else {
+    heat <- heat + scale_fill_gradient(low = "white", high = "black", limits = c(0, 1),
+      breaks = c(0, 1), name = "m6A call") +
+      scale_x_continuous(labels = scales::label_number(accuracy = 1, big.mark = ","), expand = c(0, 0)) +
+      geom_vline(xintercept = result$region$focal_pos, color = "#984EA3", linetype = 2, linewidth = 0.4) +
+      labs(x = paste0(result$region$chr, " genomic position (bp)"),
+           caption = paste("Dashed line:", result$region$focal_snp, "| Original full-window binary m6A calls"))
+  }
+  colors <- list(cluster = cluster_id_palette(levels(a$cluster)),
+    allele_display = fiberseq_category_palette(levels(a$allele_display)))
+  bars <- lapply(names(colors), function(column) {
+    ggplot(a, aes(x = 1, y = read_rank, fill = .data[[column]])) + geom_tile() +
+      facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+      scale_fill_manual(values = colors[[column]], guide = "none") +
+      scale_y_continuous(expand = c(0, 0)) + scale_x_continuous(expand = c(0, 0)) +
+      base_theme + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+                        strip.text.y = element_blank()) +
+      labs(x = if (column == "cluster") "Cluster" else "Allele", y = NULL)
+  })
+  combined <- cowplot::plot_grid(plotlist = c(bars, list(heat)), nrow = 1,
+                                  rel_widths = c(0.055, 0.055, 1), align = "h", axis = "tb")
+  title <- cowplot::ggdraw() + cowplot::draw_label(paste0(result$region_id, " | ", nrow(a),
+    " reads | Fourier-derived Leiden clusters", if (split_alleles) " | Split by focal allele" else ""), size = 11)
+  legends <- cowplot::plot_grid(
+    fiberseq_legend(colors$cluster, "Cluster", columns = 6),
+    fiberseq_legend(colors$allele_display, "Focal SNP allele", columns = 2), ncol = 1)
+  cowplot::plot_grid(title, combined, legends, ncol = 1, rel_heights = c(0.35, 6, 1.15))
+}
+```
+
+## Prepare data for the clustering figures
+
+
+```{r Fourier-footprint-helpers}
+fourier_footprint_tracks_dir <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks"
+fourier_footprint_cache_dir <- file.path(fourier_clustering_dir, "footprint_summary")
+fourier_footprint_caches <- fourier_lcl_helpers$cache_footprint_tracks(
+  dplyr::bind_rows(lapply(fourier_leiden_results, function(result) result$region)),
+  fourier_footprint_tracks_dir, fourier_footprint_cache_dir, workers = 1L)
+
+
+fourier_footprint_view <- function(result, original_m6a) {
+  view <- fourier_m6a_plot_view(result, original_m6a)
+  assignments <- view$assignments
+  samples <- fourier_sample_table[match(unique(assignments$sample_name),
+    fourier_sample_table$sample_name), , drop = FALSE]
+  aliases <- assignments
+  aliases$RID <- paste(assignments$sample_name, assignments$original_RID, sep = "::")
+  stopifnot(!anyDuplicated(aliases$RID))
+  nuc <- extract_nucleosomes(samples, view$region, aliases)
+  nuc$RID <- assignments$RID[match(nuc$RID, aliases$RID)]
+  tf <- region_footprints(fourier_footprint_caches, view$region, assignments)$records
+  footprints <- dplyr::bind_rows(nuc, tf)
+  stopifnot(!anyNA(footprints$RID), all(footprints$RID %in% assignments$RID))
+  signal <- signal_profiles(view, footprints)
+  stopifnot(all(is.finite(signal$profiles$fraction)),
+    all(signal$profiles$fraction >= 0 & signal$profiles$fraction <= 1))
+  list(result = view, signal = signal)
+}
+```
+
+```{r Fourier-plot-data}
+fourier_plot_data <- setNames(vector("list", length(fourier_leiden_results)), names(fourier_leiden_results))
+fourier_footprint_audit <- list()
+for (region_id in names(fourier_leiden_results)) {
+  message("Preparing Fourier figure data: ", region_id)
+  prepared <- fourier_footprint_view(fourier_leiden_results[[region_id]],
+                                    region_met_mats[[region_id]]$met_mat)
+  fourier_plot_data[[region_id]] <- prepared
+  view <- prepared$result
+  signal <- prepared$signal
+  fourier_footprint_audit[[region_id]] <- list(n_reads = nrow(view$assignments),
+    n_clusters = view$n_clusters, track_record_counts = table(signal$records$track),
+    plot_start = view$region$analysis_start, plot_end = view$region$analysis_end)
+}
+stopifnot(is.function(fourier_lcl_helpers$save_fiberseq_plots))
+```
+
+## 1. Dominant period by cluster and haplotype
+
+```{r dominant_period_by_cluster_and_haplotype, results="asis", echo=TRUE, eval=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  a <- result$assignments
+  x <- fourier_complex_results[[region_id]]
+  spectrum <- fft_results[[region_id]]
+  stopifnot(identical(spectrum$use_hann, x$use_hann))
+  allele_colors <- fiberseq_category_palette(levels(a$allele_display))
+  # each read's dominant period from positive frequency spectrum
+  power <- spectrum$raw_power[a$RID, , drop = FALSE]
+  dominant_k <- apply(power, 1, which.max)
+  dominant <- data.frame(a, dominant_period_bp = x$periods_bp[dominant_k])
+  dominant_plot <- ggplot(dominant, aes(cluster, dominant_period_bp, fill = allele_display)) +
+    geom_boxplot(outlier.size = .6, position = position_dodge(width = .8)) +
+    scale_fill_manual(values = allele_colors) + scale_y_continuous(breaks = seq(0, max(x$periods_bp), 250)) +
+    theme_classic() + labs(title = region_id, subtitle = "Per-read dominant period; complete positive-frequency spectrum",
+                          x = "Fourier-derived Leiden cluster", y = "Dominant period (bp)", fill = "Focal SNP allele")
+  fourier_save_plot(dominant_plot, region_id, "dominant_period_by_cluster_and_haplotype", 12, 6)
+
+ 
+  fourier_leiden_results[[region_id]]$dominant_periods <- dominant
+}
+```
+
+## 2. Fiber-seq haplotype example
+
+```{r fiberseq_haplotype_example, results="asis", echo=TRUE, eval=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  prepared <- fourier_plot_data[[region_id]]
+  view <- prepared$result
+  signal <- prepared$signal
+  sample_colors <- sample_palette(view$assignments$sample_name)
+  title <- paste(view$region$annotation, "Fourier-derived Leiden clusters", sep = " | ")
+  settings_label <- paste0("k = ", view$params$k_eff, "; resolution = ", view$params$resolution,
+                            "; Hann = ", view$params$use_hann)
+  example_view <- view
+  example_view$region$annotation <- paste(title, settings_label, sep = " | ")
+  full_sample_colors <- setNames(unname(sample_colors[sub("_.*$", "", unique(view$assignments$sample_name))]),
+    unique(view$assignments$sample_name))
+  fourier_lcl_helpers$save_fiberseq_plots(example_view, signal$records,
+    file.path(fourier_clustering_dir, region_id), full_sample_colors,
+    embedding = view$embedding, example_only = TRUE,
+    plot_writer = function(plot, name, width, height) {
+      fourier_save_plot(plot, region_id, name, width, height)
+    })
+}
+```
+
+## 3. Individual-read footprints
+
+```{r fig1_read_footprints, results="asis", echo=TRUE, eval=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  prepared <- fourier_plot_data[[region_id]]
+  view <- prepared$result
+  signal <- prepared$signal
+  sample_colors <- sample_palette(view$assignments$sample_name)
+  title <- paste(view$region$annotation, "Fourier-derived Leiden clusters", sep = " | ")
+  settings_label <- paste0("k = ", view$params$k_eff, "; resolution = ", view$params$resolution,
+                            "; Hann = ", view$params$use_hann)
+  reads_plot <- plot_smf_reads(view, signal$records, sample_colors,
+                                  include_haplotype = TRUE) +
+    labs(title = title, subtitle = paste("One row per retained molecule;", settings_label))
+  fourier_save_plot(reads_plot, region_id, "fig1_read_footprints", 12,
+                    max(7, .03 * nrow(view$assignments) + 3.5 + .3 * view$n_clusters))
+}
+```
+
+## 4. Occupancy by cluster
+
+```{r fig2_occupancy_by_cluster, results="asis", echo=TRUE, eval=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  prepared <- fourier_plot_data[[region_id]]
+  view <- prepared$result
+  signal <- prepared$signal
+  sample_colors <- sample_palette(view$assignments$sample_name)
+  title <- paste(view$region$annotation, "Fourier-derived Leiden clusters", sep = " | ")
+  settings_label <- paste0("k = ", view$params$k_eff, "; resolution = ", view$params$resolution,
+                            "; Hann = ", view$params$use_hann)
+  occupancy_plot <- plot_signal_profile(signal$profiles, view$region,
+    levels(view$assignments$cluster), title = title) +
+    labs(subtitle = paste("m6A calls and footprint occupancy;", settings_label))
+  fourier_save_plot(occupancy_plot, region_id, "fig2_occupancy_by_cluster", 10,
+                    1.4 * view$n_clusters + 2.5)
+}
+```
+
+## 5. m6A heatmap grouped by Fourier cluster
+
+```{r m6a_heatmap_by_fourier_cluster, results="asis", echo=TRUE, eval=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  view <- fourier_plot_data[[region_id]]$result
+  fourier_save_m6a_heatmap(view, split_alleles = FALSE)
+}
+```
+
+## 6. m6A heatmap split by haplotype
+
+```{r m6a_heatmap_split_by_haplotype, results="asis", echo=TRUE, eval=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  view <- fourier_plot_data[[region_id]]$result
+  fourier_save_m6a_heatmap(view, split_alleles = TRUE)
+}
+```
+
+clustering summary stats
+
+```{r Fourier-clustering-summary, echo=TRUE, results="asis"}
+fourier_clustering_summary <- bind_rows(lapply(fourier_leiden_results, function(r) {
+  data.frame(region_id = r$region_id, n_input_reads = nrow(r$read_filter_audit),
+    n_clustered_reads = nrow(r$assignments), n_features = ncol(r$feat_mat),
+    n_clusters = r$n_clusters, k_neighbors = r$params$k_eff, resolution = r$params$resolution,
+    use_hann = r$params$use_hann)
+}))
+knitr::kable(fourier_clustering_summary)
+```
+
+```{r Fourier-knn-graphs, results="asis", echo=TRUE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  graph_plot <- plot_knn_graph(result,
+    main = paste(region_id, "Fourier-feature Manhattan KNN graph colored by Leiden cluster", sep = "\n"))
+  fourier_save_plot(graph_plot, region_id, "knn_graph", width = 12, height = 9,
+    label = paste(region_id, "Fourier-feature Manhattan KNN graph"))
+}
+```
+
+### UMAP by cluster, sample, and haplotype
+
+```{r umap_cluster_sample_haplotype, results="asis", echo=TRUE, eval=FALSE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  a <- result$assignments
+  cluster_colors <- cluster_id_palette(levels(a$cluster))
+  allele_colors <- fiberseq_category_palette(levels(a$allele_display))
+  short_colors <- sample_palette(unique(a$sample_name))
+  sample_colors <- setNames(unname(short_colors[sub("_.*$", "", unique(a$sample_name))]), unique(a$sample_name))
+  embedding <- result$embedding
+  subtitle <- paste(preprocessing_label, "| Full-spectrum normalized Re/Im | k =", k_neighbors,
+                    "| resolution =", resolution, "|", nrow(a), "reads")
+  message("Plotting Fourier Leiden: ", region_id)
+
+  overview <- cowplot::plot_grid(
+    plot_umap(embedding, "cluster", cluster_colors, "Leiden cluster", show_legend = TRUE),
+    plot_umap(embedding, "sample_name", sample_colors, "LCL sample",
+      sub("_.*$", "", names(sample_colors)), show_legend = TRUE),
+    plot_umap(embedding, "allele_display", allele_colors, "Focal SNP allele", show_legend = TRUE), ncol = 2)
+  heading <- cowplot::ggdraw() + cowplot::draw_label(paste(region_id, subtitle, sep = "\n"), size = 11)
+  fourier_save_plot(cowplot::plot_grid(heading, overview, ncol = 1, rel_heights = c(.6, 8)),
+                   region_id, "umap_cluster_sample_haplotype", 14, 10)
+}
+```
+
+### UMAP split by haplotype
+
+```{r umap_split_by_haplotype, results="asis", echo=TRUE, eval=FALSE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  a <- result$assignments
+  cluster_colors <- cluster_id_palette(levels(a$cluster))
+  embedding <- result$embedding
+  split_umap <- plot_umap(embedding, "cluster", cluster_colors, region_id, show_legend = TRUE) +
+    facet_wrap(~ allele_display, nrow = 1) +
+    labs(subtitle = "Same pooled Leiden assignments and UMAP coordinates, split by focal allele")
+  fourier_save_plot(split_umap, region_id, "umap_split_by_haplotype", 12, 5)
+}
+```
+
+### Fourier Re/Im feature heatmap
+
+```{r fourier_re_im_heatmap, results="asis", echo=TRUE, eval=FALSE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  fourier_save_plot(fourier_matrix_plot(result$feat_mat, result, "features"),
+                   region_id, "fourier_re_im_heatmap", 14, 9)
+}
+```
+
+### Median power spectra by cluster
+
+```{r median_power_spectra_by_cluster, results="asis", echo=TRUE, eval=FALSE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  a <- result$assignments
+  x <- fourier_complex_results[[region_id]]
+  spectrum <- fft_results[[region_id]]
+  stopifnot(identical(spectrum$use_hann, x$use_hann))
+  cluster_colors <- cluster_id_palette(levels(a$cluster))
+  # aggregate per-read relative power
+  aggregate <- bind_rows(lapply(levels(a$cluster), function(cl) {
+    p <- spectrum$relative_power[a$RID[a$cluster == cl], , drop = FALSE]
+    data.frame(cluster = cl, period_bp = spectrum$periods_bp,
+      median_power = apply(p, 2, median), q25 = apply(p, 2, quantile, .25),
+      q75 = apply(p, 2, quantile, .75), n_reads = nrow(p))
+  }))
+  aggregate$cluster <- factor(aggregate$cluster, levels = levels(a$cluster))
+  spectra_plot <- ggplot(aggregate, aes(period_bp, median_power, color = cluster, fill = cluster)) +
+    geom_ribbon(aes(ymin = q25, ymax = q75), alpha = .2, color = NA) + geom_line(linewidth = .5) +
+    facet_wrap(~ cluster, ncol = 3) + scale_color_manual(values = cluster_colors) +
+    scale_fill_manual(values = cluster_colors) + scale_x_continuous(breaks = seq(0, max(x$periods_bp), 500)) +
+    theme_classic() + theme(legend.position = "none") +
+    labs(title = region_id, subtitle = "Median relative-power spectrum per Fourier cluster; ribbon = IQR",
+         x = "Spatial period (bp)", y = "Relative power")
+  fourier_save_plot(spectra_plot, region_id, "median_power_spectra_by_cluster", 12,
+                   max(5, 2.8 * ceiling(result$n_clusters / 3)))
+
+  fourier_leiden_results[[region_id]]$aggregate_spectra <- aggregate
+}
+```
+
+### Fourier phase by haplotype
+
+```{r phase_at_cluster_peak_by_haplotype, results="asis", echo=TRUE, eval=FALSE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  a <- result$assignments
+  x <- fourier_complex_results[[region_id]]
+  aggregate <- result$aggregate_spectra
+  allele_colors <- fiberseq_category_palette(levels(a$allele_display))
+  phase_plot_data <- bind_rows(lapply(levels(a$cluster), function(cl) {
+    ag <- aggregate[aggregate$cluster == cl, ]
+    peak_period <- max(ag$period_bp[ag$median_power == max(ag$median_power)])
+    peak_k <- match(peak_period, x$periods_bp)
+    reads <- a[a$cluster == cl, , drop = FALSE]
+    data.frame(reads, phase_radians = x$phase_radians[reads$RID, peak_k],
+      phase_period_bp = peak_period,
+      panel = paste0(cl, " | ", round(peak_period, 3), " bp"))
+  }))
+  phase_plot <- ggplot(phase_plot_data, aes(phase_radians, fill = allele_display)) +
+    geom_histogram(breaks = seq(-pi, pi, length.out = 25), position = "identity", alpha = .55, na.rm = TRUE) +
+    facet_wrap(~ panel, ncol = 3) + scale_fill_manual(values = allele_colors) +
+    scale_x_continuous(limits = c(-pi, pi), breaks = c(-pi, 0, pi), labels = c("-pi", "0", "pi")) +
+    theme_classic() + labs(title = region_id,
+      subtitle = "Phase at each cluster's median-spectrum peak; the same frequency is used for all reads in a panel",
+      caption = "Angles are circular: -pi and pi coincide. Phase is relative to the original Fourier window start; weak components have uncertain phase.",
+      x = "Fourier phase (radians)", y = "Reads", fill = "Focal SNP allele")
+  fourier_save_plot(phase_plot, region_id, "phase_at_cluster_peak_by_haplotype", 13,
+                   max(5, 2.8 * ceiling(result$n_clusters / 3)))
+
+  fourier_leiden_results[[region_id]]$phase_plot_data <- phase_plot_data
+}
+```
+
+### Cluster composition
+
+```{r cluster_haplotype_sample_composition, results="asis", echo=TRUE, eval=FALSE}
+for (region_id in names(fourier_leiden_results)) {
+  result <- fourier_leiden_results[[region_id]]
+  a <- result$assignments
+  allele_colors <- fiberseq_category_palette(levels(a$allele_display))
+  short_colors <- sample_palette(unique(a$sample_name))
+  composition <- plot_category_composition(result, "allele_display", allele_colors,
+    main = "Focal allele composition within each cluster", legend_title = "Focal SNP allele")
+  sample_composition <- plot_sample_composition(result, short_colors,
+    main = "Sample composition within each Fourier cluster")
+  fourier_save_plot(cowplot::plot_grid(composition, sample_composition, ncol = 1),
+                   region_id, "cluster_haplotype_sample_composition", 12, 10)
+}
+```
+
+### Read retention by region
+
+```{r read_retention_by_region, results="asis", echo=TRUE, eval=FALSE}
+retention_counts <- bind_rows(fourier_clustering_audits) %>% count(region_id, exclusion_reason)
+retention_plot <- ggplot(retention_counts, aes(region_id, n, fill = exclusion_reason)) +
+  geom_col() + coord_flip() + theme_classic() +
+  labs(title = "Read selection for Fourier-derived Leiden clustering", x = NULL, y = "Reads", fill = NULL)
+save_report_plot(file.path(fourier_clustering_dir, "read_retention_by_region.pdf"), retention_plot,
+       width = 12, height = 7, bg = "white")
+```

@@ -1,0 +1,327 @@
+---
+title: "LCL Fiber-seq: testing Leiden clustering parameters"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    self_contained: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+project_dir <- "/project/spott/cshan/fiber-seq"
+code_dir <- file.path(project_dir, "code/clustering_methods/Leiden_Manhattan")
+input_dir <- file.path(project_dir, "LCL_project/Leiden_manhattan")
+suppressPackageStartupMessages(library(dplyr))
+source(file.path(project_dir, "code/topic_model/topic_modelling_functions.r"), local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  cache = FALSE, dev = "png", dpi = 120, out.width = "100%",
+  fig.path = file.path(tempdir(), "testing-clustering-figures/"))
+options(scipen = 999)
+data.table::setDTthreads(2L)
+```
+
+<style>
+.main-container { max-width: 1700px; padding: 0 24px; }
+</style>
+
+# Region and fixed settings
+
+This notebook tests only the **rank-1 AS-FIRE region** selected in `leiden_LCL.Rmd`.
+It reads the existing clustering input and annotations, preserving the retained
+full-span, phased heterozygous reads, m6A sites, focal SNP, and sample information.
+Only the number of graph neighbours (`k`) and Leiden resolution change.
+
+Other settings remain unchanged: no binning, no imputation, Manhattan distance,
+the union k-nearest-neighbour graph, exponential affinity weights with automatic
+sigma (the mean retained neighbour distance), modularity objective, and seed 1.
+Automatic sigma is recalculated for each `k`, as in the original workflow.
+UMAP is calculated **once**, with Manhattan distance, 15 neighbours, minimum
+distance 0.1, random initialization, and the original plotting seed. Its
+coordinates are reused for every parameter pair.
+
+All results stay in memory. Running a figure chunk displays its plot. Knitting
+embeds plots in the self-contained HTML; temporary figure files are placed in
+R's temporary directory. No separate analysis tables, RDS files, or plot exports
+are written.
+
+```{r select-rank-one}
+signature <- readRDS(file.path(input_dir, "summary tables/selection_signature.rds"))
+region <- signature$regions[signature$regions$rank == 1L, , drop = FALSE]
+stopifnot(nrow(region) == 1L)
+result_paths <- readRDS(file.path(input_dir, "summary tables/fiberseq_result_paths.rds"))
+baseline <- fiberseq_display_result(readRDS(result_paths[[region$region_id]]))
+stopifnot(identical(baseline$region$region_id, region$region_id),
+  baseline$params$window_size == 0L, !baseline$params$impute_missing,
+  baseline$params$k_neighbors == 10L, baseline$params$resolution == 1,
+  baseline$params$seed == 1L,
+  identical(rownames(baseline$feat_mat), baseline$assignments$RID),
+  !anyNA(baseline$feat_mat))
+knitr::kable(region[, c("rank", "region_id", "focal_snp", "peak_name",
+  "analysis_start", "analysis_end")])
+```
+
+# Five parameter pairs
+
+The preliminary sweep produced 1, 2, 3, 5, and 6 clusters for these pairs,
+respectively. The table below is recalculated when this notebook runs.
+Cluster labels are assigned by decreasing size independently for each pair:
+the same colour across panels does not imply identical cluster membership.
+
+```{r cluster-five-pairs}
+parameter_pairs <- data.frame(
+  k = c(10L, 10L, 5L, 10L, 5L),
+  resolution = c(0.1, 1, 1, 1.5, 1.5))
+parameter_pairs$label <- sprintf("k = %d; resolution = %g",
+  parameter_pairs$k, parameter_pairs$resolution)
+
+# Use the saved feature matrix directly, so the reads and features cannot change.
+graphs <- setNames(lapply(unique(parameter_pairs$k), function(k) {
+  manhattan_knn_graph(baseline$feat_mat, k_neighbors = k,
+    sigma = NULL, verbose = FALSE)
+}), as.character(unique(parameter_pairs$k)))
+
+results <- lapply(seq_len(nrow(parameter_pairs)), function(i) {
+  pair <- parameter_pairs[i, ]
+  knn <- graphs[[as.character(pair$k)]]
+  part <- leiden_partition(knn$graph, resolution = pair$resolution,
+    n_iterations = -1L, seed = baseline$params$seed)
+  membership <- part$membership[baseline$assignments$RID]
+  stopifnot(!anyNA(membership))
+  cluster_order <- names(sort(table(membership), decreasing = TRUE))
+  result <- baseline
+  result$assignments$cluster <- factor(
+    paste0("cluster", match(as.character(membership), cluster_order)),
+    levels = paste0("cluster", seq_along(cluster_order)))
+  result$n_clusters <- length(cluster_order)
+  result$profiles <- do.call(rbind, lapply(levels(result$assignments$cluster), function(cl) {
+    colMeans(result$feat_mat[result$assignments$cluster == cl, , drop = FALSE])
+  }))
+  rownames(result$profiles) <- levels(result$assignments$cluster)
+  result$graph <- knn$graph
+  result$params$k_neighbors <- pair$k
+  result$params$k_eff <- knn$k_eff
+  result$params$resolution <- pair$resolution
+  result$params$sigma <- knn$sigma
+  result$params$mean_knn_dist <- knn$mean_knn_dist
+  result$params$quality <- part$quality
+  # The saved signature describes the baseline, not this in-memory rerun.
+  result$analysis_signature <- NULL
+  result
+})
+names(results) <- parameter_pairs$label
+baseline_index <- which(parameter_pairs$k == 10L & parameter_pairs$resolution == 1)
+stopifnot(identical(results[[baseline_index]]$assignments, baseline$assignments),
+  all(vapply(results, function(x) identical(x$feat_mat, baseline$feat_mat), logical(1))))
+parameter_pairs$n_clusters <- vapply(results, function(x) x$n_clusters, integer(1))
+parameter_pairs$smallest_cluster <- vapply(results, function(x)
+  min(as.integer(table(x$assignments$cluster))), integer(1))
+parameter_pairs$largest_cluster <- vapply(results, function(x)
+  max(as.integer(table(x$assignments$cluster))), integer(1))
+knitr::kable(parameter_pairs[, c("k", "resolution", "n_clusters",
+  "smallest_cluster", "largest_cluster")])
+cat("Retained reads:", nrow(baseline$feat_mat),
+  " | m6A features:", ncol(baseline$feat_mat),
+  " | Baseline assignments reproduced exactly.\n")
+```
+
+```{r prepare-fixed-embedding-and-footprints}
+fixed_embedding <- fiberseq_umap(baseline, seed = signature$view_params$seed,
+  n_neighbors = 15L, min_dist = 0.1)
+fixed_embedding <- fixed_embedding[, c("RID", "UMAP1", "UMAP2")]
+stopifnot(identical(fixed_embedding$RID, baseline$assignments$RID))
+
+# These two requested figure types use 130-160 bp nucleosomes and m6A.
+# Extract nucleosomes once, without invoking any cache or export functions.
+selected_samples <- lcl_region_samples(region, signature$sample_table)
+footprints <- extract_nucleosomes(selected_samples, region, baseline$assignments)
+all_sample_colors <- sample_palette(signature$sample_table$sample_name)
+short_colors <- all_sample_colors[names(all_sample_colors) %in%
+  sub("_.*$", "", baseline$assignments$sample_name)]
+sample_names <- signature$sample_table$sample_name
+sample_colors <- setNames(unname(all_sample_colors[sub("_.*$", "", sample_names)]), sample_names)
+sample_colors <- sample_colors[names(sample_colors) %in% baseline$assignments$sample_name]
+```
+
+# Fixed UMAP coloured by clustering result
+
+Every point represents the same read at the same coordinates in all five panels.
+The UMAP neighbour setting remains 15; `k` in each title refers to the clustering
+graph only.
+
+```{r fixed-umap, fig.width=16, fig.height=10}
+umap_panels <- lapply(seq_along(results), function(i) {
+  result <- results[[i]]
+  embedding <- data.frame(result$assignments, fixed_embedding[, c("UMAP1", "UMAP2")])
+  plot_umap(embedding, "cluster",
+    cluster_id_palette(levels(result$assignments$cluster)),
+    paste0(parameter_pairs$label[i], "\n", result$n_clusters, " clusters"),
+    show_legend = TRUE)
+})
+print(cowplot::plot_grid(plotlist = umap_panels, ncol = 2))
+```
+
+# Heatmap of number of clusters
+
+Only the five selected pairs are tested here. The grey cell is untested.
+
+```{r cluster-count-heatmap, fig.width=8, fig.height=5}
+count_grid <- merge(expand.grid(k = sort(unique(parameter_pairs$k)),
+  resolution = sort(unique(parameter_pairs$resolution))),
+  parameter_pairs[, c("k", "resolution", "n_clusters")],
+  by = c("k", "resolution"), all.x = TRUE)
+count_grid$label <- ifelse(is.na(count_grid$n_clusters), "Not tested", count_grid$n_clusters)
+ggplot2::ggplot(count_grid, ggplot2::aes(factor(resolution), factor(k), fill = n_clusters)) +
+  ggplot2::geom_tile(color = "white", linewidth = 1) +
+  ggplot2::geom_text(ggplot2::aes(label = label), size = 5) +
+  ggplot2::scale_fill_gradient(low = "#eff3ff", high = "#6baed6",
+    na.value = "grey90", breaks = sort(unique(parameter_pairs$n_clusters))) +
+  ggplot2::labs(x = "Leiden resolution", y = "Number of graph neighbours (k)",
+    fill = "Clusters", title = paste(region$focal_snp, "— number of clusters")) +
+  ggplot2::coord_equal() + ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(panel.grid = ggplot2::element_blank())
+```
+
+# Per-pair figures
+
+`fiberseq_haplotype_example` combines the fixed UMAP coloured by cluster, sample,
+and focal allele; cluster proportions; per-cluster m6A and nucleosome profiles;
+and within-cluster sample and allele proportions, matching the original layout.
+
+`heatmap_m6a_footprints` uses the original genomic heatmap function and settings:
+m6A calls per read, cluster/sample/focal-allele annotations, and m6A profiles above
+the heatmap. Despite its original filename, this heatmap does not overlay
+footprint intervals. Nucleosome occupancy is shown in the haplotype example.
+
+```{r figure-helpers}
+# Assemble the original haplotype-example layout without its file-saving wrapper.
+fiberseq_haplotype_example <- function(result, title) {
+  tables <- fiberseq_tables(result, footprints)
+  cluster_colors <- cluster_id_palette(tables$groups)
+  allele_colors <- fiberseq_category_palette(result$allele_display_levels)
+  profiles <- plot_fiberseq_profiles(tables, result$region, result$markers,
+    cluster_colors, sample_colors, allele_colors, title)
+  stopifnot(identical(fixed_embedding$RID, result$assignments$RID))
+  embedding <- data.frame(result$assignments, fixed_embedding[, c("UMAP1", "UMAP2")])
+  pc <- plot_umap(embedding, "cluster", cluster_colors, "UMAP: cluster")
+  ps <- plot_umap(embedding, "sample_name", sample_colors, "UMAP: LCL sample")
+  pa <- plot_umap(embedding, "allele_display", allele_colors, "UMAP: Focal SNP allele")
+  counts <- tables$counts
+  counts$cluster <- factor(counts$cluster, levels = tables$groups)
+  counts$label <- sprintf("%s\nn=%d (%.1f%%)", counts$cluster, counts$n_reads, 100 * counts$proportion)
+  rgb <- grDevices::col2rgb(cluster_colors) / 255
+  text_colors <- setNames(ifelse(colSums(rgb * c(.299, .587, .114)) < .5,
+    "white", "black"), names(cluster_colors))
+  pie <- ggplot2::ggplot(counts, ggplot2::aes(x = "", y = proportion, fill = cluster)) +
+    ggplot2::geom_col(width = 1, color = "white", position = ggplot2::position_stack(reverse = TRUE)) +
+    ggplot2::geom_text(ggplot2::aes(label = ifelse(proportion >= .03,
+      sprintf("%.1f%%", 100 * proportion), ""), color = cluster),
+      position = ggplot2::position_stack(vjust = .5, reverse = TRUE), size = 3) +
+    ggplot2::scale_color_manual(values = text_colors, guide = "none") +
+    ggplot2::coord_polar(theta = "y") +
+    ggplot2::scale_fill_manual(values = cluster_colors, labels = counts$label) +
+    ggplot2::labs(title = paste0("Cluster proportions: ", nrow(embedding), " reads"), fill = NULL) +
+    ggplot2::theme_void() + ggplot2::theme(legend.position = "right",
+      legend.text = ggplot2::element_text(size = 8))
+  cluster_labels <- paste0(tables$groups, " (n=", tables$counts$n_reads, ")")
+  legends <- list(fiberseq_legend(cluster_colors, "Cluster", 5, cluster_labels),
+    fiberseq_legend(sample_colors, "LCL sample", 6, sub("_.*$", "", names(sample_colors))),
+    fiberseq_legend(allele_colors, "Focal SNP allele", 3))
+  lh <- vapply(legends, fiberseq_legend_height, numeric(1))
+  heading <- cowplot::ggdraw() + cowplot::draw_label(
+    paste(result$region$annotation, title, sep = "\n"), size = 12)
+  overview <- cowplot::plot_grid(plotlist = c(list(heading,
+    cowplot::plot_grid(pc, ps, pa, pie, ncol = 2)), legends),
+    ncol = 1, rel_heights = c(.65, 8, lh))
+  cowplot::plot_grid(overview, profiles$plot, ncol = 1,
+    rel_heights = c(8.65 + sum(lh), profiles$height))
+}
+
+heatmap_m6a_footprints <- function(result, title) {
+  heatmap <- plot_genomic_cluster_heatmap(result, result$region, short_colors,
+    include_haplotype = TRUE, variants = result$variants,
+    show_cluster_profiles = TRUE, cluster_label = title)
+  ComplexHeatmap::draw(heatmap)
+  invisible(NULL)
+}
+```
+
+## k = 10, resolution = 0.1
+
+### fiberseq_haplotype_example
+
+```{r haplotype-k10-resolution01, fig.width=16, fig.height=18}
+print(fiberseq_haplotype_example(results[[1]], parameter_pairs$label[1]))
+```
+
+### heatmap_m6a_footprints
+
+```{r heatmap-k10-resolution01, fig.width=14, fig.height=11.55}
+heatmap_m6a_footprints(results[[1]], parameter_pairs$label[1])
+```
+
+## k = 10, resolution = 1 (baseline)
+
+### fiberseq_haplotype_example
+
+```{r haplotype-k10-resolution1, fig.width=16, fig.height=19.5}
+print(fiberseq_haplotype_example(results[[2]], parameter_pairs$label[2]))
+```
+
+### heatmap_m6a_footprints
+
+```{r heatmap-k10-resolution1, fig.width=14, fig.height=12.1}
+heatmap_m6a_footprints(results[[2]], parameter_pairs$label[2])
+```
+
+## k = 5, resolution = 1
+
+### fiberseq_haplotype_example
+
+```{r haplotype-k5-resolution1, fig.width=16, fig.height=21}
+print(fiberseq_haplotype_example(results[[3]], parameter_pairs$label[3]))
+```
+
+### heatmap_m6a_footprints
+
+```{r heatmap-k5-resolution1, fig.width=14, fig.height=12.65}
+heatmap_m6a_footprints(results[[3]], parameter_pairs$label[3])
+```
+
+## k = 10, resolution = 1.5
+
+### fiberseq_haplotype_example
+
+```{r haplotype-k10-resolution15, fig.width=16, fig.height=24}
+print(fiberseq_haplotype_example(results[[4]], parameter_pairs$label[4]))
+```
+
+### heatmap_m6a_footprints
+
+```{r heatmap-k10-resolution15, fig.width=14, fig.height=13.75}
+heatmap_m6a_footprints(results[[4]], parameter_pairs$label[4])
+```
+
+## k = 5, resolution = 1.5
+
+### fiberseq_haplotype_example
+
+```{r haplotype-k5-resolution15, fig.width=16, fig.height=25.5}
+print(fiberseq_haplotype_example(results[[5]], parameter_pairs$label[5]))
+```
+
+### heatmap_m6a_footprints
+
+```{r heatmap-k5-resolution15, fig.width=14, fig.height=14.3}
+heatmap_m6a_footprints(results[[5]], parameter_pairs$label[5])
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

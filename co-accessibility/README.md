@@ -47,7 +47,7 @@ one-flag rerun. The value used is recorded in every output row.
 ## Pipeline
 
 ```
-make_gencode_v46_all_tss.sh  ->  01_make_cre_universe.sh  ->  02_read_spans.sh
+make_gencode_v46_all_tss.sh  ->  01_make_fire_universe.sh  ->  02_read_spans.sh
                                        ->  03_coaccess_cres.py  ->  coaccess_examples.Rmd
 ```
 
@@ -59,7 +59,7 @@ and the `Ensembl_canonical` subset used as gene anchors:
 - `/project/spott/cshan/annotations/gencode.v46.annotation_all_tss.bed` (254,070 transcript TSSs)
 - `/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed` (63,086 canonical TSSs, one per gene)
 
-### 1. `01_make_cre_universe.sh` — the shared element universe
+### 1. `01_make_fire_universe.sh` — the shared element universe
 
 Run once. A few minutes; no `sbatch` needed.
 
@@ -216,7 +216,7 @@ cd /project/spott/cshan/fiber-seq/code/co-accessibility
 bash make_gencode_v46_all_tss.sh
 
 # 1. shared cCRE universe (once)
-bash 01_make_cre_universe.sh
+bash 01_make_fire_universe.sh
 
 # 2. genome-wide fiber spans, four timepoints in parallel (~25 min each)
 sbatch 02_read_spans.sh

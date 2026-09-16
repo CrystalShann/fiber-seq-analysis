@@ -13,7 +13,7 @@ the sense direction always points right). Per (window, bin) and timepoint:
     n_mod     called m6A read x site events (calls landing on a reference A/T)
     m6a       n_mod / n_cov
 
-i.e. the same accessibility definition as 04_m6a_binned.py; parsing follows it
+i.e. the same accessibility definition as 06_m6a_binned.py; parsing follows it
 too: the first and last BED12 blocks are ft extract sentinels (dropped), split
 reads are deduped keeping the longest alignment per read name, and calls not on
 a reference A/T are counted off-site and excluded. Reads are pulled through the
