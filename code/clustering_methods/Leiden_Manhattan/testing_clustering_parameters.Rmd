@@ -1,0 +1,236 @@
+---
+title: "LCL Fiber-seq: testing Leiden clustering parameters"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    self_contained: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+project_dir <- "/project/spott/cshan/fiber-seq"
+code_dir <- file.path(project_dir, "code/clustering_methods/Leiden_Manhattan")
+input_dir <- file.path(project_dir, "LCL_project/Leiden_manhattan")
+suppressPackageStartupMessages(library(dplyr))
+source(file.path(project_dir, "code/topic_model/topic_modelling_functions.r"), local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  cache = FALSE, dev = "png", dpi = 120, out.width = "100%",
+  fig.path = file.path(tempdir(), "testing-clustering-figures/"))
+options(scipen = 999)
+data.table::setDTthreads(2L)
+```
+
+<style>
+.main-container { max-width: 1700px; padding: 0 24px; }
+</style>
+
+# Region and fixed settings
+
+This notebook tests only the **rank-1 AS-FIRE region** selected for Leiden clustering.
+  - the variables are the number of graph neighbours (`k`) and Leiden resolution change.
+
+
+```{r select-rank-one}
+signature <- readRDS(file.path(input_dir, "summary tables/selection_signature.rds"))
+region <- signature$regions[signature$regions$rank == 1L, , drop = FALSE]
+stopifnot(nrow(region) == 1L)
+result_paths <- readRDS(file.path(input_dir, "summary tables/fiberseq_result_paths.rds"))
+baseline <- fiberseq_display_result(readRDS(result_paths[[region$region_id]]))
+stopifnot(identical(baseline$region$region_id, region$region_id),
+  baseline$params$window_size == 0L, !baseline$params$impute_missing,
+  baseline$params$k_neighbors == 10L, baseline$params$resolution == 1,
+  baseline$params$seed == 1L,
+  identical(rownames(baseline$feat_mat), baseline$assignments$RID),
+  !anyNA(baseline$feat_mat))
+knitr::kable(region[, c("rank", "region_id", "focal_snp", "peak_name",
+  "analysis_start", "analysis_end")])
+```
+
+# Parameters
+
+Every combination of six neighbour counts and seven resolutions is clustered,
+extending the earlier test towards larger `k` and smaller resolutions
+
+
+```{r cluster-parameter-sweep}
+k_values <- c(5L, 10L, 15L, 20L, 30L, 50L)
+resolution_values <- c(0.01, 0.05, 0.1, 0.25, 0.5, 1, 1.5)
+
+parameter_pairs <- expand.grid(resolution = resolution_values, k = k_values)[, c("k", "resolution")]
+parameter_pairs$label <- sprintf("k = %d; resolution = %g",
+  parameter_pairs$k, parameter_pairs$resolution)
+
+
+graphs <- setNames(lapply(k_values, function(k) {
+  manhattan_knn_graph(baseline$feat_mat, k_neighbors = k,
+    sigma = NULL, verbose = FALSE)
+}), as.character(k_values))
+
+results <- lapply(seq_len(nrow(parameter_pairs)), function(i) {
+  pair <- parameter_pairs[i, ]
+  knn <- graphs[[as.character(pair$k)]]
+  part <- leiden_partition(knn$graph, resolution = pair$resolution,
+    n_iterations = -1L, seed = baseline$params$seed)
+  membership <- part$membership[baseline$assignments$RID]
+  stopifnot(!anyNA(membership))
+  cluster_order <- names(sort(table(membership), decreasing = TRUE))
+  result <- baseline
+  result$assignments$cluster <- factor(
+    paste0("cluster", match(as.character(membership), cluster_order)),
+    levels = paste0("cluster", seq_along(cluster_order)))
+  result$n_clusters <- length(cluster_order)
+  result$profiles <- do.call(rbind, lapply(levels(result$assignments$cluster), function(cl) {
+    colMeans(result$feat_mat[result$assignments$cluster == cl, , drop = FALSE])
+  }))
+  rownames(result$profiles) <- levels(result$assignments$cluster)
+  result$graph <- knn$graph
+  result$params$k_neighbors <- pair$k
+  result$params$k_eff <- knn$k_eff
+  result$params$resolution <- pair$resolution
+  result$params$sigma <- knn$sigma
+  result$params$mean_knn_dist <- knn$mean_knn_dist
+  result$params$quality <- part$quality
+
+  result$analysis_signature <- NULL
+  result
+})
+names(results) <- parameter_pairs$label
+baseline_index <- which(parameter_pairs$k == 10L & parameter_pairs$resolution == 1)
+stopifnot(length(baseline_index) == 1L,
+  identical(results[[baseline_index]]$assignments, baseline$assignments),
+  all(vapply(results, function(x) identical(x$feat_mat, baseline$feat_mat), logical(1))))
+parameter_pairs$n_clusters <- vapply(results, function(x) x$n_clusters, integer(1))
+parameter_pairs$smallest_cluster <- vapply(results, function(x)
+  min(as.integer(table(x$assignments$cluster))), integer(1))
+parameter_pairs$largest_cluster <- vapply(results, function(x)
+  max(as.integer(table(x$assignments$cluster))), integer(1))
+knitr::kable(parameter_pairs[, c("k", "resolution", "n_clusters",
+  "smallest_cluster", "largest_cluster")], row.names = FALSE)
+cat("Retained reads:", nrow(baseline$feat_mat),
+  " | m6A features:", ncol(baseline$feat_mat),
+  " | Baseline assignments reproduced exactly.\n")
+```
+
+# Heatmap of number of clusters
+
+Every cell of the sweep is tested.
+
+```{r cluster-count-heatmap, fig.width=9, fig.height=6}
+ggplot2::ggplot(parameter_pairs,
+    ggplot2::aes(factor(resolution), factor(k), fill = n_clusters)) +
+  ggplot2::geom_tile(color = "white", linewidth = 1) +
+  ggplot2::geom_text(ggplot2::aes(label = n_clusters), size = 4) +
+  ggplot2::scale_fill_gradient(low = "#eff3ff", high = "#6baed6") +
+  ggplot2::labs(x = "Leiden resolution", y = "Number of graph neighbours (k)",
+    fill = "Clusters", title = paste(region$focal_snp, "— number of clusters")) +
+  ggplot2::coord_equal() + ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(panel.grid = ggplot2::element_blank())
+```
+
+# Per-pair figures
+
+
+```{r prepare-footprints}
+# These two requested figure types use 130-160 bp nucleosomes and m6A.
+# Extract nucleosomes once, without invoking any cache or export functions.
+selected_samples <- lcl_region_samples(region, signature$sample_table)
+footprints <- extract_nucleosomes(selected_samples, region, baseline$assignments)
+all_sample_colors <- sample_palette(signature$sample_table$sample_name)
+short_colors <- all_sample_colors[names(all_sample_colors) %in%
+  sub("_.*$", "", baseline$assignments$sample_name)]
+sample_names <- signature$sample_table$sample_name
+sample_colors <- setNames(unname(all_sample_colors[sub("_.*$", "", sample_names)]), sample_names)
+sample_colors <- sample_colors[names(sample_colors) %in% baseline$assignments$sample_name]
+```
+
+```{r figure-helpers}
+# Assemble the original haplotype-example layout without its file-saving wrapper
+# and without the UMAP panels. Returns the plot with the figure height it needs.
+fiberseq_haplotype_example <- function(result, title) {
+  tables <- fiberseq_tables(result, footprints)
+  cluster_colors <- cluster_id_palette(tables$groups)
+  allele_colors <- fiberseq_category_palette(result$allele_display_levels)
+  profiles <- plot_fiberseq_profiles(tables, result$region, result$markers,
+    cluster_colors, sample_colors, allele_colors, title)
+  counts <- tables$counts
+  counts$cluster <- factor(counts$cluster, levels = tables$groups)
+  counts$label <- sprintf("%s\nn=%d (%.1f%%)", counts$cluster, counts$n_reads, 100 * counts$proportion)
+  rgb <- grDevices::col2rgb(cluster_colors) / 255
+  text_colors <- setNames(ifelse(colSums(rgb * c(.299, .587, .114)) < .5,
+    "white", "black"), names(cluster_colors))
+  pie <- ggplot2::ggplot(counts, ggplot2::aes(x = "", y = proportion, fill = cluster)) +
+    ggplot2::geom_col(width = 1, color = "white", position = ggplot2::position_stack(reverse = TRUE)) +
+    ggplot2::geom_text(ggplot2::aes(label = ifelse(proportion >= .03,
+      sprintf("%.1f%%", 100 * proportion), ""), color = cluster),
+      position = ggplot2::position_stack(vjust = .5, reverse = TRUE), size = 3) +
+    ggplot2::scale_color_manual(values = text_colors, guide = "none") +
+    ggplot2::coord_polar(theta = "y") +
+    ggplot2::scale_fill_manual(values = cluster_colors, labels = counts$label) +
+    ggplot2::labs(title = paste0("Cluster proportions: ", nrow(result$assignments), " reads"), fill = NULL) +
+    ggplot2::theme_void() + ggplot2::theme(legend.position = "right",
+      legend.text = ggplot2::element_text(size = 8))
+  heading <- cowplot::ggdraw() + cowplot::draw_label(
+    paste(result$region$annotation, title, sep = "\n"), size = 12)
+  overview <- cowplot::plot_grid(heading, pie, ncol = 1, rel_heights = c(.65, 4))
+  heights <- c(4.65, profiles$height)
+  # Row heights are relative; 1.35 inch per unit keeps the original row density.
+  list(plot = cowplot::plot_grid(overview, profiles$plot, ncol = 1, rel_heights = heights),
+    height = min(1.35 * sum(heights), 40))
+}
+
+heatmap_m6a_footprints <- function(result, title) {
+  heatmap <- plot_genomic_cluster_heatmap(result, result$region, short_colors,
+    include_haplotype = TRUE, variants = result$variants,
+    show_cluster_profiles = TRUE, cluster_label = title)
+  ComplexHeatmap::draw(heatmap)
+  invisible(NULL)
+}
+
+detail_index <- sort(union(which(!duplicated(parameter_pairs$n_clusters)), baseline_index))
+```
+
+```{r per-pair-figures, results="asis"}
+knitting <- isTRUE(getOption("knitr.in.progress"))
+for (i in detail_index) {
+  result <- results[[i]]
+  label <- parameter_pairs$label[i]
+  hap <- fiberseq_haplotype_example(result, label)
+  if (!knitting) {
+    # Interactive run: show the figures directly instead of generating sections.
+    print(hap$plot)
+    heatmap_m6a_footprints(result, label)
+    next
+  }
+  slug <- sprintf("k%d-res%s", parameter_pairs$k[i],
+    sub(".", "p", format(parameter_pairs$resolution[i]), fixed = TRUE))
+  cat(knitr::knit_child(text = c(
+    sprintf("## %s%s", label, if (i == baseline_index) " (baseline)" else ""),
+    "",
+    sprintf("%d clusters.", result$n_clusters),
+    "",
+    "### fiberseq_haplotype_example",
+    "",
+    sprintf("```{r haplotype-%s, fig.width=16, fig.height=%.2f, echo=FALSE}", slug, hap$height),
+    "print(hap$plot)",
+    "```",
+    "",
+    "### heatmap_m6a_footprints",
+    "",
+    sprintf("```{r heatmap-%s, fig.width=14, fig.height=%.2f, echo=FALSE}",
+      slug, min(11 + .55 * result$n_clusters, 40)),
+    "heatmap_m6a_footprints(result, label)",
+    "```", ""),
+    envir = environment(), quiet = TRUE), sep = "\n")
+}
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

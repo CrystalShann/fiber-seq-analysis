@@ -1,0 +1,820 @@
+---
+title: "LCL Fiber-seq: top 10 heterozygous AS-FIRE regions"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    self_contained: true
+params:
+  regenerate_plots: true
+---
+
+```{r lcl-knit, include=FALSE}
+knit_report <- function(inputFile, encoding = "UTF-8") {
+  lines <- readLines(inputFile, warn = FALSE)
+  start <- which(trimws(lines) == "```{r lcl-output-loader}")
+  stopifnot(length(start) == 1L)
+  end <- which(seq_along(lines) > start & trimws(lines) == "```")[1L]
+  stopifnot(!is.na(end), end > start + 1L)
+  eval(parse(text = lines[seq.int(start + 1L, end - 1L)]))
+  source_lcl_output_config(inputFile)
+  source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r", local = TRUE)
+  source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", local = TRUE)
+  source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r", local = TRUE)
+  # RStudio's Knit button uses a separate report for the top-ten analysis.
+  render_report <- function(input, ...) {
+    root <- lcl_output_path(LCL_TOP10_ROOT)
+    dir.create(root, recursive = TRUE, showWarnings = FALSE)
+    intermediates <- lcl_output_path(file.path(root, "report_intermediates"))
+    dir.create(intermediates, recursive = TRUE, showWarnings = FALSE)
+    rmarkdown::render(input, output_file = "leiden_LCL_top10_asfire_het_2kb.html",
+      output_dir = "/project/spott/cshan/fiber-seq/code/docs",
+      intermediates_dir = intermediates, knit_root_dir = root, ...)
+  }
+  render_report(inputFile, encoding = encoding)
+}
+```
+
+```{r manual-render, eval=FALSE, include=FALSE}
+knit_report("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_LCL.Rmd")
+```
+
+```{r lcl-output-loader}
+#| include: false
+source_lcl_output_config <- function(notebook, envir = parent.frame()) {
+  lines <- readLines(notebook, warn = FALSE)
+  start <- which(trimws(lines) == "```{r lcl-output-config}")
+  if (length(start) != 1L) stop("Expected one LCL output configuration chunk")
+  end <- which(seq_along(lines) > start & trimws(lines) == "```")[1L]
+  if (is.na(end) || end <= start + 1L) stop("Missing LCL output configuration code")
+  eval(parse(text = lines[seq.int(start + 1L, end - 1L)]), envir = envir)
+  invisible(NULL)
+}
+```
+
+```{r lcl-output-config}
+#| include: false
+LCL_OUTPUT_ROOT <- "/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan"
+LCL_TOP10_ROOT <- Sys.getenv("LCL_REPORT_ROOT", unset = LCL_OUTPUT_ROOT)
+lcl_output_path <- function(path) {
+  if (any(strsplit(path, "/", fixed = TRUE)[[1]] %in% c(".", "..")))
+    stop("Output path must not contain dot components")
+  root <- normalizePath(LCL_OUTPUT_ROOT, mustWork = TRUE)
+  ancestor <- path
+  suffix <- character()
+  while (!file.exists(ancestor)) {
+    suffix <- c(basename(ancestor), suffix)
+    parent <- dirname(ancestor)
+    if (identical(parent, ancestor)) stop("Cannot resolve output path")
+    ancestor <- parent
+  }
+  resolved <- do.call(file.path, as.list(c(normalizePath(ancestor), suffix)))
+  if (!(identical(resolved, root) || startsWith(resolved, paste0(root, "/"))))
+    stop("Output must be inside ", root, ": ", path)
+  resolved
+}
+```
+
+The AS-FIRE analyses use only fully spanning, read-level phased heterozygotes:
+HP1/HP2, a focal-SNP genotype of `0|1` or `1|0`, and a resolved SNP allele.
+`lcl_filter_focal_heterozygotes()` applies this requirement before Manhattan
+clustering for every selected region. Fourier and autocorrelation now apply
+the same filter before their transforms, so their summaries and plots also
+exclude unphased, unresolved and nonheterozygous reads. This policy applies to
+future AS-FIRE regions as well; each must supply focal-SNP and sample metadata.
+The promoter analysis below instead pools all fully spanning reads without phasing.
+
+```{r setup, include=FALSE}
+code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
+suppressPackageStartupMessages(library(dplyr))
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", local = TRUE)
+source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
+output_dir <- lcl_output_path(LCL_TOP10_ROOT)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  fig.path = file.path(output_dir, "report_figures/"), dev = "pdf", cache = FALSE)
+options(scipen = 999)
+data.table::setDTthreads(2L)
+```
+
+
+
+knn plot colored by alleles
+```{r plot-knn-by-allele, include=TRUE}
+plot_knn_allele_composition <- function(summary, main = NULL) {
+  composition <- summary$composition
+  counts <- tapply(composition$n_reads, composition$group, sum)
+  ggplot2::ggplot(composition, ggplot2::aes(group, fraction, fill = allele)) +
+    ggplot2::geom_col(width = 0.75, position = ggplot2::position_stack(reverse = TRUE)) +
+    ggplot2::geom_text(ggplot2::aes(label = ifelse(fraction >= 0.05, scales::percent(fraction, accuracy = 1), "")),
+      position = ggplot2::position_stack(vjust = 0.5, reverse = TRUE), color = "white", size = 3) +
+    ggplot2::scale_fill_manual(values = fiberseq_category_palette(summary$allele_levels), drop = FALSE) +
+    ggplot2::scale_x_discrete(labels = function(labels) paste0(labels, "\n(n=", counts[labels], ")")) +
+    ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, 1),
+      expand = ggplot2::expansion(mult = c(0, 0.02))) +
+    ggplot2::labs(title = main, x = "Leiden cluster", y = "Proportion of retained reads", fill = "Focal SNP allele",
+      subtitle = "All reads: region-wide baseline; each bar sums to 100%") +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+}
+
+plot_knn_allele_connectivity <- function(summary, main = NULL) {
+  connectivity <- summary$connectivity
+  connected <- connectivity[connectivity$n_reads_with_neighbors > 0L, , drop = FALSE]
+  if (!nrow(connected)) stop("No reads have neighbors in the saved KNN graph")
+  bars <- dplyr::bind_rows(
+    data.frame(allele = connected$allele, relationship = "Same allele", fraction = connected$same_fraction),
+    data.frame(allele = connected$allele, relationship = "Opposite allele", fraction = connected$opposite_fraction))
+  bars$relationship <- factor(bars$relationship, levels = c("Same allele", "Opposite allele"))
+  counts <- setNames(connectivity$n_reads_with_neighbors, as.character(connectivity$allele))
+  ggplot2::ggplot(bars, ggplot2::aes(allele, fraction, fill = relationship)) +
+    ggplot2::geom_col(width = 0.65, position = ggplot2::position_stack(reverse = TRUE)) +
+    ggplot2::geom_text(ggplot2::aes(label = ifelse(fraction >= 0.05, scales::percent(fraction, accuracy = 1), "")),
+      position = ggplot2::position_stack(vjust = 0.5, reverse = TRUE), color = "white", size = 3) +
+    ggplot2::geom_point(data = connected, ggplot2::aes(x = allele, y = expected_same_fraction),
+      inherit.aes = FALSE, shape = 23, size = 3, fill = "white", color = "black") +
+    ggplot2::scale_fill_manual(values = c("Same allele" = "#0072B2", "Opposite allele" = "#D55E00"), drop = FALSE) +
+    ggplot2::scale_x_discrete(labels = function(labels) paste0(labels, "\n(n=", counts[labels], ")")) +
+    ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, 1),
+      expand = ggplot2::expansion(mult = c(0, 0.02))) +
+    ggplot2::labs(title = main, x = "Source read's focal SNP allele", y = "Mean fraction of neighbors", fill = "Neighbor relationship",
+      subtitle = "Unweighted neighbor fractions, averaged equally across reads within each allele",
+      caption = paste0("Uses all undirected graph neighbors, including connections between Leiden clusters.\n",
+        "Diamonds: region-wide random-mixing baseline excluding the source read, not a significance test.\n",
+        sum(connectivity$n_isolated_reads), " isolated reads excluded from connectivity means; retained in composition bars.")) +
+    ggplot2::theme_bw(base_size = 11)
+}
+
+```
+
+```{r lcl-figure-helpers, include=FALSE}
+save_plots <- function(result, footprints, sample_colors, output_dir, include_haplotype = FALSE) {
+  output_dir <- lcl_output_path(output_dir)
+  plot_dir <- file.path(output_dir, "plots")
+  dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(file.path(plot_dir, "knn_graph.pdf"), plot_knn_graph(result),
+    width = 12, height = 9, bg = "white")
+  signals <- signal_profiles(result, footprints)
+  profiles <- signals$profiles
+  records <- signals$records
+  matched <- match(records$RID, result$assignments$RID)
+  for (column in intersect(c("cluster", "sample_name", "haplotype", "phase_set", "group_id"),
+                           names(result$assignments))) records[[column]] <- result$assignments[[column]][matched]
+  summary <- methylation_by_cluster(result)
+  ggplot2::ggsave(file.path(plot_dir, "methylation_proportion_by_cluster.pdf"),
+    plot_methylation_by_cluster(summary, result$region), width = 8, height = 4.5)
+  heatmap_file <- if (include_haplotype) "heatmap_m6a_footprints.pdf" else "heatmap_m6a.pdf"
+  heatmap_height <- if (include_haplotype) 11 + 0.55 * result$n_clusters else 11
+  heatmap <- plot_genomic_cluster_heatmap(result, result$region, sample_colors,
+    include_haplotype = include_haplotype, variants = result$variants,
+    show_cluster_profiles = include_haplotype)
+  grDevices::pdf(file.path(plot_dir, heatmap_file), width = 14, height = heatmap_height)
+  tryCatch(ComplexHeatmap::draw(heatmap, newpage = FALSE), finally = grDevices::dev.off())
+  ggplot2::ggsave(file.path(plot_dir, "fig1_read_footprints.pdf"),
+    plot_smf_reads(result, records, sample_colors, include_haplotype = include_haplotype),
+    width = 12, height = max(7, 0.03 * nrow(result$assignments) + 3.5 + 0.3 * result$n_clusters), limitsize = FALSE)
+  ggplot2::ggsave(file.path(plot_dir, "fig2_occupancy_by_cluster.pdf"),
+    plot_signal_profile(profiles, result$region, levels(result$assignments$cluster)),
+    width = 10, height = 1.4 * result$n_clusters + 2.5, limitsize = FALSE)
+  ggplot2::ggsave(file.path(plot_dir, "cluster_sample_composition.pdf"),
+    plot_sample_composition(result, sample_colors, result$region$annotation), width = 12, height = 5)
+  invisible(signals)
+}
+
+
+save_all_plots <- function(result, footprints, output_dir, sample_colors,
+                               embedding = NULL) {
+  plotted <- save_fiberseq_plots(result, footprints, output_dir, sample_colors,
+    embedding = embedding)
+  view <- fiberseq_display_result(result)
+  short_colors <- setNames(unname(sample_colors), sub("_.*$", "", names(sample_colors)))
+  save_plots(view, footprints, short_colors, output_dir, include_haplotype = TRUE)
+  invisible(plotted)
+}
+
+```
+
+```{r lcl-report-helpers, include=FALSE}
+report_url <- function(path) {
+  path <- lcl_output_path(path)
+  if (!file.exists(path)) stop("Missing report artifact: ", path)
+  paste0("https://gate.rcc.uchicago.edu/spott/file_show?path=",
+    utils::URLencode(path, reserved = TRUE))
+}
+```
+
+<style>
+.main-container { max-width: 1700px; padding: 0 24px; }
+table { display: block; overflow-x: auto; }
+</style>
+
+# Select the top 10 AS-FIRE regions
+
+*Definition of AS-FIRE and how it is selected:*
+
+1. AS-FIRE: whehther a FIRE peak is accessible at different frequencies on reads carrying  a SNP's reference vs alternate allele
+2. retains genotypes 0|1 or 1|0, retains reads tagged H1/H2, and pairs peaks with nearby variants using a 2,000-bp distance setting
+  - Each SNP is associated with a set of contributing samples based on its phase and the phase of the reads
+  - Different SNPs can therefore have different contributing samples
+3. Counts are combined across contributing samples for each SNP–peak pair 
+  - Fisher’s exact test compares reference/alternate alleles against FIRE/non-FIRE observations
+4. Significance filters
+  - combined coverage >= 20 reads
+  - reference and alternate alleles each have >= 0 reads
+  - q value < 0.1
+  - FIRE frequency >= 0.1
+  
+  
+AS-FIRE from kevin:
+  - /project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds
+  
+| peak_name | rsID | snp_pos | ref | alt | coverage_ref | coverage_alt | fisher_pvalue |
+|---|---|---:|---|---|---:|---:|---:|
+| chr1_11161_11494 | rs180734498 | 13302 | C | T | 2 | 3 | 0.5238095 |
+| chr1_28837_29482 | rs140337953 | 30923 | G | T | 19 | 25 | 0.6412728 |
+| chr1_88661_88783 | rs146836579 | 87647 | T | C | 15 | 5 | 0.6286665 |
+| chr1_88661_88783 | rs1524602 | 87190 | G | A | 15 | 5 | 0.6286665 |
+| chr1_88661_88783 | rs59529791 | 88136 | G | A | 15 | 5 | 0.6286665 |
+
+
+*Selection of top 10 regions:*
+Only biallelic A/C/G/T SNPs with a valid rsID and a complete 2 kb reference window
+are eligible. Each region is defined by the lead SNP's position and the FIRE peak, 
+in this case, it is the SNP with the smallest Fisher p-value within the peak
+
+  - allele label: each phased read is assigned to H1 or H2 based on the focal SNP's
+  phased genotype in the sample
+  - lowest p-value: the SNP with the lowest Fisher p-value within the peak is selected as the focal SNP for that region
+  - before clustering, homozygous and unphased reads are removed
+
+example block table:
+  - `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL10_bc2178_19130/blocks.tsv`
+
+
+| source_block_index | sample_name | phase_block_id | chrom | start | end | num_variants |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | NA19130 | 52238 | chr1 | 52238 | 103905 | 16 |
+| 1 | NA19130 | 126108 | chr1 | 126108 | 135032 | 2 |
+| 4 | NA19130 | 591460 | chr1 | 591460 | 599165 | 5 |
+| 5 | NA19130 | 638771 | chr1 | 638771 | 638771 | 1 |
+| 5 | NA19130 | 665098 | chr1 | 665098 | 683083 | 3 |
+| 6 | NA19130 | 779825 | chr1 | 779825 | 1190918 | 437 |
+| 8 | NA19130 | 1285767 | chr1 | 1285767 | 1290261 | 2 |
+| 9 | NA19130 | 1339884 | chr1 | 1339884 | 1339911 | 2 |
+| 12 | NA19130 | 1427454 | chr1 | 1427454 | 1427474 | 3 |
+| 14 | NA19130 | 1457071 | chr1 | 1457071 | 1457071 | 1 |
+| 15 | NA19130 | 1483249 | chr1 | 1483249 | 1492007 | 3 |
+| 16 | NA19130 | 1514366 | chr1 | 1514366 | 1516323 | 2 |
+| 17 | NA19130 | 1543702 | chr1 | 1543702 | 1922424 | 259 |
+
+example read level haplotype file:
+  - `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL10_bc2178_19130/read-level-phasing.tsv`
+  - haplotag 1 = first allele in GT
+  
+| source_block_index | sample_name | chrom | phase_block_id | read_name | haplotag |
+|---:|---|---|---:|---|---:|
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/81201882/ccs | 1 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/219218451/ccs | 1 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/65275399/ccs | 2 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/7869529/ccs | 1 |
+| 4 | NA19130 | chr1 | 591460 | m84241_250311_201728_s2/56759899/ccs | 1 |
+
+example vcf file:
+  - `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL10_bc2178_19130/AL10_bc2178_19130.5mC.6mA.aligned.phased.vcf.gz`
+    - GT = 0|1 means HP1 carries reference allele and HP2 carries alternate allele
+    - PS =  a cluster of phased genotypes that belong to the same local chromosome block
+    - GT:PS = 0|1:100 with A and T, and GT:PS = 0|1:100 with C and G means haplotype A reads A-C and haplotype B reads T-G
+  
+  
+The block file and vcf file are used to determine the phased genotype of each read at the focal SNP
+  - they are matched based on the sample name, chr, and phase_block_id - groups of variants whose alleles
+  have been assgned to the same haplotype (H1 or H2) based on the phased genotype of the sample
+
+
+example RDS file produced by cache_lcl_haplotags
+  - finds the block containing the focal SNP, then matches its ID to the VCF and read haplotags to determine each read’s allele
+  - `/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan/phase_summary/AL10_bc2178_19130_haplotags.rds`: a list contain the blocks file and the tags file with haplotype label for each read
+
+
+
+```{r settings}
+asfire_file <- "/project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds"
+sample_csv <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+sample_table <- read.csv(sample_csv, stringsAsFactors = FALSE)
+stopifnot(!anyDuplicated(sample_table$sample_name),
+          !anyDuplicated(sub("_.*$", "", sample_table$sample_name)))
+phasing_root <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+signature_file <- file.path(output_dir, "summary tables", "selection_signature.rds")
+if (file.exists(signature_file)) {
+  signature <- readRDS(signature_file)
+  regions <- signature$regions
+  sample_table <- signature$sample_table
+} else {
+  asfire_results <- readRDS(asfire_file)
+  regions <- select_lcl_top_asfire_regions(asfire_results, top_n = 10L, width_bp = 2000L)
+  rm(asfire_results)
+}
+knitr::kable(regions[, c("rank", "region_id", "peak_name", "focal_snp", "focal_pos",
+  "fisher_pvalue", "fisher_qvalue", "coverage", "coverage_ref", "coverage_alt",
+  "n_listed_samples", "analysis_start", "analysis_end", "overlapping_selected_windows",
+  "overlapping_selected_peaks", "nearest_selected_snp_distance_bp", "same_focal_snp_as_another_peak")])
+```
+
+plot methylation by cluster
+```{r methylation-figures, include=TRUE}
+
+plot_methylation_by_cluster <- function(summary, region) {
+  summary$cluster <- factor(summary$cluster, levels = summary$cluster)
+  ggplot2::ggplot(summary, ggplot2::aes(cluster, methylation_proportion, fill = cluster)) +
+    ggplot2::geom_col(width = 0.7) +
+    ggplot2::scale_fill_manual(values = cluster_id_palette(levels(summary$cluster)), guide = "none") +
+    ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.03))) +
+    ggplot2::labs(x = "m6A-defined cluster", y = "Mean m6A call proportion", title = region$annotation,
+      subtitle = "Mean across observed m6A sites; all cluster reads included") +
+    cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border()
+}
+
+methylation_by_cluster <- function(result) {
+  dplyr::bind_rows(lapply(levels(result$assignments$cluster), function(cluster) {
+    ids <- result$assignments$RID[result$assignments$cluster == cluster]
+    m <- result$site_met_mat[ids, , drop = FALSE]
+    n_calls <- sum(m > 0)
+    denominator <- nrow(m) * ncol(m)
+    data.frame(cluster = cluster, n_reads = nrow(m), n_sites = ncol(m),
+      n_m6a_calls = n_calls, denominator = denominator,
+      methylation_proportion = if (denominator) n_calls / denominator else NA_real_)
+  }))
+}
+
+```
+
+# Main results and haplotype examples
+
+```{r generate-results, include=FALSE}
+if (params$regenerate_plots) {
+  if (file.exists(file.path(output_dir, "summary tables", "fiberseq_result_paths.rds"))) {
+    # Redraw the saved clusters without rebuilding matrices or clustering.
+    result_paths <- local({
+      tracks_dir <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks"
+      output_dir <- lcl_output_path(output_dir)
+      summary_dir <- file.path(output_dir, "summary tables")
+      paths <- readRDS(file.path(summary_dir, "fiberseq_result_paths.rds"))
+      signature <- readRDS(file.path(summary_dir, "selection_signature.rds"))
+      stopifnot(all(signature$regions$region_id %in% names(paths)))
+      paths <- paths[signature$regions$region_id]
+      caches <- cache_footprint_tracks(signature$regions, tracks_dir,
+        file.path(output_dir, "footprint_summary"), workers = 3L, reuse = TRUE)
+      colors <- sample_palette(signature$sample_table$sample_name)
+      audit <- list()
+      for (rid in names(paths)) {
+        message("Reproducing saved-cluster plots: ", rid)
+        original_path <- paths[[rid]]
+        result <- readRDS(original_path)
+        original <- result$assignments
+        original_hash <- unname(tools::md5sum(original_path))
+        out <- lcl_output_path(file.path(output_dir, rid, "bin0", "k10", "resolution1"))
+        table_dir <- file.path(out, "tables")
+        dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+        # Consolidate the existing annotations and main-analysis audits into one region folder.
+        for (source_dir in unique(c(dirname(original_path),
+          file.path(output_dir, "results", rid, "bin0", "k10", "resolution1", "tables")))) {
+          if (dir.exists(source_dir) && normalizePath(source_dir) != normalizePath(table_dir)) {
+            entries <- list.files(source_dir, full.names = TRUE)
+            entries <- entries[!file.exists(file.path(table_dir, basename(entries)))]
+            if (length(entries) && !all(file.copy(entries, table_dir, recursive = TRUE))) stop("Table consolidation failed")
+          }
+        }
+        result <- fiberseq_display_result(result)
+        sample_colors <- colors[names(colors) %in% result$assignments$sample_label]
+        nuc <- extract_nucleosomes(lcl_region_samples(result$region, signature$sample_table),
+          result$region, result$assignments)
+        tf <- region_footprints(caches, result$region, result$assignments)$records
+        footprints <- dplyr::bind_rows(nuc, tf)
+        embedding <- fiberseq_umap(result, seed = signature$view_params$seed)
+        embedding <- embedding[match(result$assignments$RID, embedding$RID), , drop = FALSE]
+        full_colors <- setNames(unname(colors[sub("_.*$", "", signature$sample_table$sample_name)]),
+          signature$sample_table$sample_name)
+        full_colors <- full_colors[names(full_colors) %in% result$assignments$sample_name]
+        save_all_plots(result, footprints, out, full_colors,
+          embedding = embedding)
+        paths[[rid]] <- file.path(table_dir, "fiberseq_annotated_clustering.rds")
+        stopifnot(identical(result$assignments$RID, original$RID),
+          identical(result$assignments$cluster, original$cluster),
+          identical(unname(tools::md5sum(original_path)), original_hash),
+          identical(readRDS(paths[[rid]])$assignments, original))
+        audit[[rid]] <- data.frame(region_id = rid, n_reads = nrow(original),
+          n_clusters = result$n_clusters, assignments_unchanged = TRUE,
+          original_result_md5 = original_hash, nucleosome_footprints = nrow(nuc), tf_footprints = nrow(tf))
+        data.table::fwrite(dplyr::bind_rows(audit), file.path(summary_dir, "plot_reproduction_validation.tsv"), sep = "\t")
+      }
+      saveRDS(paths, file.path(summary_dir, "fiberseq_result_paths.rds"))
+      main_ids <- intersect(signature$regions$region_id, names(paths))
+      main_paths <- setNames(file.path(dirname(paths[main_ids]), "clustering.rds"), main_ids)
+      stopifnot(all(file.exists(main_paths)))
+      saveRDS(main_paths, file.path(summary_dir, "result_paths.rds"))
+      old_summary <- file.path(output_dir, "results", "summary tables", "run_summary.tsv")
+      if (file.exists(old_summary)) file.copy(old_summary, file.path(summary_dir, "run_summary.tsv"), overwrite = TRUE)
+      paths
+    })
+  } else {
+    # Build the top-ten results when no saved result paths exist.
+    result_paths <- local({
+      seed <- 1L
+      reuse_cache <- TRUE
+      output_dir <- lcl_output_path(output_dir)
+      stopifnot(nrow(regions) > 0L, all(regions$width == 2000L),
+        all(regions$fisher_qvalue < .1), !anyDuplicated(regions$peak_name))
+      summary_dir <- file.path(output_dir, "summary tables")
+      results_dir <- output_dir
+      haplotype_dir <- output_dir
+      matrix_dir <- lcl_output_path(file.path(output_dir, "m6a_summary"))
+      dir.create(summary_dir, recursive = TRUE, showWarnings = FALSE)
+      # Both the main results and haplotype examples derive from this one selection.
+      data.table::fwrite(regions, file.path(summary_dir, "selected_top10_regions.tsv"), sep = "\t")
+      datasets <- lapply(seq_len(nrow(regions)), function(i) {
+        assemble_region_m6a(sample_table = lcl_region_samples(regions[i, ], sample_table),
+          region = regions[i, ], matrix_dir = matrix_dir, reuse = reuse_cache, full_span = TRUE)
+      })
+      sample_ids <- unique(unlist(strsplit(regions$contributing_samples, ",", fixed = TRUE)))
+      used_samples <- sample_table[match(sample_ids, sample_table$sample_name), , drop = FALSE]
+      phases <- cache_lcl_haplotags(used_samples, datasets, phasing_root,
+        lcl_output_path(file.path(output_dir, "phase_summary")), reuse = reuse_cache)
+      rm(datasets)
+      main_paths <- run_lcl_clustering(regions, sample_table, matrix_dir, results_dir,
+        window_size = 0L, k_neighbors = 10L, leiden_resolution = 1, leiden_seed = seed,
+        reuse_cache = reuse_cache, phase_cache = phases)
+      short_colors <- sample_palette(sample_table$sample_name)
+      sample_colors <- setNames(unname(short_colors[sub("_.*$", "", sample_table$sample_name)]), sample_table$sample_name)
+      footprint_summaries <- cache_footprint_tracks(regions,
+        "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks",
+        file.path(output_dir, "footprint_summary"), workers = 3L, reuse = reuse_cache)
+      paths <- main_paths
+      audit <- list()
+      for (rid in names(main_paths)) {
+        message("Top AS-FIRE Fiber-seq views: ", rid)
+        result <- fiberseq_display_result(readRDS(main_paths[[rid]]))
+        assignments <- result$assignments
+        region_colors <- sample_colors[names(sample_colors) %in% assignments$sample_name]
+        source_hash <- tools::md5sum(main_paths[[rid]])
+        selected_samples <- lcl_region_samples(result$region, sample_table)
+        out <- lcl_output_path(file.path(haplotype_dir, rid, "bin0", "k10", "resolution1"))
+        dir.create(file.path(out, "tables"), recursive = TRUE, showWarnings = FALSE)
+        focal <- result$focal
+        result$markers <- focal_markers(result)
+        footprints <- dplyr::bind_rows(
+          extract_nucleosomes(selected_samples, result$region, assignments),
+          region_footprints(footprint_summaries, result$region, assignments)$records)
+        embedding <- fiberseq_umap(result, seed = seed)
+        # Main and haplotype outputs have identical retained reads and main labels.
+        save_all_plots(result, footprints, out, region_colors, embedding = embedding)
+        paths[[rid]] <- file.path(out, "tables", "fiberseq_annotated_clustering.rds")
+        saveRDS(result, paths[[rid]])
+        stopifnot(identical(result$assignments, assignments),
+                  identical(tools::md5sum(main_paths[[rid]]), source_hash),
+                  all(assignments$allele_status == "phased_focal_genotype"),
+                  all(assignments$focal_genotype %in% c("0|1", "1|0")))
+        audit[[rid]] <- data.frame(region_id = rid, rank = result$region$rank,
+          focal_snp = result$region$focal_snp, n_reads = nrow(assignments),
+          n_samples = length(unique(assignments$sample_name)), n_clusters = result$n_clusters,
+          main_haplotype_assignments_identical = TRUE, n_unresolved_plotted = 0L,
+          n_ref_reads = sum(assignments$allele_label == paste0(focal$variant_id, ": ", focal$ref)),
+          n_alt_reads = sum(assignments$allele_label == paste0(focal$variant_id, ": ", focal$alt)))
+        data.table::fwrite(dplyr::bind_rows(audit), file.path(summary_dir, "fiberseq_validation.tsv"), sep = "\t")
+      }
+      saveRDS(paths, file.path(summary_dir, "fiberseq_result_paths.rds"))
+      # A selection signature prevents plots-only rendering from loading the previous examples.
+      saveRDS(list(regions = regions, sample_table = sample_table,
+        view_params = list(seed = seed),
+        asfire_file = asfire_file),
+        file.path(summary_dir, "selection_signature.rds"))
+      paths
+    })
+  }
+} else {
+  result_paths <- readRDS(file.path(output_dir, "summary tables", "fiberseq_result_paths.rds"))
+}
+stopifnot(all(regions$region_id %in% names(result_paths)))
+result_paths <- result_paths[regions$region_id]
+# Reject cached results that do not satisfy the current LCL cohort policy.
+for (path in result_paths) {
+  retained <- readRDS(path)$assignments
+  stopifnot(nrow(retained) > 0L,
+    all(c("haplotype", "focal_genotype", "allele_status") %in% names(retained)),
+    all(retained$haplotype %in% c("HP1", "HP2")),
+    all(retained$focal_genotype %in% c("0|1", "1|0")),
+    all(retained$allele_status == "phased_focal_genotype"))
+}
+main_paths <- readRDS(file.path(output_dir, "summary tables", "result_paths.rds"))
+```
+
+```{r results-summary}
+knitr::kable(data.table::fread(file.path(output_dir, "summary tables", "run_summary.tsv")))
+validation_file <- file.path(output_dir, "summary tables", "plot_reproduction_validation.tsv")
+if (!file.exists(validation_file)) validation_file <- file.path(output_dir, "summary tables", "fiberseq_validation.tsv")
+knitr::kable(data.table::fread(validation_file))
+```
+
+# Visualization of results
+- Accessibility is the fraction of retained cluster reads with an m6A call at an observed site over all the reads in the cluster
+- Nucleosome occupancy is the fraction covered by a 130–160 bp footprint at each base, counting overlapping footprints on a read once
+
+```{r gallery-helper, include = FALSE}
+pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
+xpdfrc <- tempfile("xpdfrc-")
+sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
+mono <- "/usr/share/fonts/dejavu/DejaVuSansMono"
+writeLines(c(
+  paste0("fontFile Helvetica ", sans, "Regular.ttf"),
+  paste0("fontFile Helvetica-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Helvetica-Oblique ", sans, "Italic.ttf"),
+  paste0("fontFile Helvetica-BoldOblique ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Times-Roman ", sans, "Regular.ttf"),
+  paste0("fontFile Times-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Times-Italic ", sans, "Italic.ttf"),
+  paste0("fontFile Times-BoldItalic ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Courier ", mono, ".ttf"),
+  paste0("fontFile Courier-Bold ", mono, "-Bold.ttf"),
+  paste0("fontFile Courier-Oblique ", mono, "-Oblique.ttf"),
+  paste0("fontFile Courier-BoldOblique ", mono, "-BoldOblique.ttf"),
+  "fontFile Symbol /usr/share/fonts/dejavu/DejaVuSans.ttf",
+  "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
+
+inline_png <- function(path, label, dpi = 120) {
+  stopifnot(file.exists(path), file.info(path)$size > 0)
+  prefix <- tempfile("fig-")
+  status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
+    shQuote(path), shQuote(prefix)))
+  png <- paste0(prefix, "-000001.png")
+  stopifnot(status == 0, file.exists(png))
+  on.exit(unlink(png))
+  cat(as.character(htmltools::tags$figure(
+    htmltools::tags$img(
+      src = base64enc::dataURI(file = png, mime = "image/png"),
+      alt = label, loading = "lazy",
+      style = "display:block;max-width:100%;height:auto;"),
+    htmltools::tags$figcaption(label))), "\n\n")
+  invisible(NULL)
+}
+
+figure_gallery <- function(name, title) {
+  cat("\n## ", title, "\n\n", sep = "")
+  for (rid in names(result_paths)) {
+    cat("\n### ", rid, "\n\n", sep = "")
+    plot_dir <- file.path(dirname(dirname(result_paths[[rid]])), "plots")
+    pdf <- lcl_output_path(file.path(plot_dir, paste0(name, ".pdf")))
+    stopifnot(file.exists(pdf))
+    inline_png(pdf, paste(rid, title, sep = " — "))
+    cat(as.character(htmltools::tags$p(htmltools::tags$a(
+      href = report_url(pdf), paste("Download original PDF:", name)))), "\n\n")
+  }
+}
+```
+
+```{r gallery-haplotype-example, results='asis'}
+figure_gallery("fiberseq_haplotype_example", "Haplotype overview")
+```
+
+```{r gallery-read-footprints, results='asis'}
+figure_gallery("fig1_read_footprints", "Read-level footprints")
+```
+
+```{r gallery-occupancy-profiles, results='asis'}
+figure_gallery("fig2_occupancy_by_cluster", "Occupancy profiles by cluster")
+```
+
+
+```{r gallery-m6a-footprint-heatmap, results='asis'}
+figure_gallery("heatmap_m6a_footprints", "m6A and footprint heatmaps")
+```
+
+# KNN graph
+
+- how similar individual reads are to each other based on their m6A footprint patterns
+  - each dot is one read, an edge connects two reads if either selects the other as one of its 10 nearest neighbors. 
+  - a read can have more than 10 edges if it is selected as a neighbor by multiple other reads
+
+```{r gallery-knn-graph, results='asis'}
+for (rid in names(result_paths)) {
+  plot_dir <- lcl_output_path(file.path(dirname(dirname(result_paths[[rid]])), "plots"))
+  graph_pdf <- file.path(plot_dir, "knn_graph.pdf")
+  if (!file.exists(graph_pdf)) {
+    result <- readRDS(result_paths[[rid]])
+    dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+    ggplot2::ggsave(graph_pdf, plot_knn_graph(result), width = 12, height = 9, bg = "white")
+  }
+}
+figure_gallery("knn_graph", "Manhattan KNN graphs colored by Leiden cluster")
+```
+
+
+# KNN graph colored by haplotype
+
+Within each group of connected reads in the KNN graph, what fraction carries each lead SNP allele?
+
+```{r knn-haplotype-summaries, include=FALSE}
+knn_haplotype_views <- setNames(vector("list", length(result_paths)), names(result_paths))
+for (rid in names(result_paths)) {
+  result <- readRDS(result_paths[[rid]])
+  result <- result[c("graph", "assignments", "params", "region", "focal")]
+  summary <- knn_allele_summary(result)
+  knn_haplotype_views[[rid]] <- list(result = result, summary = summary)
+  table_dir <- lcl_output_path(dirname(result_paths[[rid]]))
+  data.table::fwrite(summary$composition, file.path(table_dir, "knn_allele_composition.tsv"), sep = "\t")
+  data.table::fwrite(summary$connectivity, file.path(table_dir, "knn_allele_connectivity.tsv"), sep = "\t")
+  data.table::fwrite(summary$reads, file.path(table_dir, "knn_read_allele_connectivity.tsv"), sep = "\t")
+}
+```
+
+```{r knn-graph-by-haplotype, results='asis'}
+for (rid in names(knn_haplotype_views)) {
+  result <- knn_haplotype_views[[rid]]$result
+  plot_dir <- lcl_output_path(file.path(dirname(dirname(result_paths[[rid]])), "plots"))
+  dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(file.path(plot_dir, "knn_graph_by_allele.pdf"),
+    plot_knn_graph(result, color_by = "allele"), width = 12, height = 9, bg = "white")
+}
+figure_gallery("knn_graph_by_allele", "KNN graph colored by focal SNP allele")
+```
+
+```{r knn-haplotype-cluster-composition, results='asis'}
+for (rid in names(knn_haplotype_views)) {
+  summary <- knn_haplotype_views[[rid]]$summary
+  plot_dir <- lcl_output_path(file.path(dirname(dirname(result_paths[[rid]])), "plots"))
+  ggplot2::ggsave(file.path(plot_dir, "knn_allele_composition.pdf"),
+    plot_knn_allele_composition(summary, paste(rid, "Focal SNP allele proportions", sep = "\n")),
+    width = max(10, 0.7 * nlevels(summary$composition$group) + 3), height = 6, bg = "white")
+}
+figure_gallery("knn_allele_composition", "Focal SNP allele proportions within each Leiden cluster")
+```
+
+```{r knn-haplotype-connectivity, results='asis'}
+for (rid in names(knn_haplotype_views)) {
+  summary <- knn_haplotype_views[[rid]]$summary
+  plot_dir <- lcl_output_path(file.path(dirname(dirname(result_paths[[rid]])), "plots"))
+  ggplot2::ggsave(file.path(plot_dir, "knn_allele_connectivity.pdf"),
+    plot_knn_allele_connectivity(summary, paste(rid, "Allele mixing in the KNN graph", sep = "\n")),
+    width = 11, height = 7, bg = "white")
+}
+figure_gallery("knn_allele_connectivity", "Same- versus opposite-allele graph connectivity")
+```
+
+
+
+# PRDX1 and ALAS1 promoters: all reads, without haplotype information
+
+Pool all 31 LCL samples, including samples without genotypes, and retain every
+read spanning the complete promoter window. No haplotype, SNP, genotype or
+allele filtering is applied, and reads are not downsampled. Clustering uses
+the existing m6A Manhattan/Leiden helpers with `window_size = 0`, `k = 10`,
+resolution 1 and seed 1, as in the selected AS-FIRE figures.
+
+The canonical TSS BED encodes 20 bp intervals `[TSS - 10, TSS + 10)` in
+zero-based coordinates. Use their centers (`start + 11` in one-based coordinates)
+and the exactly 2,000 bp half-open window `[TSS0 - 1000, TSS0 + 1000)`.
+Read-footprint and occupancy plots orient the coordinates by gene strand.
+Dashed lines mark the TSS (0 bp on these relative axes), including each
+cluster slice and m6A profile of the genomic heatmap. UMAPs and the pie chart
+have no genomic coordinate axis.
+
+
+```{r lcl-promoters-all-reads, results='hide'}
+local({
+  genes <- c("PRDX1", "ALAS1")
+  tss_bed <- data.table::fread(
+    "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed",
+    header = FALSE, col.names = c("chr", "start", "end", "annotation", "score", "strand"),
+    data.table = FALSE)
+  tss_bed$gene <- vapply(strsplit(tss_bed$annotation, ";", fixed = TRUE), `[`, character(1), 3L)
+  selected <- tss_bed[tss_bed$gene %in% genes, , drop = FALSE]
+  stopifnot(nrow(selected) == length(genes), !anyDuplicated(selected$gene),
+    all(selected$end - selected$start == 20L))
+  selected <- selected[match(genes, selected$gene), , drop = FALSE]
+  tss0 <- selected$start + 10L
+  promoters <- data.frame(region_id = genes, gene = genes, chr = selected$chr,
+    start = tss0 - 1000L, end = tss0 + 1000L,
+    analysis_start = tss0 - 999L, analysis_end = tss0 + 1000L,
+    width = 2000L, tss = tss0 + 1L, strand = selected$strand,
+    region_type = "promoter", annotation = paste(genes, "canonical promoter"))
+  stopifnot(all(promoters$analysis_end - promoters$analysis_start + 1L == 2000L))
+
+  # Read the complete sample table afresh, independently of AS-FIRE contributors.
+  samples <- read.csv(
+    "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv",
+    stringsAsFactors = FALSE)[, c("sample_name", "fire_dir")]
+  stopifnot(!anyDuplicated(samples$sample_name),
+    !anyDuplicated(sub("_.*$", "", samples$sample_name)))
+  sample_colors <- sample_palette(samples$sample_name)
+  full_colors <- setNames(unname(sample_colors[sub("_.*$", "", samples$sample_name)]), samples$sample_name)
+  root <- lcl_output_path(file.path(LCL_OUTPUT_ROOT, "test_promoters"))
+  dir.create(root, recursive = TRUE, showWarnings = FALSE)
+  # The existing footprint extractor requires a cache; remove it after plotting
+  # so the only persistent outputs are the requested PDFs.
+  cache_dir <- tempfile(".footprint-cache-", tmpdir = root)
+  # Plot layout helpers may open a device before export; avoid an extra Rplots.pdf.
+  grDevices::pdf(NULL)
+  layout_device <- grDevices::dev.cur()
+  tryCatch({
+    caches <- cache_footprint_tracks(promoters,
+      "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks",
+      cache_dir, workers = 2L, reuse = FALSE)
+    for (i in seq_len(nrow(promoters))) {
+      region <- promoters[i, , drop = FALSE]
+      dat <- assemble_region_m6a(sample_table = samples, region = region,
+        full_span = TRUE, matrix_dir = NULL, reuse = FALSE)
+      result <- leiden_manhattan_cluster(dat$met_mat, dat$rids_df,
+        region$analysis_start, region$analysis_end, window_size = 0L,
+        k_neighbors = 10L, resolution = 1, seed = 1L, impute_missing = FALSE)
+      result$region <- region
+      result$site_met_mat <- dat$met_mat
+      result$assignments$original_RID <- dat$rids_df$original_RID[
+        match(result$assignments$RID, dat$rids_df$RID)]
+      stopifnot(identical(result$assignments$RID, dat$rids_df$RID),
+        nrow(result$assignments) == sum(dat$qc$full_span_reads))
+      message(region$gene, ": retained all ", nrow(result$assignments),
+        " full-span reads from ", length(unique(result$assignments$sample_name)), " samples")
+      footprints <- dplyr::bind_rows(
+        extract_nucleosomes(samples, region, result$assignments),
+        region_footprints(caches, region, result$assignments)$records)
+      signals <- signal_profiles(result, footprints)
+      plot_dir <- lcl_output_path(file.path(root, region$gene))
+      dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+      embedding <- fiberseq_umap(result, seed = 1L)
+      cluster_colors <- cluster_id_palette(levels(result$assignments$cluster))
+      counts <- as.data.frame(table(result$assignments$cluster),
+        responseName = "n_reads", stringsAsFactors = FALSE)
+      names(counts)[1L] <- "cluster"
+      counts$proportion <- counts$n_reads / sum(counts$n_reads)
+      counts$label <- sprintf("%s (n=%d; %.1f%%)", counts$cluster,
+        counts$n_reads, 100 * counts$proportion)
+      # There is no standalone pie helper; compose it with the sourced UMAPs.
+      pie <- ggplot2::ggplot(counts, ggplot2::aes(x = "", y = proportion, fill = cluster)) +
+        ggplot2::geom_col(width = 1, color = "white",
+          position = ggplot2::position_stack(reverse = TRUE)) +
+        ggplot2::coord_polar(theta = "y") +
+        ggplot2::scale_fill_manual(values = cluster_colors, breaks = counts$cluster, labels = counts$label) +
+        ggplot2::labs(title = paste0("Cluster proportions: ", nrow(embedding), " reads"), fill = NULL) +
+        ggplot2::theme_void() + ggplot2::theme(legend.text = ggplot2::element_text(size = 8))
+      overview <- cowplot::plot_grid(
+        plot_umap(embedding, "sample_name", full_colors, "UMAP: LCL sample",
+          labels = sub("_.*$", "", names(full_colors)), show_legend = TRUE),
+        plot_umap(embedding, "cluster", cluster_colors, "UMAP: cluster", show_legend = TRUE),
+        pie, ncol = 3, rel_widths = c(1.3, 1, 1))
+      ggplot2::ggsave(file.path(plot_dir, "fiberseq_haplotype_example.pdf"),
+        overview, width = 20, height = 7, bg = "white")
+      tss_caption <- paste0("Dashed line: canonical TSS ", region$chr, ":", region$tss, " (0 bp)")
+      ggplot2::ggsave(file.path(plot_dir, "fig1_read_footprints.pdf"),
+        plot_smf_reads(result, signals$records, sample_colors, include_haplotype = FALSE) +
+          ggplot2::labs(caption = tss_caption),
+        width = 12, height = max(7, 0.03 * nrow(result$assignments) + 3.5 + 0.3 * result$n_clusters),
+        limitsize = FALSE)
+      ggplot2::ggsave(file.path(plot_dir, "fig2_occupancy_by_cluster.pdf"),
+        plot_signal_profile(signals$profiles, region, levels(result$assignments$cluster)) +
+          ggplot2::labs(subtitle = "m6A calls and footprint occupancy; all full-span reads",
+            caption = tss_caption),
+        width = 10, height = 1.4 * result$n_clusters + 2.5, limitsize = FALSE)
+      heatmap <- plot_genomic_cluster_heatmap(result, region, sample_colors,
+        include_haplotype = FALSE, variants = NULL, show_cluster_profiles = TRUE)
+      grDevices::pdf(file.path(plot_dir, "heatmap_m6a_footprints.pdf"),
+        width = 14, height = 11 + 0.55 * result$n_clusters)
+      tryCatch({
+        ComplexHeatmap::draw(heatmap, newpage = FALSE)
+        # Column centers occupy (index - 0.5) / width of each heatmap slice.
+        tss_x <- (region$tss - region$analysis_start + 0.5) / region$width
+        for (slice in seq_len(result$n_clusters)) {
+          ComplexHeatmap::decorate_heatmap_body("m6A", {
+            grid::grid.lines(x = c(tss_x, tss_x), y = c(0, 1),
+              gp = grid::gpar(col = "#D55E00", lty = "dashed", lwd = 1.2))
+          }, slice = slice)
+        }
+        for (cluster in levels(result$assignments$cluster)) {
+          ComplexHeatmap::decorate_annotation(paste0(cluster, " m6A"), {
+            grid::grid.lines(x = c(tss_x, tss_x), y = c(0, 1),
+              gp = grid::gpar(col = "#D55E00", lty = "dashed", lwd = 1.2))
+          })
+        }
+      }, finally = grDevices::dev.off())
+    }
+  }, finally = {
+    grDevices::dev.off(layout_device)
+    unlink(cache_dir, recursive = TRUE)
+  })
+})
+```
+
+#### Outputs
+
+The final output location is
+`/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan`.
+Each of the ten region folders contains `bin0/k10/resolution1/plots` and `tables`
+
+`tables` has saved clustering objects (`clustering.rds` and
+`fiberseq_annotated_clustering.rds`)
+
+Selection follows [Kevin's heterozygous AS-FIRE examples](https://kevinlkx.github.io/fiber-seq-analysis/example_figures_with_merged_samples.html#AS-fire_results).
+
+```{r session}
+sessionInfo()
+```

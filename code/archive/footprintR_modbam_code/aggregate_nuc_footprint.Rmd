@@ -1,0 +1,2190 @@
+---
+title: "Promoter-Level Fiber-seq Aggregation"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+This notebook builds a promoter-centered summary for the default sample and chromosome:
+
+- `structure`: nucleosome features from `ft extract --nuc`
+- `accessibility`: adenine modification calls from the phased BAM, summarized as m6A modified versus not-modified
+- `methylation`: cytosine methylation calls from the phased BAM, summarized as 5mC modified versus not-modified
+
+For scalability across all `chr1` promoters, the chromosome-wide accessibility and methylation summaries use `footprintR::readModBam(..., level = "summary")`. To keep the read-level adaptation from `/project/spott/cshan/code/fiberseqFunctions.R`, the notebook also generates one small example per-read binary m6A table for a single promoter window.
+
+
+The threshold for defining whether a base is modified (`modProbThreshold`) is 0.9 because the score distribution is binary.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+required_pkgs <- c(
+  "data.table",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "stringr",
+  "GenomicRanges",
+  "IRanges",
+  "GenomeInfoDb",
+  "SummarizedExperiment",
+  "BiocParallel",
+  "Rsamtools",
+  "footprintR",
+  "ggplot2",
+  "patchwork",
+  "scales",
+  "signal"
+)
+
+missing_pkgs <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_pkgs) > 0) {
+  stop(
+    sprintf(
+      "Missing required packages: %s",
+      paste(missing_pkgs, collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+default_sample <- "AL10_bc2178_19130"
+default_chrom  <- "chr1"
+window_bp <- 1e6L
+bin_size <- 10L
+mod_prob_threshold <- 0.9
+example_tss_index <- 1L
+results_root_dir <- "/project/spott/cshan/fiber-seq/results/promoter_summary/window_1Mb_TSS"
+threshold_dir <- file.path(results_root_dir, "threshold_0.9")
+ccre_output_dir <- file.path(results_root_dir, "ccre")
+
+bam_path <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples",
+  sprintf("%s.5mC.6mA.aligned.phased.bam", default_sample)
+)
+
+tss_path <- "/project/spott/cshan/annotations/TSS.gencode.v49.bed"
+
+sample_extract_dir <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
+  default_sample,
+  "extracted_results"
+)
+
+nuc_path <- file.path(
+  sample_extract_dir,
+  "nuc_by_chr",
+  sprintf("%s.ft_extracted_nuc.%s.bed.gz", default_sample, default_chrom)
+)
+
+m6a_ft_path <- file.path(
+  sample_extract_dir,
+  "m6a_by_chr",
+  sprintf("%s.ft_extracted_m6a.%s.bed.gz", default_sample, default_chrom)
+)
+
+cpg_ft_path <- file.path(
+  sample_extract_dir,
+  "cpg_by_chr",
+  sprintf("%s.ft_extracted_cpg.%s.bed.gz", default_sample, default_chrom)
+)
+
+fire_peak_path <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
+  default_sample,
+  sprintf("%s-fire-v0.1-peaks.bed.gz", default_sample)
+)
+
+fire_element_path <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
+  default_sample,
+  "additional-outputs-v0.1",
+  "fire-peaks",
+  sprintf("%s-v0.1-fire-elements.bed.gz", default_sample)
+)
+
+output_dir <- file.path(threshold_dir, default_sample)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(ccre_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+bamfiles <- setNames(bam_path, default_sample)
+bpparam_modbam <- BiocParallel::SerialParam()
+```
+
+## Helpers
+
+```{r helpers}
+assert_file_exists <- function(path, label = "file") {
+  if (!file.exists(path)) {
+    stop(sprintf("Missing %s: %s", label, path), call. = FALSE)
+  }
+  invisible(path)
+}
+
+write_gz_tsv <- function(x, path) {
+  data.table::fwrite(x, file = path, sep = "\t")
+  invisible(path)
+}
+
+read_bam_seqinfo <- function(bam_path) {
+  targets <- Rsamtools::scanBamHeader(bam_path)[[1]]$targets
+  GenomeInfoDb::Seqinfo(
+    seqnames = names(targets),
+    seqlengths = as.numeric(targets)
+  )
+}
+
+read_gencode_tss <- function(path, chrom = NULL, window_bp = 2000L, seqinfo = NULL) {
+  dt <- data.table::fread(
+    path,
+    header = FALSE,
+    col.names = c("chromosome", "start0", "end0", "tss_id", "score", "tss_strand")
+  )
+
+  if (!is.null(chrom)) {
+    dt <- dt[chromosome == chrom]
+  }
+
+  if (!nrow(dt)) {
+    stop("No TSS rows remained after chromosome filtering.", call. = FALSE)
+  }
+
+  dt[, row_id := .I]
+  dt[, tss_coordinate := start0 + 1L]
+  dt[, gene_name_or_tss_id := tss_id]
+  dt[, tss_uid := paste(chromosome, tss_coordinate, tss_strand, tss_id, row_id, sep = "|")]
+
+  tss_gr <- GenomicRanges::GRanges(
+    seqnames = dt$chromosome,
+    ranges = IRanges::IRanges(dt$tss_coordinate, dt$tss_coordinate),
+    strand = dt$tss_strand
+  )
+
+  if (!is.null(seqinfo)) {
+    GenomeInfoDb::seqinfo(tss_gr) <- seqinfo[unique(dt$chromosome)]
+  }
+
+  mcols(tss_gr)$tss_uid <- dt$tss_uid
+  mcols(tss_gr)$tss_id <- dt$tss_id
+  mcols(tss_gr)$gene_name_or_tss_id <- dt$gene_name_or_tss_id
+
+  promoter_windows <- GenomicRanges::promoters(
+    tss_gr,
+    upstream = window_bp,
+    downstream = window_bp + 1L
+  )
+
+  promoter_windows <- GenomicRanges::trim(promoter_windows)
+
+  promoter_meta <- data.table::data.table(
+    tss_uid = dt$tss_uid,
+    chromosome = dt$chromosome,
+    tss_coordinate = dt$tss_coordinate,
+    tss_strand = dt$tss_strand,
+    gene_name_or_tss_id = dt$gene_name_or_tss_id,
+    tss_id = dt$tss_id,
+    promoter_start = start(promoter_windows),
+    promoter_end = end(promoter_windows)
+  )
+
+  tss_table <- copy(promoter_meta)
+  tss_table[, strand := tss_strand]
+  tss_table[, tss_strand := NULL]
+  data.table::setcolorder(
+    tss_table,
+    c(
+      "chromosome",
+      "tss_coordinate",
+      "strand",
+      "gene_name_or_tss_id",
+      "tss_id",
+      "tss_uid",
+      "promoter_start",
+      "promoter_end"
+    )
+  )
+
+  list(
+    tss_table = tss_table,
+    tss_gr = tss_gr,
+    promoter_windows = promoter_windows,
+    promoter_meta = promoter_meta
+  )
+}
+
+read_fiber_bed12 <- function(path) {
+  data.table::fread(
+    path,
+    header = FALSE,
+    col.names = c(
+      "chrom",
+      "chromStart",
+      "chromEnd",
+      "name",
+      "score",
+      "strand",
+      "thickStart",
+      "thickEnd",
+      "itemRgb",
+      "blockCount",
+      "blockSizes",
+      "blockStarts"
+    )
+  )
+}
+
+parse_bed12_blocks <- function(block_sizes, block_starts, drop_terminal_blocks = TRUE) {
+  sizes <- as.integer(strsplit(block_sizes, ",", fixed = TRUE)[[1]])
+  starts <- as.integer(strsplit(block_starts, ",", fixed = TRUE)[[1]])
+
+  keep <- !is.na(sizes) & !is.na(starts)
+  sizes <- sizes[keep]
+  starts <- starts[keep]
+
+  if (drop_terminal_blocks && length(sizes) >= 2L) {
+    idx <- seq_along(sizes)
+    idx <- idx[-c(1L, length(idx))]
+    sizes <- sizes[idx]
+    starts <- starts[idx]
+  }
+
+  list(sizes = sizes, starts = starts)
+}
+
+expand_ft_bed12_features <- function(bed12, feature_name = "feature", drop_terminal_blocks = TRUE) {
+  feature_name_local <- feature_name
+  
+  # { ... } = run once per row/read
+  # for each group, expand into multiple rows and return a new table using .()
+  bed12[, {
+    parsed <- parse_bed12_blocks(
+      # block size = length of 1
+      block_sizes = blockSizes, # a compressed string representation of multiple blocks for a single read
+      block_starts = blockStarts,
+      drop_terminal_blocks = drop_terminal_blocks
+    )
+
+    sizes <- parsed$sizes
+    starts0 <- parsed$starts
+
+    if (!length(sizes)) {
+      return(NULL)
+    }
+
+    feature_start0 <- chromStart + starts0
+    feature_end0 <- chromStart + starts0 + sizes
+    feature_mid0 <- as.integer((feature_start0 + feature_end0) / 2)
+ 
+    # .() is shorthand for list()
+    .(
+      feature_chromosome = chrom,
+      read_id = name,
+      read_strand = strand,
+      feature_start0 = feature_start0,
+      feature_end0 = feature_end0,
+      feature_mid0 = feature_mid0,
+      feature_pos = feature_mid0 + 1L,
+      feature_size = sizes,
+      feature_name = feature_name_local
+    )
+  }, by = .(chrom, chromStart, chromEnd, name, strand)]
+}
+
+# Converts feature table into GRanges
+feature_blocks_to_granges <- function(feature_dt) {
+  GenomicRanges::GRanges(
+    seqnames = feature_dt$feature_chromosome,
+    ranges = IRanges::IRanges(
+      start = feature_dt$feature_start0 + 1L,
+      end = feature_dt$feature_end0
+    ),
+    strand = "*"
+  )
+}
+
+
+# Finds which features overlap TSS promoter windows and computes relative positions
+
+## feature_dt: a data.table containing feature information, like chromosome, read ID, feature position, feature size
+## feature_gr: the same features, but stored as a GRanges object for overlap operations
+## promoter_windows: genomic promoter intervals around TSSs, also as GRanges
+## promoter_meta: a table containing metadata for those promoter windows, such as TSS coordinate, strand, gene/TSS ID
+
+align_feature_blocks_to_tss <- function(feature_dt, feature_gr, promoter_windows, promoter_meta) {
+  if (!nrow(feature_dt) || !length(feature_gr) || !length(promoter_windows)) {
+    # if any of the input is empty, return an empty data table instead of giving errors
+    return(data.table::data.table())
+  }
+
+  # which feature block overlap which promoter windows?
+  hits <- GenomicRanges::findOverlaps(
+    # set query ranges to be the feature ranges --> intervals want to test for overlap
+    query = feature_gr, 
+    # subject ranges = promoter windows --> reference interval
+    subject = promoter_windows,
+    # overlap is only based on genommic coordinate
+    ignore.strand = TRUE
+  )
+
+  if (!length(hits)) {
+    return(data.table::data.table())
+  }
+
+  aligned <- cbind(
+    # subset feature meta table to only include overlapping features
+    feature_dt[S4Vectors::queryHits(hits)], 
+    # subset promoter meta table to only include overlapping promoter windows
+    promoter_meta[S4Vectors::subjectHits(hits)]
+  )
+
+  # Create a relative-position column based on strand
+  ## add a new column to indicate relative position to TSS
+  aligned[, rel_pos := ifelse(
+    tss_strand == "+",
+    # if + strand, relative position = feature - TSS coordinate --> positive number = donwstream
+    feature_pos - tss_coordinate,
+    tss_coordinate - feature_pos
+  )]
+  # return aligned data table after modifications
+  aligned[]
+}
+
+
+# summarize nucleosome count, size and distance to TSS for each unique TSS/read
+summarize_nucleosomes_by_tss <- function(nuc_aligned, window_bp = 2000L) {
+  # takes output from  <align_feature_blocks_to_tss> to construct nuc_aligned
+  if (!nrow(nuc_aligned)) {
+    return(data.table::data.table(tss_uid = character()))
+  }
+
+  nuc_aligned[, {
+    # .N = number of rows in the group
+    n_nuc <- .N
+    .(
+      # n_nuc = nucleosome count per TSS
+      structure_nucleosome_count = n_nuc,
+      # average nucleosome size in this TSS group
+      structure_mean_nucleosome_size = mean(feature_size),
+      # Computes the median nucleosome size per TSS
+      structure_median_nucleosome_size = as.double(median(feature_size)),
+      # How many nucleosomes per kilobase are present around this TSS
+      structure_nucleosome_density_per_kb = n_nuc / ((2L * window_bp + 1L) / 1000),
+      # Counts how many nucleosomes have midpoint positions within 150 bp of the TSS
+      structure_core_nucleosome_count = sum(abs(rel_pos) <= 150L),
+      # Computes the average signed midpoint offset from the TSS.
+      ## On average, are nucleosome midpoints shifted upstream or downstream of the TSS?
+      structure_mean_midpoint_offset = mean(rel_pos),
+      # How far away, on average, are nucleosome midpoints from the TSS?
+      structure_mean_abs_midpoint_offset = mean(abs(rel_pos))
+    )
+  }, by = tss_uid]
+}
+
+## modbase_code == "a" ~ "m6A",
+## modbase_code == "m" ~ "5mC"
+
+# function that incorporates <footprintR::readModBam> to count how many bases were observed and how many were modified at each genomic position for this sample, then return the results as a clean table
+read_modbam_summary_positions <- function(
+  bamfiles,
+  sample_name,
+  promoter_windows,
+  modbase_code,
+  seqinfo, # A chromosome metadata object containing chromosome names and lengths
+  bpparam,
+  modProbThreshold = 0.9
+) {
+  se_summary <- footprintR::readModBam(
+    bamfiles = bamfiles,
+    regions = promoter_windows,
+    modbase = setNames(modbase_code, sample_name), # Creates a named vector where the modification code is assigned to the sample name
+    # aggregated counts at each genomic position
+    ## count total valid bases per position/strand
+    ## count modified bases per position/strand
+    ## return assays Nvalid, Nmod, and FracM
+    level = "summary",
+    modProbThreshold = modProbThreshold,
+    seqinfo = seqinfo,
+    trim = TRUE,
+    BPPARAM = bpparam,
+    verbose = TRUE
+  )
+  
+  # rows = genomic positions
+  # columns = samples
+  # assays = count summaries for those positions
+  rr <- data.table::as.data.table(as.data.frame(SummarizedExperiment::rowRanges(se_summary)))
+  rr <- rr[, .(
+    call_chromosome = as.character(seqnames),
+    position = start,
+    call_strand = as.character(strand)
+  )]
+  
+  # Pulls the "Nvalid" assay from the SummarizedExperiment
+  ## Nvalid is the total number of valid/callable bases at each position for each sample
+  total_calls <- as.integer(SummarizedExperiment::assay(se_summary, "Nvalid")[, sample_name])
+  
+  ## Nmod is the number of bases classified as modified at each position.
+  modified_calls <- as.integer(SummarizedExperiment::assay(se_summary, "Nmod")[, sample_name])
+
+  rr[, sample_name := sample_name]
+  rr[, modbase_code := modbase_code]
+  rr[, total_calls := total_calls]
+  rr[, modified_calls := modified_calls]
+  # Computes how many calls were not modified
+  rr[, unmodified_calls := total_calls - modified_calls]
+  rr[, frac_modified := data.table::fifelse(total_calls > 0, modified_calls / total_calls, NA_real_)]
+
+  # only rows where there was at least one valid call
+  rr[total_calls > 0]
+}
+
+
+# converts per-position modified vs unmodified counts into a long-format table with a status label and n_calls column
+make_modified_status_table <- function(position_dt) {
+  if (!nrow(position_dt)) {
+    return(data.table::data.table())
+  }
+
+  modified_dt <- copy(position_dt)
+  modified_dt[, `:=`(status = "modified", n_calls = modified_calls)]
+
+  unmodified_dt <- copy(position_dt)
+  unmodified_dt[, `:=`(status = "not_modified", n_calls = unmodified_calls)]
+
+  data.table::rbindlist(
+    list(modified_dt, unmodified_dt),
+    use.names = TRUE,
+    fill = TRUE
+  )[n_calls > 0]
+}
+
+align_positions_to_tss <- function(position_dt, promoter_windows, promoter_meta) {
+  if (!nrow(position_dt) || !length(promoter_windows)) {
+    return(data.table::data.table())
+  }
+
+  pos_gr <- GenomicRanges::GRanges(
+    seqnames = position_dt$call_chromosome,
+    ranges = IRanges::IRanges(position_dt$position, position_dt$position),
+    strand = "*"
+  )
+
+  hits <- GenomicRanges::findOverlaps(
+    query = pos_gr,
+    subject = promoter_windows,
+    ignore.strand = TRUE
+  )
+
+  if (!length(hits)) {
+    return(data.table::data.table())
+  }
+
+  aligned <- cbind(
+    position_dt[S4Vectors::queryHits(hits)],
+    promoter_meta[S4Vectors::subjectHits(hits)]
+  )
+
+  aligned[, rel_pos := ifelse(
+    tss_strand == "+",
+    position - tss_coordinate,
+    tss_coordinate - position
+  )]
+
+  aligned[]
+}
+
+summarize_modality_by_tss <- function(aligned_dt, prefix = c("accessibility", "methylation")) {
+  prefix <- match.arg(prefix)
+
+  if (!nrow(aligned_dt)) {
+    return(data.table::data.table(tss_uid = character()))
+  }
+
+  out <- aligned_dt[, {
+    total <- sum(total_calls)
+    modified <- sum(modified_calls)
+    unmodified <- sum(unmodified_calls)
+    .(
+      modified_calls = modified,
+      unmodified_calls = unmodified,
+      total_calls = total,
+      positions_with_coverage = sum(total_calls > 0),
+      fraction_modified = if (total > 0) modified / total else NA_real_
+    )
+  }, by = tss_uid]
+
+  data.table::setnames(
+    out,
+    old = c("modified_calls", "unmodified_calls", "total_calls", "positions_with_coverage", "fraction_modified"),
+    new = c(
+      sprintf("%s_modified_calls", prefix),
+      sprintf("%s_unmodified_calls", prefix),
+      sprintf("%s_total_calls", prefix),
+      sprintf("%s_positions_with_coverage", prefix),
+      sprintf("%s_fraction_modified", prefix)
+    )
+  )
+
+  out[]
+}
+
+make_nucleosome_meta <- function(nuc_aligned, num_tss, window_bp = 2000L, bin_size = 10L) {
+  bins <- data.table::data.table(bin = seq(-window_bp, window_bp, by = bin_size))
+
+  if (!nrow(nuc_aligned)) {
+    bins[, nucleosome_midpoints_per_tss := 0]
+    return(bins[])
+  }
+
+  tmp <- copy(nuc_aligned)
+  tmp[, bin := round(rel_pos / bin_size) * bin_size]
+
+  meta <- tmp[, .N, by = bin]
+  meta <- merge(bins, meta, by = "bin", all.x = TRUE, sort = TRUE)
+  meta[is.na(N), N := 0]
+  meta[, nucleosome_midpoints_per_tss := N / num_tss]
+  meta[]
+}
+
+# takes modification calls already aligned relative to TSSs, groups them into position bins, summarizes modified and total calls per bin, computes fraction modified and modified calls per TSS
+
+make_modification_meta <- function(aligned_dt, num_tss, label, window_bp = 2000L, bin_size = 10L) {
+  bins <- data.table::data.table(bin = seq(-window_bp, window_bp, by = bin_size))
+  label_value <- label
+
+  if (!nrow(aligned_dt)) {
+    bins[, `:=`(
+      modified_calls = 0L,
+      total_calls = 0L,
+      fraction_modified = NA_real_,
+      modified_calls_per_tss = 0,
+      label = label_value
+    )]
+    return(bins[])
+  }
+
+  tmp <- copy(aligned_dt)
+  # converts each relative position rel_pos into the nearest bin value
+  tmp[, bin := round(rel_pos / bin_size) * bin_size]
+
+  meta <- tmp[, .(
+    modified_calls = sum(modified_calls),
+    total_calls = sum(total_calls)
+  ), by = bin]
+
+  meta <- merge(bins, meta, by = "bin", all.x = TRUE, sort = TRUE)
+  meta[is.na(modified_calls), modified_calls := 0L]
+  meta[is.na(total_calls), total_calls := 0L]
+  meta[, fraction_modified := data.table::fifelse(total_calls > 0, modified_calls / total_calls, NA_real_)]
+  meta[, modified_calls_per_tss := modified_calls / num_tss]
+  meta[, label := label_value]
+  meta[]
+}
+
+plot_structure_meta <- function(
+  meta_dt,
+  sample_name,
+  chrom,
+  window_bp        = 5000L,   # x-axis range (+/- bp from TSS)
+  x_break_interval = 500,     # spacing of x-axis tick marks (bp)
+  loess_span       = 0.06,    # LOESS smoothing bandwidth (smaller = tighter fit)
+  ylim             = NULL,    # c(lo, hi) to fix y-axis, NULL for auto
+  line_color       = "#4D4D4D",
+  smooth_color     = "#1f77b4",
+  linewidth        = 0.6,     # raw data line width
+  smooth_linewidth = 0.9,     # LOESS line width
+  base_size        = 12       # ggplot theme base font size
+) {
+  p <- ggplot2::ggplot(meta_dt, ggplot2::aes(x = bin, y = nucleosome_midpoints_per_tss)) +
+    ggplot2::geom_line(color = line_color, linewidth = linewidth) +
+    ggplot2::geom_smooth(
+      method = "loess",
+      span   = loess_span,
+      se     = FALSE,
+      color  = smooth_color,
+      linewidth = smooth_linewidth
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(-window_bp, window_bp, x_break_interval),
+      labels = function(x) paste0(x / 1000, " kb")
+    ) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.4) +
+    ggplot2::labs(
+      x     = "Distance to TSS",
+      y     = "Nucleosome midpoints per TSS",
+      title = sprintf("Promoter structure: %s %s", sample_name, chrom)
+    ) +
+    ggplot2::theme_bw(base_size = base_size)
+
+  if (!is.null(ylim)) {
+    p <- p + ggplot2::coord_cartesian(ylim = ylim)
+  }
+  p
+}
+
+plot_modification_meta <- function(
+  meta_dt,
+  title,
+  color,
+  window_bp        = 5000L,   # x-axis range (+/- bp from TSS)
+  x_break_interval = 500,     # spacing of x-axis tick marks (bp)
+  loess_span       = 0.06,    # LOESS smoothing bandwidth (smaller = tighter fit)
+  ylim             = NULL,    # c(lo, hi) to fix y-axis, NULL for auto
+  linewidth        = 0.6,     # raw data line width
+  smooth_linewidth = 0.9,     # LOESS line width
+  y_label          = "Modified fraction",
+  base_size        = 12       # ggplot theme base font size
+) {
+  p <- ggplot2::ggplot(meta_dt, ggplot2::aes(x = bin, y = fraction_modified)) +
+    ggplot2::geom_line(color = color, linewidth = linewidth, na.rm = TRUE) +
+    ggplot2::geom_smooth(
+      method = "loess",
+      span   = loess_span,
+      se     = FALSE,
+      color  = color,
+      linewidth = smooth_linewidth,
+      na.rm  = TRUE
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(-window_bp, window_bp, x_break_interval),
+      labels = function(x) paste0(x / 1000, " kb")
+    ) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.4) +
+    ggplot2::labs(
+      x     = "Distance to TSS",
+      y     = y_label,
+      title = title
+    ) +
+    ggplot2::theme_bw(base_size = base_size)
+
+  if (!is.null(ylim)) {
+    p <- p + ggplot2::coord_cartesian(ylim = ylim)
+  }
+  p
+}
+
+# Adapted from /project/spott/cshan/code/fiberseqFunctions.R
+
+## takes a SummarizedExperiment containing read-level modification probabilities, converts those probabilities into 0/1 modified calls using a threshold, reshapes the data into a long table with one row per genomic position per read, and annotates each row with chromosome, position, strand, sample, and modification label
+getBinarizedModificationsLongTable <- function(footprintRObject, sampleName, modProbThreshold = 0.9) {
+  if (!inherits(footprintRObject, "SummarizedExperiment")) {
+    stop("footprintRObject must be a SummarizedExperiment.", call. = FALSE)
+  }
+
+  # default is at per read level
+  ## Extracts the assay named "mod_prob" from the SummarizedExperiment
+  mod_prob_assay <- SummarizedExperiment::assay(footprintRObject, "mod_prob")[[sampleName]]
+  mod_prob_matrix <- as(mod_prob_assay, "matrix")
+
+  # 1 = probability greater than threshold = modified 
+  mod_prob_matrix[mod_prob_matrix > modProbThreshold] <- 1
+  mod_prob_matrix[mod_prob_matrix <= modProbThreshold] <- 0
+
+  rownames(mod_prob_matrix) <- rownames(footprintRObject)
+  mod_wide <- tibble::as_tibble(mod_prob_matrix, rownames = "genomic_location")
+
+  # Reshapes from wide to long format
+  mod_long <- tidyr::pivot_longer(
+    mod_wide,
+    cols = -genomic_location,
+    names_to = "read_id",
+    values_to = "mod_status"
+  )
+
+  # Parse genomic location and annotate call state
+  mod_long <- dplyr::mutate(
+    mod_long,
+    call_chromosome = stringr::str_extract(genomic_location, "^[^:]+"),
+    position = as.integer(stringr::str_extract(genomic_location, "(?<=:)[0-9]+")),
+    call_strand = stringr::str_extract(genomic_location, "[+-]$"),
+    sample_name = sampleName,
+    call_state = ifelse(mod_status == 1, "modified", "not_modified")
+  )
+
+  modbase_code <- SummarizedExperiment::colData(footprintRObject)$modbase[[sampleName]]
+
+  mod_long <- dplyr::mutate(
+    mod_long,
+    modbase_code = modbase_code,
+    modbase_label = dplyr::case_when(
+      modbase_code == "a" ~ "m6A",
+      modbase_code == "m" ~ "5mC",
+      TRUE ~ modbase_code
+    )
+  )
+
+  dplyr::select(
+    mod_long,
+    sample_name,
+    modbase_code,
+    modbase_label,
+    read_id,
+    call_chromosome,
+    position,
+    call_strand,
+    mod_status,
+    call_state
+  )
+}
+
+# Make a vector with 20 positive weights, then 120 negative weights, then 20 positive weights
+build_nucleosome_weight_vector <- function() {
+  c(
+    rep(0.375, 20),
+    rep(-0.125, 120),
+    rep(0.375, 20)
+  )
+}
+
+make_chapter5_example_plot <- function(
+  bamfiles,
+  sample_name,
+  seqinfo,
+  promoter_windows,
+  promoter_meta,
+  mod_prob_threshold,
+  example_tss_index,
+  output_dir,
+  chrom
+) {
+  if (length(promoter_windows) < example_tss_index) {
+    return(NULL)
+  }
+
+  example_region <- promoter_windows[example_tss_index]
+  example_tss_uid <- promoter_meta$tss_uid[example_tss_index]
+
+  se_example <- footprintR::readModBam(
+    bamfiles = bamfiles,
+    regions = example_region,
+    modbase = setNames("a", sample_name),
+    level = "quickread",
+    seqinfo = seqinfo,
+    trim = TRUE,
+    BPPARAM = BiocParallel::SerialParam(),
+    verbose = TRUE
+  )
+
+  se_example <- footprintR::flattenReadLevelAssay(se_example)
+  wgt <- build_nucleosome_weight_vector()
+  se_example <- footprintR::addFootprints(
+    se = se_example,
+    wgt = wgt,
+    thresh = 0.02,
+    name = "nucl"
+  )
+
+  example_binary_calls <- getBinarizedModificationsLongTable(
+    footprintRObject = se_example,
+    sampleName = sample_name,
+    modProbThreshold = mod_prob_threshold
+  )
+
+  example_binary_calls <- data.table::as.data.table(example_binary_calls)
+  example_binary_calls[, example_tss_uid := example_tss_uid]
+  write_gz_tsv(
+    example_binary_calls,
+    file.path(
+      output_dir,
+      sprintf("%s_%s_exampleTSS_read_level_m6A_binary_calls.tsv.gz", sample_name, chrom)
+    )
+  )
+
+  p <- footprintR::plotRegion(
+    se_example,
+    region = example_region,
+    minCoveredFraction = 0,
+    tracks = list(
+      list(
+        trackData = "mod_prob",
+        trackType = "Heatmap",
+        interpolate = TRUE,
+        footprintColumns = "nucl",
+        arglistFootprints = list(
+          nucl = list(color = scales::alpha("firebrick", 0.5))
+        ),
+        orderReads = "squish"
+      ),
+      list(
+        trackData = "FracMod",
+        trackType = "Smooth",
+        smoothMethod = "rollingMean",
+        windowSize = 41
+      )
+    )
+  ) + patchwork::plot_layout(heights = c(2, 0.6))
+
+  ggplot2::ggsave(
+    filename = file.path(
+      output_dir,
+      sprintf("%s_%s_exampleTSS_footprintR_nucleosome_plot.pdf", sample_name, chrom)
+    ),
+    plot = p,
+    width = 10,
+    height = 6
+  )
+
+  list(
+    plot = p,
+    binary_calls = example_binary_calls,
+    example_tss_uid = example_tss_uid
+  )
+}
+```
+
+## Validate inputs
+
+Check that `run_modbam_promoter_summary.R` has already been run and output files exist.
+
+```{r validate-inputs}
+expected_files <- c(
+  file.path(output_dir, sprintf("%s_%s_tss_table.tsv.gz",                                          default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_promoter_structure.tsv.gz",                                 default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_nucleosome_meta.tsv.gz",                                    default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_promoter_accessibility.tsv.gz",                             default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_m6A_meta.tsv.gz",                                           default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_promoter_methylation.tsv.gz",                               default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_5mC_meta.tsv.gz",                                           default_sample, default_chrom)),
+  file.path(output_dir, sprintf("%s_%s_promoter_structure_accessibility_methylation.tsv.gz",       default_sample, default_chrom))
+)
+
+missing <- expected_files[!file.exists(expected_files)]
+if (length(missing)) {
+  stop(
+    "Missing pre-computed files. Run run_modbam_promoter_summary.R first:\n",
+    paste(missing, collapse = "\n"),
+    call. = FALSE
+  )
+}
+message("All expected output files found.")
+```
+
+## TSS table and promoter windows
+
+```{r tss-table}
+tss_table <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_tss_table.tsv.gz", default_sample, default_chrom))
+)
+
+tss_table[1:10]
+```
+
+## Promoter structure from `ft extract --nuc`
+
+```{r promoter-structure}
+nuc_summary <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_promoter_structure.tsv.gz", default_sample, default_chrom))
+)
+
+nuc_meta <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_nucleosome_meta.tsv.gz", default_sample, default_chrom))
+)
+
+nuc_summary[1:10]
+```
+
+## Promoter accessibility from BAM m6A calls
+
+Results pre-computed by `run_modbam_promoter_summary.R` (submit via
+`code/run_modbam_promoter_summary.sh`). Read output files below.
+
+```{r promoter-accessibility}
+m6a_summary <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_promoter_accessibility.tsv.gz", default_sample, default_chrom))
+)
+
+m6a_meta <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_m6A_meta.tsv.gz", default_sample, default_chrom))
+)
+
+m6a_summary[1:10]
+```
+
+## Promoter methylation from BAM 5mC calls
+
+```{r promoter-methylation}
+m5c_summary <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_promoter_methylation.tsv.gz", default_sample, default_chrom))
+)
+
+m5c_meta <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_5mC_meta.tsv.gz", default_sample, default_chrom))
+)
+
+m5c_summary[1:10]
+```
+
+## Join structure, accessibility, and methylation per promoter
+
+```{r promoter-join}
+# Pre-computed and saved by run_modbam_promoter_summary.R
+promoter_multiomic_summary <- data.table::fread(
+  file.path(
+    output_dir,
+    sprintf("%s_%s_promoter_structure_accessibility_methylation.tsv.gz", default_sample, default_chrom)
+  )
+)
+
+promoter_multiomic_summary[1:10]
+```
+
+## Promoter-centered metaprofiles
+
+```{r promoter-metaprofiles, fig.width=16, fig.height=4.5}
+# load nuc_meta, m6a_meta, and m5c_meta from storage
+# /project/spott/cshan/fiber-seq/results/promoter_summary/AL10_bc2178_19130
+source("/project/spott/cshan/fiber-seq/code/footprintR_modbam_code/modbam_footprintR_functions.R")
+
+output_dir <- "/project/spott/cshan/fiber-seq/results/promoter_summary/5kb_TSS/threshold_0.9/AL10_bc2178_19130"
+default_sample <- "AL10_bc2178_19130"
+default_chrom <- "chr1"
+
+nuc_meta <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_nucleosome_meta.tsv.gz", default_sample, default_chrom))
+)
+m6a_meta <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_m6A_meta.tsv.gz", default_sample, default_chrom))
+)
+
+
+m5c_meta <- data.table::fread(
+  file.path(output_dir, sprintf("%s_%s_5mC_meta.tsv.gz", default_sample, default_chrom))
+)
+
+
+structure_plot <- plot_structure_meta(
+  meta_dt         = nuc_meta,
+  sample_name     = default_sample,
+  chrom           = default_chrom,
+  window_bp        = 5000L,       # x-axis range (+/- bp)
+  x_break_interval = 500,         # tick spacing (bp)
+  loess_span       = 0.06,        # smoothing bandwidth
+  ylim             = NULL,        # e.g. c(0, 0.5) to fix y-axis
+  line_color       = "#4D4D4D",
+  smooth_color     = "#1f77b4",
+  linewidth        = 0.6,
+  smooth_linewidth = 0.9,
+  base_size        = 12
+)
+
+accessibility_plot <- plot_modification_meta(
+  meta_dt          = m6a_meta,
+  title            = sprintf("Promoter accessibility: %s %s", default_sample, default_chrom),
+  color            = "#7B3294",
+  window_bp        = 5000L,       # x-axis range (+/- bp)
+  x_break_interval = 500,         # tick spacing (bp)
+  loess_span       = 0.06,        # smoothing bandwidth
+  ylim             = NULL,        # e.g. c(0, 0.3) to fix y-axis
+  linewidth        = 0.6,
+  smooth_linewidth = 0.9,
+  y_label          = "Modified fraction",
+  base_size        = 12
+)
+
+methylation_plot <- plot_modification_meta(
+  meta_dt          = m5c_meta,
+  title            = sprintf("Promoter methylation: %s %s", default_sample, default_chrom),
+  color            = "#8C510A",
+  window_bp        = 5000L,       # x-axis range (+/- bp)
+  x_break_interval = 500,         # tick spacing (bp)
+  loess_span       = 0.06,        # smoothing bandwidth
+  ylim             = NULL,        # e.g. c(0, 0.3) to fix y-axis
+  linewidth        = 0.6,
+  smooth_linewidth = 0.9,
+  y_label          = "Modified fraction",
+  base_size        = 12
+)
+
+# Overlay the three plots using patchwork
+
+
+
+# Overlay the plots using patchwork
+# structure_plot is included as-is, which allows it to autoscale
+combined_plot <- structure_plot / accessibility_plot / methylation_plot + 
+  patchwork::plot_layout(heights = c(1, 1, 1))
+
+# Save the plot
+ggplot2::ggsave(
+  filename = file.path(
+    output_dir,
+    sprintf("%s_%s_promoter_multiomic_metaprofiles_5kb_threshold_0.9.pdf", default_sample, default_chrom)
+  ),
+  plot = combined_plot,
+  width = 10,
+  height = 16
+)
+
+# Display the plot
+combined_plot
+```
+
+## One example `footprintR` nucleosome call from the BAM
+
+This small example follows the chapter-5 `footprintR` nucleosome workflow on a single promoter window. It keeps the notebook tied to the `nucleosomes.html` analysis pattern while the chromosome-wide summary stays scalable.
+
+```{r chapter5-example, fig.width=10, fig.height=6}
+# use example promoter region from region_str = "chr3:186782192-186785192"
+test_window =   GenomicRanges::GRanges(
+  seqnames = default_chrom,
+  ranges = IRanges::IRanges(186782192, 186785192),
+  strand = "+"
+)
+
+# extract promoter_meta to match test_window
+test_tss_uid <- promoter_meta$tss_uid[1] 
+test_promoter_meta <- promoter_meta[tss_uid == test_tss_uid]
+
+# get example_tss_index by matching test_tss_uid to promoter_meta$tss_uid
+example_tss_index <- which(promoter_meta$tss_uid == test_tss_uid)
+
+example_footprint <- make_chapter5_example_plot(
+  bamfiles = bamfiles,
+  sample_name = default_sample,
+  seqinfo = bam_seqinfo,
+  promoter_windows = test_window,
+  promoter_meta = test_promoter_meta,
+  mod_prob_threshold = mod_prob_threshold,
+  example_tss_index = example_tss_index,
+  output_dir = output_dir,
+  chrom = default_chrom
+)
+
+if (!is.null(example_footprint)) {
+  example_footprint$plot
+}
+```
+
+## Output files
+
+```{r output-files}
+list.files(output_dir, full.names = TRUE)
+```
+
+# Examine % modified
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(tidyr)
+
+# 1. Define the file path (using the variables from your environment)
+saved_file <- file.path(
+  output_dir,
+  sprintf("%s_%s_promoter_structure_accessibility_methylation.tsv.gz", default_sample, default_chrom)
+)
+
+# 2. Load the data
+summary_data <- data.table::fread(saved_file)
+
+# 3. Prepare data for QC Bar Plot (Calculating global means)
+qc_summary <- data.frame(
+  Modality = c("Accessibility (m6A)", "Methylation (5mC)"),
+  Mean_Fraction = c(
+    mean(summary_data$accessibility_fraction_modified, na.rm = TRUE),
+    mean(summary_data$methylation_fraction_modified, na.rm = TRUE)
+  )
+)
+
+# 4. Create the QC Bar Plot
+qc_plot <- ggplot(qc_summary, aes(x = Modality, y = Mean_Fraction, fill = Modality)) +
+  geom_bar(stat = "identity", color = "black", width = 0.6) +
+  scale_fill_manual(values = c("Accessibility (m6A)" = "#7B3294", "Methylation (5mC)" = "#008837")) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(
+    title = paste("QC: Average Promoter Signal -", default_sample),
+    subtitle = paste("Region:", default_chrom),
+    y = "Mean Fraction Modified",
+    x = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Display the plot
+print(qc_plot)
+
+# Histogram to see the distribution across all promoters
+dist_plot <- summary_data %>%
+  pivot_longer(cols = c(accessibility_fraction_modified, methylation_fraction_modified),
+               names_to = "Modality", values_to = "Fraction") %>%
+  ggplot(aes(x = Fraction, fill = Modality)) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+  theme_minimal() +
+  labs(title = "Distribution of Modifications across Promoters")
+
+print(dist_plot)
+
+plot_dir <- "/project/spott/cshan/fiber-seq/results/promoter_summary/threshold_0.9/AL10_bc2178_19130/QC_plots/"
+
+combined_QC_plot <- qc_plot / dist_plot + patchwork::plot_layout(heights = c(1, 1))
+combined_QC_plot <- ggarrange(qc_plot, dist_plot, ncol = 1, nrow = 2)
+ggsave(file.path(paste0(plot_dir, "accessibility_methylation_dist.png")), combined_QC_plot)
+```
+
+Correlation Plot (Accessibility vs. Methylation)
+Check if individual promoters follow the expected rule: High Accessibility = Low Methylation
+```{r}
+
+pdf(file.path(paste0(plot_dir, "accessibility_methylation_correlation.pdf")))
+ggplot(summary_data, aes(x = accessibility_fraction_modified, y = methylation_fraction_modified)) +
+  geom_point(alpha = 0.2, color = "darkblue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Promoter-wise: Accessibility vs. Methylation",
+       x = "m6A Fraction (Accessibility)", y = "5mC Fraction (Methylation)")
+dev.off()
+
+
+```
+
+
+
+Does having more nucleosomes at the promoter actually decrease the measured accessibility?
+```{r}
+
+pdf(file.path(paste0(plot_dir, "accessibility_nuc.pdf")), width = 12)
+ggplot(summary_data, aes(x = factor(structure_core_nucleosome_count), y = accessibility_fraction_modified)) +
+  geom_boxplot(fill = "#7B3294", alpha = 0.6) +
+  labs(title = "Accessibility by Nucleosome Count",
+       x = "Number of Nucleosomes in Promoter Core", y = "m6A Fraction")
+dev.off()
+
+```
+
+Coverage QC (Total Calls and modified Distribution)
+
+```{r}
+
+ggplot(summary_data, aes(x = accessibility_total_calls)) +
+  geom_histogram(bins = 100, fill = "steelblue") +
+  labs(title = "Distribution of Read Coverage per Promoter",
+       x = "Total Valid Calls", y = "Count of Promoters") 
+```
+
+
+
+# Examine cCRE to examine their m6A and 5mc distribution
+##############################################################
+
+  - PLS = promoter like
+  - pELS = proximial enhancer like
+  - dELS = distal enhancer like
+  - chromatin accessible with TF = CA-TF
+  - chromatin accessible with CTCF = CA-CTC
+  - chromatin accessible with H3K4me3 = CA-H3K4me3
+  - all candidate enhancers = pELS + dELS
+  - chromatin accessible only = CA
+  - TF only = TF
+  
+
+  https://screen.wenglab.org/downloads
+
+  donwload cCRE is at /project/spott/cshan/annotations/GRCh38-cCREs.bed
+
+```{bash, eval = FALSE}
+# donwload  cCREs
+
+wget https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.bed
+
+```
+
+
+
+## Random-region and cCRE sanity check
+
+The goal of this section is to check the m6A and 5mC signal distribution in random genomic regions and cCREs, to confirm that the promoter patterns we see are specific to promoters and not a genome-wide artifact
+
+```{r random-region-cCRE, fig.width=12, fig.height=10}
+# ── Variables ────────────────────────────────────────────────────────────────
+default_sample     <- "AL10_bc2178_19130"
+default_chrom      <- "chr1"
+window_bp          <- 2000L
+mod_prob_threshold <- 0.9
+
+results_root_dir <- "/project/spott/cshan/fiber-seq/results/promoter_summary"
+ccre_output_dir  <- file.path(results_root_dir, "ccre")
+dir.create(ccre_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+bam_path <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples",
+  sprintf("%s.5mC.6mA.aligned.phased.bam", default_sample)
+)
+tss_path    <- "/project/spott/cshan/annotations/TSS.gencode.v49.bed"
+cpg_ft_path <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
+  default_sample, "extracted_results", "cpg_by_chr",
+  sprintf("%s.ft_extracted_cpg.%s.bed.gz", default_sample, default_chrom)
+)
+ccre_path <- "/project/spott/cshan/annotations/GRCh38-cCREs.bed"
+
+# ── Utility functions (mirrors Helpers chunk) ─────────────────────────────────
+assert_file_exists <- function(path, label = "file") {
+  if (!file.exists(path)) stop(sprintf("Missing %s: %s", label, path), call. = FALSE)
+  invisible(path)
+}
+
+write_gz_tsv <- function(x, path) {
+  data.table::fwrite(x, file = path, sep = "\t")
+  invisible(path)
+}
+
+read_bam_seqinfo <- function(bam_path) {
+  targets <- Rsamtools::scanBamHeader(bam_path)[[1]]$targets
+  GenomeInfoDb::Seqinfo(seqnames = names(targets), seqlengths = as.numeric(targets))
+}
+
+read_gencode_tss <- function(path, chrom = NULL, window_bp = 2000L, seqinfo = NULL) {
+  dt <- data.table::fread(path, header = FALSE,
+    col.names = c("chromosome", "start0", "end0", "tss_id", "score", "tss_strand"))
+  if (!is.null(chrom)) dt <- dt[chromosome == chrom]
+  if (!nrow(dt)) stop("No TSS rows remained after chromosome filtering.", call. = FALSE)
+  dt[, tss_coordinate     := start0 + 1L]
+  dt[, tss_uid            := paste(chromosome, tss_coordinate, tss_strand, tss_id, .I, sep = "|")]
+  tss_gr <- GenomicRanges::GRanges(
+    seqnames = dt$chromosome,
+    ranges   = IRanges::IRanges(dt$tss_coordinate, dt$tss_coordinate),
+    strand   = dt$tss_strand
+  )
+  if (!is.null(seqinfo)) GenomeInfoDb::seqinfo(tss_gr) <- seqinfo[unique(dt$chromosome)]
+  list(
+    tss_gr           = tss_gr,
+    promoter_windows = GenomicRanges::trim(
+      GenomicRanges::promoters(tss_gr, upstream = window_bp, downstream = window_bp + 1L)
+    )
+  )
+}
+
+read_fiber_bed12 <- function(path) {
+  data.table::fread(path, header = FALSE,
+    col.names = c("chrom","chromStart","chromEnd","name","score","strand",
+                  "thickStart","thickEnd","itemRgb","blockCount","blockSizes","blockStarts"))
+}
+
+parse_bed12_blocks <- function(block_sizes, block_starts, drop_terminal_blocks = TRUE) {
+  sizes  <- as.integer(strsplit(block_sizes,  ",", fixed = TRUE)[[1]])
+  starts <- as.integer(strsplit(block_starts, ",", fixed = TRUE)[[1]])
+  keep   <- !is.na(sizes) & !is.na(starts)
+  sizes  <- sizes[keep];  starts <- starts[keep]
+  if (drop_terminal_blocks && length(sizes) >= 2L) {
+    idx <- seq_along(sizes)[-c(1L, length(sizes))]
+    sizes <- sizes[idx];  starts <- starts[idx]
+  }
+  list(sizes = sizes, starts = starts)
+}
+
+expand_ft_bed12_features <- function(bed12, drop_terminal_blocks = TRUE) {
+  bed12[, {
+    parsed        <- parse_bed12_blocks(blockSizes, blockStarts, drop_terminal_blocks)
+    if (!length(parsed$sizes)) return(NULL)
+    feature_start0 <- chromStart + parsed$starts
+    feature_end0   <- chromStart + parsed$starts + parsed$sizes
+    feature_mid0   <- as.integer((feature_start0 + feature_end0) / 2)
+    .(feature_chromosome = chrom,
+      feature_start0 = feature_start0, feature_end0 = feature_end0,
+      feature_mid0   = feature_mid0,   feature_pos   = feature_mid0 + 1L,
+      feature_size   = parsed$sizes)
+  }, by = .(chrom, chromStart, chromEnd, name, strand)]
+}
+
+feature_blocks_to_granges <- function(feature_dt) {
+  GenomicRanges::GRanges(
+    seqnames = feature_dt$feature_chromosome,
+    ranges   = IRanges::IRanges(feature_dt$feature_start0 + 1L, feature_dt$feature_end0),
+    strand   = "*"
+  )
+}
+
+read_modbam_summary_positions <- function(bamfiles, sample_name, promoter_windows,
+                                          modbase_code, seqinfo, bpparam,
+                                          modProbThreshold = 0.9) {
+  se_summary <- footprintR::readModBam(
+    bamfiles         = bamfiles,
+    regions          = promoter_windows,
+    modbase          = setNames(modbase_code, sample_name),
+    level            = "summary",
+    modProbThreshold = modProbThreshold,
+    seqinfo          = seqinfo,
+    trim             = TRUE,
+    BPPARAM          = bpparam,
+    verbose          = FALSE
+  )
+  rr <- data.table::as.data.table(as.data.frame(SummarizedExperiment::rowRanges(se_summary)))
+  rr <- rr[, .(call_chromosome = as.character(seqnames),
+               position        = start,
+               call_strand     = as.character(strand))]
+  total_calls    <- as.integer(SummarizedExperiment::assay(se_summary, "Nvalid")[, sample_name])
+  modified_calls <- as.integer(SummarizedExperiment::assay(se_summary, "Nmod")[,  sample_name])
+  rr[, `:=`(sample_name      = sample_name,
+             modbase_code     = modbase_code,
+             total_calls      = total_calls,
+             modified_calls   = modified_calls,
+             unmodified_calls = total_calls - modified_calls,
+             frac_modified    = data.table::fifelse(total_calls > 0,
+                                  modified_calls / total_calls, NA_real_))]
+  rr[total_calls > 0]
+}
+
+assert_file_exists(bam_path,     "BAM")
+assert_file_exists(cpg_ft_path,  "CpG ft extract BED")
+assert_file_exists(ccre_path,    "cCRE BED")
+
+bamfiles      <- setNames(bam_path, default_sample)
+bpparam_modbam <- BiocParallel::SerialParam()
+
+# --- New helper  ---
+
+region_granges <- function(region_row) {
+  GenomicRanges::GRanges(
+    seqnames = region_row$chromosome,
+    ranges   = IRanges::IRanges(region_row$start0 + 1L, region_row$end0),
+    strand   = "*"
+  )
+}
+
+summarize_region_modbam <- function(region_row, bamfiles, sample_name, seqinfo, bpparam, modbase_code) {
+  position_dt <- read_modbam_summary_positions(
+    bamfiles         = bamfiles,
+    sample_name      = sample_name,
+    promoter_windows = region_granges(region_row),
+    modbase_code     = modbase_code,
+    seqinfo          = seqinfo,
+    bpparam          = bpparam,
+    modProbThreshold = mod_prob_threshold
+  )
+  total_calls    <- sum(position_dt$total_calls)
+  modified_calls <- sum(position_dt$modified_calls)
+  data.table::data.table(
+    region_source           = region_row$region_source,
+    region_class            = region_row$region_class,
+    region_label            = region_row$region_label,
+    chromosome              = region_row$chromosome,
+    start                   = region_row$start0 + 1L,
+    end                     = region_row$end0,
+    region_width_bp         = region_row$end0 - region_row$start0,
+    modbase_code            = modbase_code,
+    modified_calls          = modified_calls,
+    unmodified_calls        = sum(position_dt$unmodified_calls),
+    total_calls             = total_calls,
+    positions_with_coverage = sum(position_dt$total_calls > 0),
+    fraction_modified       = if (total_calls > 0) modified_calls / total_calls else NA_real_
+  )
+}
+
+summarize_region_cpg <- function(region_row, cpg_bed12_all) {
+  region_gr     <- region_granges(region_row)
+  cpg_candidate <- cpg_bed12_all[
+    chrom      == region_row$chromosome &
+      chromEnd   >= region_row$start0 + 1L &
+      chromStart <= region_row$end0
+  ]
+  empty_row <- data.table::data.table(
+    region_source             = region_row$region_source,
+    region_class              = region_row$region_class,
+    region_label              = region_row$region_label,
+    chromosome                = region_row$chromosome,
+    start                     = region_row$start0 + 1L,
+    end                       = region_row$end0,
+    region_width_bp           = region_row$end0 - region_row$start0,
+    cpg_feature_blocks        = 0L,
+    cpg_feature_blocks_per_kb = 0,
+    cpg_covered_bases         = 0L,
+    cpg_covered_fraction      = 0
+  )
+  if (!nrow(cpg_candidate)) return(empty_row)
+  cpg_features <- expand_ft_bed12_features(cpg_candidate, drop_terminal_blocks = FALSE)
+  if (!nrow(cpg_features)) return(empty_row)
+  cpg_gr   <- feature_blocks_to_granges(cpg_features)
+  overlaps <- GenomicRanges::findOverlaps(cpg_gr, region_gr, ignore.strand = TRUE)
+  if (!length(overlaps)) return(empty_row)
+  hit_idx       <- unique(S4Vectors::queryHits(overlaps))
+  covered_bases <- sum(width(GenomicRanges::pintersect(cpg_gr[hit_idx], region_gr)))
+  cpg_blocks    <- length(hit_idx)
+  region_width  <- region_row$end0 - region_row$start0
+  data.table::data.table(
+    region_source             = region_row$region_source,
+    region_class              = region_row$region_class,
+    region_label              = region_row$region_label,
+    chromosome                = region_row$chromosome,
+    start                     = region_row$start0 + 1L,
+    end                       = region_row$end0,
+    region_width_bp           = region_width,
+    cpg_feature_blocks        = cpg_blocks,
+    cpg_feature_blocks_per_kb = cpg_blocks / (region_width / 1000),
+    cpg_covered_bases         = covered_bases,
+    cpg_covered_fraction      = covered_bases / region_width
+  )
+}
+
+# mod_dt: modification fraction per region (m6A and 5mC rows)
+# cpg_dt: CpG block density per region
+# random_mod_dt / random_cpg_dt: optional random-region data to overlay
+make_region_plot <- function(mod_dt, cpg_dt, plot_title,
+                             random_mod_dt = NULL, random_cpg_dt = NULL) {
+  mod_dt <- data.table::copy(mod_dt)
+  cpg_dt <- data.table::copy(cpg_dt)
+
+  if (!is.null(random_mod_dt) && !is.null(random_cpg_dt)) {
+    mod_dt <- data.table::rbindlist(list(data.table::copy(random_mod_dt), mod_dt), use.names = TRUE, fill = TRUE)
+    cpg_dt <- data.table::rbindlist(list(data.table::copy(random_cpg_dt), cpg_dt), use.names = TRUE, fill = TRUE)
+  }
+
+  mod_dt[, modality := data.table::fifelse(modbase_code == "a", "m6A", "5mC")]
+
+  ccre_classes <- setdiff(unique(cpg_dt$region_class), "random")
+  class_levels <- c("random", ccre_classes)
+
+  mod_dt[, region_class  := factor(region_class, levels = class_levels)]
+  mod_dt[, modality      := factor(modality,     levels = c("m6A", "5mC"))]
+  cpg_dt[, region_class  := factor(region_class, levels = class_levels)]
+  cpg_dt[, region_source := factor(region_source, levels = c("random", "cCRE"))]
+
+  mod_plot <- ggplot2::ggplot(mod_dt, ggplot2::aes(x = region_class, y = fraction_modified, fill = modality)) +
+    ggplot2::geom_boxplot(position = ggplot2::position_dodge(width = 0.7), outlier.shape = NA, alpha = 0.45) +
+    ggplot2::geom_point(position = ggplot2::position_jitterdodge(jitter.width = 0.12, dodge.width = 0.7), size = 2, alpha = 0.8) +
+    ggplot2::scale_fill_manual(values = c("m6A" = "#7B3294", "5mC" = "#8C510A")) +
+    ggplot2::coord_cartesian(ylim = c(0, 1)) +
+    ggplot2::labs(title = paste0(plot_title, " - modification fractions"), x = "Region class", y = "Fraction modified", fill = "Modality") +
+    ggplot2::theme_bw(base_size = 12)
+
+  cpg_plot <- ggplot2::ggplot(cpg_dt, ggplot2::aes(x = region_class, y = cpg_feature_blocks_per_kb, fill = region_source)) +
+    ggplot2::geom_boxplot(position = ggplot2::position_dodge(width = 0.7), outlier.shape = NA, alpha = 0.45) +
+    ggplot2::geom_point(position = ggplot2::position_jitterdodge(jitter.width = 0.12, dodge.width = 0.7), size = 2, alpha = 0.8) +
+    ggplot2::scale_fill_manual(values = c("random" = "#4D4D4D", "cCRE" = "#1B9E77")) +
+    ggplot2::labs(title = paste0(plot_title, " - CpG block density"), x = "Region class", y = "CpG feature blocks per kb", fill = "Region source") +
+    ggplot2::theme_bw(base_size = 12)
+
+  mod_plot / cpg_plot + patchwork::plot_layout(heights = c(1, 1))
+}
+
+sample_nonoverlap_windows <- function(n_regions, chr_len, width_bp, exclude_gr) {
+  starts0      <- integer()
+  attempts     <- 0L
+  max_attempts <- n_regions * 500L
+  while (length(starts0) < n_regions && attempts < max_attempts) {
+    attempts         <- attempts + 1L
+    candidate_start0 <- sample.int(chr_len - width_bp + 1L, 1L) - 1L
+    candidate_gr     <- GenomicRanges::GRanges(
+      seqnames = default_chrom,
+      ranges   = IRanges::IRanges(candidate_start0 + 1L, candidate_start0 + width_bp),
+      strand   = "*"
+    )
+    if (!length(GenomicRanges::findOverlaps(candidate_gr, exclude_gr, ignore.strand = TRUE))) {
+      starts0 <- c(starts0, candidate_start0)
+      exclude_gr <- c(exclude_gr, candidate_gr)
+    }
+  }
+  if (length(starts0) < n_regions) stop("Could not sample enough random non-cCRE, non-promoter windows.", call. = FALSE)
+  starts0
+}
+
+# --- Analysis ---
+
+bam_seqinfo   <- read_bam_seqinfo(bam_path)
+tss_objects   <- read_gencode_tss(tss_path, chrom = default_chrom, window_bp = window_bp, seqinfo = bam_seqinfo)
+promoter_gr   <- tss_objects$promoter_windows
+cpg_bed12_all <- read_fiber_bed12(cpg_ft_path)
+
+# All ENCODE Registry V4 cCRE classes:
+#   PLS          = promoter-like signature
+#   pELS         = proximal enhancer-like signature
+#   dELS         = distal enhancer-like signature
+#   CA-TF        = chromatin accessible with TF footprint
+#   CA-CTCF      = chromatin accessible with CTCF binding
+#   CA-H3K4me3   = chromatin accessible with H3K4me3
+#   CA           = chromatin accessible only
+#   TF           = TF binding only
+#   Enhancers    = synthetic class: pELS + dELS combined
+ccre_classes_base <- c("PLS", "pELS", "dELS", "CA-TF", "CA-CTCF", "CA-H3K4me3", "CA", "TF")
+
+ccre_table_raw <- data.table::fread(
+  ccre_path,
+  header    = FALSE,
+  col.names = c("chromosome", "start0", "end0", "ccre_id", "ccre_element_id", "ccre_class")
+)[chromosome == default_chrom & ccre_class %in% ccre_classes_base]
+
+# Synthetic "Enhancers" class = pELS + dELS rows relabelled
+enhancer_rows <- data.table::copy(ccre_table_raw[ccre_class %in% c("pELS", "dELS")])
+enhancer_rows[, ccre_class := "Enhancers"]
+
+ccre_table_all <- data.table::rbindlist(
+  list(ccre_table_raw, enhancer_rows),
+  use.names = TRUE, fill = TRUE
+)
+
+# Use only raw (non-synthetic) rows for the exclusion GRanges
+ccre_gr <- GenomicRanges::GRanges(
+  seqnames = ccre_table_raw$chromosome,
+  ranges   = IRanges::IRanges(ccre_table_raw$start0 + 1L, ccre_table_raw$end0),
+  strand   = "*"
+)
+
+chr_len <- as.integer(GenomeInfoDb::seqlengths(bam_seqinfo)[default_chrom])
+if (is.na(chr_len) || chr_len < window_bp) {
+  stop(sprintf("Chromosome length for %s is not usable for random sampling.", default_chrom), call. = FALSE)
+}
+
+# Sample 5 non-overlapping random windows outside all promoters and cCREs
+exclude_gr     <- c(promoter_gr, ccre_gr)
+random_starts0 <- sample_nonoverlap_windows(5L, chr_len, window_bp, exclude_gr)
+random_table   <- data.table::data.table(
+  region_source = "random",
+  region_class  = "random",
+  chromosome    = default_chrom,
+  start0        = random_starts0,
+  end0          = random_starts0 + window_bp
+)
+random_table[, region_label := sprintf("random_%d|%s:%d-%d", .I, chromosome, start0 + 1L, end0)]
+
+# Sample up to 5 regions per class (including synthetic Enhancers)
+ccre_table <- ccre_table_all[, .SD[sample.int(.N, min(.N, 5L))], by = ccre_class]
+ccre_table[, `:=`(
+  region_source = "cCRE",
+  region_class  = ccre_class,
+  region_label  = sprintf("%s_%s|%s:%d-%d", ccre_class, ccre_id, chromosome, start0 + 1L, end0)
+)]
+
+random_cpg_summary <- data.table::rbindlist(
+  lapply(seq_len(nrow(random_table)), function(i) summarize_region_cpg(random_table[i], cpg_bed12_all)),
+  use.names = TRUE, fill = TRUE
+)
+random_mod_summary <- data.table::rbindlist(
+  lapply(seq_len(nrow(random_table)), function(i) {
+    rr <- random_table[i]
+    data.table::rbindlist(list(
+      summarize_region_modbam(rr, bamfiles, default_sample, bam_seqinfo, bpparam_modbam, "a"),
+      summarize_region_modbam(rr, bamfiles, default_sample, bam_seqinfo, bpparam_modbam, "m")
+    ), use.names = TRUE, fill = TRUE)
+  }),
+  use.names = TRUE, fill = TRUE
+)
+
+ccre_cpg_summary <- data.table::rbindlist(
+  lapply(seq_len(nrow(ccre_table)), function(i) summarize_region_cpg(ccre_table[i], cpg_bed12_all)),
+  use.names = TRUE, fill = TRUE
+)
+ccre_mod_summary <- data.table::rbindlist(
+  lapply(seq_len(nrow(ccre_table)), function(i) {
+    rr <- ccre_table[i]
+    data.table::rbindlist(list(
+      summarize_region_modbam(rr, bamfiles, default_sample, bam_seqinfo, bpparam_modbam, "a"),
+      summarize_region_modbam(rr, bamfiles, default_sample, bam_seqinfo, bpparam_modbam, "m")
+    ), use.names = TRUE, fill = TRUE)
+  }),
+  use.names = TRUE, fill = TRUE
+)
+
+# --- Plots ---
+
+random_plot <- make_region_plot(
+  random_mod_summary, random_cpg_summary,
+  "Random non-promoter regions"
+)
+
+ccre_plot <- make_region_plot(
+  ccre_mod_summary, ccre_cpg_summary,
+  "cCRE regions (all classes) vs random",
+  random_mod_dt = random_mod_summary,
+  random_cpg_dt = random_cpg_summary
+)
+
+# --- Save outputs ---
+
+write_gz_tsv(
+  data.table::rbindlist(
+    list(
+      data.table::copy(random_cpg_summary)[, row_type := "cpg"],
+      data.table::copy(random_mod_summary)[, row_type := "modbam"],
+      data.table::copy(ccre_cpg_summary)[,  row_type := "cpg"],
+      data.table::copy(ccre_mod_summary)[,  row_type := "modbam"]
+    ),
+    use.names = TRUE, fill = TRUE
+  ),
+  file.path(ccre_output_dir, sprintf("%s_%s_random_and_ccre_region_summary.tsv.gz", default_sample, default_chrom))
+)
+
+ggplot2::ggsave(
+  file.path(ccre_output_dir, sprintf("%s_%s_random_nonpromoter_mod_cpg.pdf", default_sample, default_chrom)),
+  random_plot, width = 12, height = 10
+)
+ggplot2::ggsave(
+  file.path(ccre_output_dir, sprintf("%s_%s_ccre_vs_random_mod_cpg.pdf", default_sample, default_chrom)),
+  ccre_plot, width = 18, height = 10
+)
+
+# --- Display ---
+random_plot
+ccre_plot
+```
+
+## CpG-only 5mC fraction
+
+The previous section computes the 5mC fraction across **all C positions** in the BAM MM tag. 
+Here we restrict the 5mC denominator and numerator to CpG-context cytosines only
+```{r cpg-only-5mc, fig.width=18, fig.height=10}
+
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+default_sample     <- "AL10_bc2178_19130"
+default_chrom      <- "chr1"
+mod_prob_threshold <- 0.9
+
+results_root_dir <- "/project/spott/cshan/fiber-seq/results/promoter_summary"
+ccre_output_dir  <- file.path(results_root_dir, "ccre")
+
+bam_path <- file.path(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples",
+  sprintf("%s.5mC.6mA.aligned.phased.bam", default_sample)
+)
+pbcpg_bed_path <- file.path(
+  "/project/spott/cshan/fiber-seq/results/fire_CpG",
+  default_sample,
+  sprintf("%s_CPG.combined.bed.gz", default_sample)
+)
+prior_summary_path <- file.path(
+  ccre_output_dir,
+  sprintf("%s_%s_random_and_ccre_region_summary.tsv.gz", default_sample, default_chrom)
+)
+
+# ── Helpers (all functions needed; duplicates helpers chunk for standalone use) ─
+assert_file_exists <- function(path, label = "file") {
+  if (!file.exists(path)) stop(sprintf("Missing %s: %s", label, path), call. = FALSE)
+  invisible(path)
+}
+
+write_gz_tsv <- function(x, path) {
+  data.table::fwrite(x, file = path, sep = "\t")
+  invisible(path)
+}
+
+read_bam_seqinfo <- function(bam_path) {
+  targets <- Rsamtools::scanBamHeader(bam_path)[[1]]$targets
+  GenomeInfoDb::Seqinfo(seqnames = names(targets), seqlengths = as.numeric(targets))
+}
+
+region_granges <- function(region_row) {
+  GenomicRanges::GRanges(
+    seqnames = region_row$chromosome,
+    ranges   = IRanges::IRanges(region_row$start0 + 1L, region_row$end0),
+    strand   = "*"
+  )
+}
+
+read_modbam_summary_positions <- function(bamfiles, sample_name, promoter_windows,
+                                          modbase_code, seqinfo, bpparam,
+                                          modProbThreshold = 0.9) {
+  se_summary <- footprintR::readModBam(
+    bamfiles         = bamfiles,
+    regions          = promoter_windows,
+    modbase          = setNames(modbase_code, sample_name),
+    level            = "summary",
+    modProbThreshold = modProbThreshold,
+    seqinfo          = seqinfo,
+    trim             = TRUE,
+    BPPARAM          = bpparam,
+    verbose          = FALSE
+  )
+  gr             <- SummarizedExperiment::rowRanges(se_summary)
+  total_calls    <- as.integer(SummarizedExperiment::assay(se_summary, "Nvalid")[, sample_name])
+  modified_calls <- as.integer(SummarizedExperiment::assay(se_summary, "Nmod")[,  sample_name])
+  data.table::data.table(
+    call_chromosome  = as.character(GenomicRanges::seqnames(gr)),
+    position         = as.integer(GenomicRanges::start(gr)),
+    call_strand      = as.character(GenomicRanges::strand(gr)),
+    sample_name      = sample_name,
+    modbase_code     = modbase_code,
+    total_calls      = total_calls,
+    modified_calls   = modified_calls,
+    unmodified_calls = total_calls - modified_calls,
+    frac_modified    = data.table::fifelse(total_calls > 0,
+                         modified_calls / total_calls, NA_real_)
+  )[total_calls > 0]
+}
+
+make_region_plot <- function(mod_dt, cpg_dt, plot_title,
+                             random_mod_dt = NULL, random_cpg_dt = NULL) {
+  mod_dt <- data.table::copy(mod_dt)
+  cpg_dt <- data.table::copy(cpg_dt)
+  if (!is.null(random_mod_dt) && !is.null(random_cpg_dt)) {
+    mod_dt <- data.table::rbindlist(list(data.table::copy(random_mod_dt), mod_dt),
+                                    use.names = TRUE, fill = TRUE)
+    cpg_dt <- data.table::rbindlist(list(data.table::copy(random_cpg_dt), cpg_dt),
+                                    use.names = TRUE, fill = TRUE)
+  }
+  mod_dt[, modality := data.table::fifelse(modbase_code == "a", "m6A", "5mC")]
+  ccre_classes <- setdiff(unique(cpg_dt$region_class), "random")
+  class_levels <- c("random", ccre_classes)
+  mod_dt[, region_class  := factor(region_class, levels = class_levels)]
+  mod_dt[, modality      := factor(modality,     levels = c("m6A", "5mC"))]
+  cpg_dt[, region_class  := factor(region_class, levels = class_levels)]
+  cpg_dt[, region_source := factor(region_source, levels = c("random", "cCRE"))]
+  mod_plot <- ggplot2::ggplot(mod_dt,
+      ggplot2::aes(x = region_class, y = fraction_modified, fill = modality)) +
+    ggplot2::geom_boxplot(position = ggplot2::position_dodge(width = 0.7),
+                          outlier.shape = NA, alpha = 0.45) +
+    ggplot2::geom_point(position = ggplot2::position_jitterdodge(
+                          jitter.width = 0.12, dodge.width = 0.7), size = 2, alpha = 0.8) +
+    ggplot2::scale_fill_manual(values = c("m6A" = "#7B3294", "5mC" = "#8C510A")) +
+    ggplot2::coord_cartesian(ylim = c(0, 1)) +
+    ggplot2::labs(title = paste0(plot_title, " - modification fractions"),
+                  x = "Region class", y = "Fraction modified", fill = "Modality") +
+    ggplot2::theme_bw(base_size = 12)
+  cpg_plot <- ggplot2::ggplot(cpg_dt,
+      ggplot2::aes(x = region_class, y = cpg_feature_blocks_per_kb, fill = region_source)) +
+    ggplot2::geom_boxplot(position = ggplot2::position_dodge(width = 0.7),
+                          outlier.shape = NA, alpha = 0.45) +
+    ggplot2::geom_point(position = ggplot2::position_jitterdodge(
+                          jitter.width = 0.12, dodge.width = 0.7), size = 2, alpha = 0.8) +
+    ggplot2::scale_fill_manual(values = c("random" = "#4D4D4D", "cCRE" = "#1B9E77")) +
+    ggplot2::labs(title = paste0(plot_title, " - CpG block density"),
+                  x = "Region class", y = "CpG feature blocks per kb", fill = "Region source") +
+    ggplot2::theme_bw(base_size = 12)
+  mod_plot / cpg_plot + patchwork::plot_layout(heights = c(1, 1))
+}
+
+# ── Load saved output from random-region-cCRE chunk ──────────────────────────
+assert_file_exists(prior_summary_path, "prior-chunk summary TSV")
+prior_summary <- data.table::fread(prior_summary_path)
+
+# Reconstruct region tables (one row per region, deduped from modbam rows)
+modbam_rows  <- prior_summary[row_type == "modbam"]
+random_table <- unique(modbam_rows[region_source == "random",
+  .(region_source, region_class, region_label, chromosome,
+    start0 = start - 1L, end0 = end)])
+ccre_table   <- unique(modbam_rows[region_source == "cCRE",
+  .(region_source, region_class, region_label, chromosome,
+    start0 = start - 1L, end0 = end)])
+
+# CpG density summaries for the plot's lower panel (unchanged from prior chunk)
+random_cpg_summary <- prior_summary[row_type == "cpg" & region_source == "random"]
+ccre_cpg_summary   <- prior_summary[row_type == "cpg" & region_source == "cCRE"]
+
+# ── Re-read file-based inputs ─────────────────────────────────────────────────
+assert_file_exists(bam_path,       "BAM")
+assert_file_exists(pbcpg_bed_path, "pb-CpG-tools combined BED")
+
+bamfiles       <- setNames(bam_path, default_sample)
+bam_seqinfo    <- read_bam_seqinfo(bam_path)
+bpparam_modbam <- BiocParallel::SerialParam()
+
+# Read pb-CpG-tools BED: skip ##/# header lines, keep only chr of interest and
+# type == "Total" (combined across haplotypes).
+# Columns: chrom, begin (0-based), end, mod_score (0-100), type, cov,
+#          est_mod_count, est_unmod_count, discretized_mod_score
+pbcpg_bed <- data.table::fread(
+  cmd = sprintf("zcat '%s' | grep -v '^#'", pbcpg_bed_path),
+  col.names = c("chrom","begin","end","mod_score","type","cov",
+                "est_mod_count","est_unmod_count","discretized_mod_score")
+)[chrom == default_chrom & type == "Total"]
+
+message(sprintf("pb-CpG BED loaded: %d CpG sites on %s", nrow(pbcpg_bed), default_chrom))
+
+# ── m6A summarizer (BAM-based, unchanged) ────────────────────────────────────
+summarize_region_modbam_m6a <- function(region_row, bamfiles, sample_name, seqinfo, bpparam) {
+  position_dt <- read_modbam_summary_positions(
+    bamfiles         = bamfiles,
+    sample_name      = sample_name,
+    promoter_windows = region_granges(region_row),
+    modbase_code     = "a",
+    seqinfo          = seqinfo,
+    bpparam          = bpparam,
+    modProbThreshold = mod_prob_threshold
+  )
+  total_calls    <- sum(position_dt$total_calls)
+  modified_calls <- sum(position_dt$modified_calls)
+  data.table::data.table(
+    region_source           = region_row$region_source,
+    region_class            = region_row$region_class,
+    region_label            = region_row$region_label,
+    chromosome              = region_row$chromosome,
+    start                   = region_row$start0 + 1L,
+    end                     = region_row$end0,
+    region_width_bp         = region_row$end0 - region_row$start0,
+    modbase_code            = "a",
+    modified_calls          = modified_calls,
+    unmodified_calls        = total_calls - modified_calls,
+    total_calls             = total_calls,
+    positions_with_coverage = nrow(position_dt),
+    fraction_modified       = data.table::fifelse(
+      total_calls > 0L, modified_calls / total_calls, NA_real_
+    )
+  )
+}
+
+# ── 5mC summarizer (pb-CpG-tools BED-based) ──────────────────────────────────
+# For each region, sum est_mod_count and est_unmod_count over all CpG sites
+# whose 0-based interval [begin, end) falls within [start0, end0).
+# fraction_modified = est_mod_count / (est_mod_count + est_unmod_count).
+summarize_region_pbcpg <- function(region_row, pbcpg_bed) {
+  hits <- pbcpg_bed[
+    chrom == region_row$chromosome &
+    begin >= region_row$start0 &
+    end   <= region_row$end0
+  ]
+  modified_calls   <- as.integer(round(sum(hits$est_mod_count)))
+  unmodified_calls <- as.integer(round(sum(hits$est_unmod_count)))
+  total_calls      <- modified_calls + unmodified_calls
+  data.table::data.table(
+    region_source           = region_row$region_source,
+    region_class            = region_row$region_class,
+    region_label            = region_row$region_label,
+    chromosome              = region_row$chromosome,
+    start                   = region_row$start0 + 1L,
+    end                     = region_row$end0,
+    region_width_bp         = region_row$end0 - region_row$start0,
+    modbase_code            = "m",
+    modified_calls          = modified_calls,
+    unmodified_calls        = unmodified_calls,
+    total_calls             = total_calls,
+    positions_with_coverage = nrow(hits),
+    fraction_modified       = data.table::fifelse(
+      total_calls > 0L, modified_calls / total_calls, NA_real_
+    )
+  )
+}
+
+# ── Summarize: random regions ─────────────────────────────────────────────────
+random_mod_cpgonly <- data.table::rbindlist(
+  lapply(seq_len(nrow(random_table)), function(i) {
+    rr <- random_table[i]
+    data.table::rbindlist(list(
+      summarize_region_modbam_m6a(rr, bamfiles, default_sample, bam_seqinfo, bpparam_modbam),
+      summarize_region_pbcpg(rr, pbcpg_bed)
+    ), use.names = TRUE, fill = TRUE)
+  }),
+  use.names = TRUE, fill = TRUE
+)
+
+# ── Summarize: cCRE regions ───────────────────────────────────────────────────
+ccre_mod_cpgonly <- data.table::rbindlist(
+  lapply(seq_len(nrow(ccre_table)), function(i) {
+    rr <- ccre_table[i]
+    data.table::rbindlist(list(
+      summarize_region_modbam_m6a(rr, bamfiles, default_sample, bam_seqinfo, bpparam_modbam),
+      summarize_region_pbcpg(rr, pbcpg_bed)
+    ), use.names = TRUE, fill = TRUE)
+  }),
+  use.names = TRUE, fill = TRUE
+)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+cpgonly_plot <- make_region_plot(
+  ccre_mod_cpgonly, ccre_cpg_summary,
+  "cCRE regions - CpG-only 5mC vs random",
+  random_mod_dt = random_mod_cpgonly,
+  random_cpg_dt = random_cpg_summary
+)
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+write_gz_tsv(
+  data.table::rbindlist(
+    list(
+      data.table::copy(random_mod_cpgonly)[, row_type := "modbam_cpgonly"],
+      data.table::copy(ccre_mod_cpgonly)[,  row_type := "modbam_cpgonly"]
+    ),
+    use.names = TRUE, fill = TRUE
+  ),
+  file.path(ccre_output_dir,
+    sprintf("%s_%s_random_and_ccre_cpgonly_5mc_summary.tsv.gz", default_sample, default_chrom))
+)
+
+ggplot2::ggsave(
+  file.path(ccre_output_dir,
+    sprintf("%s_%s_ccre_vs_random_cpgonly_5mc.pdf", default_sample, default_chrom)),
+  cpgonly_plot, width = 18, height = 10
+)
+
+cpgonly_plot
+```
+
+## All-cCRE CpG-only 5mC (pb-CpG-tools, no subsampling)
+
+Uses all chr1 cCREs from the ENCODE Registry V4. Methylation is computed entirely
+from the pb-CpG-tools combined BED — no BAM query, no m6A.
+
+```{r all-ccre-pbcpg-5mc, fig.width=14, fig.height=6}
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+default_sample  <- "AL10_bc2178_19130"
+default_chrom   <- "chr1"
+
+results_root_dir <- "/project/spott/cshan/fiber-seq/results/promoter_summary"
+ccre_output_dir  <- file.path(results_root_dir, "CpG_methylation_cCRE")
+
+pbcpg_bed_path <- file.path(
+  "/project/spott/cshan/fiber-seq/results/fire_CpG",
+  default_sample,
+  sprintf("%s_CPG.combined.bed.gz", default_sample)
+)
+ccre_path <- "/project/spott/cshan/annotations/GRCh38-cCREs.bed"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+assert_file_exists <- function(path, label = "file") {
+  if (!file.exists(path)) stop(sprintf("Missing %s: %s", label, path), call. = FALSE)
+  invisible(path)
+}
+
+write_gz_tsv <- function(x, path) {
+  data.table::fwrite(x, file = path, sep = "\t")
+  invisible(path)
+}
+
+summarize_region_pbcpg_5mc <- function(region_row, pbcpg_bed) {
+  hits <- pbcpg_bed[
+    chrom == region_row$chromosome &
+    begin >= region_row$start0 &
+    end   <= region_row$end0
+  ]
+  modified_calls   <- as.integer(round(sum(hits$est_mod_count)))
+  unmodified_calls <- as.integer(round(sum(hits$est_unmod_count)))
+  total_calls      <- modified_calls + unmodified_calls
+  data.table::data.table(
+    region_class            = region_row$region_class,
+    chromosome              = region_row$chromosome,
+    start                   = region_row$start0 + 1L,
+    end                     = region_row$end0,
+    region_width_bp         = region_row$end0 - region_row$start0,
+    n_cpg_sites             = nrow(hits),
+    modified_calls          = modified_calls,
+    unmodified_calls        = unmodified_calls,
+    total_calls             = total_calls,
+    fraction_modified       = data.table::fifelse(
+      total_calls > 0L, modified_calls / total_calls, NA_real_
+    )
+  )
+}
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+assert_file_exists(pbcpg_bed_path, "pb-CpG-tools combined BED")
+assert_file_exists(ccre_path,      "cCRE BED")
+
+pbcpg_bed <- data.table::fread(
+  cmd = sprintf("zcat '%s' | grep -v '^#'", pbcpg_bed_path),
+  col.names = c("chrom", "begin", "end", "mod_score", "type", "cov",
+                "est_mod_count", "est_unmod_count", "discretized_mod_score")
+)[chrom == default_chrom & type == "Total"]
+
+message(sprintf("pb-CpG BED: %d CpG sites on %s", nrow(pbcpg_bed), default_chrom))
+
+ccre_classes_base <- c("PLS", "pELS", "dELS", "CA-TF", "CA-CTCF", "CA-H3K4me3", "CA", "TF")
+
+ccre_table_raw <- data.table::fread(
+  ccre_path, header = FALSE,
+  col.names = c("chromosome", "start0", "end0", "ccre_id", "ccre_element_id", "ccre_class")
+)[chromosome == default_chrom & ccre_class %in% ccre_classes_base]
+
+# Synthetic Enhancers class = pELS + dELS combined
+enhancer_rows <- data.table::copy(ccre_table_raw[ccre_class %in% c("pELS", "dELS")])
+enhancer_rows[, ccre_class := "Enhancers"]
+
+ccre_table_all <- data.table::rbindlist(
+  list(ccre_table_raw, enhancer_rows),
+  use.names = TRUE, fill = TRUE
+)
+ccre_table_all[, region_class := ccre_class]
+
+message(sprintf("cCREs loaded: %d regions across %d classes on %s",
+  nrow(ccre_table_raw), length(ccre_classes_base), default_chrom))
+
+# ── Summarize all cCREs ───────────────────────────────────────────────────────
+ccre_5mc_all <- data.table::rbindlist(
+  lapply(seq_len(nrow(ccre_table_all)), function(i) {
+    summarize_region_pbcpg_5mc(ccre_table_all[i], pbcpg_bed)
+  }),
+  use.names = TRUE, fill = TRUE
+)
+
+# Order classes: base classes in defined order, then synthetic Enhancers
+class_order <- c(ccre_classes_base, "Enhancers")
+ccre_5mc_all[, region_class := factor(region_class, levels = class_order)]
+
+message(sprintf("Regions with CpG coverage: %d / %d",
+  sum(ccre_5mc_all$total_calls > 0L, na.rm = TRUE), nrow(ccre_5mc_all)))
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+n_per_class <- ccre_5mc_all[!is.na(fraction_modified), .N, by = region_class]
+x_labels    <- setNames(
+  sprintf("%s\n(n=%d)", n_per_class$region_class, n_per_class$N),
+  n_per_class$region_class
+)
+
+all_ccre_5mc_plot <- ggplot2::ggplot(
+    ccre_5mc_all[!is.na(fraction_modified)],
+    ggplot2::aes(x = region_class, y = fraction_modified)
+  ) +
+  ggplot2::geom_boxplot(fill = "#8C510A", alpha = 0.45, outlier.shape = NA) +
+  ggplot2::scale_x_discrete(labels = x_labels) +
+  ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = 0.02)) +
+  ggplot2::labs(
+    title = sprintf("CpG-only 5mC fraction by cCRE class — all %s cCREs (%s)",
+                    default_chrom, default_sample),
+    x     = "cCRE class",
+    y     = "CpG methylation fraction (pb-CpG-tools)"
+  ) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(size = 10))
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+write_gz_tsv(
+  ccre_5mc_all,
+  file.path("/project/spott/cshan/fiber-seq/results/promoter_summary/CpG_methylation_cCRE/",
+    sprintf("%s_%s_all_ccre_pbcpg_5mc.tsv.gz", default_sample, default_chrom))
+)
+
+ggplot2::ggsave(
+  file.path(ccre_output_dir,
+    sprintf("%s_%s_all_ccre_pbcpg_5mc.pdf", default_sample, default_chrom)),
+  all_ccre_5mc_plot, width = 14, height = 6
+)
+
+saveRDS(ccre_5mc_all, file = "/project/spott/cshan/fiber-seq/results/promoter_summary/CpG_methylation_cCRE/ccre_5mc_all.rds")
+all_ccre_5mc_plot
+```
+
+## All-cCRE CpG-only 5mC metaprofile (aggregate signal around cCRE centers)
+
+Average CpG methylation fraction binned by distance from each cCRE center.
+Uses all chr1 cCREs from the previous chunk (`pbcpg_bed`, `ccre_table_all`, `class_order`).
+
+```{r all-ccre-pbcpg-5mc-metaprofile, fig.width=16, fig.height=10}
+# ccre_5mc_all <- fread("/project/spott/cshan/fiber-seq/results/promoter_summary/CpG_methylation_cCRE/AL10_bc2178_19130_chr1_all_ccre_pbcpg_5mc_metaprofile.tsv.gz")
+# class_order <- c(ccre_classes_base, "Enhancers")
+# ccre_5mc_all[, region_class := factor(region_class, levels = class_order)]
+
+message(sprintf("Regions with CpG coverage: %d / %d",
+  sum(ccre_5mc_all$total_calls > 0L, na.rm = TRUE), nrow(ccre_5mc_all)))
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+meta_window_bp <- 1000L   # flanking bp each side of cCRE center
+bin_size       <- 20L     # bp per bin
+
+# ── Build windows centred on each cCRE ───────────────────────────────────────
+ccre_wins <- data.table::copy(ccre_table_all)[, .(
+  chrom      = chromosome,
+  region_class,
+  center     = as.integer((start0 + end0) / 2L),
+  win_start  = as.integer((start0 + end0) / 2L) - meta_window_bp,
+  win_end    = as.integer((start0 + end0) / 2L) + meta_window_bp
+)]
+ccre_wins[win_start < 0L, win_start := 0L]   # clamp to chromosome start
+
+# ── Prepare CpG table for interval overlap ────────────────────────────────────
+# pbcpg_bed already filtered to default_chrom & type == "Total"
+cpg_for_join <- pbcpg_bed[, .(
+  chrom           = chrom,
+  cpg_pos         = begin,           # 0-based; treat as point interval
+  cpg_pos_end     = begin,
+  est_mod_count   = as.numeric(est_mod_count),
+  est_unmod_count = as.numeric(est_unmod_count)
+)]
+data.table::setkey(cpg_for_join, chrom, cpg_pos, cpg_pos_end)
+data.table::setkey(ccre_wins,    chrom, win_start, win_end)
+
+# foverlaps: for each CpG point, find all cCRE windows it falls in
+overlaps <- data.table::foverlaps(
+  cpg_for_join, ccre_wins,
+  by.x    = c("chrom", "cpg_pos", "cpg_pos_end"),
+  by.y    = c("chrom", "win_start", "win_end"),
+  type    = "within",
+  nomatch = NULL
+)
+
+overlaps[, rel_pos := cpg_pos - center]
+overlaps[, bin     := as.integer(round(rel_pos / bin_size) * bin_size)]
+
+# ── Aggregate per (class, bin) ────────────────────────────────────────────────
+meta_dt <- overlaps[, .(
+  modified_calls   = sum(est_mod_count),
+  unmodified_calls = sum(est_unmod_count),
+  total_calls      = sum(est_mod_count + est_unmod_count),
+  n_cpg_obs        = .N
+), by = .(region_class, bin)]
+
+meta_dt[, fraction_modified := data.table::fifelse(
+  total_calls > 0, modified_calls / total_calls, NA_real_
+)]
+
+# Fill in missing bins so lines are continuous
+all_bins  <- seq(-meta_window_bp, meta_window_bp, by = bin_size)
+meta_full <- data.table::CJ(
+  region_class = unique(ccre_table_all$region_class),
+  bin          = all_bins
+)
+meta_full <- meta_dt[meta_full, on = .(region_class, bin)]
+meta_full[, region_class := factor(region_class, levels = class_order)]
+
+# Count of cCREs per class (for facet labels)
+n_ccre_class <- ccre_table_all[, .N, by = .(region_class = region_class)]
+facet_labels <- setNames(
+  sprintf("%s\n(n=%d cCREs)", n_ccre_class$region_class, n_ccre_class$N),
+  n_ccre_class$region_class
+)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+meta_plot <- ggplot2::ggplot(
+    meta_full[!is.na(fraction_modified)],
+    ggplot2::aes(x = bin, y = fraction_modified)
+  ) +
+  ggplot2::geom_line(color = "#8C510A", linewidth = 0.4, na.rm = TRUE) +
+  ggplot2::geom_smooth(
+    method    = "loess",
+    span      = 0.15,
+    se        = FALSE,
+    color     = "#8C510A",
+    linewidth = 0.9,
+    na.rm     = TRUE
+  ) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    linetype   = "dashed",
+    color      = "grey40",
+    linewidth  = 0.4
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(-meta_window_bp, meta_window_bp, 200)
+  ) +
+  ggplot2::scale_y_continuous(
+    expand = ggplot2::expansion(mult = 0.02)
+  ) +
+  ggplot2::facet_wrap(
+    ~region_class,
+    nrow     = 3,
+    scales   = "free_y",
+    labeller = ggplot2::as_labeller(facet_labels)
+  ) +
+  ggplot2::labs(
+    title = sprintf(
+      "CpG-only 5mC metaprofile around cCRE centers — all %s cCREs (%s)",
+      default_chrom, default_sample
+    ),
+    x = "Distance from cCRE center",
+    y = "CpG methylation fraction"
+  ) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::theme(
+    strip.text  = ggplot2::element_text(size = 9),
+    axis.text.x = ggplot2::element_text(size = 8)
+  )
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+# write_gz_tsv(
+#   meta_full,
+#   file.path(ccre_output_dir,
+#     sprintf("%s_%s_all_ccre_pbcpg_5mc_metaprofile.tsv.gz", default_sample, default_chrom))
+# )
+
+
+
+ggplot2::ggsave(
+  file.path(ccre_output_dir,
+    sprintf("100bp_window_20bp_bin%s_%s_all_ccre_pbcpg_5mc_metaprofile.pdf", default_sample, default_chrom)),
+  meta_plot, width = 16, height = 10
+)
+
+meta_plot
+```

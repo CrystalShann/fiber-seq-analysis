@@ -1,0 +1,227 @@
+---
+title: "Single-molecule nucleosome positioning around TSS by Leiden accessibility cluster"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+FiberHMM nucleosome and TF footprints of single molecules at the
+early-response promoters and two custom regions, grouped by their m6A
+accessibility cluster from `leiden_manhattan.Rmd` (Leiden + Manhattan, all
+four LPS timepoints pooled) and oriented to the GENCODE canonical TSS. Every
+region is plotted on exactly the window it was clustered on: canonical TSS
++/- 1000 bp for the promoters, the region itself for the custom regions.
+Questions:
+
+1. Do the Leiden accessibility clusters have distinct single-molecule
+   nucleosome configurations? (read-level tracks, per-cluster occupancy)
+2. Within a cluster, do the -1 / +1 nucleosome positions move across the LPS
+   time course? (positional summaries, timepoint bars in the tracks)
+
+Processing functions: `process_nuc_pos.R`; plots: `plot_nuc_pos.R`; cluster
+assignments: `clustering_methods/Leiden_Manhattan/marcophage_leiden_manhattan.Rmd`
+(window_size = 0, Manhattan distance, k = 10, resolution = 1, seed = 1).
+Nucleosome positions are never used for clustering: accessibility defines the
+states, the footprints describe them.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Libraries and source files
+
+```{r libraries, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(cowplot)
+
+source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/process_nuc_pos.R")
+source("/project/spott/cshan/fiber-seq/code/nucleosome_positioning/plot_nuc_pos.R")
+```
+
+# 2. Settings
+
+```{r settings}
+options(scipen = 999)
+
+promoter_table <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_methods/hamming_hierarchical/promoter_regions_gencode_v49.tsv"
+
+# Leiden + Manhattan outputs (leiden_manhattan.Rmd): the run to use is the one
+# whose run_parameters match these values and the region's window -- unbinned
+# m6A sites, k = 10, resolution = 1, all four timepoints pooled.
+leiden_dir    <- "/project/spott/cshan/fiber-seq/macrophage_project/clustering_methods/Leiden_Manhattan"
+leiden_params <- list(window_size = 0L, k_neighbors = 10, resolution = 1, seed = 1)
+
+out_dir   <- "/project/spott/cshan/fiber-seq/macrophage_project/nucleosome_positioning/results"
+table_dir <- file.path(out_dir, "tables")
+plot_dir  <- file.path(out_dir, "plots")
+for (d in c(table_dir, plot_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+# the figure files of the knitted html go under results/plots as well, so
+# nothing is written next to this Rmd
+knitr::opts_chunk$set(fig.path = file.path(plot_dir, "html", ""))
+
+# analysis constants (defined in process_nuc_pos.R)
+data.frame(gencode_tss = GENCODE_TSS_PATH, view_half_width = VIEW_HALF_WIDTH,
+           profile_bin_bp = PROFILE_BIN_BP)
+```
+
+# 3. Regions
+
+The 8 early-response promoters from `make_promoter_table.R` (genes, ENSG and
+strand; region_id = gene, IL8 = GENCODE CXCL8) plus the two custom coordinate
+regions, as in `leiden_manhattan.Rmd`.
+
+```{r regions}
+promoters <- load_promoter_table(promoter_table)
+promoters
+
+custom <- data.frame(
+  chr = c("chr4", "chr5"),
+  start = c(112284963, 150068577),
+  end = c(112285236, 150068792)
+)
+custom$region_id <- paste(custom$chr, custom$start, custom$end, sep = "_")
+
+regions <- rbind(
+  data.frame(chr = promoters$chr, start = promoters$start, end = promoters$end,
+             region_id = promoters$gene),
+  custom
+)
+regions
+```
+
+# 4. GENCODE canonical TSS annotation and windows
+
+Promoters are anchored on the GENCODE v46 Ensembl-canonical TSS of their ENSG
+(TSS = 0, upstream negative, mirrored for minus-strand genes); their window
+(`view_start`-`view_end`) is the canonical TSS +/- `r VIEW_HALF_WIDTH` bp
+clustered in `leiden_manhattan.Rmd`. `tss_offset` is the distance from the
+promoter table's own TSS (the v49 gene 5' end) to the canonical TSS in the
+direction of transcription. The custom regions are anchored on their centre
+and their window is the region itself.
+
+```{r gencode-tss}
+gencode_tss <- load_gencode_tss()
+head(gencode_tss)
+
+anchors <- build_region_anchors(regions, promoters, gencode_tss)
+anchors
+fwrite(anchors, file.path(table_dir, "region_anchors.tsv"), sep = "\t")
+```
+
+# 5. Load Leiden assignments
+
+One cluster label per read from the pooled-timepoint run of each region
+(`<region_id>/bin0/k<n>/read_cluster_assignments_<region_id>.tsv`, the run
+whose parameters and window match section 4), with region_id added. Read
+spans are kept: they are the denominators of the occupancy profiles and the
+baselines of the read tracks.
+
+```{r leiden}
+assignments <- load_leiden_assignments(leiden_dir, anchors, leiden_params)
+reads <- build_read_table(assignments, anchors)
+
+dcast(reads[, .N, by = .(region_id, timepoint)], region_id ~ timepoint, value.var = "N")
+dcast(reads[, .N, by = .(region_id, cluster)], region_id ~ cluster, value.var = "N", fill = 0)
+```
+
+# 6. Extract nucleosome footprints
+
+All FiberHMM nucleosome footprints (every block of the footprint BED12, no
+size filter) and the three TF footprint size classes for every clustered
+read, from each read's own sample BED, RID preserved. One row per footprint,
+in genomic (BED) and anchor-relative coordinates.
+
+```{r footprints}
+footprints <- extract_region_footprints(reads, anchors)
+dcast(footprints[, .N, by = .(region_id, fp_class)], region_id ~ fp_class,
+      value.var = "N", fill = 0)
+```
+
+# 7. Join footprints to Leiden clusters
+
+```{r join}
+footprints <- merge(footprints,
+                    reads[, .(region_id, RID, sample_name, timepoint, cluster, gene, ensg)],
+                    by = c("region_id", "RID", "sample_name"))
+setcolorder(footprints, c("region_id", "gene", "ensg", "RID", "sample_name", "timepoint",
+                          "cluster", "fp_class", "fp_start", "fp_end", "fp_mid",
+                          "rel_start", "rel_end", "rel_mid", "fp_size"))
+head(footprints)
+
+# per-read positional summary (-1 / +1 nucleosome, NFR width, anchor occupied)
+read_positions <- read_position_summary(footprints, reads)
+head(read_positions)
+
+fwrite(reads,          file.path(table_dir, "reads_by_cluster.tsv"), sep = "\t")
+fwrite(footprints,     file.path(table_dir, "footprints_by_read.tsv.gz"), sep = "\t")
+fwrite(read_positions, file.path(table_dir, "read_position_summary.tsv"), sep = "\t")
+```
+
+# 8. Read-level nucleosome and TF footprint plots (Fig 1)
+
+One row per molecule, footprints at their full width, clipped to the window.
+Rows are grouped by Leiden cluster (facets), then timepoint, then the position
+of the +1 nucleosome; the bars on the left mark cluster and timepoint.
+
+```{r read-tracks, fig.width=9, fig.height=11}
+p_reads <- list()
+for (rid in anchors$region_id) {
+  m       <- anchors[region_id == rid]
+  reads_r <- reads[region_id == rid]
+  if (!nrow(reads_r)) next
+  p_reads[[rid]] <- plot_read_footprints(footprints[region_id == rid], reads_r,
+                                         read_positions[region_id == rid], m)
+  print(p_reads[[rid]])
+  ggsave(file.path(plot_dir, sprintf("%s_fig1_read_footprints.pdf", rid)), p_reads[[rid]],
+         width = 9, height = max(5, 0.03 * nrow(reads_r) + 2.5 + 0.3 * uniqueN(reads_r$cluster)),
+         limitsize = FALSE)
+}
+```
+
+# 9. Nucleosome occupancy per cluster (Fig 2)
+
+Fraction of reads with a nucleosome footprint covering each position
+(`r PROFILE_BIN_BP`-bp bins; denominator = reads spanning the position), one
+panel per cluster, timepoints pooled. Distinct profiles = the accessibility
+states are also distinct nucleosome-positioning states.
+
+```{r occupancy-cluster, fig.width=7.5, fig.height=9}
+occ_cluster <- occupancy_profile(footprints, reads, anchors, by = c("region_id", "cluster"))
+fwrite(occ_cluster, file.path(table_dir, "occupancy_by_cluster.tsv"), sep = "\t")
+
+for (rid in names(p_reads)) {
+  reads_r <- reads[region_id == rid]
+  p <- plot_occupancy_by_cluster(occ_cluster[region_id == rid], reads_r, anchors[region_id == rid])
+  print(p)
+  ggsave(file.path(plot_dir, sprintf("%s_fig2_occupancy_by_cluster.pdf", rid)), p,
+         width = 7.5, height = 1.4 * uniqueN(reads_r$cluster) + 1.4)
+}
+```
+
+# 10. Positional summaries across time
+
+Per read: midpoint of the nearest upstream (-1) and downstream (+1) nucleosome
+and the gap between them (NFR width), by cluster and timepoint. A shift of a
+few tens of bp within a cluster is easier to read here than from the tracks.
+
+```{r position-summary, fig.width=10, fig.height=6.5}
+position_groups <- position_summary_by_group(read_positions)
+fwrite(position_groups, file.path(table_dir, "position_summary_by_cluster_timepoint.tsv"),
+       sep = "\t")
+position_groups
+
+for (rid in names(p_reads)) {
+  p <- plot_position_summary(read_positions[region_id == rid], reads[region_id == rid],
+                             anchors[region_id == rid])
+  print(p)
+  ggsave(file.path(plot_dir, sprintf("%s_position_summary.pdf", rid)), p,
+         width = 10, height = 6.5)
+}
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

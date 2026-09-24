@@ -1,0 +1,540 @@
+---
+title: "vis_m6a"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(DT)
+```
+
+# Average m6A level at the union FIRE regions
+
+Region-level table from 06_m6a_binned.py: for each union FIRE region and
+timepoint, n_cov = read x A/T-site events, n_mod = called m6A events,
+m6a = n_mod / n_cov, n_reads = distinct reads overlapping the region.
+
+```{r load_data}
+input_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency/methylation"
+fire_dir  <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency"
+plot_dir  <- file.path(input_dir, "plots")
+dir.create(plot_dir, showWarnings = FALSE)
+
+m6a_region <- fread(file.path(input_dir, "m6a_region_long.tsv.gz"))
+head(m6a_region)
+
+# one timepoint -> color mapping shared by every plot
+timepoint_levels <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
+timepoint_colors <- setNames(scales::hue_pal()(4), timepoint_levels)
+m6a_region$timepoint <- factor(m6a_region$timepoint, levels = timepoint_levels)
+```
+
+
+# Cumulative distribution of region m6A level for each timepoint
+
+for a given m6A level x, what fraction of FIRE-universe regions have level <= x?
+Left-shifted curve = overall lower m6A (less accessible) at that timepoint.
+
+```{r CDF_m6a}
+p_m6a_cdf <- ggplot(m6a_region, aes(x = m6a, color = timepoint)) +
+  stat_ecdf(na.rm = TRUE) +
+  scale_color_manual(values = timepoint_colors) +
+  labs(
+    x = "Average m6A level (n_mod / n_cov)",
+    y = "Cumulative fraction of regions",
+    color = "Timepoint"
+  ) +
+  theme_classic()
+p_m6a_cdf
+ggsave(file.path(plot_dir, "m6a_level_cdf.pdf"), p_m6a_cdf, width = 7, height = 4)
+```
+
+
+# Pairwise differential m6A level
+
+Wilcoxon rank-sum test on per-read m6A fractions (05): reads are the
+independent unit, so the p-values are calibrated at read level (unlike a
+Fisher test on pooled read x site events, which within-read correlation
+inflates).
+
+```{r load_pairwise}
+pairwise_m6a <- read_tsv(file.path(input_dir, "pairwise_wilcoxon_m6a.tsv.gz"),
+                         show_col_types = FALSE)
+
+comparison_levels <- c("LPS_0_vs_LPS_5", "LPS_0_vs_LPS_10", "LPS_0_vs_LPS_15",
+                       "LPS_5_vs_LPS_10", "LPS_5_vs_LPS_15", "LPS_10_vs_LPS_15")
+pairwise_m6a <- pairwise_m6a %>%
+  mutate(comparison = factor(comparison, levels = comparison_levels))
+
+passing <- pairwise_m6a %>% filter(pass_coverage, !is.na(p_value))
+
+# top 100 per comparison by raw p; head(100) instead of rank_p <= 100 because
+# rank_p uses ties.method = "min" and can return != 100 rows at tie boundaries
+top100 <- passing %>%
+  group_by(comparison) %>%
+  arrange(p_value, .by_group = TRUE) %>%
+  slice_head(n = 100) %>%
+  ungroup() %>%
+  mutate(direction = ifelse(delta_m6a > 0, "gain", "loss"))
+
+# gain = higher m6A level at the later timepoint
+table(top100$comparison, top100$direction)
+write_tsv(top100, file.path(input_dir, "pairwise_m6a_top100.tsv"))
+```
+
+
+# P-value distribution per comparison
+
+Histogram of the unadjusted Wilcoxon p-values over coverage-passing regions.
+The dashed red line is the count expected per bin if all p-values were uniform
+(no signal). An excess in the leftmost bins = real differential signal (the
+remaining caveat is biological: merged pools, no replication).
+
+```{r pvalue_hist, fig.width=12, fig.height=6}
+expected_bin <- passing %>%
+  count(comparison) %>%
+  mutate(expected = n * 0.025)
+
+p_pval_hist <- ggplot(passing, aes(x = p_value)) +
+  geom_histogram(binwidth = 0.025, boundary = 0,
+                 fill = "grey70", color = "grey30", linewidth = 0.2) +
+  geom_hline(data = expected_bin, aes(yintercept = expected),
+             linetype = "dashed", color = "red") +
+  facet_wrap(~ comparison, nrow = 2) +
+  labs(x = "Wilcoxon rank-sum p (unadjusted)", y = "Regions") +
+  theme_classic()
+p_pval_hist
+ggsave(file.path(plot_dir, "pvalue_histogram_m6a.pdf"), p_pval_hist, width = 12, height = 6)
+```
+
+
+# Distribution of m6A level changes
+
+```{r delta_violin, fig.width=10, fig.height=5}
+p_delta_violin <- ggplot(passing, aes(x = comparison, y = delta_m6a)) +
+  geom_violin(fill = "grey80") +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = NULL, y = "delta m6A (later - earlier)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_delta_violin
+ggsave(file.path(plot_dir, "delta_m6a_violin.pdf"), p_delta_violin, width = 10, height = 5)
+```
+
+
+
+# Does m6A change where FIRE frequency changes?
+
+Join with the FIRE-frequency Fisher results by region x comparison. FIRE
+elements are called from m6A density, so a positive delta_freq / delta_m6a
+correlation is expected by construction; the informative regions are the
+discordant ones.
+
+```{r fire_overlay}
+pairwise_fire <- read_tsv(file.path(fire_dir, "pairwise_fisher.tsv.gz"),
+                          show_col_types = FALSE) %>%
+  select(region_id, comparison, delta_freq, p_fire = p_value,
+         pass_coverage_fire = pass_coverage)
+
+both <- passing %>%
+  inner_join(pairwise_fire, by = c("region_id", "comparison")) %>%
+  filter(pass_coverage_fire) %>%
+  mutate(fire_signif = p_fire < 0.05)
+
+both %>%
+  group_by(comparison) %>%
+  summarise(spearman = cor(delta_freq, delta_m6a, method = "spearman",
+                           use = "complete.obs"))
+```
+
+```{r fire_signif_violin, fig.width=12, fig.height=5}
+# |delta_m6a| at FIRE-significant regions (raw Fisher p < 0.05 in that same
+# comparison) vs the rest of the coverage-passing universe
+p_sig <- ggplot(both, aes(x = fire_signif, y = delta_m6a, fill = fire_signif)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ comparison, nrow = 1) +
+  labs(x = "FIRE frequency change significant (raw p < 0.05)", y = "delta m6A") +
+  theme_classic() +
+  theme(legend.position = "none")
+p_sig
+ggsave(file.path(plot_dir, "delta_m6a_by_fire_sig.pdf"), p_sig, width = 12, height = 5)
+
+# regions significant in both tests (raw p < 0.05, per comparison)
+both %>%
+  group_by(comparison) %>%
+  summarise(n_pass = n(),
+            fire_sig = sum(fire_signif),
+            m6a_sig = sum(p_value < 0.05),
+            both_sig = sum(fire_signif & p_value < 0.05))
+```
+
+# Read-level plots: top 5 cCRE-supported m6A changes without significant FIRE-frequency changes
+
+Select union FIRE regions with significant methylation change (unadjusted
+Wilcoxon p < 0.05) but no significant FIRE-frequency change (unadjusted Fisher
+p >= 0.05) **in the same comparison**, passing coverage in both tests. A
+nonsignificant FIRE test is not evidence of equivalence; `delta_freq_best` is
+reported alongside the p-value. Other comparisons for a selected region may
+have significant FIRE-frequency changes.
+
+As in `05_vis_fire_freq.Rmd`, require a single ENCODE cCRE to cover at least
+50% of the region and the nearest GENCODE v46 gene to be protein-coding.
+For these examples, additionally require `gene_distance == 0` (the region
+overlaps or directly adjoins the gene body).
+Keep each region's smallest methylation p-value among qualifying comparisons,
+then select the top five distinct regions overall. Here, "significant" refers
+to methylation change within a FIRE region, not to FIRE-frequency change.
+
+```{r m6a_only_ccre_regions, message=FALSE}
+suppressPackageStartupMessages(library(GenomicRanges))
+read_level_dir <- file.path(plot_dir, "read_level_results")
+read_level_table_dir <- file.path(read_level_dir, "tables")
+read_level_plot_dir <- file.path(read_level_dir, "plots")
+dir.create(read_level_table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(read_level_plot_dir, recursive = TRUE, showWarnings = FALSE)
+p_sig <- 0.05
+ccre_file <- "/project/spott/cshan/annotations/GRCh38-cCREs.bed"
+gtf_file <- "/project/spott/cshan/annotations/gencode.v46.annotation.gtf.gz"
+
+m6a_only_rows <- both %>%
+  filter(p_value < p_sig, !is.na(p_fire), p_fire >= p_sig)
+
+# Choose the best qualifying comparison, with deterministic ordering for ties.
+m6a_only_regions <- m6a_only_rows %>%
+  group_by(region_id) %>%
+  mutate(n_qualifying_comparisons = n()) %>%
+  arrange(p_value, comparison, .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(region_id, chrom, start, end, n_qualifying_comparisons,
+            best_comparison = comparison, min_p = p_value,
+            p_fire_best = p_fire, delta_m6a_best = delta_m6a,
+            delta_freq_best = delta_freq, n_reads_A, n_reads_B)
+
+ccre <- data.table::fread(ccre_file, header = FALSE,
+                         col.names = c("chr", "start", "end",
+                                       "ccre_dcc", "ccre_id", "ccre_class"))
+reg.gr <- GRanges(m6a_only_regions$chrom,
+                  IRanges(m6a_only_regions$start + 1L, m6a_only_regions$end))
+ccre.gr <- GRanges(ccre$chr, IRanges(ccre$start + 1L, ccre$end))
+hits <- findOverlaps(reg.gr, ccre.gr)
+ov_frac <- width(pintersect(reg.gr[queryHits(hits)], ccre.gr[subjectHits(hits)])) /
+  width(reg.gr)[queryHits(hits)]
+best <- tibble(ri = queryHits(hits), frac = ov_frac,
+               ccre_id = ccre$ccre_id[subjectHits(hits)],
+               ccre_class = ccre$ccre_class[subjectHits(hits)]) %>%
+  group_by(ri) %>%
+  slice_max(frac, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+m6a_only_regions <- m6a_only_regions %>%
+  mutate(ccre_frac = 0, ccre_id = NA_character_, ccre_class = NA_character_)
+m6a_only_regions$ccre_frac[best$ri] <- best$frac
+m6a_only_regions$ccre_id[best$ri] <- best$ccre_id
+m6a_only_regions$ccre_class[best$ri] <- best$ccre_class
+m6a_only_ccre <- m6a_only_regions %>% filter(ccre_frac >= 0.5)
+
+# Annotate against all genes before filtering for a protein-coding nearest gene,
+# matching the association rule in 05_vis_fire_freq.Rmd.
+gtf <- data.table::fread(
+  cmd = paste("zcat", shQuote(gtf_file), "| awk -F'\\t' '$3==\"gene\"'"),
+  header = FALSE, sep = "\t")
+genes.gr <- GRanges(gtf$V1, IRanges(gtf$V4, gtf$V5),
+                    gene_name = sub('.*gene_name "([^"]+)".*', "\\1", gtf$V9),
+                    gene_type = sub('.*gene_type "([^"]+)".*', "\\1", gtf$V9))
+sc.gr <- GRanges(m6a_only_ccre$chrom,
+                 IRanges(m6a_only_ccre$start + 1L, m6a_only_ccre$end))
+d <- distanceToNearest(sc.gr, genes.gr)
+m6a_only_ccre$nearest_gene <- NA_character_
+m6a_only_ccre$nearest_gene_type <- NA_character_
+m6a_only_ccre$gene_distance <- NA_integer_
+m6a_only_ccre$nearest_gene[queryHits(d)] <- genes.gr$gene_name[subjectHits(d)]
+m6a_only_ccre$nearest_gene_type[queryHits(d)] <- genes.gr$gene_type[subjectHits(d)]
+m6a_only_ccre$gene_distance[queryHits(d)] <- mcols(d)$distance
+m6a_only_ccre <- m6a_only_ccre %>% arrange(min_p, region_id)
+write_tsv(m6a_only_ccre, file.path(read_level_table_dir, "m6a_only_ccre_regions.tsv"))
+
+pad <- 1000L
+top5_m6a_only <- m6a_only_ccre %>%
+  filter(nearest_gene_type == "protein_coding", gene_distance == 0L) %>%
+  slice_head(n = 5) %>%
+  mutate(outname = paste(chrom, start, end, sep = "_"),
+         window_start = as.integer(pmax(1L, start + 1L - pad)),
+         window_end = as.integer(end + pad))
+if (nrow(top5_m6a_only) < 5L) {
+  warning("Only ", nrow(top5_m6a_only), " regions satisfy all selection criteria.")
+}
+write_tsv(top5_m6a_only, file.path(read_level_table_dir, "top5_m6a_only_ccre_regions.tsv"))
+
+top5_m6a_only %>%
+  transmute(region_id, best_comparison, n_qualifying_comparisons,
+            min_p = signif(min_p, 3), p_fire_best = signif(p_fire_best, 3),
+            delta_m6a_best = round(delta_m6a_best, 3),
+            delta_freq_best = round(delta_freq_best, 3),
+            ccre_class, ccre_frac = round(ccre_frac, 2),
+            nearest_gene, gene_distance) %>%
+  datatable(rownames = FALSE, options = list(pageLength = 5, scrollX = TRUE))
+```
+
+Plot all four timepoints with 1 kb flanks, the same panel heights, footprint
+colors, cCRE tracks, and highlighted tested region as the FIRE-frequency
+notebook. The title identifies the qualifying comparison and both p-values.
+Tables and PDFs are saved under `plots/read_level_results/tables` and
+`plots/read_level_results/plots`, respectively. Extraction is cached under
+`plots/read_level_results/extracted`; a completion marker is written only
+after the extraction script succeeds.
+
+```{r m6a_only_region_functions, message=FALSE}
+code_dir <- "/project/spott/cshan/fiber-seq/code/topic_model/read_region_extraction"
+source(file.path(code_dir, "region_data_utils.R"))
+source(file.path(code_dir, "region_plot_functions.R"))
+```
+
+```{r top5_m6a_only_extract}
+extract_script <- file.path(code_dir, "extract_region_result_macrophage.sh")
+extract_root <- file.path(read_level_dir, "extracted")
+sample_names <- timepoint_levels
+required_files <- c("extracted.m6a.bed.gz", "extracted.m6a.bed.gz.tbi",
+                    "extracted.cpg.bed.gz", "extracted.cpg.bed.gz.tbi",
+                    "region.fiberhmm_tf.bed", "region.fiberhmm_footprint.bed",
+                    "fire_elements.bed", "fire.bed")
+
+for (i in seq_len(nrow(top5_m6a_only))) {
+  row <- top5_m6a_only[i, ]
+  region_str <- paste0(row$chrom, ":", row$window_start, "-", row$window_end)
+  for (s in sample_names) {
+    parsed <- file.path(extract_root, row$outname, s, "parsed")
+    marker <- file.path(parsed, "extraction_complete.txt")
+    if (file.exists(marker) && identical(readLines(marker, warn = FALSE), region_str) &&
+        all(file.exists(file.path(parsed, required_files))) &&
+        all(file.size(file.path(parsed, required_files)) > 0) &&
+        file.exists(file.path(parsed, "fire_peaks.bed"))) next
+    if (file.exists(marker)) unlink(marker)
+    cat("extracting", row$outname, s, "\n")
+    rc <- system2("bash", shQuote(c(extract_script, s, region_str, row$outname,
+                                    extract_root)))
+    if (rc != 0) stop("extraction failed for ", row$outname, " ", s)
+    writeLines(region_str, marker)
+  }
+}
+```
+
+```{r top5_m6a_only_region_plots, fig.width=10, fig.height=16, fig.path=paste0(read_level_plot_dir, "/")}
+for (i in seq_len(nrow(top5_m6a_only))) {
+  row <- top5_m6a_only[i, ]
+  cat("=== ", row$region_id, " (", row$ccre_class, ", nearest gene: ",
+      row$nearest_gene, ") ===\n", sep = "")
+
+  res <- load_region_results(
+    region = data.frame(chr = row$chrom, start = row$window_start,
+                        end = row$window_end),
+    sample_names = sample_names,
+    result_dirs = file.path(extract_root, row$outname, sample_names, "parsed"),
+    fiberHMM_feature = "tf",
+    min_fiberHMM_fp_score = 50,
+    fiberHMM_size_breaks = c(10, 30, 60, 80))
+  res <- add_read_groups(res,
+                         labels = setNames(as.character(res$rids_df$sample_name),
+                                           as.character(res$rids_df$RID)),
+                         group_col = "timepoint",
+                         group_levels = sample_names)
+
+  peaks_df <- ccre %>%
+    filter(chr == row$chrom, end > row$window_start, start < row$window_end) %>%
+    arrange(ccre_class, start) %>%
+    transmute(chr, start, end, group = ccre_class)
+  plot_title <- paste0(
+    row$region_id, "  (", row$ccre_class, ", nearest gene: ", row$nearest_gene,
+    ", distance: ", row$gene_distance, " bp)\n", row$best_comparison,
+    ": m6A p = ", formatC(row$min_p, format = "e", digits = 2),
+    "; FIRE p = ", formatC(row$p_fire_best, format = "g", digits = 3))
+  p <- plot_region_panels(res,
+                          plot_name = plot_title,
+                          peaks_df = peaks_df,
+                          highlight = c(row$start, row$end),
+                          fiberHMM_cols = c("purple", "magenta", "#41c4e1"),
+                          heights = c(pileup = 10, peaks = 2, fire_peaks = 1,
+                                      reads = 8, fire_fiberHMM = 8))
+  print(p$combined)
+  ggsave(file.path(read_level_plot_dir, paste0("m6a_only_region_", row$outname,
+                                   "_by_timepoint.pdf")),
+         p$combined, width = 10, height = 16, limitsize = FALSE)
+}
+```
+
+
+# Read-level plots: top 2 cCRE-supported FIRE-frequency changes without significant m6A changes
+
+Select regions with significant FIRE-frequency change (unadjusted Fisher
+p < 0.05) and no significant methylation change (unadjusted Wilcoxon
+p >= 0.05) **in the same comparison**, passing coverage in both tests.
+A nonsignificant methylation test does not establish equivalence;
+`delta_m6a_best` is reported alongside its p-value. Other comparisons for a
+selected region may have significant methylation changes.
+
+Use the same cCRE support (at least 50% covered by one cCRE), nearest
+protein-coding gene, and `gene_distance == 0` requirements as above. Keep
+each region's smallest FIRE p-value among qualifying comparisons, then
+select the top two distinct regions overall. Plot all four timepoints in
+the same format, saving tables and plots with a `fire_only` label in the
+same `read_level_results` folders.
+
+```{r fire_only_ccre_regions, message=FALSE}
+fire_only_rows <- both %>%
+  filter(!is.na(p_fire), p_fire < p_sig, p_value >= p_sig)
+fire_only_regions <- fire_only_rows %>%
+  group_by(region_id) %>%
+  mutate(n_qualifying_comparisons = n()) %>%
+  arrange(p_fire, comparison, .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(region_id, chrom, start, end, n_qualifying_comparisons,
+            best_comparison = comparison, min_p = p_fire,
+            p_m6a_best = p_value, delta_m6a_best = delta_m6a,
+            delta_freq_best = delta_freq, n_reads_A, n_reads_B)
+
+# Reuse the full cCRE and gene annotations loaded above, not the m6A-selected
+# candidate table: the two selections have different qualifying comparisons.
+fire_only.gr <- GRanges(fire_only_regions$chrom,
+                        IRanges(fire_only_regions$start + 1L, fire_only_regions$end))
+fire_only_hits <- findOverlaps(fire_only.gr, ccre.gr)
+fire_only_frac <- width(pintersect(fire_only.gr[queryHits(fire_only_hits)],
+                                  ccre.gr[subjectHits(fire_only_hits)])) /
+  width(fire_only.gr)[queryHits(fire_only_hits)]
+fire_only_best <- tibble(
+  ri = queryHits(fire_only_hits), frac = fire_only_frac,
+  ccre_id = ccre$ccre_id[subjectHits(fire_only_hits)],
+  ccre_class = ccre$ccre_class[subjectHits(fire_only_hits)]) %>%
+  group_by(ri) %>%
+  slice_max(frac, n = 1, with_ties = FALSE) %>%
+  ungroup()
+fire_only_regions <- fire_only_regions %>%
+  mutate(ccre_frac = 0, ccre_id = NA_character_, ccre_class = NA_character_)
+fire_only_regions$ccre_frac[fire_only_best$ri] <- fire_only_best$frac
+fire_only_regions$ccre_id[fire_only_best$ri] <- fire_only_best$ccre_id
+fire_only_regions$ccre_class[fire_only_best$ri] <- fire_only_best$ccre_class
+fire_only_ccre <- fire_only_regions %>% filter(ccre_frac >= 0.5)
+
+fire_only_ccre.gr <- GRanges(fire_only_ccre$chrom,
+                             IRanges(fire_only_ccre$start + 1L, fire_only_ccre$end))
+fire_only_nearest <- distanceToNearest(fire_only_ccre.gr, genes.gr)
+fire_only_ccre$nearest_gene <- NA_character_
+fire_only_ccre$nearest_gene_type <- NA_character_
+fire_only_ccre$gene_distance <- NA_integer_
+fire_only_ccre$nearest_gene[queryHits(fire_only_nearest)] <-
+  genes.gr$gene_name[subjectHits(fire_only_nearest)]
+fire_only_ccre$nearest_gene_type[queryHits(fire_only_nearest)] <-
+  genes.gr$gene_type[subjectHits(fire_only_nearest)]
+fire_only_ccre$gene_distance[queryHits(fire_only_nearest)] <-
+  mcols(fire_only_nearest)$distance
+fire_only_ccre <- fire_only_ccre %>% arrange(min_p, region_id)
+write_tsv(fire_only_ccre, file.path(read_level_table_dir, "fire_only_ccre_regions.tsv"))
+
+# min_p is the FIRE-frequency Fisher p-value in this section.
+top2_fire_only <- fire_only_ccre %>%
+  filter(nearest_gene_type == "protein_coding", gene_distance == 0L) %>%
+  slice_head(n = 2) %>%
+  mutate(outname = paste(chrom, start, end, sep = "_"),
+         window_start = as.integer(pmax(1L, start + 1L - pad)),
+         window_end = as.integer(end + pad))
+if (nrow(top2_fire_only) < 2L) {
+  warning("Only ", nrow(top2_fire_only), " regions satisfy all FIRE-only selection criteria.")
+}
+write_tsv(top2_fire_only, file.path(read_level_table_dir, "top2_fire_only_ccre_regions.tsv"))
+
+top2_fire_only %>%
+  transmute(region_id, best_comparison, n_qualifying_comparisons,
+            p_fire_best = signif(min_p, 3), p_m6a_best = signif(p_m6a_best, 3),
+            delta_freq_best = round(delta_freq_best, 3),
+            delta_m6a_best = round(delta_m6a_best, 3),
+            ccre_class, ccre_frac = round(ccre_frac, 2),
+            nearest_gene, gene_distance) %>%
+  datatable(rownames = FALSE, options = list(pageLength = 2, scrollX = TRUE))
+```
+
+```{r top2_fire_only_extract}
+extract_script <- file.path(code_dir, "extract_region_result_macrophage.sh")
+extract_root <- file.path(read_level_dir, "extracted")
+sample_names <- timepoint_levels
+required_files <- c("extracted.m6a.bed.gz", "extracted.m6a.bed.gz.tbi",
+                    "extracted.cpg.bed.gz", "extracted.cpg.bed.gz.tbi",
+                    "region.fiberhmm_tf.bed", "region.fiberhmm_footprint.bed",
+                    "fire_elements.bed", "fire.bed")
+
+for (i in seq_len(nrow(top2_fire_only))) {
+  row <- top2_fire_only[i, ]
+  region_str <- paste0(row$chrom, ":", row$window_start, "-", row$window_end)
+  for (s in sample_names) {
+    parsed <- file.path(extract_root, row$outname, s, "parsed")
+    marker <- file.path(parsed, "extraction_complete.txt")
+    if (file.exists(marker) && identical(readLines(marker, warn = FALSE), region_str) &&
+        all(file.exists(file.path(parsed, required_files))) &&
+        all(file.size(file.path(parsed, required_files)) > 0) &&
+        file.exists(file.path(parsed, "fire_peaks.bed"))) next
+    if (file.exists(marker)) unlink(marker)
+    cat("extracting", row$outname, s, "\n")
+    rc <- system2("bash", shQuote(c(extract_script, s, region_str, row$outname,
+                                    extract_root)))
+    if (rc != 0) stop("extraction failed for ", row$outname, " ", s)
+    writeLines(region_str, marker)
+  }
+}
+```
+
+```{r top2_fire_only_region_plots, fig.width=10, fig.height=16, fig.path=paste0(read_level_plot_dir, "/")}
+for (i in seq_len(nrow(top2_fire_only))) {
+  row <- top2_fire_only[i, ]
+  cat("=== ", row$region_id, " (", row$ccre_class, ", nearest gene: ",
+      row$nearest_gene, ") ===\n", sep = "")
+
+  res <- load_region_results(
+    region = data.frame(chr = row$chrom, start = row$window_start,
+                        end = row$window_end),
+    sample_names = sample_names,
+    result_dirs = file.path(extract_root, row$outname, sample_names, "parsed"),
+    fiberHMM_feature = "tf",
+    min_fiberHMM_fp_score = 50,
+    fiberHMM_size_breaks = c(10, 30, 60, 80))
+  res <- add_read_groups(res,
+                         labels = setNames(as.character(res$rids_df$sample_name),
+                                           as.character(res$rids_df$RID)),
+                         group_col = "timepoint",
+                         group_levels = sample_names)
+
+  peaks_df <- ccre %>%
+    filter(chr == row$chrom, end > row$window_start, start < row$window_end) %>%
+    arrange(ccre_class, start) %>%
+    transmute(chr, start, end, group = ccre_class)
+  plot_title <- paste0(
+    row$region_id, "  (", row$ccre_class, ", nearest gene: ", row$nearest_gene,
+    ", distance: ", row$gene_distance, " bp)\n", row$best_comparison,
+    ": m6A p = ", formatC(row$p_m6a_best, format = "g", digits = 3),
+    "; FIRE p = ", formatC(row$min_p, format = "e", digits = 2))
+  p <- plot_region_panels(res,
+                          plot_name = plot_title,
+                          peaks_df = peaks_df,
+                          highlight = c(row$start, row$end),
+                          fiberHMM_cols = c("purple", "magenta", "#41c4e1"),
+                          heights = c(pileup = 10, peaks = 2, fire_peaks = 1,
+                                      reads = 8, fire_fiberHMM = 8))
+  print(p$combined)
+  ggsave(file.path(read_level_plot_dir, paste0("fire_only_region_", row$outname,
+                                   "_by_timepoint.pdf")),
+         p$combined, width = 10, height = 16, limitsize = FALSE)
+}
+```
