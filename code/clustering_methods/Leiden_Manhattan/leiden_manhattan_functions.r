@@ -341,7 +341,8 @@ bin_read_matrix <- function(met_mat, region_start, region_end, window_size = 0) 
 
 # ---------------------------------------------------------------------------
 # Steps 4-6: Manhattan distances between reads, KNN graph, exponential-kernel
-# affinities as edge weights.
+# affinities as edge weights. Each edge also retains its original Manhattan
+# distance (before the exponential kernel) as the manhattan_distance attribute.
 #
 # k_neighbours is capped at nrow(mat) - 1. sigma = NULL uses the mean of the
 # retained KNN distances; pass sigma = ncol(mat) for scikit-learn's
@@ -391,7 +392,8 @@ manhattan_knn_graph <- function(mat, k_neighbors = 50, sigma = NULL, verbose = T
   # create the edge table using read ID
   edges <- data.frame(from = rownames(mat)[a[keep]],
                       to   = rownames(mat)[b[keep]],
-                      weight = affinity[keep], stringsAsFactors = FALSE)
+                      weight = affinity[keep],
+                      manhattan_distance = d_nn[keep], stringsAsFactors = FALSE)
   # convert edge table into igraph object
   g <- igraph::graph_from_data_frame(
     edges, directed = FALSE,

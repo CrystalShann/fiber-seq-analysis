@@ -572,3 +572,502 @@ for (i in seq_len(nrow(top10))) {
   print(p$combined)
 }
 ```
+
+
+# Top 10 cCRE-supported regions: LPS time-course example figures
+
+The same 10 regions as the read-level plots above (`top10`: cCRE-supported,
+nearest gene protein coding, ranked by best pairwise Fisher p). Every panel uses
+the same window, the tested FIRE region +/- `pad` bp (`window_start`-`window_end`),
+and marks the tested region itself.
+
+Molecules are the full-span reads of the Leiden + Manhattan workflow
+(`assemble_region_m6a()` + `filter_met_mat()`: reads covering every m6A-called
+site in the window), so panels A-D all describe the same reads. Each timepoint
+is one merged sample (`LPS_0` ... `LPS_15`, biological replicates already
+pooled), as in the rest of this notebook.
+
+- **A** aggregate m6A per timepoint: the pileup of the read-level plots above
+  (`pileup_reads()`: fraction of reads with an m6A call at each A, +/- 5 bp
+  sliding mean), with ENCODE cCREs in the window.
+- **B** every full-span molecule, by timepoint, not clustered (rows ordered by
+  alignment start). Footprint encoding of the read-level plots above: FIRE /
+  linker segmentation from `fire.bed`, FiberHMM 130-160 bp nucleosomes, and
+  FIRE-polished FiberHMM TF footprints.
+- **C** Leiden + Manhattan clustering of the molecules pooled over 0-15 min,
+  with the settings of `marcophage_leiden_manhattan.Rmd` (site-level 0/1 m6A
+  matrix, no windowing, k = 10, resolution 1). Timepoint is metadata only and no
+  haplotype information is used. C1 = m6A heatmap, C2 = per-cluster m6A pileup
+  and every molecule's footprints, by cluster.
+- **D** cluster composition per timepoint, P(cluster | time).
+
+Only PDFs are written, one folder per region under `top10_example_plots/`.
+
+```{r top10_examples_setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(igraph)
+  library(ComplexHeatmap)
+  library(cowplot)
+  library(patchwork)
+})
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r")
+ht_opt$message <- FALSE
+
+example_dir   <- file.path(input_dir, "top10_example_plots")
+ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir"
+
+sample_table <- tibble::tribble(
+  ~sample_name, ~condition, ~timepoint,
+  "LPS_0",      "LPS",       0L,
+  "LPS_5",      "LPS",       5L,
+  "LPS_10",     "LPS",       10L,
+  "LPS_15",     "LPS",       15L
+)
+
+# Leiden + Manhattan settings of marcophage_leiden_manhattan.Rmd
+window_size       <- 0L
+k_neighbors       <- 10
+leiden_resolution <- 1
+leiden_seed       <- 1
+kernel_sigma      <- NULL
+impute_missing    <- FALSE
+impute_k          <- 5
+
+time_levels <- c("0 min", "5 min", "10 min", "15 min")
+time_labels <- setNames(time_levels, sample_names)
+time_cols   <- setNames(unname(LEIDEN_TIMEPOINT_COLORS[sample_names]), time_levels)
+
+# footprint colours of plot_region_panels() in the read-level plots above
+fp_cols <- c("linker (non-FIRE MSP)"  = "darkgray",
+             "FIRE element"           = "#FF8C00",
+             "nucleosome 130-160 bp"  = "darkblue",
+             "TF footprint 10-30 bp"  = "purple",
+             "TF footprint 30-60 bp"  = "magenta",
+             "TF footprint 60-80 bp"  = "#41c4e1")
+
+# ENCODE SCREEN cCRE colours
+ccre_cols <- c(PLS = "#FF0000", pELS = "#FFA700", dELS = "#FFCD00",
+               "CA-H3K4me3" = "#FFAAAA", "CA-CTCF" = "#00B0F0", "CA-TF" = "#BE28E5",
+               CA = "#06DA93", TF = "#D876EC", "tested FIRE region" = "black")
+```
+
+```{r top10_examples_regions}
+top10_examples_regions <- top10 %>%
+  mutate(example_id = sprintf("rank%02d_%s", rank, outname)) %>%
+  select(rank, example_id, outname, region_id, chrom, start, end, window_start, window_end,
+         best_comparison, n_signif_comparisons, min_p, delta_freq_best,
+         ccre_id, ccre_class, ccre_frac, nearest_gene, gene_distance)
+
+# FIRE frequency of the tested region at each timepoint (fire_frequency_long)
+top10_fire_freq <- fire_freq %>%
+  filter(region_id %in% top10_examples_regions$region_id) %>%
+  mutate(time = factor(time_labels[timepoint], levels = time_levels)) %>%
+  select(region_id, time, n_reads, n_fire, freq)
+
+top10_examples_regions %>%
+  mutate(min_p = signif(min_p, 3), delta_freq_best = round(delta_freq_best, 3),
+         ccre_frac = round(ccre_frac, 2)) %>%
+  select(-region_id)
+```
+
+## Leiden + Manhattan clustering, timepoints pooled
+
+`leiden_manhattan_cluster_regions()` pools the reads of the four samples before
+the distance, graph and Leiden steps; `sample_name` / `timepoint` are only
+carried into `assignments`. `k_eff` < `k_neighbors` would mean the region had
+too few reads and k was capped at n - 1.
+
+```{r top10_examples_leiden}
+top10_leiden <- leiden_manhattan_cluster_regions(
+  sample_names   = sample_names,
+  regions        = data.frame(chr = top10_examples_regions$chrom,
+                              start = top10_examples_regions$window_start,
+                              end = top10_examples_regions$window_end,
+                              region_id = top10_examples_regions$example_id),
+  ft_result_dir  = ft_result_dir,
+  window_size    = window_size,
+  k_neighbors    = k_neighbors,
+  resolution     = leiden_resolution,
+  impute_missing = impute_missing,
+  impute_k       = impute_k,
+  sigma          = kernel_sigma,
+  seed           = leiden_seed,
+  sample_table   = sample_table,
+  verbose        = FALSE)
+
+bind_rows(lapply(names(top10_leiden), function(id) {
+  p <- top10_leiden[[id]]$params
+  data.frame(example_id = id, n_reads = p$n_reads, n_features = p$n_features,
+             k_neighbors = p$k_neighbors, k_eff = p$k_eff, resolution = p$resolution,
+             sigma = round(p$sigma, 2), n_clusters = top10_leiden[[id]]$n_clusters)
+}))
+```
+
+```{r top10_examples_functions}
+theme_example <- function() {
+  theme_classic(base_size = 9) +
+    theme(strip.background = element_rect(fill = "grey95", colour = NA),
+          strip.text.y = element_text(angle = 0, hjust = 0),
+          plot.title = element_text(face = "bold", size = 10),
+          plot.subtitle = element_text(size = 8, colour = "grey30"),
+          legend.position = "bottom", legend.key.size = unit(3, "mm"),
+          legend.text = element_text(size = 8))
+}
+
+window_breaks <- function(ex) {
+  b <- pretty(c(ex$window_start, ex$window_end), n = 5)
+  b[b >= ex$window_start & b <= ex$window_end]
+}
+
+example_title <- function(ex) {
+  sprintf("#%d  %s:%s-%s  |  %s %s  |  nearest gene %s", ex$rank, ex$chrom,
+          scales::comma(ex$start), scales::comma(ex$end), ex$ccre_class, ex$ccre_id,
+          ex$nearest_gene)
+}
+
+# plotting row of each molecule within its facet, in the current row order
+stack_rows <- function(df, group_col) {
+  df$y <- as.integer(ave(seq_len(nrow(df)), df[[group_col]], FUN = seq_along))
+  df
+}
+
+# FIRE / linker segmentation, FiberHMM nucleosomes and FIRE-polished TF footprints
+# of a load_region_results() result, one row per interval
+molecule_tracks <- function(res) {
+  as_track <- function(df, class) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    data.frame(RID = as.character(df$RID), start = df$start, end = df$end, class = class)
+  }
+  fire <- res$fire[res$fire$class %in% c("FIRE", "linker"), , drop = FALSE]
+  fps  <- res$fps_infire[!is.na(res$fps_infire$class), , drop = FALSE]
+  tr <- bind_rows(
+    as_track(fire, ifelse(fire$class == "FIRE", "FIRE element", "linker (non-FIRE MSP)")),
+    as_track(res$nucs, "nucleosome 130-160 bp"),
+    as_track(fps, paste("TF footprint", fps$class)))
+  tr$class <- factor(tr$class, levels = names(fp_cols))
+  tr[order(tr$class), , drop = FALSE]      # TF footprints drawn last, on top
+}
+
+# cCREs overlapping the window plus the tested region, one row each
+plot_ccre_track <- function(ex, xlim) {
+  cc <- ccre %>%
+    filter(chr == ex$chrom, end > ex$window_start, start < ex$window_end) %>%
+    arrange(start) %>%
+    transmute(start, end, label = paste(ccre_class, ccre_id), class = ccre_class)
+  tr <- bind_rows(tibble(start = ex$start, end = ex$end, label = "tested FIRE region",
+                         class = "tested FIRE region"), cc)
+  tr$y <- rev(seq_len(nrow(tr)))
+  p <- ggplot(tr) +
+    geom_rect(aes(xmin = pmax(start, ex$window_start), xmax = pmin(end, ex$window_end),
+                  ymin = y - 0.35, ymax = y + 0.35, fill = class)) +
+    scale_fill_manual(values = ccre_cols, guide = "none") +
+    scale_y_continuous(breaks = tr$y, labels = tr$label, expand = expansion(add = 0.5)) +
+    scale_x_continuous(breaks = window_breaks(ex), labels = scales::comma) +
+    coord_cartesian(xlim = xlim, expand = FALSE) +
+    labs(x = paste(ex$chrom, "position (bp)"), y = NULL) +
+    theme_example() +
+    theme(axis.line.y = element_blank(), axis.ticks.y = element_blank())
+  list(plot = p, n_tracks = nrow(tr))
+}
+
+# Panel A: per-timepoint m6A pileup on a shared y axis
+plot_aggregate_m6a <- function(pileup, ex, n_reads, fire_freq_ex) {
+  xlim <- c(ex$window_start, ex$window_end)
+  strip <- setNames(sprintf("%s\nn = %d", time_levels, as.integer(n_reads[time_levels])),
+                    time_levels)
+  p_sig <- ggplot(pileup, aes(pos, smooth_frac)) +
+    annotate("rect", xmin = ex$start, xmax = ex$end, ymin = -Inf, ymax = Inf,
+             fill = "grey88") +
+    geom_area(aes(fill = time), alpha = 0.9) +
+    geom_line(linewidth = 0.25, colour = "grey15") +
+    facet_grid(time ~ ., labeller = as_labeller(strip)) +
+    scale_fill_manual(values = time_cols, guide = "none") +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.05))) +
+    coord_cartesian(xlim = xlim, expand = FALSE) +
+    labs(x = NULL, y = "m6A fraction (+/- 5 bp mean)",
+         title = example_title(ex),
+         subtitle = sprintf(paste0("Aggregate m6A, full-span reads per timepoint; grey band = tested region\n",
+                                   "FIRE frequency of the tested region 0 / 5 / 10 / 15 min: %s;  ",
+                                   "best %s: p = %s, delta = %+.3f"),
+                            paste(sprintf("%.2f", fire_freq_ex$freq[match(time_levels, fire_freq_ex$time)]),
+                                  collapse = " / "),
+                            ex$best_comparison, formatC(ex$min_p, format = "e", digits = 2),
+                            ex$delta_freq_best)) +
+    theme_example() +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          axis.line.x = element_blank())
+  cc <- plot_ccre_track(ex, xlim)
+  list(plot = p_sig / cc$plot + plot_layout(heights = c(4 * 1.2, 0.3 * cc$n_tracks + 0.2)),
+       height = 1.6 + 4 * 1.2 + 0.3 * cc$n_tracks + 0.6)
+}
+
+# x range of the molecule plots: the window plus room for n_bars colour bars
+bar_width <- function(ex) 0.022 * (ex$window_end - ex$window_start)
+bar_gap   <- function(ex) 0.006 * (ex$window_end - ex$window_start)
+molecule_xlim <- function(ex, n_bars) {
+  c(ex$window_start - n_bars * (bar_width(ex) + bar_gap(ex)) - bar_gap(ex), ex$window_end)
+}
+
+# Panels B and C2: one row per molecule, facetted by `facet_col`; `bar_cols`
+# draws a colour bar per molecule left of the window for each named column
+plot_molecules <- function(rows, tracks, ex, facet_col, facet_labels,
+                           bar_cols = character(), bar_palette = NULL, legend_extra = NULL,
+                           title = NULL, subtitle = NULL) {
+  bw   <- bar_width(ex)
+  gap  <- bar_gap(ex)
+  xlim <- molecule_xlim(ex, length(bar_cols))
+
+  rows$facet <- rows[[facet_col]]
+  tr <- inner_join(tracks, rows[, c("RID", "facet", "y")], by = "RID")
+  tr$start <- pmax(tr$start, ex$window_start)
+  tr$end   <- pmin(tr$end, ex$window_end)
+  tr <- tr[tr$end > tr$start, , drop = FALSE]
+
+  bars <- bind_rows(lapply(seq_along(bar_cols), function(i) {
+    xmax <- ex$window_start - gap - (i - 1) * (bw + gap)
+    data.frame(facet = rows$facet, y = rows$y, xmin = xmax - bw, xmax = xmax,
+               fill = as.character(rows[[bar_cols[i]]]))
+  }))
+
+  p <- ggplot() +
+    geom_segment(data = rows, aes(x = ex$window_start, xend = ex$window_end, y = y, yend = y),
+                 colour = "grey80", linewidth = 0.15) +
+    geom_rect(data = tr, aes(xmin = start, xmax = end, ymin = y - 0.45, ymax = y + 0.45,
+                             fill = class))
+  if (nrow(bars) > 0)
+    p <- p + geom_rect(data = bars, aes(xmin = xmin, xmax = xmax, ymin = y - 0.5,
+                                        ymax = y + 0.5, fill = fill))
+  p +
+    geom_vline(xintercept = c(ex$start, ex$end), linetype = "dashed", linewidth = 0.3) +
+    facet_grid(facet ~ ., scales = "free_y", space = "free_y",
+               labeller = as_labeller(facet_labels)) +
+    # clusters are named by the facets, so only classes and extra keys are listed
+    scale_fill_manual(values = c(fp_cols, bar_palette),
+                      breaks = c(names(fp_cols), legend_extra), name = NULL) +
+    scale_x_continuous(breaks = window_breaks(ex), labels = scales::comma) +
+    scale_y_reverse(expand = expansion(add = 0.6)) +
+    coord_cartesian(xlim = xlim, expand = FALSE) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    labs(x = paste(ex$chrom, "position (bp)"), y = NULL, title = title, subtitle = subtitle) +
+    theme_example() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          axis.line.y = element_blank(), panel.spacing.y = unit(1.5, "mm"),
+          plot.margin = margin(5.5, 5.5, 5.5, 20))
+}
+
+# Panel C2 top: per-cluster m6A pileup, same normalisation as panel A
+plot_cluster_m6a <- function(pileup, ex, xlim, cl_cols) {
+  ggplot(pileup, aes(pos, smooth_frac, colour = cluster)) +
+    geom_vline(xintercept = c(ex$start, ex$end), linetype = "dashed", linewidth = 0.3) +
+    geom_line(linewidth = 0.4) +
+    scale_colour_manual(values = cl_cols, name = NULL) +
+    scale_x_continuous(breaks = window_breaks(ex), labels = NULL) +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.05))) +
+    coord_cartesian(xlim = xlim, expand = FALSE) +
+    labs(x = NULL, y = "m6A fraction\n(per cluster)") +
+    theme_example() +
+    theme(legend.position = "right", axis.ticks.x = element_blank())
+}
+
+# Panel C1: rows = molecules split by cluster (then time, then read start),
+# columns = every bp of the window; 0/1 = m6A call from the clustering input
+draw_leiden_heatmap <- function(lr, rows, ex, cl_cols) {
+  pos  <- seq.int(ex$window_start, ex$window_end)
+  site <- as.matrix(lr$site_met_mat[rows$RID, , drop = FALSE])
+  m <- matrix(0L, nrow(rows), length(pos), dimnames = list(rows$RID, pos))
+  m[, match(colnames(site), pos)] <- site
+  ticks <- window_breaks(ex)
+  n_cl  <- table(rows$cluster)
+  in_region <- ifelse(pos > ex$start & pos <= ex$end, "tested FIRE region", "outside")
+
+  ht <- Heatmap(
+    m, name = "m6A", col = c("0" = "white", "1" = "black"),
+    heatmap_legend_param = list(at = c(0, 1), labels = c("no m6A call", "m6A call"),
+                                title = "m6A"),
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    row_split = rows$cluster,
+    row_title = sprintf("%s\nn = %d", names(n_cl), as.integer(n_cl)),
+    row_title_rot = 0, row_title_gp = grid::gpar(fontsize = 8),
+    row_gap = unit(1, "mm"), border = TRUE,
+    show_row_names = FALSE, show_column_names = FALSE,
+    use_raster = TRUE, raster_quality = 4,
+    left_annotation = rowAnnotation(
+      cluster = rows$cluster, time = rows$time,
+      col = list(cluster = cl_cols, time = time_cols),
+      annotation_name_gp = grid::gpar(fontsize = 8),
+      annotation_legend_param = list(cluster = list(title = "Leiden cluster"),
+                                     time = list(title = "Time"))),
+    bottom_annotation = HeatmapAnnotation(
+      region = anno_simple(in_region, col = c("tested FIRE region" = "black", outside = "white"),
+                           height = unit(1.5, "mm")),
+      position = anno_mark(at = match(ticks, pos), labels = scales::comma(ticks),
+                           side = "bottom", labels_rot = 0,
+                           labels_gp = grid::gpar(fontsize = 8)),
+      show_annotation_name = c(region = TRUE, position = FALSE),
+      annotation_name_gp = grid::gpar(fontsize = 8), annotation_label = c("tested region", "")),
+    column_title = paste0(example_title(ex), "\nLeiden + Manhattan clusters, reads pooled 0-15 min (",
+                          ex$chrom, ", ", nrow(rows), " molecules)"),
+    column_title_gp = grid::gpar(fontsize = 9))
+
+  draw(ht, merge_legend = TRUE, heatmap_legend_side = "bottom",
+       annotation_legend_side = "bottom")
+  # dashed lines at the tested-region boundaries, through every cluster slice
+  x <- match(c(ex$start, ex$end), pos) / length(pos)
+  for (s in seq_along(n_cl))
+    decorate_heatmap_body("m6A", slice = s, {
+      grid::grid.segments(x0 = x, x1 = x, y0 = 0, y1 = 1,
+                          gp = grid::gpar(lty = 2, lwd = 0.8, col = "#D55E00"))
+    })
+  invisible(NULL)
+}
+
+# Panel D: P(cluster | time) as stacked bars
+plot_cluster_proportions <- function(counts, ex, cl_cols) {
+  totals <- counts %>% distinct(time, n_time)
+  n_cl <- counts %>% group_by(cluster) %>% summarise(n = sum(n), .groups = "drop")
+  ggplot(counts, aes(time, prop, fill = cluster)) +
+    geom_col(width = 0.7, colour = "white", linewidth = 0.2,
+             position = position_stack(reverse = TRUE)) +
+    geom_text(data = totals, aes(time, 1.01, label = paste0("n = ", n_time)),
+              inherit.aes = FALSE, vjust = 0, size = 2.8) +
+    scale_fill_manual(values = cl_cols,
+                      labels = setNames(sprintf("%s (n = %d)", n_cl$cluster, n_cl$n),
+                                        n_cl$cluster),
+                      name = "Leiden cluster") +
+    scale_y_continuous(limits = c(0, 1.07), breaks = seq(0, 1, 0.25),
+                       labels = scales::percent, expand = c(0, 0)) +
+    labs(x = "Time after LPS", y = "Fraction of the timepoint's reads",
+         title = example_title(ex),
+         subtitle = "P(cluster | time); clusters called on reads pooled over 0-15 min") +
+    theme_example() +
+    theme(legend.position = "right", plot.title = element_text(size = 8))
+}
+```
+
+```{r top10_examples_plots, message=FALSE}
+if (!dir.exists(example_dir)) dir.create(example_dir, recursive = TRUE)
+top10_examples <- list()
+
+for (i in seq_len(nrow(top10_examples_regions))) {
+  ex  <- top10_examples_regions[i, ]
+  id  <- ex$example_id
+  lr  <- top10_leiden[[id]]
+  out <- file.path(example_dir, id)
+  if (!dir.exists(out)) dir.create(out)
+  f <- function(name) file.path(out, sprintf("rank%02d_%s.pdf", ex$rank, name))
+
+  # footprints and m6A of every read in the window, as in the read-level plots
+  res_ex <- load_region_results(
+    region       = data.frame(chr = ex$chrom, start = ex$window_start, end = ex$window_end),
+    sample_names = sample_names,
+    result_dirs  = file.path(extract_root, ex$outname, sample_names, "parsed"),
+    fiberHMM_feature      = "tf",
+    min_fiberHMM_fp_score = 50,
+    fiberHMM_size_breaks  = c(10, 30, 60, 80),
+    verbose = FALSE)
+
+  # the clustered (full-span) reads, with timepoint as metadata
+  a <- lr$assignments
+  a$time <- factor(time_labels[as.character(a$sample_name)], levels = time_levels)
+  stopifnot(all(a$RID %in% levels(res_ex$rids_df$RID)))
+  cl_cols <- cluster_palette(levels(a$cluster))
+  tracks  <- molecule_tracks(res_ex)
+
+  ## A: aggregate m6A per timepoint --------------------------------------------
+  res_time <- add_read_groups(res_ex, labels = setNames(as.character(a$time), a$RID),
+                              group_col = "time", group_levels = time_levels,
+                              verbose = FALSE)
+  pA <- plot_aggregate_m6a(res_time$pileup, ex, table(a$time),
+                           top10_fire_freq[top10_fire_freq$region_id == ex$region_id, ])
+  ggsave(f("panel_A_aggregate_m6a"), pA$plot, width = 8, height = pA$height)
+
+  ## B: molecules by timepoint, not clustered -------------------------------------
+  rows_B <- stack_rows(a[order(a$time, a$start, a$RID), ], "time")
+  n_B <- table(rows_B$time)
+  lab_B <- setNames(sprintf("%s\nn = %d", time_levels, as.integer(n_B)), time_levels)
+  pB <- plot_molecules(rows_B, tracks, ex, "time", lab_B,
+    title = example_title(ex),
+    subtitle = sprintf(paste0("All %d full-span molecules by timepoint (not clustered; ordered by read start)\n",
+                              "dashed lines = tested region"), nrow(rows_B)))
+  ggsave(f("panel_B_timepoint_footprints"), pB, width = 8,
+         height = 1.8 + 0.025 * nrow(rows_B) + 0.1 * length(time_levels), limitsize = FALSE)
+
+  ## C1: Leiden m6A heatmap ---------------------------------------------------------
+  rows_C <- a[order(a$cluster, a$time, a$start, a$RID), ]
+  h_C1 <- min(14, 3 + 0.02 * nrow(rows_C))
+  pdf(f("panel_C_leiden_heatmap"), width = 9, height = h_C1)
+  draw_leiden_heatmap(lr, rows_C, ex, cl_cols)
+  dev.off()
+
+  ## C2: per-cluster aggregate + molecules --------------------------------------------
+  res_cl <- add_read_groups(res_ex, labels = setNames(as.character(a$cluster), a$RID),
+                            group_col = "cluster", group_levels = levels(a$cluster),
+                            verbose = FALSE)
+  rows_C2 <- stack_rows(rows_C, "cluster")
+  n_C2 <- table(rows_C2$cluster)
+  lab_C2 <- setNames(sprintf("%s\nn = %d", names(n_C2), as.integer(n_C2)), names(n_C2))
+  pC2_mol <- plot_molecules(rows_C2, tracks, ex, "cluster", lab_C2,
+                            bar_cols = c("cluster", "time"),
+                            bar_palette = c(cl_cols, time_cols), legend_extra = time_levels)
+  pC2 <- (plot_cluster_m6a(res_cl$pileup, ex, molecule_xlim(ex, 2), cl_cols) / pC2_mol) +
+    plot_layout(heights = c(1, 0.025 * nrow(rows_C2) + 0.1 * nlevels(a$cluster))) +
+    plot_annotation(
+      title = example_title(ex),
+      subtitle = sprintf(paste0("Leiden clusters: per-cluster m6A pileup (top) and all %d molecules (bottom; ",
+                                "left bars = cluster, time; ordered by time then read start)\n",
+                                "dashed lines = tested region"), nrow(rows_C2)),
+      theme = theme(plot.title = element_text(face = "bold", size = 10),
+                    plot.subtitle = element_text(size = 8, colour = "grey30")))
+  h_C2 <- 3.2 + 0.025 * nrow(rows_C2) + 0.1 * nlevels(a$cluster)
+  ggsave(f("panel_C_cluster_footprints"), pC2, width = 8.5, height = h_C2, limitsize = FALSE)
+
+  ## C: heatmap and cluster footprints side by side --------------------------------------
+  h_C <- max(h_C1, h_C2)
+  g_C1 <- grid::grid.grabExpr(draw_leiden_heatmap(lr, rows_C, ex, cl_cols),
+                              width = 9, height = h_C)
+  pC <- cowplot::plot_grid(
+    cowplot::plot_grid(NULL, NULL, nrow = 1, rel_widths = c(9, 8.5), labels = c("C1", "C2")),
+    cowplot::plot_grid(g_C1, patchwork::patchworkGrob(pC2), nrow = 1, rel_widths = c(9, 8.5)),
+    ncol = 1, rel_heights = c(0.3, h_C))
+  ggsave(f("panel_C_combined"), pC, width = 17.5, height = h_C + 0.3, limitsize = FALSE)
+
+  ## D: cluster proportions per timepoint ----------------------------------------------
+  counts <- a %>%
+    count(time, cluster, .drop = FALSE) %>%
+    group_by(time) %>%
+    mutate(n_time = sum(n), prop = n / n_time) %>%
+    ungroup()
+  ggsave(f("panel_D_cluster_proportions"), plot_cluster_proportions(counts, ex, cl_cols),
+         width = 6, height = 4.5)
+
+  top10_examples[[id]] <- list(
+    region = ex,
+    leiden = lr,
+    molecules = data.frame(
+      time = time_levels,
+      n_reads_window = as.integer(table(factor(time_labels[as.character(res_ex$rids_df$sample_name)],
+                                               levels = time_levels))),
+      n_full_span = as.integer(table(a$time))),
+    cluster_time_counts = counts,
+    files = list.files(out, full.names = TRUE))
+}
+```
+
+Molecules per timepoint: reads overlapping the window (`n_reads_window`) and the
+full-span reads used, all of them, in every panel (`n_full_span`).
+
+```{r top10_examples_molecules}
+bind_rows(lapply(top10_examples, function(x)
+  data.frame(example_id = x$region$example_id, x$molecules)))
+```
+
+Raw counts behind panel D (`n` reads of cluster c at time t; `prop` = n / n_time).
+
+```{r top10_examples_counts}
+bind_rows(lapply(top10_examples, function(x)
+  data.frame(example_id = x$region$example_id, x$cluster_time_counts))) %>%
+  mutate(prop = round(prop, 3))
+```

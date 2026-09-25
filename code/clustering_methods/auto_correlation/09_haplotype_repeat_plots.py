@@ -1,10 +1,9 @@
-"""In-memory, annotation-only repeat-length views of unsmoothed per-fiber ACFs.
+"""ACF-based repeat-length 
 
-REF/ALT are phased focal alleles, never pooled sample-local HP1/HP2 tags.
-Primary peaks: strongest positive local maximum in 120–250 bp, prominence
+strongest positive local maximum in 120–250 bp, prominence
 >= 0.01 ACF units. Candidate maxima are >= 20 bp apart. Higher-order markers
 require an observed qualifying peak within +/-20 bp of an integer multiple.
-These are descriptive ACF-based repeat-length candidates, not validated NRLs.
+
 """
 
 import textwrap

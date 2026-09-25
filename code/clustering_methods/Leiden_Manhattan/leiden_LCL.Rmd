@@ -662,6 +662,373 @@ figure_gallery("knn_allele_connectivity", "Same- versus opposite-allele graph co
 
 
 
+# AS-FIRE promoter examples: ranks 1, 2 and 5
+
+These figures retain the saved examples' SNP-centred, 2 kb windows. The aggregate
+analysis pools **every fully spanning read from all 31 LCL samples**, without
+genotype or phasing filters, and reclusters with site-level Manhattan distance,
+`k = 10`, Leiden resolution 1 and seed 1. Panels B and D contain the same molecules
+in the same order (cluster, alignment start, read ID). Accessibility is the m6A
+call fraction at each observed site, with every read in the group in the denominator.
+Nucleosome occupancy is the per-base fraction of group reads covered by a
+fibertools footprint **strictly longer than 100 bp**, without an upper size limit.
+TF tracks retain the existing FiberHMM 10–30, 40–60 and 60–80 bp definitions.
+
+The allele-specific figures use the saved, phased heterozygous AS-FIRE reads and
+their saved clusters. Hap1 and Hap2 denote the first and second **focal-SNP allele
+groups in the existing heatmap**, with the SNP base and REF/ALT identity written
+on each panel; they do not denote sample-local HP1/HP2 tags. Allele summaries
+include all reads in that allele group, including reads with no footprint.
+
+Run the following four chunks in order to generate just these examples without
+rerunning the top-ten report. Each region has separate labelled panels and a
+combined figure, as PDFs only, under `promoter_example/aggregate_ex` or
+`promoter_example/hap_ex`. Two additional aggregate figures place the all-read
+profile above the cluster-specific profiles, for accessibility and >100-bp
+nucleosome occupancy. Cluster line colors match the molecule panels; the pooled
+profile is dark grey. Supporting tables record read order, profiles and QC.
+
+```{r lcl-asfire-example-setup, include=FALSE}
+# Self-contained setup: these four chunks also run independently of the report.
+example_code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
+suppressPackageStartupMessages(library(dplyr))
+source(file.path(example_code_dir, "leiden_manhattan_functions.r"), local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source(file.path(example_code_dir, "leiden_manhattan_plots.r"), local = TRUE)
+if (!exists("lcl_output_path", mode = "function")) {
+  notebook <- readLines(file.path(example_code_dir, "leiden_LCL.Rmd"), warn = FALSE)
+  first <- which(trimws(notebook) == "```{r lcl-output-config}")
+  last <- which(seq_along(notebook) > first & trimws(notebook) == "```")[1L]
+  eval(parse(text = notebook[seq.int(first + 1L, last - 1L)]))
+}
+data.table::setDTthreads(2L)
+example_root <- lcl_output_path(file.path(LCL_OUTPUT_ROOT, "promoter_example"))
+dir.create(example_root, recursive = TRUE, showWarnings = FALSE)
+example_ranks <- c(1L, 2L, 5L)
+example_samples <- read.csv(
+  "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv",
+  stringsAsFactors = FALSE)
+stopifnot(nrow(example_samples) == 31L, !anyDuplicated(example_samples$sample_name))
+example_sample_colors <- sample_palette(example_samples$sample_name)
+example_regenerate <- if (exists("params")) isTRUE(params$regenerate_plots) else TRUE
+example_saved_paths <- vapply(example_ranks, function(rank) {
+  path <- Sys.glob(file.path(LCL_OUTPUT_ROOT, sprintf("rank%02d_*", rank),
+    "bin0", "k10", "resolution1", "tables", "fiberseq_annotated_clustering.rds"))
+  if (length(path) != 1L) stop("Expected one saved AS-FIRE result for rank ", rank)
+  path
+}, character(1))
+example_saved <- lapply(example_saved_paths, readRDS)
+example_regions <- dplyr::bind_rows(lapply(example_saved, `[[`, "region"))
+stopifnot(identical(as.integer(example_regions$rank), example_ranks))
+
+# Reuse the existing plotters with a private >100-bp track palette. The shared
+# helpers retain their 130-160-bp defaults for every other notebook/figure.
+example_plotters <- local({
+  e <- new.env(parent = environment(plot_smf_reads))
+  e$LCL_FOOTPRINT_TRACKS <- c("ft_nuc_gt100bp", LCL_FOOTPRINT_TRACKS[-1L])
+  e$LCL_TRACK_COLORS <- setNames(unname(LCL_TRACK_COLORS),
+    c("m6A", e$LCL_FOOTPRINT_TRACKS))
+  e$LCL_TRACK_LABELS <- setNames(c("m6A", "Nucleosome footprint >100 bp",
+    unname(LCL_TRACK_LABELS[-c(1L, 2L)])), names(e$LCL_TRACK_COLORS))
+  for (name in c("feature_colors", "plot_smf_reads", "plot_signal_profile")) {
+    fn <- get(name, mode = "function")
+    environment(fn) <- e
+    assign(name, fn, envir = e)
+  }
+  e
+})
+
+example_subset <- function(result, ids) {
+  result$assignments <- result$assignments[match(ids, result$assignments$RID), , drop = FALSE]
+  result$assignments$cluster <- droplevels(result$assignments$cluster)
+  result$site_met_mat <- result$site_met_mat[ids, , drop = FALSE]
+  result$n_clusters <- nlevels(result$assignments$cluster)
+  stopifnot(!anyNA(result$assignments$RID), nrow(result$assignments) > 0L)
+  result
+}
+
+example_m6a_profile <- function(result) {
+  p <- cluster_site_profiles(result, result$site_met_mat)
+  data.frame(cluster = p$cluster, pos = p$pos, track = "m6A",
+    fraction = p$met, n_reads = p$n_reads)
+}
+
+example_profile_plot <- function(profiles, result, title, subtitle, y_label) {
+  stopifnot(length(unique(profiles$track)) == 1L)
+  colors <- c("All reads" = "#333333",
+    cluster_id_palette(levels(result$assignments$cluster)))
+  plot <- example_plotters$plot_signal_profile(profiles, result$region,
+    unique(as.character(profiles$cluster)), title = title)
+  # Replace the shared plotter's track colors with the existing cluster palette.
+  suppressMessages(plot +
+    ggplot2::aes(color = cluster, fill = cluster, group = cluster) +
+    ggplot2::scale_color_manual(values = colors) +
+    ggplot2::scale_fill_manual(values = colors) +
+    ggplot2::labs(subtitle = subtitle, y = y_label) +
+    ggplot2::theme(legend.position = "none"))
+}
+
+example_heatmap <- function(result, title, height) {
+  region <- result$region
+  region$annotation <- title
+  colors <- example_sample_colors[names(example_sample_colors) %in%
+    sub("_.*$", "", result$assignments$sample_name)]
+  heatmap <- plot_genomic_cluster_heatmap(result, region, colors,
+    include_haplotype = FALSE, variants = NULL, show_cluster_profiles = FALSE)
+  grid::grid.grabExpr(ComplexHeatmap::draw(heatmap, newpage = FALSE,
+    heatmap_legend_side = "right", annotation_legend_side = "right"),
+    width = 14, height = height)
+}
+
+example_save <- function(plot, directory, name, height, width = 14) {
+  ggplot2::ggsave(file.path(directory, paste0(name, ".pdf")), plot = plot,
+    width = width, height = height, bg = "white", limitsize = FALSE)
+}
+
+example_read_order <- function(result, footprints) {
+  reads <- prepare_read_tracks(result, footprints, example_sample_colors)$reads
+  heatmap_ids <- with(result$assignments, RID[order(cluster, start, RID)])
+  stopifnot(identical(as.character(reads$RID), as.character(heatmap_ids)))
+  reads$plot_row <- seq_len(nrow(reads))
+  reads[, intersect(c("plot_row", "row", "RID", "original_RID", "cluster",
+    "sample_name", "start", "end", "allele_label", "haplotype"), names(reads))]
+}
+```
+
+```{r lcl-asfire-example-data, include=FALSE}
+example_inputs <- local({
+  cache_dir <- lcl_output_path(file.path(example_root, "cache"))
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  if (example_regenerate) {
+    tf_caches <- cache_footprint_tracks(example_regions,
+      "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks",
+      file.path(cache_dir, "tf_tracks"), workers = 3L, reuse = TRUE)
+  }
+  lapply(seq_along(example_saved), function(i) {
+    saved <- example_saved[[i]]
+    region <- saved$region
+    cache <- file.path(cache_dir, paste0(region$region_id, "_inputs.rds"))
+    if (!example_regenerate) {
+      if (!file.exists(cache)) stop("Generate example inputs first: ", cache)
+      return(readRDS(cache))
+    }
+    message("All-31-sample AS-FIRE example: rank ", region$rank)
+    dat <- assemble_region_m6a(sample_table = example_samples, region = region,
+      full_span = TRUE, matrix_dir = NULL, reuse = FALSE)
+    pooled <- leiden_manhattan_cluster(dat$met_mat, dat$rids_df,
+      region$analysis_start, region$analysis_end, window_size = 0L,
+      k_neighbors = 10L, resolution = 1, seed = 1L, impute_missing = FALSE)
+    pooled$region <- region
+    pooled$region$region_type <- "asfire_all_reads"
+    pooled$site_met_mat <- dat$met_mat
+    pooled$assignments$original_RID <- dat$rids_df$original_RID[
+      match(pooled$assignments$RID, dat$rids_df$RID)]
+    stopifnot(nrow(pooled$assignments) == sum(dat$qc$full_span_reads),
+      identical(pooled$assignments$RID, dat$rids_df$RID),
+      all(saved$assignments$RID %in% pooled$assignments$RID),
+      all(pooled$assignments$start <= region$analysis_start),
+      all(pooled$assignments$end >= region$analysis_end))
+    # Integer lengths >=101 are strictly >100; Inf leaves no upper size cutoff.
+    nucleosomes <- extract_nucleosomes(example_samples, region, pooled$assignments,
+      min_size = 101L, max_size = Inf)
+    nucleosomes$track <- rep("ft_nuc_gt100bp", nrow(nucleosomes))
+    stopifnot(all(nucleosomes$size > 100L))
+    footprints <- dplyr::bind_rows(nucleosomes,
+      region_footprints(tf_caches, region, pooled$assignments)$records)
+    out <- list(pooled = pooled, saved = saved, footprints = footprints, qc = dat$qc,
+      source_path = example_saved_paths[i],
+      source_md5 = unname(tools::md5sum(example_saved_paths[i])))
+    saveRDS(out, cache)
+    out
+  })
+})
+```
+
+```{r lcl-asfire-example-aggregate, results='hide'}
+local({
+  grDevices::pdf(NULL)
+  device <- grDevices::dev.cur()
+  on.exit(grDevices::dev.off(device))
+  for (input in example_inputs) {
+    result <- input$pooled
+    region <- result$region
+    directory <- lcl_output_path(file.path(example_root, "aggregate_ex", region$region_id))
+    dir.create(file.path(directory, "tables"), recursive = TRUE, showWarnings = FALSE)
+    n <- nrow(result$assignments)
+    title <- paste0("AS-FIRE rank ", region$rank, " | ", region$focal_snp)
+    subtitle <- paste0(title, " | ", n, " full-span reads; all 31 samples pooled")
+    message("Aggregate panels: ", region$region_id, " (", n, " reads)")
+    all_reads <- result
+    all_reads$assignments$cluster <- factor(rep("All reads", n))
+    aggregate_profile <- example_m6a_profile(all_reads)
+    cluster_profiles <- example_m6a_profile(result)
+    occupancy <- footprint_profiles(input$footprints, "ft_nuc_gt100bp",
+      result$assignments, region)
+    aggregate_occupancy <- footprint_profiles(input$footprints, "ft_nuc_gt100bp",
+      all_reads$assignments, region)
+    read_order <- example_read_order(result, input$footprints)
+    heatmap_height <- max(7, 0.012 * n + 2)
+    footprint_height <- max(7, 0.018 * n + 3)
+    profile_height <- 1.4 * result$n_clusters + 2.5
+    panels <- list(
+      A = example_profile_plot(aggregate_profile, result, "A  Aggregate accessibility",
+        subtitle, "Fraction of reads with m6A") + ggplot2::facet_null(),
+      B = example_heatmap(result, paste0("B  Raw m6A reads ordered by Leiden cluster\n", subtitle),
+        heatmap_height),
+      C = example_profile_plot(cluster_profiles, result, "C  Cluster-specific accessibility",
+        subtitle, "Fraction of cluster reads with m6A"),
+      D = example_plotters$plot_smf_reads(result, input$footprints, example_sample_colors,
+        include_haplotype = FALSE) + ggplot2::labs(
+          title = "D  Same molecules: nucleosome and TF footprints", subtitle = subtitle),
+      E = example_profile_plot(occupancy, result, "E  Cluster-specific nucleosome occupancy (>100 bp)",
+        subtitle, "Fraction of cluster reads occupied"))
+    filenames <- c("A_aggregate_accessibility", "B_raw_m6a_by_Leiden_cluster",
+      "C_cluster_accessibility", "D_nucleosome_TF_fibers", "E_nucleosome_occupancy_gt100bp")
+    heights <- c(3.5, heatmap_height, profile_height, footprint_height, profile_height)
+    for (j in seq_along(panels)) example_save(panels[[j]], directory, filenames[j], heights[j])
+    # Capture the heatmap at its final panel height: its legends use absolute
+    # units and otherwise spill into adjacent panels when the grob is resized.
+    combined_panels <- panels
+    combined_panels$B <- example_heatmap(result,
+      paste0("B  Raw m6A reads ordered by Leiden cluster\n", subtitle), 6)
+    combined <- cowplot::plot_grid(plotlist = combined_panels, ncol = 1,
+      rel_heights = c(2.5, 6, profile_height, 6, profile_height))
+    example_save(combined, directory, "aggregate_A-E", 14.5 + 2 * profile_height)
+    example_save(example_profile_plot(dplyr::bind_rows(aggregate_profile, cluster_profiles),
+      result, "Aggregate and cluster-specific accessibility", subtitle,
+      "Fraction of group reads with m6A"), directory,
+      "aggregate_and_cluster_accessibility", profile_height + 1.4)
+    example_save(example_profile_plot(dplyr::bind_rows(aggregate_occupancy, occupancy),
+      result, "Aggregate and cluster-specific nucleosome occupancy (>100 bp)", subtitle,
+      "Fraction of group reads occupied"), directory,
+      "aggregate_and_cluster_nucleosome_occupancy_gt100bp", profile_height + 1.4)
+    data.table::fwrite(read_order, file.path(directory, "tables", "molecule_order.tsv"), sep = "\t")
+    data.table::fwrite(input$qc, file.path(directory, "tables", "all_31_samples_read_qc.tsv"), sep = "\t")
+    data.table::fwrite(dplyr::bind_rows(
+      transform(aggregate_profile, panel = "A"), transform(cluster_profiles, panel = "C"),
+      transform(occupancy, panel = "E"), transform(aggregate_occupancy, panel = "aggregate_nucleosome")),
+      file.path(directory, "tables", "profiles.tsv"), sep = "\t")
+    saveRDS(result, file.path(directory, "tables", "all_reads_clustering.rds"))
+    stopifnot(nrow(read_order) == n, all(is.finite(occupancy$fraction)),
+      all(occupancy$fraction >= 0 & occupancy$fraction <= 1))
+  }
+})
+```
+
+```{r lcl-asfire-example-haplotype, results='hide'}
+local({
+  grDevices::pdf(NULL)
+  device <- grDevices::dev.cur()
+  on.exit(grDevices::dev.off(device))
+  audit <- list()
+  for (input in example_inputs) {
+    result <- fiberseq_display_result(input$saved)
+    region <- result$region
+    directory <- lcl_output_path(file.path(example_root, "hap_ex", region$region_id))
+    dir.create(file.path(directory, "tables"), recursive = TRUE, showWarnings = FALSE)
+    alleles <- result$allele_display_levels
+    stopifnot(length(alleles) == 2L, all(result$assignments$haplotype %in% c("HP1", "HP2")),
+      all(result$assignments$focal_genotype %in% c("0|1", "1|0")))
+    bases <- sub("^.*: ", "", alleles)
+    labels <- paste0("Hap", 1:2, ": ", bases,
+      ifelse(bases == region$ref, " (REF)", " (ALT)"))
+    colors <- setNames(unname(fiberseq_category_palette(alleles)), labels)
+    counts <- vapply(alleles, function(a) sum(result$assignments$allele_display == a), integer(1))
+    title <- paste0("AS-FIRE rank ", region$rank, " | ", region$focal_snp)
+    subtitle <- paste0(title, " | ", paste0(labels, ", n=", counts, collapse = "; "))
+    message("Allele panels: ", region$region_id)
+    allele_result <- result
+    allele_result$assignments$cluster <- factor(
+      labels[match(as.character(result$assignments$allele_display), alleles)], levels = labels)
+    footprints <- input$footprints[input$footprints$RID %in% result$assignments$RID, , drop = FALSE]
+    accessibility <- example_m6a_profile(allele_result)
+    occupancy <- footprint_profiles(footprints, example_plotters$LCL_FOOTPRINT_TRACKS,
+      allele_result$assignments, region)
+    occupancy$track <- factor(occupancy$track, levels = example_plotters$LCL_FOOTPRINT_TRACKS)
+    overlay <- function(profiles, heading, y_label) {
+      anchor <- plot_anchor(region)
+      profiles$relative_pos <- profiles$pos - anchor$anchor
+      profiles$cluster <- factor(profiles$cluster, levels = labels)
+      profiles <- profiles[order(profiles$cluster, profiles$track, profiles$pos), ]
+      ggplot2::ggplot(profiles, ggplot2::aes(relative_pos, fraction, color = cluster)) +
+        ggplot2::geom_line(linewidth = 0.55) +
+        ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+        ggplot2::scale_color_manual(values = colors, drop = FALSE) +
+        ggplot2::scale_x_continuous(limits = c(anchor$left, anchor$right), expand = c(0, 0)) +
+        ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
+        ggplot2::labs(title = heading, subtitle = subtitle, x = anchor$x_label,
+          y = y_label, color = "Focal-SNP allele group") +
+        cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
+        ggplot2::theme(legend.position = "bottom")
+    }
+    views <- lapply(alleles, function(allele) example_subset(result,
+      result$assignments$RID[result$assignments$allele_display == allele]))
+    panels <- list(
+      A = overlay(accessibility, "A  Haplotype-specific aggregate accessibility",
+        "Fraction of allele-group reads with m6A"),
+      B = example_heatmap(views[[1L]], paste0("B  ", labels[1L], " individual chromatin fibers\n",
+        title, " | n=", counts[1L], "; saved Leiden clusters"), 7),
+      C = example_heatmap(views[[2L]], paste0("C  ", labels[2L], " individual chromatin fibers\n",
+        title, " | n=", counts[2L], "; saved Leiden clusters"), 7),
+      D = overlay(occupancy, "D  Haplotype-specific nucleosome and TF occupancy",
+        "Fraction of allele-group reads occupied") +
+        ggplot2::facet_wrap(~track, ncol = 1,
+          labeller = ggplot2::as_labeller(example_plotters$LCL_TRACK_LABELS)))
+    filenames <- c("A_haplotype_accessibility", "B_Hap1_m6a_fibers", "C_Hap2_m6a_fibers",
+      "D_haplotype_nucleosome_TF_occupancy")
+    heights <- c(4, 7, 7, 8)
+    for (j in seq_along(panels)) example_save(panels[[j]], directory, filenames[j], heights[j])
+    combined_panels <- panels
+    for (j in 1:2) combined_panels[[j + 1L]] <- example_heatmap(views[[j]],
+      paste0(LETTERS[j + 1L], "  ", labels[j], " individual chromatin fibers\n",
+        title, " | n=", counts[j], "; saved Leiden clusters"), 6)
+    example_save(cowplot::plot_grid(plotlist = combined_panels, ncol = 1,
+      rel_heights = c(3, 6, 6, 7)), directory, "haplotype_A-D", 22)
+    for (j in 1:2) {
+      order <- example_read_order(views[[j]], footprints)
+      order$allele_group <- labels[j]
+      data.table::fwrite(order, file.path(directory, "tables", paste0("Hap", j, "_molecule_order.tsv")), sep = "\t")
+    }
+    data.table::fwrite(data.frame(allele_group = labels, allele_label = alleles,
+      n_reads = counts), file.path(directory, "tables", "allele_groups.tsv"), sep = "\t")
+    data.table::fwrite(dplyr::bind_rows(transform(accessibility, panel = "A"),
+      transform(occupancy, panel = "D")), file.path(directory, "tables", "profiles.tsv"), sep = "\t")
+    unchanged <- identical(unname(tools::md5sum(input$source_path)), input$source_md5)
+    stopifnot(unchanged, sum(counts) == nrow(result$assignments),
+      all(is.finite(occupancy$fraction)), all(occupancy$fraction >= 0 & occupancy$fraction <= 1))
+    audit[[region$region_id]] <- data.frame(rank = region$rank, region_id = region$region_id,
+      samples_queried = nrow(input$qc), samples_with_full_span_reads = sum(input$qc$full_span_reads > 0),
+      aggregate_reads = nrow(input$pooled$assignments), aggregate_clusters = input$pooled$n_clusters,
+      hap1_allele = alleles[1L], hap1_reads = counts[1L], hap2_allele = alleles[2L], hap2_reads = counts[2L],
+      saved_clusters_unchanged = unchanged, source_md5 = input$source_md5)
+  }
+  audit <- dplyr::bind_rows(audit)
+  data.table::fwrite(audit, file.path(example_root, "validation.tsv"), sep = "\t")
+  writeLines(c("# LCL AS-FIRE examples: ranks 1, 2 and 5", "",
+    "Aggregate: all fully spanning reads from all 31 LCL samples, newly clustered together.",
+    "Allele-specific: saved phased heterozygous reads, grouped by focal-SNP allele as in the heatmaps.",
+    "Nucleosome footprints are strictly >100 bp; the original 2 kb SNP-centred windows are retained.", "",
+    "Each folder includes individual panel PDFs, combined figures, and supporting tables.",
+    "The aggregate profile summaries show all reads above the clusters, with consistent cluster colors.", "",
+    "| Rank | Aggregate reads | Combined aggregate | Hap1 allele (reads) | Hap2 allele (reads) | Combined allele-specific |",
+    "|---|---:|---|---|---|---|",
+    vapply(seq_len(nrow(audit)), function(i) {
+      a <- audit[i, ]
+      sprintf("| %d | %d | [PDF](aggregate_ex/%s/aggregate_A-E.pdf) | %s (%d) | %s (%d) | [PDF](hap_ex/%s/haplotype_A-D.pdf) |",
+        a$rank, a$aggregate_reads, a$region_id, a$hap1_allele, a$hap1_reads,
+        a$hap2_allele, a$hap2_reads, a$region_id)
+    }, character(1)), "",
+    "| Rank | Aggregate and cluster accessibility | Aggregate and cluster nucleosome occupancy |",
+    "|---|---|---|",
+    vapply(seq_len(nrow(audit)), function(i) {
+      a <- audit[i, ]
+      sprintf("| %d | [PDF](aggregate_ex/%s/aggregate_and_cluster_accessibility.pdf) | [PDF](aggregate_ex/%s/aggregate_and_cluster_nucleosome_occupancy_gt100bp.pdf) |",
+        a$rank, a$region_id, a$region_id)
+    }, character(1)), "", "See [validation.tsv](validation.tsv) for counts and saved-result checks."),
+    file.path(example_root, "index.md"))
+})
+```
+
 # PRDX1 and ALAS1 promoters: all reads, without haplotype information
 
 Pool all 31 LCL samples, including samples without genotypes, and retain every
