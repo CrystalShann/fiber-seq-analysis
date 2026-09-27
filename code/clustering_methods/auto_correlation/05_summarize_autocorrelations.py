@@ -4,11 +4,16 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
 
+#############################################
+# whether an ACF curve has a positive local peak between 140–250 bp, which is the nucleosome-repeat-length
+#############################################
 
+# profile = 1D autocorrelation curve
 def repeat_peak(profile, lower=140, upper=250):
-    """Strongest positive *local* peak in a declared band; no forced period."""
+    """Strongest positive *local* peak in 140-250 period"""
     if len(profile) <= upper + 1 or not np.isfinite(profile).all():
         return np.nan, np.nan
+    # find local max in the ACF curve, distance is represented by lag
     peaks, _ = find_peaks(profile)
     peaks = peaks[(peaks >= lower) & (peaks <= upper) & (profile[peaks] > 0)]
     if not len(peaks):
@@ -16,6 +21,13 @@ def repeat_peak(profile, lower=140, upper=250):
     peak = peaks[np.argmax(profile[peaks])]
     return int(peak), float(profile[peak])
 
+#############################################
+# takes all reads assigned to each Leiden cluster and calculates 
+# the mean ACF curve, variability, repeat peak, m6A level, cluster size, 
+# and sample composition
+#############################################
+
+# mean ACF: average autocorrelation value across all reads in a cluster at every lag
 
 def summarize(profiles, records):
     clustered = records[records.status == "clustered"]
