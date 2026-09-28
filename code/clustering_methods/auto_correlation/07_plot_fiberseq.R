@@ -23,7 +23,7 @@ message(R.version.string)
 message(paste(c("ComplexHeatmap", "ggplot2", "igraph"),
   vapply(c("ComplexHeatmap", "ggplot2", "igraph"), function(p) as.character(packageVersion(p)), ""), collapse = "; "))
 
-# Shared export helper requires this path guard; scope it to this new run only.
+
 lcl_output_path <- function(path) {
   path <- normalizePath(path, mustWork = FALSE)
   if (!(identical(path, output) || startsWith(path, paste0(output, "/"))))
@@ -31,8 +31,7 @@ lcl_output_path <- function(path) {
   path
 }
 
-# Every input read is already phased and heterozygous before ACF computation.
-# Use the original strict LCL display helper, including its allele assertions.
+
 original_display_result <- fiberseq_display_result
 
 payload <- jsonlite::fromJSON(paste(readLines(file("stdin"), warn = FALSE), collapse = "\n"), simplifyMatrix = TRUE)
@@ -49,7 +48,7 @@ a$end <- a$read_end
 a$chr <- region$chr
 a$sample_label <- sub("_.*$", "", a$sample_name)
 a$cluster <- factor(a$cluster, levels = as.character(sort(unique(as.integer(a$cluster)))))
-# Keep each ACF cluster's color stable when a display subset lacks a cluster.
+
 all_cluster_levels <- levels(a$cluster)
 original_cluster_palette <- cluster_id_palette
 cluster_id_palette <- function(levels) original_cluster_palette(all_cluster_levels)[levels]
@@ -97,14 +96,13 @@ save_gg <- function(plot, name, width, height) {
     width = width, height = height, limitsize = FALSE, bg = "white")
 }
 
-# Use the same phased-heterozygote input samples for nucleosome extraction.
+# phased-heterozygote input samples
 ft_root <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
 nuc_samples <- data.frame(sample_name = unique(a$sample_name),
   fire_dir = file.path(ft_root, unique(a$sample_name)))
 nucleosomes <- extract_nucleosomes(nuc_samples, region, a)
 
-# Reuse read-only regional footprint caches only when they cover this exact
-# requested window. Wider windows stream the source BED instead of truncating.
+
 tracks_root <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks"
 footprint_sources <- list()
 tf_records <- lapply(c("10-30", "40-60", "60-80"), function(size) {
@@ -133,8 +131,7 @@ tf_records <- lapply(c("10-30", "40-60", "60-80"), function(size) {
     used <- source_file
   }
   records <- records[records$chr == region$chr & records$start < region$end & records$end > region$start, , drop = FALSE]
-  # A physical PacBio RID can occur in both an original and a merged AL input.
-  # Match its same footprint to every retained sample/RID row, preserving cohort.
+
   records <- merge(records, a[, c("original_RID", "RID")], by = "original_RID", sort = FALSE)
   records$size <- records$end - records$start
   records$track <- rep(paste0("FiberHMM_", size, "bp"), nrow(records))
@@ -165,8 +162,7 @@ heat_result$site_met_mat <- met[heat_keep, , drop = FALSE]
 heat_result$n_clusters <- nlevels(heat_result$assignments$cluster)
 heat_result$region$annotation <- paste0(region$annotation, "\nPhased heterozygous display: ",
   sum(heat_keep), " / ", nrow(a), " clustered reads")
-# The original strict display helper verifies HP-linked focal alleles and
-# removes Unknown from the legend, just as in the LCL Leiden notebook.
+
 heat_result <- original_display_result(heat_result)
 heat_a <- heat_result$assignments
 heat_colors <- short_colors[names(short_colors) %in% sub("_.*$", "", heat_a$sample_name)]
@@ -205,8 +201,7 @@ save_fiberseq_plots(result, footprints, plot_dir, full_colors, embedding = embed
 message("Annotated ", nrow(a), " reads; known focal alleles: ", sum(a$allele_status == "phased_focal_genotype"),
   "; heatmap phased heterozygotes: ", sum(heat_keep), "; graph edges: ", igraph::ecount(graph))
 
-# The shared helper creates an unused plots/ directory even with our flat writer.
-# Remove only that empty directory; never delete unexpected contents.
+
 unused_plot_dir <- file.path(plot_dir, "plots")
 if (dir.exists(unused_plot_dir) &&
     !length(list.files(unused_plot_dir, all.files = TRUE, no.. = TRUE)))

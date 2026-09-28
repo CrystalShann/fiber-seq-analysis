@@ -23,7 +23,6 @@ import pandas as pd
 acf = import_module("03_compute_autocorrelations")
 clustering = import_module("04_cluster_autocorrelations")
 summaries = import_module("05_summarize_autocorrelations")
-repeat_plots = import_module("09_haplotype_repeat_plots")
 PROJECT = Path(__file__).resolve().parents[3]
 FUNCTIONS = PROJECT / "code/topic_model/topic_modelling_functions.r"
 PHASED_INPUT = PROJECT / "code/haplotype_phasing/LCL_phased_m6a_input.r"
@@ -34,7 +33,7 @@ OUTPUT_ROOT = PROJECT / "LCL_project/auto_correlation"
 DEFAULT_OUTPUT = OUTPUT_ROOT / "resolution04"
 RECOVERED_SIGNATURE = OUTPUT_ROOT / "resolution1/inputs/selection_signature.rds"
 SAMPLE_TABLE = Path("/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv")
-R_PLOTS = Path(__file__).with_name("07_plot_fiberseq.R")
+R_REPORT = Path(__file__).with_name("06_autocorrelation.Rmd")
 
 
 def input_directory(output, region_id=None):
@@ -107,32 +106,46 @@ def load_m6a_binary(region, selection_signature=SIGNATURE):
     return matrix, records, result.stderr
 
 
-def plot_fiberseq(output, region, binary, profiles, records, edges, args, info):
-    chosen = records.status.eq("clustered").to_numpy()
-    if not chosen.any():
-        return 0
+def save_report_data(output, region, binary, profiles, records, edges, args, info,
+                     averages, stats, counts, allele_tables):
+    """Save portable R inputs; plotting and repeat-length analysis live in the Rmd."""
     ids = records.row_id.to_numpy()
-    payload = dict(region=json.loads(pd.DataFrame([region._asdict()]).to_json(orient="records")),
+    def table_data(table):
+        return json.loads(table.to_json(orient="records", double_precision=15))
+
+    payload = dict(schema_version=1, region=table_data(pd.DataFrame([region._asdict()])),
                    records=json.loads(records.to_json(orient="records", double_precision=15)),
-                   row_ids=ids[chosen].tolist(),
-                   call_offsets=[np.flatnonzero(row).tolist() for row in binary[chosen]],
-                   acf=profiles[chosen].tolist(),
+                   row_ids=ids.tolist(),
+                   call_offsets=[np.flatnonzero(row).tolist() for row in binary],
+                   acf=json.loads(pd.DataFrame(profiles).to_json(orient="values", double_precision=15)),
+                   params=dict(seed=args.seed, k_eff=info["actual_neighbors"],
+                               resolution=args.resolution, window_size=args.window_size,
+                               n_features=profiles.shape[1], n_pcs=args.n_pcs),
+                   tables=dict(cluster_acf_summary=table_data(averages),
+                               cluster_summary=table_data(stats),
+                               sample_composition=table_data(counts),
+                               **{name: table_data(table) for name, table in allele_tables.items()}),
                    edges=dict(source=ids[edges[:, 0].astype(int)].tolist(),
                               target=ids[edges[:, 1].astype(int)].tolist(),
                               weight=edges[:, 2].tolist()))
     rscript, env = r_environment()
-    result = subprocess.run([rscript, "--vanilla", str(R_PLOTS), str(PROJECT),
-        str(output), region.region_id, str(args.seed), str(args.resolution),
-        str(info["actual_neighbors"])], input=json.dumps(payload, allow_nan=False),
+    destination = result_directory(output, region.region_id) / "report_data.rds"
+    # Report chunks have purl=FALSE; only function definitions are sourced here.
+    prepare = ('args <- commandArgs(TRUE); code <- tempfile(fileext=".R"); '
+               'knitr::purl(args[1], output=code, documentation=0, quiet=TRUE); '
+               'source(code); unlink(code); '
+               'payload <- jsonlite::fromJSON(paste(readLines(file("stdin"), warn=FALSE), '
+               'collapse="\\n"), simplifyMatrix=TRUE); '
+               'prepare_report_data(payload, args[2], args[3])')
+    result = subprocess.run([rscript, "--vanilla", "-e", prepare, "--args",
+        str(R_REPORT), str(PROJECT), str(destination)], input=json.dumps(payload, allow_nan=False),
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    (result_directory(output, region.region_id) / "plotting.log").write_text(result.stdout + result.stderr)
+    (result_directory(output, region.region_id) / "report_preparation.log").write_text(result.stdout + result.stderr)
     if result.returncode:
-        raise RuntimeError(f"Fiber-seq plotting failed for {region.region_id}:\n{result.stderr}")
-    prefix = "AUTOCOR_HEATMAP_READS="
-    counts = [line[len(prefix):] for line in result.stdout.splitlines() if line.startswith(prefix)]
-    if len(counts) != 1:
-        raise RuntimeError(f"Missing plotting completion count for {region.region_id}")
-    return int(counts[0])
+        raise RuntimeError(f"Report data preparation failed for {region.region_id}:\n{result.stderr}")
+    if not destination.is_file() or not destination.stat().st_size:
+        raise RuntimeError(f"Missing report data for {region.region_id}")
+    return destination
 
 
 def sha256(path):
@@ -186,7 +199,7 @@ def main(argv=None):
     for region in regions.itertuples(index=False):
         input_directory(output, region.region_id).mkdir()
         result_directory(output, region.region_id).mkdir()
-    sources = [FUNCTIONS, PHASED_INPUT, R_BUILDER, args.selection_signature, args.sample_table, R_PLOTS,
+    sources = [FUNCTIONS, PHASED_INPUT, R_BUILDER, args.selection_signature, args.sample_table, R_REPORT,
                PROJECT / "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
                PROJECT / "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r",
                PROJECT / "code/haplotype_phasing/LCL_phasing.r",
@@ -194,8 +207,7 @@ def main(argv=None):
     source_hashes = {str(p): sha256(p) for p in sources}
     print(f"Resolution={args.resolution}; window={args.window_size}; lags=0–{n_features - 1}; "
           f"PCs={args.n_pcs}; neighbors={args.n_neighbors}; seed={args.seed}. "
-          "Tables and matrices remain in memory; saving PDFs and diagnostic logs only.", flush=True)
-    locus_rows = []
+          "Saving summary PDFs, portable report_data.rds files, and diagnostic logs.", flush=True)
     for region in regions.itertuples(index=False):
         rid = region.region_id
         print(f"{rid}: building m6A input from original BEDs in memory", flush=True)
@@ -216,15 +228,12 @@ def main(argv=None):
         avg, stats, counts = summaries.summarize(profiles, records)
         summaries.plot_region(result_directory(output, rid), region, binary, profiles, records, avg, counts)
         allele_tables = write_allele_results(output, region, profiles, records)
-        repeat_rows = repeat_plots.summarize_repeats(profiles, records, region, allele_tables)
-        repeat_plots.plot_haplotype_repeats(result_directory(output, rid), region, profiles, repeat_rows)
-        locus_rows.extend(repeat_plots.compact_locus_rows(repeat_rows))
-        n_heatmap = plot_fiberseq(output, region, binary, profiles, records, edges, args, info)
-        print(f"{rid}: wrote {len(stats)} clusters' figures; {n_heatmap} heatmap reads", flush=True)
-    repeat_plots.plot_locus_heatmap(result_directory(output), locus_rows)
+        report_data = save_report_data(output, region, binary, profiles, records, edges, args, info,
+                                      avg, stats, counts, allele_tables)
+        print(f"{rid}: wrote {len(stats)} clusters' summaries and {report_data.name}", flush=True)
     if any(sha256(p) != digest for p, digest in source_hashes.items()):
         raise RuntimeError("An input/code source changed during the run")
-    print(f"Complete: {output}", flush=True)
+    print(f"Complete: {output}. Knit {R_REPORT.name} to draw the R figures and print tables.", flush=True)
 
 
 if __name__ == "__main__":

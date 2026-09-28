@@ -8,7 +8,8 @@ from scipy.signal import find_peaks
 # whether an ACF curve has a positive local peak between 140–250 bp, which is the nucleosome-repeat-length
 #############################################
 
-# profile = 1D autocorrelation curve
+# profile = 1D autocorrelation curve, rows = molecules, columns = lags
+
 def repeat_peak(profile, lower=140, upper=250):
     """Strongest positive *local* peak in 140-250 period"""
     if len(profile) <= upper + 1 or not np.isfinite(profile).all():
@@ -27,19 +28,30 @@ def repeat_peak(profile, lower=140, upper=250):
 # and sample composition
 #############################################
 
+# record = metadata for the reads = read ID, cluster, sample name, m6a fraction
+
 # mean ACF: average autocorrelation value across all reads in a cluster at every lag
+# variability: how much individual ACF curves differ from the cluster mean, measured in SD and SEM
+# repeat peak: the strongest positive local max in the cluster mean ACF between 140-250 bp
 
 def summarize(profiles, records):
     clustered = records[records.status == "clustered"]
     averages, summaries, composition = [], [], []
     cluster_ids = sorted(clustered.cluster.unique(), key=int)
+    # find every unique sample represented among clustered reads
     samples = sorted(clustered.sample_name.unique())
+    # idenfity all reads from each cluster and extract ACF profiles from the cluster
     for cluster in cluster_ids:
         in_cluster = records.cluster.eq(cluster).to_numpy() & records.status.eq("clustered").to_numpy()
         subset = profiles[in_cluster]
+        # mean cluster ACF
         mean = subset.mean(axis=0)
+        # standard deviation of ACF for each read at every lag
+        # sample SD - spread of data for a small subset taken from a larger population
         sd = subset.std(axis=0, ddof=1) if len(subset) > 1 else np.full(profiles.shape[1], np.nan)
+        # strongest peak at 140-250 bp -> repeat peak of the mean cluster ACF, not the average individual read peak positions 
         lag, height = repeat_peak(mean)
+        # summarize all reads in the window
         summaries.append(dict(region_id=records.region_id.iloc[0], cluster=cluster,
                               n_reads=len(subset), fraction_clustered=len(subset) / len(clustered),
                               mean_m6a_call_fraction=records.loc[in_cluster, "m6a_call_fraction"].mean(),
@@ -47,6 +59,7 @@ def summarize(profiles, records):
         averages.append(pd.DataFrame(dict(region_id=records.region_id.iloc[0], cluster=cluster,
                                           lag_bp=np.arange(profiles.shape[1]), mean_acf=mean,
                                           sd_acf=sd, sem_acf=sd / np.sqrt(len(subset)), n_reads=len(subset))))
+        # get sample composition to calculate how many reads fall into the current cluster
         for sample in samples:
             c = clustered.cluster.eq(cluster)
             s = clustered.sample_name.eq(sample)
@@ -56,12 +69,34 @@ def summarize(profiles, records):
                                     fraction_within_sample=a / int(s.sum())))
     avg = pd.concat(averages, ignore_index=True) if averages else pd.DataFrame(columns=[
         "region_id", "cluster", "lag_bp", "mean_acf", "sd_acf", "sem_acf", "n_reads"])
+    # for each cluster, store the # number of reads, fraction of total reads, mean m6A,
+    # peak lag and peak ACF
     stats = pd.DataFrame(summaries, columns=["region_id", "cluster", "n_reads", "fraction_clustered",
                                            "mean_m6a_call_fraction", "positive_local_peak_140_250_bp", "peak_acf"])
+    # sample composition
+    # fraction within cluster = fraction of reads come from a specific sample in a given cluster
+    # fraction within sample = fraction of samples from a specific cluster in a given sample
     counts = pd.DataFrame(composition, columns=["region_id", "cluster", "sample_name", "n_reads",
                                                "fraction_within_cluster", "fraction_within_sample"])
     return avg, stats, counts
 
+
+#############################################
+# Plotting
+#############################################
+
+# inputs
+# 1. regon
+# 2. binary m6a matrix
+# 3. read x lag autocorrelation matrix
+# 4. per read metadata
+# 5. cluster average ACF table
+# 6. sample x cluster composition
+
+# outputs
+# 1. mean ACF curve for each cluster as a function of lag in bp
+# 2. UMAP of ACF clusters
+# 3. smaple position
 
 def plot_region(directory, region, binary, profiles, records, averages, composition):
     import matplotlib
@@ -126,7 +161,9 @@ def plot_region(directory, region, binary, profiles, records, averages, composit
     ax.legend(title="Cluster", fontsize=7, ncol=3)
     save(fig, "sample_composition")
 
-
+#############################################
+# convert haplotype tag and genotype into ALT and REF
+#############################################
 def annotate_alleles(records, region, sample_table):
     """Map sample-local HP tags to the focal REF/ALT and biological cell line."""
     result = records.copy().reset_index(drop=True)
@@ -149,6 +186,13 @@ def annotate_alleles(records, region, sample_table):
         raise ValueError('HP/genotype mapping disagrees with the saved focal allele label')
     return result
 
+#############################################
+# allele specific features 
+#############################################
+
+# 1. allele specific ACF curve
+# 2. allele specific peaks
+# 3. allele specific cluster proportions
 
 def summarize_alleles(profiles, records, region):
     """Pool unique molecules by focal allele, with no sample-level stratification."""

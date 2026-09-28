@@ -46,23 +46,6 @@ if (!length(region_dirs)) stop("No region figures found; run 01_run_autocorrelat
 
 ### Input
 
-**Real example setup**
-
-These are actual records from sample `AL16_bc2114_18508`, read from:
-
-`/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results/AL16_bc2114_18508/extracted_results/m6a_by_chr/AL16_bc2114_18508.ft_extracted_m6a.chr2.bed.gz`
-
-The selected region is `rank01_rs12470189_chr2_119290945_119291178`.
-Its analysis window is **chr2:119290056–119292055** (2,000 bases, 1-based,
-inclusive), centered on **rs12470189 at chr2:119291056, REF G / ALT A**.
-This historical example uses the region definitions in the selection RDS.
-
-Four real reads are labeled A–D below. A–C are retained reads representing
-both focal alleles; D illustrates a read that does not span the full window.
-They are an explanatory subset of the regional cohort. Matrix tables display
-only **chr2:119291048–119291059**, 12 consecutive columns from the full
-2,000-column matrix. Coverage filtering and call offsets always use the full
-analysis window
 
 **Step 1: Original fibertools m6A BED12 records**
 
@@ -80,8 +63,7 @@ included immediately below the table.
 | C | m84241_250908_180102_s3/258540726/ccs | 119289060 | 119298334 | 119289060 | 119298334 | 18 | - | 266 | 0,1,1,1,1, …, 1,1,1 | 0,293,299,301,309, …, 9078,9080,9273 |
 | D | m84241_250515_002859_s3/165545798/ccs | 119291372 | 119296368 | 119291372 | 119296368 | 32 | + | 120 | 0,1,1,1,1, …, 1,1,1 | 0,117,122,184,277, …, 4815,4821,4995 |
 
-
-The first and last blocks are fibertools sentinel blocks and are removed.
+The first and last blocks are fibertools blocks and are removed.
 In these real records, the first block has size **0** and the last has size
 **1**. Internal m6A-call blocks have size **1**.
 
@@ -96,8 +78,6 @@ BED12 blocks, removes the sentinel blocks, and keeps calls within
 For example, read A's call at 119291048 is `119282125 + 8922 + 1`.
 Strand does not reverse the genomic column order.
 
-The table includes each read's first in-window call and every call in the
-12-base display excerpt. Other calls remain in the full matrix.
 
 | Read | Block number (1-based) | Block offset | Block size | Call position |
 | --- | --- | --- | --- | --- |
@@ -119,8 +99,7 @@ The table includes each read's first in-window call and every call in the
 **Step 3: Extract one metadata row per read**
 
 `extract_ft_read_info(reads)` uses `BED12 column 7 + 1` as the inclusive
-read start and column 8 as the inclusive read end. Read labels refer to the
-exact RIDs in Step 1.
+read start and column 8 as the inclusive read end
 
 | Read | Chromosome | Start (1-based) | End (inclusive) | Strand | In-window m6A calls |
 | --- | --- | --- | --- | --- | --- |
@@ -131,8 +110,6 @@ exact RIDs in Step 1.
 
 **Step 4: Construct the read-by-position matrix**
 
-The actual call is
-`get_sparse_met_mat(..., window_start = 119290056, window_end = 119292055, all_met_pos = 119290056:119292055, base = "A")`.
 
 1. Initialize entries to `NA`.
 2. Set positions covered by a read to `0`.
@@ -155,14 +132,6 @@ It covers only part of the full analysis window.
 
 **Step 5: Filter coverage and phasing**
 
-`rowSums(is.na(mat)) == 0` removes D before phasing. The sample prefix is
-then added to each retained RID as `AL16_bc2114_18508__<RID>`.
-
-The phasing values below are historical results matched by sample and original
-RID. Current runs hold the extraction audit and retained assignments in memory.
-No haplotype or genotype is inferred from the m6A calls. D is absent from
-that audit because the audit begins after full-span filtering.
-
 | Read | Spans full 2,000 bp? | Haplotype | Phase set | Focal genotype | Resolved allele | Outcome |
 | --- | --- | --- | --- | --- | --- | --- |
 | A | Yes | HP1 | 119099734 | 0\|1 | rs12470189: G | Keep |
@@ -170,16 +139,15 @@ that audit because the audit begins after full-span filtering.
 | C | Yes | HP1 | 119099734 | 0\|1 | rs12470189: G | Keep |
 | D | No | Not evaluated | — | — | — | Remove before phasing |
 
-A–C have `allele_status = phased_focal_genotype` and pass the phased
-heterozygote filter. The current filter requires at least three retained
+`allele_status = phased_focal_genotype` and pass the phased
+heterozygote filter. Requires at least three retained
 reads, both focal alleles, and at least two columns with observed m6A calls.
-The regional cohort, rather than just the displayed excerpt, is filtered.
+
 
 **Step 6: Final m6A matrix**
 
-The shared phasing filter temporarily removes all-zero columns.
-`lcl_build_phased_m6a_input()` restores all 2,000 genomic columns for the
-retained reads. The same 12-column excerpt after filtering is:
+`lcl_build_phased_m6a_input()` builds all 2,000 genomic columns for the
+retained reads
 
 | Read | 119291048 | 119291049 | 119291050 | 119291051 | 119291052 | 119291053 | 119291054 | 119291055 | 119291056 | 119291057 | 119291058 | 119291059 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -187,78 +155,38 @@ retained reads. The same 12-column excerpt after filtering is:
 | B | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | C | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 0 | 1 |
 
-Read labels A–C stand for the sample-prefixed RIDs described above.
-Positions 119291049, 119291051, 119291053, 119291054, and 119291056–119291058
-are all zero in these three rows and remain in the matrix. These zeros do
-not imply that the positions are zero across every other regional read.
-B's displayed values are all zero, but B has 50 calls elsewhere in the full
 
-
-
-
-The notebook parameters configure a new run only. Saved PDFs and diagnostic logs
-show the actual results; no saved manifest or table is required to view this gallery.
-
-The defaults are a **2,000-bp window and all 2,000 nonnegative ACF lags**.
+The defaults are a **2,000-bp window and all 2,000 non-negative ACF lags**.
 Set `window_size` to change the window, centered at the same focal SNP;
 set `n_features` to retain the first N lags, including lag 0. `null` retains
-all lags. For an even window, the inclusive start is SNP position minus half
-the width; the end is start plus width minus one. The worked tables above are historical examples, not summaries of the current run.
-
-Set `run_analysis: true` to launch the pipeline with the notebook parameters;
-choose a new, empty `output_dir` inside `LCL_project/auto_correlation`.
-Leave it false to render existing results.
+all lags.
 
 # Method
 
-Following [SAMOSA-ChAAT](https://github.com/RamaniLab/SAMOSA-ChAAT), each
-nonconstant molecule is mean-centered and its linear autocorrelation is
-normalized by `N * population_variance`, with a fixed denominator at every lag.
-Lag 0 equals one. Explicit lag indexing avoids the reference's even-length
-`mode='same'` slicing offset. Constant molecules have undefined ACF and are
-excluded from clustering.
 
-All retained ACF features enter centered, unscaled PCA. Correlation-distance
-neighbors and weighted Leiden cluster molecules separately in each region.
-UMAP displays this same ACF representation. Cluster numbers are local to each
-region. The 140–250-bp positive local peak summary is descriptive and is not
-a tested periodicity or nucleosome repeat-length estimate.
+## Calculate autocorrelation
 
-# Pooled REF/ALT summaries
+$ACF(k) = sum((x[t]-mean(x))*(x[t+k]-mean(x))) / (N * var(x))$
 
-HP1/HP2 are mapped through each read's phased focal genotype to REF or ALT.
-All unique molecules are pooled by this focal allele, without sample grouping,
-cell-line weighting, or per-sample coverage thresholds. Sample identifiers
-remain in the in-memory read audit but are not displayed in allele plots.
+for each lag k (distance apart for a given comparison), it compares the centered signal with itself shifted by k bp. Positions with positive deviations after subtracting the mean give positive products. The differences are summed across all overlapping positions (positions that still line up after shifting by the lag), and divided by the read's total variance (variation in m6a pattern across all positions after subtracting the mean, used for normalization)
 
-Cluster fractions use clustered reads within each allele as the denominator.
-Mean ACF and peak fractions use all valid ACF reads within each allele, including
-valid unclustered reads. The ACF figure has three panels: all retained lags,
-0–500 bp, and 500–2000 bp. Each shows the same two mean curves, REF and ALT,
-using available lags and independent vertical scales. Each unique
-molecule receives equal weight. There are no difference curves or uncertainty bands.
+Autocorrelation calculates a ACF value measures the linear relationship and correlation coefficient between a time serious and a lagged version of itself at various time steps, specifically in Fiber-seq, it answers the question of how similar is the methylation pattern to itself after shifting it by k base pairs?
 
-The peak figure shows the fraction with a positive local peak in 140–250 bp
-and the distributions of peak lag and height among peak-bearing molecules.
-Boxes show medians and quartiles, whiskers extend to the most extreme values
-within 1.5 interquartile ranges, and points beyond them are individual outliers.
-The complete peak search requires at least 252 retained ACF features.
-No peak is a measured zero in the peak fraction; absent coverage or an incomplete
-search is undefined. Undefined values are omitted or explained in the plot.
-These summaries are descriptive; no hypothesis tests are performed.
+    - ACF(0) = 1, the pattern is compared to itself, so it matches perfectly
+    - ACF(k) > 0, positions k bp apart tend to have the same state 
+    - ACF(k) < 0, positions k bp apart tend to have opposite state
+    - ACG(k) = 0, little systematic relationship at that spacing
 
-The older Fiber-seq plots retain their existing annotations and grouping.
 
-# Haplotype repeat-length views
+Previous analysis using Fourier transformation does not give base pair resolution, where the resolution/period length is dependent on the frequency (k = 1,2,3…) and the length of the region, autocorrelation bypass this issue because:
 
-The new haplotype plots use median raw ACFs across all valid unique retained
-fibers, independently of cluster membership. REF/ALT are mapped through phased
-focal genotypes; sample-local HP1/HP2 labels are not pooled directly. The strongest
-positive local peak in 120–250 bp is shown as a candidate ACF-based repeat length.
-Qualifying peaks require prominence ≥0.01 ACF units and spacing ≥20 bp; observed
-higher-order peaks must lie within ±20 bp of integer multiples. No peak means
-no estimate. These are descriptive candidates, not validated nucleosome spacings.
-The legacy 140–250-bp peak plots retain their original definition.
+  - FFT has uniform frequency resolution but not uniform period resolution -> how much of this molecule can be described by oscillations having the specific frequencies?
+  - Autocorrelation samples uniformly in genomic distance
+  - Autocorrelation represents the information on a distance axis, whereas the FFT represents it on an evenly spaced frequency axis
+
+Constant molecules have undefined ACF and are excluded from clustering
+
+
 
 ```{r cross-locus-figure, results='asis'}
 path <- file.path(output, "outputs/locus_haplotype_median_acf.pdf")
