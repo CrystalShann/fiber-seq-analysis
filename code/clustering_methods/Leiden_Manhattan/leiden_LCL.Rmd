@@ -355,7 +355,7 @@ methylation_by_cluster <- function(result) {
 ```{r generate-results, include=FALSE}
 if (params$regenerate_plots) {
   if (file.exists(file.path(output_dir, "summary tables", "fiberseq_result_paths.rds"))) {
-    # Redraw the saved clusters without rebuilding matrices or clustering.
+   
     result_paths <- local({
       tracks_dir <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks"
       output_dir <- lcl_output_path(output_dir)
@@ -419,7 +419,7 @@ if (params$regenerate_plots) {
       paths
     })
   } else {
-    # Build the top-ten results when no saved result paths exist.
+  
     result_paths <- local({
       seed <- 1L
       reuse_cache <- TRUE
@@ -431,7 +431,7 @@ if (params$regenerate_plots) {
       haplotype_dir <- output_dir
       matrix_dir <- lcl_output_path(file.path(output_dir, "m6a_summary"))
       dir.create(summary_dir, recursive = TRUE, showWarnings = FALSE)
-      # Both the main results and haplotype examples derive from this one selection.
+
       data.table::fwrite(regions, file.path(summary_dir, "selected_top10_regions.tsv"), sep = "\t")
       datasets <- lapply(seq_len(nrow(regions)), function(i) {
         assemble_region_m6a(sample_table = lcl_region_samples(regions[i, ], sample_table),
@@ -467,7 +467,7 @@ if (params$regenerate_plots) {
           extract_nucleosomes(selected_samples, result$region, assignments),
           region_footprints(footprint_summaries, result$region, assignments)$records)
         embedding <- fiberseq_umap(result, seed = seed)
-        # Main and haplotype outputs have identical retained reads and main labels.
+     
         save_all_plots(result, footprints, out, region_colors, embedding = embedding)
         paths[[rid]] <- file.path(out, "tables", "fiberseq_annotated_clustering.rds")
         saveRDS(result, paths[[rid]])
@@ -484,7 +484,7 @@ if (params$regenerate_plots) {
         data.table::fwrite(dplyr::bind_rows(audit), file.path(summary_dir, "fiberseq_validation.tsv"), sep = "\t")
       }
       saveRDS(paths, file.path(summary_dir, "fiberseq_result_paths.rds"))
-      # A selection signature prevents plots-only rendering from loading the previous examples.
+    
       saveRDS(list(regions = regions, sample_table = sample_table,
         view_params = list(seed = seed),
         asfire_file = asfire_file),
@@ -497,7 +497,7 @@ if (params$regenerate_plots) {
 }
 stopifnot(all(regions$region_id %in% names(result_paths)))
 result_paths <- result_paths[regions$region_id]
-# Reject cached results that do not satisfy the current LCL cohort policy.
+
 for (path in result_paths) {
   retained <- readRDS(path)$assignments
   stopifnot(nrow(retained) > 0L,
@@ -689,7 +689,7 @@ nucleosome occupancy. Cluster line colors match the molecule panels; the pooled
 profile is dark grey. Supporting tables record read order, profiles and QC.
 
 ```{r lcl-asfire-example-setup, include=FALSE}
-# Self-contained setup: these four chunks also run independently of the report.
+
 example_code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
 suppressPackageStartupMessages(library(dplyr))
 source(file.path(example_code_dir, "leiden_manhattan_functions.r"), local = TRUE)
@@ -721,8 +721,7 @@ example_saved <- lapply(example_saved_paths, readRDS)
 example_regions <- dplyr::bind_rows(lapply(example_saved, `[[`, "region"))
 stopifnot(identical(as.integer(example_regions$rank), example_ranks))
 
-# Reuse the existing plotters with a private >100-bp track palette. The shared
-# helpers retain their 130-160-bp defaults for every other notebook/figure.
+
 example_plotters <- local({
   e <- new.env(parent = environment(plot_smf_reads))
   e$LCL_FOOTPRINT_TRACKS <- c("ft_nuc_gt100bp", LCL_FOOTPRINT_TRACKS[-1L])
@@ -759,7 +758,6 @@ example_profile_plot <- function(profiles, result, title, subtitle, y_label) {
     cluster_id_palette(levels(result$assignments$cluster)))
   plot <- example_plotters$plot_signal_profile(profiles, result$region,
     unique(as.character(profiles$cluster)), title = title)
-  # Replace the shared plotter's track colors with the existing cluster palette.
   suppressMessages(plot +
     ggplot2::aes(color = cluster, fill = cluster, group = cluster) +
     ggplot2::scale_color_manual(values = colors) +

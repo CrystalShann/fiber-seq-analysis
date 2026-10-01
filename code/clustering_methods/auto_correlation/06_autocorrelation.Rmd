@@ -17,14 +17,8 @@ params:
 ### Input
 
 
-**Step 1: Original fibertools m6A BED12 records**
+**Step 1: load m6A BED12 table**
 
-The IDs, coordinates, block counts, and block values below come from the
-original BED file. All four records have chromosome `chr2` and RGB `128,0,128`.
-BED starts are 0-based; BED ends are exclusive. `read_start` and `read_end`
-are BED12 columns 7 and 8. Block lists are abbreviated with `…` for display;
-`blockCount` gives their full length. Complete, unmodified BED12 lines are
-included immediately below the table.
 
 | Read | RID | BED start | BED end | read_start | read_end | Score | Strand | blockCount | blockSizes  | blockStarts  |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -33,20 +27,16 @@ included immediately below the table.
 | C | m84241_250908_180102_s3/258540726/ccs | 119289060 | 119298334 | 119289060 | 119298334 | 18 | - | 266 | 0,1,1,1,1, …, 1,1,1 | 0,293,299,301,309, …, 9078,9080,9273 |
 | D | m84241_250515_002859_s3/165545798/ccs | 119291372 | 119296368 | 119291372 | 119296368 | 32 | + | 120 | 0,1,1,1,1, …, 1,1,1 | 0,117,122,184,277, …, 4815,4821,4995 |
 
-The first and last blocks are fibertools blocks and are removed.
-In these real records, the first block has size **0** and the last has size
-**1**. Internal m6A-call blocks have size **1**.
+The first and last blocks and are removed
+
 
 **Step 2: Expand blocks and keep calls inside the analysis window**
 
-`extract_ft_region_reads()` retains the longest alignment per RID, expands
-BED12 blocks, removes the sentinel blocks, and keeps calls within
-119290056–119292055. A call's 1-based coordinate is its block end:
+`extract_ft_region_reads()` retains the longest alignment per RID, expands BED12 blocks, removes the first and last blocks, and keeps calls within selected window
 
-`call position = BED start + blockStarts entry + blockSizes entry`
+`m6a position = BED start + blockStarts + blockSizes`
 
 For example, read A's call at 119291048 is `119282125 + 8922 + 1`.
-Strand does not reverse the genomic column order.
 
 
 | Read | Block number (1-based) | Block offset | Block size | Call position |
@@ -68,8 +58,7 @@ Strand does not reverse the genomic column order.
 
 **Step 3: Extract one metadata row per read**
 
-`extract_ft_read_info(reads)` uses `BED12 column 7 + 1` as the inclusive
-read start and column 8 as the inclusive read end
+`extract_ft_read_info(reads)` 
 
 | Read | Chromosome | Start (1-based) | End (inclusive) | Strand | In-window m6A calls |
 | --- | --- | --- | --- | --- | --- |
@@ -87,18 +76,13 @@ read start and column 8 as the inclusive read end
 
 `0` means covered without a reported m6A call; `NA` means uncovered.
 Every genomic base is a column, including bases with no calls in any read.
-The following values were checked with the current R extraction and matrix
-functions against the original indexed BED file.
 
 | Read | 119291048 | 119291049 | 119291050 | 119291051 | 119291052 | 119291053 | 119291054 | 119291055 | 119291056 | 119291057 | 119291058 | 119291059 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 0 | 0 |
 | B | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | C | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 0 | 1 |
-| D | NA | NA | NA | NA | NA | NA | NA | NA | NA | NA | NA | NA |
 
-D starts at 119291373, so all 12 displayed bases are uncovered (`NA`).
-It covers only part of the full analysis window.
 
 **Step 5: Filter coverage and phasing**
 
@@ -126,9 +110,10 @@ retained reads
 | C | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 1 | 0 | 0 | 0 | 1 |
 
 
-The defaults are a **2,000-bp window and all 2,000 non-negative ACF lags**.
-The analysis runner accepts `--window-size` and `--n-features`; omitting
-`--n-features` retains all lags. Knitting uses the saved run parameters.
+The defaults are a **2,000-bp window and all 2,000 non-negative ACF lags**
+
+The analysis accepts `--window-size` and `--n-features`
+
 
 # Method
 
@@ -155,7 +140,8 @@ Previous analysis using Fourier transformation does not give base pair resolutio
 
 Constant molecules have undefined ACF and are excluded from clustering
 
-```{r setup, include=TRUE, purl=TRUE}
+<!-- set knitr options and find the region folders. Parameters: figures 12 x 8 in, 300 dpi, SVG; run folder = params$output_dir; regions = every rank* folder under outputs/, or only those in params$regions -->
+```{r setup, include=FALSE, purl=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE,
   out.width = "100%", fig.width = 12, fig.height = 8, dpi = 300,
   fig.retina = 1, dev = "svglite")
@@ -172,13 +158,86 @@ if (!length(region_dirs)) stop("No region results found under ", output)
 ```
 
 
+<!-- load the shared Leiden_Manhattan plotting functions (read plot, m6A heatmap, signal profiles, UMAP, kNN graph, colors) so the figures use the same code, layout and fonts as the Leiden_Manhattan report -->
+```{r source-leiden-plots, include=FALSE}
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r", local = TRUE)
+```
 
+RID = sample + read id
 ```{r empty-footprints-function, include=TRUE}
 empty_footprints <- function() {
   data.frame(RID = character(), original_RID = character(), chr = character(),
     start = integer(), end = integer(), size = integer(), track = character())
 }
 ```
+
+
+
+##### example code to extract the nucleoosme footprints 
+More on the output format at: https://fiberseq.github.io/fibertools/extracting/extract.html
+
+```{r example-nuc-bed12, include=TRUE}
+suppressPackageStartupMessages({
+  library(readr)
+  library(tidyverse)
+})
+
+nuc_bed12_ex <- read_tsv("/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results/AL19_bc2138_18861/extracted_results/nuc_by_chr/AL19_bc2138_18861.ft_extracted_nuc.chr10.bed.gz", col_names = FALSE)
+
+nuc_bed12_ex <- nuc_bed12_ex[1:1000,]
+
+bed12_col_names <- c("chr", "start", "end", "read_id", "score", "strand", "thickstart", "thickend",
+                     "itemRgb", "blockCount", "blockSizes", "blockStarts")
+
+extract_bed12 <- function(bed12) {
+  
+  colnames(bed12) <- bed12_col_names
+  
+  bed12 %>%
+    # split nucleosome starts and sizes by comma
+    mutate(
+      blockSizes = str_split(blockSizes, ","),
+      blockStarts = str_split(blockStarts, ",")) %>%
+    
+    # One row per nucleosome
+    unnest(c(blockSizes, blockStarts)) %>%
+    
+    mutate(
+      blockSizes = as.integer(blockSizes),
+      blockStarts = as.integer(blockStarts)) %>%
+    
+    # remove the first and last block for each read, 0 and 1 do not contain any info
+    group_by(read_id) %>%
+    mutate(
+      block_index = row_number(),
+      n_blocks = n()
+    ) %>%
+    filter(block_index >1,
+           block_index < n_blocks) %>%
+    
+    # get coordinates of each nucleosome
+    mutate(
+      nuc_start = start + blockStarts + 1,
+      nuc_end = nuc_start + blockSizes,
+      nuc_size = blockSizes
+    ) %>%
+    
+    # keep only nuc start, end and read metadata
+    select(chr, start, end, read_id, strand, nuc_start, nuc_end, nuc_size) %>%
+    
+    ungroup()
+}
+
+processed_bed12 <- extract_bed12(nuc_bed12_ex)
+head(processed_bed12, 20)
+  
+```
+
+#### build nucleosome footprint track
+
+builds the nucleosome footprint track for each clustered read in the autocorrelation
+
+  - Keeps footprints that are 130–160 bp
 
 ```{r prepare-nucleosomes-function, include=TRUE}
 prepare_nucleosomes <- function(region, assignments, ft_root) {
@@ -206,7 +265,6 @@ prepare_nucleosomes <- function(region, assignments, ft_root) {
       offsets <- as.integer(strsplit(sub(",$", "", bed$blockStarts[i]), ",", fixed = TRUE)[[1]])
       stopifnot(length(sizes) == bed$blockCount[i], length(offsets) == length(sizes),
         !anyNA(sizes), !anyNA(offsets))
-      # Fibertools' first and last blocks are sentinels, not footprints.
       keep <- if (length(sizes) > 2L) seq.int(2L, length(sizes) - 1L) else integer()
       starts <- bed$start[i] + offsets[keep]
       ends <- starts + sizes[keep]
@@ -216,12 +274,18 @@ prepare_nucleosomes <- function(region, assignments, ft_root) {
       output[[length(output) + 1L]] <- data.frame(
         RID = paste(sample, bed$RID[i], sep = "::"), original_RID = bed$RID[i],
         chr = region$chr, start = starts[valid], end = ends[valid],
+        
         size = sizes[keep][valid], track = "ft_nuc_130-160bp")
     }
   }
   if (length(output)) do.call(rbind, output) else empty_footprints()
 }
 ```
+
+
+#### build footprint tracks from FiberHMM
+
+10–30, 40–60, and 60–80 bp size footprints
 
 ```{r prepare-fiberhmm-function, include=TRUE}
 prepare_fiberhmm_track <- function(region, assignments, size, project, tracks_root) {
@@ -263,60 +327,63 @@ prepare_fiberhmm_track <- function(region, assignments, size, project, tracks_ro
 }
 ```
 
-```{r prepare-report-data-function, include=TRUE}
-prepare_report_data <- function(payload, project, destination,
+run autocorrelation, and get nucleeosomes and footprints
+```{r prepare-report-data-function, include=FALSE}
+prepare_report_data <- function(region_data, project, destination,
     ft_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
     tracks_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks") {
-  stopifnot(payload$schema_version == 1L, is.data.frame(payload$region),
-    nrow(payload$region) == 1L, is.data.frame(payload$records),
-    identical(payload$row_ids, payload$records$row_id), !anyDuplicated(payload$row_ids))
-  payload$acf <- autocor_payload_matrix(payload$acf, nrow(payload$records))
-  stopifnot(nrow(payload$acf) == nrow(payload$records),
-    ncol(payload$acf) == payload$params$n_features)
-  a <- payload$records[payload$records$status == "clustered", , drop = FALSE]
+  stopifnot(region_data$schema_version == 1L, is.data.frame(region_data$region),
+    nrow(region_data$region) == 1L, is.data.frame(region_data$records),
+    identical(region_data$row_ids, region_data$records$row_id), !anyDuplicated(region_data$row_ids))
+  region_data$acf <- autocor_payload_matrix(region_data$acf, nrow(region_data$records))
+  stopifnot(nrow(region_data$acf) == nrow(region_data$records),
+    ncol(region_data$acf) == region_data$params$n_features)
+  a <- region_data$records[region_data$records$status == "clustered", , drop = FALSE]
   a$original_RID <- a$RID
   a$RID <- paste(a$sample_name, a$original_RID, sep = "::")
   stopifnot(!anyDuplicated(a$RID))
-  payload$footprints <- empty_footprints()
-  payload$footprint_tracks <- character()
-  payload$footprint_sources <- data.frame(track = character(), source = character(), n_records = integer())
+  region_data$footprints <- empty_footprints()
+  region_data$footprint_tracks <- character()
+  region_data$footprint_sources <- data.frame(track = character(), source = character(), n_records = integer())
   if (nrow(a)) {
-    nucleosomes <- prepare_nucleosomes(payload$region, a, ft_root)
+    nucleosomes <- prepare_nucleosomes(region_data$region, a, ft_root)
     tracks <- lapply(c("10-30", "40-60", "60-80"), function(size)
-      prepare_fiberhmm_track(payload$region, a, size, project, tracks_root))
-    payload$footprints <- do.call(rbind, c(list(nucleosomes), lapply(tracks, `[[`, "records")))
-    payload$footprint_tracks <- c("ft_nuc_130-160bp",
+      prepare_fiberhmm_track(region_data$region, a, size, project, tracks_root))
+    region_data$footprints <- do.call(rbind, c(list(nucleosomes), lapply(tracks, `[[`, "records")))
+    region_data$footprint_tracks <- c("ft_nuc_130-160bp",
       paste0("FiberHMM_", c("10-30", "40-60", "60-80"), "bp"))
-    payload$footprint_sources <- rbind(data.frame(track = "ft_nuc_130-160bp",
+    region_data$footprint_sources <- rbind(data.frame(track = "ft_nuc_130-160bp",
       source = ft_root, n_records = nrow(nucleosomes)), do.call(rbind, lapply(tracks, `[[`, "source")))
   }
-  payload$footprints_available <- length(payload$footprint_tracks) > 0L
+  region_data$footprints_available <- length(region_data$footprint_tracks) > 0L
   dir.create(dirname(destination), recursive = TRUE, showWarnings = FALSE)
   temporary <- tempfile("report-data-", tmpdir = dirname(destination))
   on.exit(unlink(temporary), add = TRUE)
-  saveRDS(payload, temporary, compress = "gzip")
+  saveRDS(region_data, temporary, compress = "gzip")
   if (!file.rename(temporary, destination)) stop("Could not save report data: ", destination)
   message("Saved portable report data: ", destination)
   invisible(destination)
 }
 ```
 
-```{r read-report-data-function, include=TRUE}
+<!-- load one region's report_data.rds, check that reads and ACF rows line up, compute the repeat-length candidates and build the plotting object -->
+```{r read-report-data-function, include=FALSE}
 read_report_data <- function(folder) {
   path <- file.path(folder, "report_data.rds")
   if (!file.exists(path)) stop("Missing analysis data for direct plotting: ", path)
-  payload <- readRDS(path)
-  stopifnot(identical(as.integer(payload$schema_version), 1L),
-    nrow(payload$region) == 1L, payload$region$region_id == basename(folder),
-    identical(payload$row_ids, payload$records$row_id),
-    is.matrix(payload$acf), nrow(payload$acf) == nrow(payload$records))
-  rows <- summarize_repeats(payload$acf, payload$records, payload$region, payload$tables)
-  list(folder = folder, region_id = payload$region$region_id, data = payload,
-    repeats = rows, fiberseq = autocor_fiberseq_result(payload))
+  region_data <- readRDS(path)
+  stopifnot(identical(as.integer(region_data$schema_version), 1L),
+    nrow(region_data$region) == 1L, region_data$region$region_id == basename(folder),
+    identical(region_data$row_ids, region_data$records$row_id),
+    is.matrix(region_data$acf), nrow(region_data$acf) == nrow(region_data$records))
+  rows <- summarize_repeats(region_data$acf, region_data$records, region_data$region, region_data$tables)
+  list(folder = folder, region_id = region_data$region$region_id, data = region_data,
+    repeats = rows, fiberseq = autocor_fiberseq_result(region_data))
 }
 ```
 
-```{r report-fiberseq-figure-function, include=TRUE}
+<!-- draw a Fiber-seq figure for one region, or a 'No clustered reads' placeholder when the region has no clustered reads -->
+```{r report-fiberseq-figure-function, include=FALSE}
 report_fiberseq_figure <- function(entry, draw) {
   if (is.null(entry$fiberseq)) return(ggplot2::ggplot() +
     ggplot2::annotate("text", x = 0, y = 0, label = "No clustered reads in this region") +
@@ -325,7 +392,8 @@ report_fiberseq_figure <- function(entry, draw) {
 }
 ```
 
-```{r print-report-table-function, include=TRUE}
+<!-- print a table as HTML, or 'no rows' when it is empty. Parameters: 4 digits -->
+```{r print-report-table-function, include=FALSE}
 print_report_table <- function(table, caption) {
   if (is.null(table) || !is.data.frame(table) || !nrow(table)) {
     cat(caption, ": no rows.\n\n", sep = "")
@@ -338,23 +406,26 @@ print_report_table <- function(table, caption) {
 }
 ```
 
-```{r report-empty-plot-function, include=TRUE}
+<!-- blank plot that shows only a message -->
+```{r report-empty-plot-function, include=FALSE}
 report_empty_plot <- function(message, title = NULL) {
   ggplot2::ggplot() + ggplot2::annotate("text", x = 0, y = 0, label = message) +
     ggplot2::labs(title = title) + ggplot2::theme_void()
 }
 ```
 
-```{r report-allele-labels-function, include=TRUE}
-report_allele_labels <- function(payload) {
-  c(REF = paste0("REF (", payload$region$ref, ")"), ALT = paste0("ALT (", payload$region$alt, ")"))
+<!-- axis labels for the two alleles: REF (base) and ALT (base) -->
+```{r report-allele-labels-function, include=FALSE}
+report_allele_labels <- function(region_data) {
+  c(REF = paste0("REF (", region_data$region$ref, ")"), ALT = paste0("ALT (", region_data$region$alt, ")"))
 }
 ```
 
-```{r report-figure-frame-function, include=TRUE}
-report_figure_frame <- function(plot, payload, caption = NULL) {
-  title <- paste0(payload$region$region_id, "\n", payload$region$focal_snp, ": ",
-    payload$region$ref, " / ", payload$region$alt)
+<!-- add the region / focal SNP title and an optional caption around a figure -->
+```{r report-figure-frame-function, include=FALSE}
+report_figure_frame <- function(plot, region_data, caption = NULL) {
+  title <- paste0(region_data$region$region_id, "\n", region_data$region$focal_snp, ": ",
+    region_data$region$ref, " / ", region_data$region$alt)
   heading <- cowplot::ggdraw() + cowplot::draw_label(title, size = 11)
   if (is.null(caption)) return(cowplot::plot_grid(heading, plot, ncol = 1, rel_heights = c(.12, 1)))
   footer <- cowplot::ggdraw() + cowplot::draw_label(caption, size = 9)
@@ -362,12 +433,13 @@ report_figure_frame <- function(plot, payload, caption = NULL) {
 }
 ```
 
-```{r report-cluster-acf-function, include=TRUE}
-plot_report_cluster_acf <- function(payload) {
-  d <- payload$tables$cluster_acf_summary
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", payload$region$region_id))
-  d <- d[d$lag_bp > 0, , drop = FALSE]
-  if (!nrow(d)) return(report_empty_plot("No nonzero ACF lags available", payload$region$region_id))
+<!-- plot the mean ACF of each cluster as curves and as a heatmap. Parameters: lag 0 omitted, no smoothing; lower/upper set the lag range (default all nonzero lags) -->
+```{r report-cluster-acf-function, include=FALSE}
+plot_report_cluster_acf <- function(region_data, lower = 1, upper = Inf, title = "Cluster averages; no smoothing") {
+  d <- region_data$tables$cluster_acf_summary
+  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", region_data$region$region_id))
+  d <- d[d$lag_bp >= lower & d$lag_bp <= upper, , drop = FALSE]
+  if (!nrow(d)) return(report_empty_plot("No nonzero ACF lags available", region_data$region$region_id))
   groups <- as.character(sort(unique(as.integer(as.character(d$cluster)))))
   d$cluster <- factor(d$cluster, levels = groups)
   colors <- cluster_id_palette(groups)
@@ -376,8 +448,8 @@ plot_report_cluster_acf <- function(payload) {
     ggplot2::geom_hline(yintercept = 0, color = "grey60", linewidth = .3) +
     ggplot2::geom_line(linewidth = .4) +
     ggplot2::scale_color_manual(values = colors, labels = paste0("C", groups, " (n=", counts, ")")) +
-    ggplot2::labs(title = "Cluster averages; no smoothing", x = "Lag (bp)", y = "Mean ACF", color = "Cluster") +
-    ggplot2::theme_bw()
+    ggplot2::labs(title = title, x = "Lag (bp)", y = "Mean ACF", color = "Cluster") +
+    ggplot2::theme_bw(base_size = 10)
   bound <- max(c(abs(d$mean_acf[is.finite(d$mean_acf)]), .01))
   heatmap <- ggplot2::ggplot(d, ggplot2::aes(lag_bp, cluster, fill = mean_acf)) +
     ggplot2::geom_tile(width = 1, height = 1) +
@@ -385,30 +457,32 @@ plot_report_cluster_acf <- function(payload) {
     ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
       midpoint = 0, limits = c(-bound, bound), name = "Mean ACF") +
     ggplot2::scale_x_continuous(expand = c(0, 0)) +
-    ggplot2::labs(x = "Lag (bp)", y = "Cluster") + ggplot2::theme_bw()
-  report_figure_frame(cowplot::plot_grid(curves, heatmap, ncol = 1), payload)
+    ggplot2::labs(x = "Lag (bp)", y = "Cluster") + ggplot2::theme_bw(base_size = 10)
+  report_figure_frame(cowplot::plot_grid(curves, heatmap, ncol = 1), region_data)
 }
 ```
 
-```{r report-sample-composition-function, include=TRUE}
-plot_report_sample_composition <- function(payload) {
-  d <- payload$tables$sample_composition
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", payload$region$region_id))
+<!-- stacked bars: fraction of each sample's clustered reads in each cluster -->
+```{r report-sample-composition-function, include=FALSE}
+plot_report_sample_composition <- function(region_data) {
+  d <- region_data$tables$sample_composition
+  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", region_data$region$region_id))
   groups <- as.character(sort(unique(as.integer(as.character(d$cluster)))))
   d$cluster <- factor(d$cluster, levels = groups)
   ggplot2::ggplot(d, ggplot2::aes(sample_name, fraction_within_sample, fill = cluster)) +
     ggplot2::geom_col(position = ggplot2::position_stack(reverse = TRUE)) +
     ggplot2::scale_fill_manual(values = cluster_id_palette(groups)) +
     ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, .01))) +
-    ggplot2::labs(title = payload$region$region_id, x = "Sample", y = "Fraction of clustered molecules", fill = "Cluster") +
-    ggplot2::theme_bw() + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = .5))
+    ggplot2::labs(title = region_data$region$region_id, x = "Sample", y = "Fraction of clustered molecules", fill = "Cluster") +
+    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = .5))
 }
 ```
 
-```{r report-allele-coverage-function, include=TRUE}
-plot_report_allele_coverage <- function(payload) {
-  d <- payload$tables$allele_coverage
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("Allele coverage unavailable", payload$region$region_id))
+<!-- bar plots of the number of valid ACF reads and clustered reads for REF and ALT -->
+```{r report-allele-coverage-function, include=FALSE}
+plot_report_allele_coverage <- function(region_data) {
+  d <- region_data$tables$allele_coverage
+  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("Allele coverage unavailable", region_data$region$region_id))
   d$allele_group <- factor(d$allele_group, levels = c("REF", "ALT"))
   columns <- c(n_valid = "Valid ACF reads", n_clustered = "Clustered reads")
   plots <- lapply(names(columns), function(column) {
@@ -417,24 +491,29 @@ plot_report_allele_coverage <- function(payload) {
     ggplot2::ggplot(d, ggplot2::aes(allele_group, .data[[column]], fill = allele_group)) +
       ggplot2::geom_col() + ggplot2::geom_text(ggplot2::aes(label = .data[[column]]), vjust = -.4) +
       ggplot2::scale_fill_manual(values = c(REF = "#2878B5", ALT = "#D55E00"), guide = "none") +
-      ggplot2::scale_x_discrete(limits = c("REF", "ALT"), labels = report_allele_labels(payload), drop = FALSE) +
+      ggplot2::scale_x_discrete(limits = c("REF", "ALT"), labels = report_allele_labels(region_data), drop = FALSE) +
       ggplot2::scale_y_continuous(limits = c(0, maximum * 1.18), expand = c(0, 0)) +
-      ggplot2::labs(title = columns[[column]], x = NULL, y = "Unique molecules") + ggplot2::theme_bw()
+      ggplot2::labs(title = columns[[column]], x = NULL, y = "Unique molecules") + ggplot2::theme_bw(base_size = 10)
   })
-  report_figure_frame(cowplot::plot_grid(plotlist = plots, nrow = 1), payload)
+  report_figure_frame(cowplot::plot_grid(plotlist = plots, nrow = 1), region_data)
 }
 ```
 
-```{r report-allele-acf-function, include=TRUE}
-plot_report_allele_acf <- function(payload) {
-  d <- payload$tables$allele_acf_summary
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("Allele ACF summaries unavailable", payload$region$region_id))
+<!-- plot the mean ACF of REF and ALT reads in three lag ranges. Parameters: all lags (lag 0 omitted), 0–500 bp, 140–250 bp; giving lower/upper draws that single lag range instead -->
+```{r report-allele-acf-function, include=FALSE}
+plot_report_allele_acf <- function(region_data, lower = NULL, upper = NULL) {
+  d <- region_data$tables$allele_acf_summary
+  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("Allele ACF summaries unavailable", region_data$region$region_id))
   d$allele_group <- factor(d$allele_group, levels = c("REF", "ALT"))
   maximum <- max(d$lag_bp)
-  coverage <- payload$tables$allele_coverage
+  coverage <- region_data$tables$allele_coverage
   missing <- c("REF", "ALT")[!c("REF", "ALT") %in% as.character(coverage$allele_group[coverage$n_valid > 0])]
   bounds <- list(c(1, maximum), c(0, 500), c(140, 250))
   headings <- c("All retained lags (lag 0 omitted)", "Lags 0–500 bp", "Lags 140–250 bp")
+  if (!is.null(lower)) {
+    bounds <- list(c(lower, upper))
+    headings <- paste0("Lags ", lower, "–", upper, " bp")
+  }
   plots <- lapply(seq_along(bounds), function(i) {
     lower <- bounds[[i]][1]; upper <- max(lower + 1, bounds[[i]][2])
     values <- d[d$lag_bp >= lower & d$lag_bp <= upper, , drop = FALSE]
@@ -444,40 +523,43 @@ plot_report_allele_acf <- function(payload) {
     ggplot2::ggplot(values, ggplot2::aes(lag_bp, mean_acf, color = allele_group)) +
       ggplot2::geom_line(linewidth = .4, na.rm = TRUE) +
       ggplot2::scale_color_manual(values = c(REF = "#2878B5", ALT = "#D55E00"),
-        limits = c("REF", "ALT"), labels = report_allele_labels(payload), drop = FALSE) +
+        limits = c("REF", "ALT"), labels = report_allele_labels(region_data), drop = FALSE) +
       ggplot2::scale_x_continuous(limits = c(lower, upper)) +
       ggplot2::labs(title = headings[i], subtitle = note, x = "Lag (bp)", y = "Mean ACF", color = "Focal allele") +
-      ggplot2::theme_bw()
+      ggplot2::theme_bw(base_size = 10)
   })
-  panels <- cowplot::plot_grid(plots[[1]], cowplot::plot_grid(plots[[2]], plots[[3]], nrow = 1), ncol = 1)
-  report_figure_frame(panels, payload, paste0("Available lags: 0–", maximum,
+  panels <- if (length(plots) == 1L) plots[[1]] else
+    cowplot::plot_grid(plots[[1]], cowplot::plot_grid(plots[[2]], plots[[3]], nrow = 1), ncol = 1)
+  report_figure_frame(panels, region_data, paste0("Available lags: 0–", maximum,
     " bp. Each panel uses the same pooled REF/ALT means; vertical scales are independent."))
 }
 ```
 
-```{r report-allele-proportions-function, include=TRUE}
-plot_report_allele_proportions <- function(payload) {
-  d <- payload$tables$allele_cluster_proportions
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered molecules", payload$region$region_id))
+<!-- bar plot: fraction of each allele's clustered reads in each ACF cluster -->
+```{r report-allele-proportions-function, include=FALSE}
+plot_report_allele_proportions <- function(region_data) {
+  d <- region_data$tables$allele_cluster_proportions
+  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered molecules", region_data$region$region_id))
   d$cluster <- factor(d$cluster, levels = as.character(sort(unique(as.integer(as.character(d$cluster))))))
   d$allele_group <- factor(d$allele_group, levels = c("REF", "ALT"))
   d$fraction <- as.numeric(d$fraction)
-  coverage <- payload$tables$allele_coverage
+  coverage <- region_data$tables$allele_coverage
   missing <- c("REF", "ALT")[!c("REF", "ALT") %in% as.character(coverage$allele_group[coverage$n_clustered > 0])]
   p <- ggplot2::ggplot(d, ggplot2::aes(cluster, fraction, fill = allele_group)) +
     ggplot2::geom_col(position = "dodge", na.rm = TRUE) +
     ggplot2::scale_fill_manual(values = c(REF = "#2878B5", ALT = "#D55E00"),
-      limits = c("REF", "ALT"), labels = report_allele_labels(payload), drop = FALSE) +
+      limits = c("REF", "ALT"), labels = report_allele_labels(region_data), drop = FALSE) +
     ggplot2::scale_y_continuous(limits = c(0, 1.05)) +
     ggplot2::labs(x = "ACF cluster", y = "Fraction of clustered molecules within allele", fill = "Focal allele",
       subtitle = if (length(missing)) paste("No clustered reads:", paste(missing, collapse = ", "))) +
-    ggplot2::theme_bw()
-  report_figure_frame(p, payload)
+    ggplot2::theme_bw(base_size = 10)
+  report_figure_frame(p, region_data)
 }
 ```
 
-```{r report-allele-peak-distribution-function, include=TRUE}
-plot_report_peak_distribution <- function(audit, payload, column, ylabel) {
+<!-- boxplot by allele of one per-read peak value (peak lag or peak ACF height). Parameters: lag axis 135–255 bp -->
+```{r report-allele-peak-distribution-function, include=FALSE}
+plot_report_peak_distribution <- function(audit, region_data, column, ylabel) {
   audit$allele_group <- factor(audit$allele_group, levels = c("REF", "ALT"))
   audit[[column]] <- as.numeric(audit[[column]])
   values <- audit[is.finite(audit[[column]]), , drop = FALSE]
@@ -490,20 +572,21 @@ plot_report_peak_distribution <- function(audit, payload, column, ylabel) {
     ggplot2::geom_boxplot(width = .45, alpha = .65, na.rm = TRUE) +
     ggplot2::geom_text(data = note, ggplot2::aes(allele_group, value), label = "No peaks", inherit.aes = FALSE) +
     ggplot2::scale_fill_manual(values = c(REF = "#2878B5", ALT = "#D55E00"), guide = "none") +
-    ggplot2::scale_x_discrete(limits = c("REF", "ALT"), labels = report_allele_labels(payload), drop = FALSE) +
-    ggplot2::labs(x = NULL, y = ylabel) + ggplot2::theme_bw()
+    ggplot2::scale_x_discrete(limits = c("REF", "ALT"), labels = report_allele_labels(region_data), drop = FALSE) +
+    ggplot2::labs(x = NULL, y = ylabel) + ggplot2::theme_bw(base_size = 10)
   if (column == "positive_local_peak_140_250_bp") p <- p + ggplot2::scale_y_continuous(limits = c(135, 255))
   p
 }
 ```
 
-```{r report-allele-peaks-function, include=TRUE}
-plot_report_allele_peaks <- function(payload) {
-  d <- payload$tables$allele_peak_features
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("Allele peak summaries unavailable", payload$region$region_id))
+<!-- plot the fraction of reads with a positive local ACF peak and the peak lag / height distributions by allele. Parameters: peak band 140–250 bp, needs at least 252 lags -->
+```{r report-allele-peaks-function, include=FALSE}
+plot_report_allele_peaks <- function(region_data) {
+  d <- region_data$tables$allele_peak_features
+  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("Allele peak summaries unavailable", region_data$region$region_id))
   if (!all(d$peak_band_complete %in% TRUE)) {
     plots <- rep(list(report_empty_plot("140–250 bp peak range\nnot fully available")), 3L)
-    return(report_figure_frame(cowplot::plot_grid(plotlist = plots, nrow = 1), payload))
+    return(report_figure_frame(cowplot::plot_grid(plotlist = plots, nrow = 1), region_data))
   }
   d$allele_group <- factor(d$allele_group, levels = c("REF", "ALT"))
   d$peak_fraction <- as.numeric(d$peak_fraction)
@@ -513,85 +596,52 @@ plot_report_allele_peaks <- function(payload) {
     ggplot2::geom_col(na.rm = TRUE) + ggplot2::geom_text(ggplot2::aes(label = value_label), vjust = -.5, na.rm = TRUE) +
     ggplot2::geom_text(data = missing, ggplot2::aes(allele_group), y = .5, label = "No valid reads", inherit.aes = FALSE) +
     ggplot2::scale_fill_manual(values = c(REF = "#2878B5", ALT = "#D55E00"), guide = "none") +
-    ggplot2::scale_x_discrete(limits = c("REF", "ALT"), labels = report_allele_labels(payload), drop = FALSE) +
+    ggplot2::scale_x_discrete(limits = c("REF", "ALT"), labels = report_allele_labels(region_data), drop = FALSE) +
     ggplot2::scale_y_continuous(limits = c(0, 1.15)) +
-    ggplot2::labs(x = NULL, y = "Fraction with a qualifying peak") + ggplot2::theme_bw()
-  audit <- payload$tables$allele_read_audit
+    ggplot2::labs(x = NULL, y = "Fraction with a qualifying peak") + ggplot2::theme_bw(base_size = 10)
+  audit <- region_data$tables$allele_read_audit
   audit <- audit[audit$allele_analysis_included & audit$acf_valid, , drop = FALSE]
-  lag <- plot_report_peak_distribution(audit, payload, "positive_local_peak_140_250_bp", "Molecule peak lag (bp)")
-  height <- plot_report_peak_distribution(audit, payload, "peak_acf", "Molecule peak ACF height")
-  report_figure_frame(cowplot::plot_grid(fraction, lag, height, nrow = 1), payload,
+  lag <- plot_report_peak_distribution(audit, region_data, "positive_local_peak_140_250_bp", "Molecule peak lag (bp)")
+  height <- plot_report_peak_distribution(audit, region_data, "peak_acf", "Molecule peak ACF height")
+  report_figure_frame(cowplot::plot_grid(fraction, lag, height, nrow = 1), region_data,
     "Peak fraction: all valid reads. Distributions: peak-bearing reads only; boxes show median and quartiles.")
 }
 ```
 
-```{r report-table-plot-function, include=TRUE}
-plot_report_table <- function(payload, kind) {
+<!-- pick a summary figure by name: cluster_acf, sample_composition, allele_coverage, allele_acf, allele_proportions, allele_peaks -->
+```{r report-table-plot-function, include=FALSE}
+plot_report_table <- function(region_data, kind) {
   switch(kind,
-    cluster_acf = plot_report_cluster_acf(payload),
-    sample_composition = plot_report_sample_composition(payload),
-    allele_coverage = plot_report_allele_coverage(payload),
-    allele_acf = plot_report_allele_acf(payload),
-    allele_proportions = plot_report_allele_proportions(payload),
-    allele_peaks = plot_report_allele_peaks(payload),
+    cluster_acf = plot_report_cluster_acf(region_data),
+    sample_composition = plot_report_sample_composition(region_data),
+    allele_coverage = plot_report_allele_coverage(region_data),
+    allele_acf = plot_report_allele_acf(region_data),
+    allele_proportions = plot_report_allele_proportions(region_data),
+    allele_peaks = plot_report_allele_peaks(region_data),
     stop("Unknown summary figure: ", kind))
 }
 ```
 
-```{r plot-acf-umap-function, include=TRUE}
-plot_acf_umap <- function(payload) {
-  a <- payload$records[payload$records$status == "clustered", , drop = FALSE]
+<!-- UMAP of clustered reads colored by ACF cluster and by m6A call fraction -->
+```{r plot-acf-umap-function, include=FALSE}
+plot_acf_umap <- function(region_data) {
+  a <- region_data$records[region_data$records$status == "clustered", , drop = FALSE]
   if (!nrow(a)) return(ggplot2::ggplot() + ggplot2::annotate("text", x = 0, y = 0,
-    label = "No clustered reads") + ggplot2::labs(title = payload$region$region_id) +
+    label = "No clustered reads") + ggplot2::labs(title = region_data$region$region_id) +
     ggplot2::theme_void())
   clusters <- ggplot2::ggplot(a, ggplot2::aes(umap1, umap2, color = factor(cluster))) +
     ggplot2::geom_point(size = 1) + ggplot2::labs(title = "ACF clusters", x = "UMAP 1",
-      y = "UMAP 2", color = "Cluster") + ggplot2::theme_bw()
+      y = "UMAP 2", color = "Cluster") + ggplot2::theme_bw(base_size = 10)
   methylation <- ggplot2::ggplot(a, ggplot2::aes(umap1, umap2, color = m6a_call_fraction)) +
     ggplot2::geom_point(size = 1) + ggplot2::scale_color_viridis_c() +
-    ggplot2::labs(title = payload$region$region_id, x = "UMAP 1", y = "UMAP 2",
-      color = "m6A call fraction") + ggplot2::theme_bw()
+    ggplot2::labs(title = region_data$region$region_id, x = "UMAP 1", y = "UMAP 2",
+      color = "m6A call fraction") + ggplot2::theme_bw(base_size = 10)
   cowplot::plot_grid(clusters, methylation, ncol = 2)
 }
 ```
 
-```{r function-fiberseq-annotation-bar, include=TRUE}
-fiberseq_annotation_bar <- function(reads, anchor, width, offset, colors) {
-  data.frame(cluster = reads$cluster, row = reads$row,
-    left = anchor$left - offset * width, right = anchor$left - (offset - 0.025) * width,
-    fill = unname(colors))
-}
-```
-
-```{r function-fiberseq-composition-table, include=TRUE}
-fiberseq_composition_table <- function(assignments, group, counts, column) {
-  tab <- as.data.frame(table(cluster = group, category = assignments[[column]]), stringsAsFactors = FALSE)
-  names(tab)[3] <- "n_reads"
-  tab$cluster <- factor(tab$cluster, levels = levels(group))
-  tab$cluster_reads <- counts$n_reads[match(tab$cluster, counts$cluster)]
-  tab$fraction <- tab$n_reads / tab$cluster_reads
-  stopifnot(all(abs(tapply(tab$fraction, tab$cluster, sum) - 1) < 1e-10))
-  tab
-}
-```
-
-```{r function-fiberseq-composition-bar, include=TRUE}
-fiberseq_composition_bar <- function(tab, cluster, n, colors, heading) {
-  tab <- tab[tab$cluster == cluster, , drop = FALSE]
-  tab$category <- factor(tab$category, levels = names(colors))
-  ggplot2::ggplot(tab, ggplot2::aes(x = 1, y = fraction, fill = category)) +
-    ggplot2::geom_col(width = .6, position = ggplot2::position_stack(reverse = TRUE)) +
-    ggplot2::coord_flip() + ggplot2::scale_fill_manual(values = colors, drop = FALSE) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1), labels = scales::percent,
-      expand = ggplot2::expansion(mult = 0)) +
-    ggplot2::scale_x_continuous(breaks = NULL) +
-    ggplot2::labs(title = heading, subtitle = paste0("n = ", n), x = NULL, y = "Within cluster") +
-    ggplot2::theme_bw(base_size = 9) + ggplot2::theme(legend.position = "none",
-      panel.grid = ggplot2::element_blank(), plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
-}
-```
-
-```{r function-autocor-payload-matrix, include=TRUE}
+<!-- convert the saved ACF values into a numeric reads x lags matrix; missing values become NA -->
+```{r function-autocor-payload-matrix, include=FALSE}
 autocor_payload_matrix <- function(values, n_reads) {
   if (is.matrix(values) || is.data.frame(values)) {
     result <- as.matrix(values)
@@ -610,11 +660,12 @@ autocor_payload_matrix <- function(values, n_reads) {
 }
 ```
 
-```{r function-autocor-fiberseq-result, include=TRUE}
-autocor_fiberseq_result <- function(payload) {
-  region <- as.data.frame(payload$region, stringsAsFactors = FALSE)
+<!-- build the plotting object for the clustered reads: sparse m6A matrix, ACF matrix, kNN graph, footprints and focal SNP. Parameters: clustered phased heterozygous reads only (HP1/HP2, genotype 0|1 or 1|0); ACF at lag 0 must equal 1 -->
+```{r function-autocor-fiberseq-result, include=FALSE}
+autocor_fiberseq_result <- function(region_data) {
+  region <- as.data.frame(region_data$region, stringsAsFactors = FALSE)
   stopifnot(nrow(region) == 1L, region$width == region$analysis_end - region$analysis_start + 1L)
-  records <- as.data.frame(payload$records, stringsAsFactors = FALSE)
+  records <- as.data.frame(region_data$records, stringsAsFactors = FALSE)
   a <- records[records$status == "clustered" & !is.na(records$status), , drop = FALSE]
   if (!nrow(a)) return(NULL)
   stopifnot(all(a$region_id == region$region_id), !anyDuplicated(a$row_id),
@@ -628,10 +679,10 @@ autocor_fiberseq_result <- function(payload) {
   a$sample_label <- sub("_.*$", "", a$sample_name)
   a$cluster <- factor(a$cluster, levels = as.character(sort(unique(as.integer(a$cluster)))))
   a$heatmap_included <- TRUE
-  ids <- unlist(payload$row_ids, use.names = FALSE)
+  ids <- unlist(region_data$row_ids, use.names = FALSE)
   matched <- match(a$row_id, ids)
   stopifnot(!anyDuplicated(ids), !anyNA(matched), !anyDuplicated(a$RID), !anyNA(a$cluster))
-  offsets <- if (is.matrix(payload$call_offsets)) asplit(payload$call_offsets, 1L) else payload$call_offsets
+  offsets <- if (is.matrix(region_data$call_offsets)) asplit(region_data$call_offsets, 1L) else region_data$call_offsets
   stopifnot(length(offsets) == length(ids))
   offsets <- lapply(offsets[matched], function(row) as.integer(unlist(row, use.names = FALSE)))
   all_offsets <- unlist(offsets, use.names = FALSE)
@@ -640,34 +691,39 @@ autocor_fiberseq_result <- function(payload) {
   met <- Matrix::sparseMatrix(i = rep(seq_len(nrow(a)), lengths(offsets)),
     j = all_offsets + 1L, x = rep(1, length(all_offsets)), dims = c(nrow(a), region$width),
     dimnames = list(a$RID, as.character(seq.int(region$analysis_start, region$analysis_end))))
-  acf <- autocor_payload_matrix(payload$acf, length(ids))[matched, , drop = FALSE]
+  # As in Leiden_Manhattan: columns are the m6A sites observed in any retained read.
+  observed <- sort(unique(as.integer(unlist(if (is.matrix(region_data$call_offsets))
+    asplit(region_data$call_offsets, 1L) else region_data$call_offsets, use.names = FALSE)))) + 1L
+  met <- met[, observed, drop = FALSE]
+  acf <- autocor_payload_matrix(region_data$acf, length(ids))[matched, , drop = FALSE]
   stopifnot(ncol(acf) >= 1L, ncol(acf) <= region$width,
     all(is.finite(acf)), all(abs(acf[, 1] - 1) < 1e-8))
   rownames(acf) <- a$RID
-  edges <- as.data.frame(payload$edges, stringsAsFactors = FALSE)
+  edges <- as.data.frame(region_data$edges, stringsAsFactors = FALSE)
   if (!nrow(edges)) edges <- data.frame(source = character(), target = character(), weight = numeric())
   edges$source <- a$RID[match(edges$source, a$row_id)]
   edges$target <- a$RID[match(edges$target, a$row_id)]
   stopifnot(!anyNA(edges), all(is.finite(edges$weight)), all(edges$weight > 0))
   graph <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = a$RID)
-  footprints <- payload$footprints
+  footprints <- region_data$footprints
   if (is.null(footprints) || !length(footprints)) footprints <- data.frame(RID = character(),
     original_RID = character(), chr = character(), start = integer(), end = integer(),
     size = integer(), track = character())
   footprints <- as.data.frame(footprints, stringsAsFactors = FALSE)
   footprints <- footprints[footprints$RID %in% a$RID, , drop = FALSE]
-  tracks <- if (is.null(payload$footprint_tracks)) unique(footprints$track) else unlist(payload$footprint_tracks)
+  tracks <- if (is.null(region_data$footprint_tracks)) unique(footprints$track) else unlist(region_data$footprint_tracks)
   focal <- data.frame(chr = region$chr, pos = region$focal_pos, variant_id = region$focal_snp,
     ref = region$ref, alt = region$alt)
   result <- list(assignments = a, region = region, site_met_mat = met, acf = acf, graph = graph,
     n_clusters = nlevels(a$cluster), variants = focal, focal = focal,
-    params = if (is.null(payload$params)) list(seed = 0L) else payload$params,
+    params = if (is.null(region_data$params)) list(seed = 0L) else region_data$params,
     footprints = footprints, footprint_tracks = intersect(LCL_FOOTPRINT_TRACKS, tracks))
   fiberseq_display_result(result)
 }
 ```
 
-```{r function-autocor-acf-heatmap, include=TRUE}
+<!-- heatmap of each read's ACF, rows split by cluster and ordered by read start. Parameters: lag 0 omitted, color limits at the 99th percentile of |ACF| -->
+```{r function-autocor-acf-heatmap, include=FALSE}
 autocor_acf_heatmap <- function(result) {
   a <- result$assignments
   ordering <- order(a$cluster, a$start, a$RID)
@@ -688,7 +744,8 @@ autocor_acf_heatmap <- function(result) {
 }
 ```
 
-```{r function-autocor-cluster-proportions, include=TRUE}
+<!-- pie chart of the number and percent of reads per cluster. Parameters: percent labels drawn for clusters >= 3% -->
+```{r function-autocor-cluster-proportions, include=FALSE}
 autocor_cluster_proportions <- function(result) {
   groups <- levels(result$assignments$cluster)
   counts <- data.frame(cluster = factor(groups, levels = groups),
@@ -709,7 +766,8 @@ autocor_cluster_proportions <- function(result) {
 }
 ```
 
-```{r function-autocor-umap-overview, include=TRUE}
+<!-- combine UMAPs colored by cluster, LCL sample and focal SNP allele with the cluster pie chart -->
+```{r function-autocor-umap-overview, include=FALSE}
 autocor_umap_overview <- function(result) {
   embedding <- result$assignments
   embedding$UMAP1 <- embedding$umap1
@@ -724,7 +782,7 @@ autocor_umap_overview <- function(result) {
   cluster_labels <- paste0(groups, " (n=", as.integer(table(embedding$cluster)), ")")
   cluster_plot <- plot_umap(embedding, "cluster", cluster_colors, "UMAP: cluster")
   sample_plot <- plot_umap(embedding, "sample_name", sample_colors, "UMAP: LCL sample")
-  allele_plot <- plot_umap(embedding, "allele_display", allele_colors, "UMAP: focal SNP allele")
+  allele_plot <- plot_umap(embedding, "allele_display", allele_colors, "UMAP: Focal SNP allele")
   legends <- list(fiberseq_legend(cluster_colors, "Cluster", 5, cluster_labels),
     fiberseq_legend(sample_colors, "LCL sample", 6, sub("_.*$", "", names(sample_colors))),
     fiberseq_legend(allele_colors, "Focal SNP allele", 3))
@@ -737,7 +795,8 @@ autocor_umap_overview <- function(result) {
 }
 ```
 
-```{r function-autocor-profile-composition, include=TRUE}
+<!-- per-cluster m6A and nucleosome profiles with sample and allele composition bars -->
+```{r function-autocor-profile-composition, include=FALSE}
 autocor_profile_composition <- function(result) {
   short_colors <- sample_palette(result$assignments$sample_name)
   samples <- unique(result$assignments$sample_name)
@@ -749,7 +808,8 @@ autocor_profile_composition <- function(result) {
 }
 ```
 
-```{r function-autocor-haplotype-example, include=TRUE}
+<!-- stack the UMAP overview on top of the per-cluster profiles -->
+```{r function-autocor-haplotype-example, include=FALSE}
 autocor_haplotype_example <- function(result) {
   overview <- autocor_umap_overview(result)
   profiles <- autocor_profile_composition(result)
@@ -758,21 +818,8 @@ autocor_haplotype_example <- function(result) {
 }
 ```
 
-```{r function-fiberseq-colors, include=TRUE}
-LCL_CLUSTER_COLORS <- c("dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00", "black", "gold1",
-  "skyblue2", "#FB9A99", "palegreen2", "#CAB2D6", "#FDBF6F", "gray70", "khaki2",
-  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4", "darkturquoise",
-  "green1", "yellow4", "yellow3", "darkorange4", "brown")
-LCL_HAPLOTYPE_COLORS <- c(HP1 = "#ADD8E6", HP2 = "#FFF2AE", unphased = "#999999", pooled = "#BBBBBB")
-LCL_TRACK_COLORS <- c(m6A = "#800080", "ft_nuc_130-160bp" = "#4d4d4d",
-  "FiberHMM_10-30bp" = "#fdae6b", "FiberHMM_40-60bp" = "#f16913", "FiberHMM_60-80bp" = "#a63603")
-LCL_TRACK_LABELS <- c(m6A = "m6A", "ft_nuc_130-160bp" = "nucleosome footprint (130-160 bp)",
-  "FiberHMM_10-30bp" = "TF footprint 10-30 bp", "FiberHMM_40-60bp" = "TF footprint 40-60 bp",
-  "FiberHMM_60-80bp" = "TF footprint 60-80 bp")
-LCL_FOOTPRINT_TRACKS <- c("ft_nuc_130-160bp", "FiberHMM_10-30bp", "FiberHMM_40-60bp", "FiberHMM_60-80bp")
-```
-
-```{r function-autocor-fiberseq-packages, include=TRUE}
+<!-- check that the R packages needed for plotting are installed -->
+```{r function-autocor-fiberseq-packages, include=FALSE}
 autocor_fiberseq_packages <- function() {
   packages <- c("Matrix", "ggplot2", "ComplexHeatmap", "circlize", "igraph", "cowplot", "dplyr", "scales", "svglite", "png")
   missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
@@ -781,635 +828,10 @@ autocor_fiberseq_packages <- function() {
 }
 ```
 
-```{r function-cluster-id-palette, include=TRUE}
-cluster_id_palette <- function(levels) {
-  if (!length(levels)) return(setNames(character(), character()))
-  levels <- as.character(levels)
-  index <- suppressWarnings(as.integer(sub("^cluster", "", levels)))
-  if (all(grepl("^[0-9]+$", levels))) index <- index + 1L
-  if (anyNA(index) || any(index < 1L)) index <- seq_along(levels)
-  colors <- if (max(index) <= length(LCL_CLUSTER_COLORS)) LCL_CLUSTER_COLORS[index] else
-    grDevices::colorRampPalette(LCL_CLUSTER_COLORS)(max(index))[index]
-  setNames(colors, levels)
-}
-```
-
-```{r function-feature-colors, include=TRUE}
-feature_colors <- function(tracks) {
-  stopifnot(all(tracks %in% names(LCL_TRACK_COLORS)))
-  LCL_TRACK_COLORS[tracks]
-}
-```
-
-```{r function-plot-smf-reads, include=TRUE}
-plot_smf_reads <- function(result, records, sample_colors, tracks = LCL_FOOTPRINT_TRACKS,
-                                include_haplotype = FALSE) {
-  tracks <- intersect(tracks, result$footprint_tracks)
-  records <- records[records$track %in% tracks, , drop = FALSE]
-  prepared <- prepare_read_tracks(result, records, sample_colors)
-  reads <- prepared$reads
-  features <- prepared$features[prepared$features$track %in% tracks, , drop = FALSE]
-  anchor <- prepared$anchor
-  width <- max(1, anchor$right - anchor$left)
-  feature_colors <- feature_colors(tracks)
-  # Draw nucleosomes first and TF footprints on top, as in TNF Fig 1.
-  features <- features[order(match(features$track, tracks)), ]
-  features$ymin <- features$row - 0.45
-  features$ymax <- features$row + 0.45
-  features$fill <- unname(feature_colors[features$track])
-  cluster_colors <- cluster_id_palette(levels(reads$cluster))
-  bars <- rbind(fiberseq_annotation_bar(reads, anchor, width, 0.075, cluster_colors[as.character(reads$cluster)]),
-    fiberseq_annotation_bar(reads, anchor, width, 0.040, sample_colors[reads$sample_label]))
-  allele_colors <- if (identical(result$region$region_type, "top_asfire_het"))
-    fiberseq_category_palette(result$allele_display_levels) else LCL_HAPLOTYPE_COLORS
-  allele <- if (identical(result$region$region_type, "top_asfire_het")) as.character(reads$allele_display) else reads$haplotype
-  if (include_haplotype) bars <- rbind(bars, fiberseq_annotation_bar(reads, anchor, width, 0.110, allele_colors[allele]))
-  legend_colors <- c(feature_colors, sample_colors,
-    if (include_haplotype) allele_colors)
-  legend_labels <- c(unname(LCL_TRACK_LABELS[tracks]), names(sample_colors),
-    if (include_haplotype) names(allele_colors))
-  counts <- table(reads$cluster)
-  cluster_labels <- setNames(paste0(names(counts), " (n=", as.integer(counts), ")"), names(counts))
-  ticks <- pretty(c(anchor$left, anchor$right), n = 6)
-  ggplot2::ggplot() +
-    ggplot2::geom_segment(data = reads, ggplot2::aes(x = left, xend = right, y = row, yend = row),
-      color = "grey80", linewidth = 0.25) +
-    ggplot2::geom_rect(data = features,
-      ggplot2::aes(xmin = left, xmax = right, ymin = ymin, ymax = ymax, fill = fill)) +
-    ggplot2::geom_rect(data = bars,
-      ggplot2::aes(xmin = left, xmax = right, ymin = row - 0.5, ymax = row + 0.5, fill = fill)) +
-    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.3) +
-    ggplot2::scale_fill_identity(guide = "legend", name = NULL,
-      breaks = unname(legend_colors), labels = legend_labels) +
-    ggplot2::scale_x_continuous(limits = c(anchor$left - (if (include_haplotype) 0.12 * width else 0.085 * width),
-      anchor$right + 0.5), breaks = ticks[ticks >= anchor$left & ticks <= anchor$right], expand = c(0, 0)) +
-    ggplot2::scale_y_reverse(expand = ggplot2::expansion(add = 0.6)) +
-    ggplot2::facet_grid(cluster ~ ., scales = "free_y", space = "free_y",
-      labeller = ggplot2::as_labeller(cluster_labels)) +
-    ggplot2::labs(x = anchor$x_label, y = "SMF reads",
-      title = paste(c(result$region$annotation, result$group_id), collapse = " | "),
-      subtitle = "One row per retained molecule; saved autocorrelation-defined Leiden clusters") +
-    ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4, byrow = TRUE)) +
-    cowplot::theme_cowplot(font_size = 10) +
-    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank(),
-      axis.line.y = ggplot2::element_blank(), strip.text.y = ggplot2::element_text(angle = 0),
-      panel.spacing.y = grid::unit(2, "mm"), legend.position = "bottom",
-      legend.text = ggplot2::element_text(size = 8), legend.key.size = grid::unit(3, "mm"))
-}
-```
-
-```{r function-plot-signal-profile, include=TRUE}
-plot_signal_profile <- function(profiles, region, clusters,
-                                     title = region$annotation) {
-  profiles <- profiles[profiles$track %in% names(LCL_TRACK_COLORS), , drop = FALSE]
-  anchor <- plot_anchor(region)
-  profiles$relative_pos <- anchor$direction * (profiles$pos - anchor$anchor)
-  profiles$cluster <- factor(profiles$cluster, levels = clusters)
-  profiles$track <- factor(profiles$track, levels = names(LCL_TRACK_COLORS)[names(LCL_TRACK_COLORS) %in% profiles$track])
-  profiles <- profiles[order(profiles$cluster, profiles$track, profiles$relative_pos), ]
-  colors <- feature_colors(levels(profiles$track))
-  counts <- unique(profiles[, c("cluster", "n_reads")])
-  labels <- setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
-  plot <- ggplot2::ggplot(profiles,
-    ggplot2::aes(relative_pos, fraction, fill = track, color = track, group = track))
-  plot <- plot + ggplot2::geom_ribbon(
-    data = profiles[profiles$track == "ft_nuc_130-160bp", , drop = FALSE],
-    ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", color = NA, alpha = .18) +
-    ggplot2::geom_line(linewidth = 0.5)
-  plot + ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
-    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.4) +
-    ggplot2::scale_fill_manual(values = colors, labels = LCL_TRACK_LABELS) +
-    ggplot2::scale_color_manual(values = colors, labels = LCL_TRACK_LABELS) +
-    ggplot2::scale_x_continuous(limits = c(anchor$left - 0.5, anchor$right + 0.5), expand = c(0, 0)) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
-      expand = ggplot2::expansion(mult = c(0, 0.02))) +
-    ggplot2::labs(x = anchor$x_label, y = "Fraction of cluster reads", title = title,
-      subtitle = "m6A calls and footprint occupancy; retained heterozygous reads", fill = "Plot track", color = "Plot track") +
-    cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
-    ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4), color = ggplot2::guide_legend(ncol = 4)) +
-    ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8),
-      plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
-}
-```
-
-```{r function-sample-palette, include=TRUE}
-sample_palette <- function(sample_names) {
-  labels <- sub("_.*$", "", sample_names)
-  labels <- unique(labels[order(as.integer(sub("^AL-?([0-9]+).*$", "\\1", labels)))])
-  setNames(grDevices::hcl.colors(length(labels), "Dynamic"), labels)
-}
-```
-
-```{r function-plot-genomic-cluster-heatmap, include=TRUE}
-plot_genomic_cluster_heatmap <- function(res, region, sample_colors,
-                                     include_haplotype = FALSE, variants = NULL,
-                                     show_cluster_profiles = FALSE, split_alleles = FALSE,
-                                     cluster_label = "Autocorrelation-defined Leiden clusters") {
-  assignments <- res$assignments
-  if (split_alleles) stopifnot(include_haplotype, !is.null(assignments$allele_display))
-  ordering <- if (split_alleles) order(assignments$allele_display, assignments$cluster, assignments$start, assignments$RID) else
-    order(assignments$cluster, assignments$start, assignments$RID)
-  assignments <- assignments[ordering, , drop = FALSE]
-  sample <- factor(sub("_.*$", "", assignments$sample_name), levels = names(sample_colors))
-  annotation <- ComplexHeatmap::rowAnnotation(
-    cluster = assignments$cluster, sample = sample,
-    col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors))
-  if (include_haplotype && identical(region$region_type, "top_asfire_het")) {
-    annotation <- ComplexHeatmap::rowAnnotation(
-      cluster = assignments$cluster, sample = sample, allele = assignments$allele_display,
-      col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors,
-        allele = fiberseq_category_palette(res$allele_display_levels)))
-  } else if (include_haplotype) {
-    annotation <- ComplexHeatmap::rowAnnotation(
-      cluster = assignments$cluster, sample = sample, haplotype = assignments$haplotype,
-      col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors,
-        haplotype = LCL_HAPLOTYPE_COLORS))
-  }
-  met <- matrix(0L, nrow(assignments), region$width,
-                  dimnames = list(assignments$RID, seq.int(region$analysis_start, region$analysis_end)))
-  met[, match(colnames(res$site_met_mat), colnames(met))] <- as.matrix(res$site_met_mat[assignments$RID, , drop = FALSE])
-  display <- met
-  colors <- c("0" = "white", "1" = "black")
-  legend <- list(at = c(0, 1), labels = c("no m6A call", "m6A"))
-  legend_name <- "m6A"
-  top <- NULL
-  if (show_cluster_profiles) {
-    cluster_colors <- cluster_id_palette(levels(assignments$cluster))
-    observed <- match(colnames(res$site_met_mat), colnames(met))
-    profile_annotations <- lapply(levels(assignments$cluster), function(cluster) {
-      selected <- assignments$cluster == cluster
-      ComplexHeatmap::anno_lines(
-        stats::approx(observed, colMeans(met[selected, observed, drop = FALSE]),
-          xout = seq_len(ncol(met)), rule = 1)$y,
-        ylim = c(0, 1), gp = grid::gpar(col = cluster_colors[[cluster]], lwd = 0.7),
-        axis_param = list(at = c(0, 0.5, 1), labels = c("0", ".5", "1")),
-        height = grid::unit(12, "mm"))
-    })
-    names(profile_annotations) <- paste0(levels(assignments$cluster), " m6A")
-    top <- do.call(ComplexHeatmap::HeatmapAnnotation, c(profile_annotations,
-      list(annotation_name_gp = grid::gpar(fontsize = 8), gap = grid::unit(1.5, "mm"))))
-  }
-  ticks <- unique(round(seq(1, ncol(display), length.out = 5L)))
-  bottom_parts <- list(coordinate = ComplexHeatmap::anno_mark(at = ticks,
-    labels = format(as.integer(colnames(display)[ticks]), scientific = FALSE, trim = TRUE),
-    which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 8)))
-  if (identical(region$region_type, "promoter") && !is.null(region$tss) &&
-      !is.na(region$tss) && region$tss >= region$analysis_start && region$tss <= region$analysis_end) {
-    bottom_parts$TSS <- ComplexHeatmap::anno_mark(
-      at = region$tss - region$analysis_start + 1L,
-      labels = paste0("TSS: ", region$chr, ":", region$tss),
-      which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 8, col = "#D55E00"))
-  }
-  snps <- if (!is.null(region$focal_snp)) data.frame(pos = region$focal_pos,
-    label = paste0(region$focal_snp, " ", region$ref, ">", region$alt)) else window_snps(variants, region)
-  if (nrow(snps)) {
-    bottom_parts$SNP <- ComplexHeatmap::anno_mark(
-      at = snps$pos - region$analysis_start + 1L, labels = snps$label,
-      which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 7),
-      link_gp = grid::gpar(col = "#984EA3"))
-  }
-  bottom <- do.call(ComplexHeatmap::HeatmapAnnotation, c(bottom_parts,
-    list(annotation_name_gp = grid::gpar(fontsize = 8))))
-  ComplexHeatmap::Heatmap(
-    display, name = legend_name, col = colors, heatmap_legend_param = legend,
-    cluster_rows = FALSE, cluster_columns = FALSE, cluster_row_slices = FALSE,
-    row_split = if (split_alleles) data.frame(allele = assignments$allele_display,
-      cluster = assignments$cluster) else assignments$cluster,
-    row_gap = grid::unit(if (split_alleles) 3 else 0.6, "mm"),
-    row_title_rot = 0, row_title_gp = grid::gpar(fontsize = 8),
-    show_row_names = FALSE, show_column_names = FALSE,
-    use_raster = TRUE, raster_quality = 4, raster_resize_mat = FALSE,
-    raster_device = "png", raster_by_magick = FALSE,
-    left_annotation = annotation,
-    top_annotation = top, bottom_annotation = bottom,
-    column_title = paste(c(region$annotation,
-      if (include_haplotype) paste0(cluster_label, "; focal allele annotated per sample"),
-      if (split_alleles) "Rows split by focal allele, then cluster",
-      if (show_cluster_profiles) "Top: m6A call fraction per cluster (all full-span reads)",
-      if (include_haplotype && !nrow(snps)) "No phased heterozygous SNP in this window",
-      paste0(region$chr, ":", region$analysis_start, "-", region$analysis_end)), collapse = "\n"),
-    column_title_gp = grid::gpar(fontsize = 11))
-}
-```
-
-```{r function-fiberseq-category-palette, include=TRUE}
-fiberseq_category_palette <- function(categories) {
-  categories <- sort(unique(as.character(categories)))
-  categories <- c(setdiff(categories, c("unphased", "Unknown allele")),
-    intersect(c("unphased", "Unknown allele"), categories))
-  colors <- setNames(grDevices::hcl.colors(length(categories), "Dynamic"), categories)
-  focal <- categories[grepl("^rs[0-9]+: [ACGT]$", categories)]
-  colors[focal] <- c("#0072B2", "#D55E00", "#CC79A7", "#009E73")[seq_along(focal)]
-  unknown <- intersect(c("unphased", "Unknown allele"), categories)
-  colors[unknown] <- "#555555"
-  colors
-}
-```
-
-```{r function-fiberseq-legend, include=TRUE}
-fiberseq_legend <- function(colors, title, columns = 4L, labels = names(colors)) {
-  d <- data.frame(category = factor(names(colors), levels = names(colors)), x = 1, y = 1)
-  p <- ggplot2::ggplot(d, ggplot2::aes(x, y, color = category)) +
-    ggplot2::geom_point() + ggplot2::scale_color_manual(values = colors, labels = labels, drop = FALSE) +
-    ggplot2::guides(color = ggplot2::guide_legend(title = title, title.position = "top", ncol = columns, byrow = TRUE,
-      override.aes = list(size = 3))) + ggplot2::theme_void() +
-    ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8))
-  cowplot::get_legend(p)
-}
-```
-
-```{r function-fiberseq-legend-height, include=TRUE}
-fiberseq_legend_height <- function(legend) {
-  grid::convertHeight(sum(legend$heights), "in", valueOnly = TRUE) + .2
-}
-```
-
-```{r function-plot-fiberseq-profiles, include=TRUE}
-plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, sample_colors, allele_colors,
-                                  title = region$annotation) {
-  allele_heading <- if (identical(region$region_type, "top_asfire_het"))
-    "Focal SNP allele" else "Allele / local haplotype"
-  rows <- lapply(tables$groups, function(cluster) {
-    d <- tables$profiles[tables$profiles$cluster == cluster, ]
-    n <- tables$counts$n_reads[match(cluster, tables$counts$cluster)]
-    nuc <- d[d$track == "ft_nuc_130-160bp", , drop = FALSE]
-    met <- d[d$track == "m6A", , drop = FALSE]
-    p <- ggplot2::ggplot(d, ggplot2::aes(pos, fraction)) +
-      ggplot2::geom_ribbon(data = nuc, ggplot2::aes(ymin = 0, ymax = fraction),
-        fill = "#808080", alpha = .18, color = NA) +
-      ggplot2::geom_line(data = nuc, color = "#666666", linewidth = .55) +
-      ggplot2::geom_line(data = met, color = cluster_colors[[cluster]], linewidth = .45) +
-      ggplot2::scale_x_continuous(limits = c(region$analysis_start, region$analysis_end),
-        labels = function(x) format(x, scientific = FALSE, trim = TRUE), expand = ggplot2::expansion(mult = 0)) +
-      ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1)) +
-      ggplot2::labs(title = paste0(cluster, " (n = ", n, ")"), x = paste0(region$chr, " (1-based bp)"), y = "Read fraction") +
-      ggplot2::theme_bw(base_size = 9) + ggplot2::theme(legend.position = "none",
-        plot.title = ggplot2::element_text(color = cluster_colors[[cluster]], face = "bold"))
-    if (nrow(markers)) {
-      p <- p +
-        ggplot2::geom_vline(data = markers, ggplot2::aes(xintercept = pos),
-          inherit.aes = FALSE, color = "#666666", linetype = "dotted", linewidth = .35)
-    }
-    cowplot::plot_grid(p, fiberseq_composition_bar(tables$sample, cluster, n, sample_colors, "LCL sample"),
-      fiberseq_composition_bar(tables$allele, cluster, n, allele_colors, allele_heading), nrow = 1,
-      rel_widths = c(2.7, 1, 1.5), align = "h", axis = "tb")
-  })
-  marker_text <- if (nrow(markers)) paste(paste0(markers$label, ": ", markers$pos),
-    collapse = "; ") else "No focal annotation resolved"
-  footprint_caption <- if ("ft_nuc_130-160bp" %in% tables$profiles$track)
-    "grey line / light grey fill: 130-160 bp nucleosome occupancy" else "nucleosome footprints unavailable"
-  header <- cowplot::ggdraw() + cowplot::draw_label(paste0(title,
-    "\nCluster color: m6A calls; ", footprint_caption, "\n",
-    paste(strwrap(marker_text, width = 155), collapse = "\n")), size = 10)
-  sample_legend <- fiberseq_legend(sample_colors, "LCL sample", 6, sub("_.*$", "", names(sample_colors)))
-  allele_legend <- fiberseq_legend(allele_colors, allele_heading, 3)
-  heights <- c(.85, rep(1.35, length(rows)), fiberseq_legend_height(sample_legend), fiberseq_legend_height(allele_legend))
-  plot <- cowplot::plot_grid(plotlist = c(list(header), rows, list(sample_legend, allele_legend)),
-                            ncol = 1, rel_heights = heights)
-  list(plot = plot, height = sum(heights))
-}
-```
-
-```{r function-plot-umap, include=TRUE}
-plot_umap <- function(embedding, column, colors, title, labels = names(colors),
-                           show_legend = FALSE) {
-  ggplot2::ggplot(embedding, ggplot2::aes(UMAP1, UMAP2, color = .data[[column]])) +
-    ggplot2::geom_point(size = .9, alpha = .75) +
-    ggplot2::scale_color_manual(values = colors, labels = labels, breaks = names(colors), drop = FALSE) +
-    ggplot2::coord_equal() + ggplot2::labs(title = title, color = NULL) +
-    ggplot2::theme_bw(base_size = 10) +
-    ggplot2::theme(legend.position = if (show_legend) "right" else "none")
-}
-```
-
-```{r function-plot-knn-graph, include=TRUE}
-plot_knn_graph <- function(result, main = NULL, seed = NULL, vertex_size = 1.5,
-                           edge_width = 0.3, edge_alpha = 0.2, color_by = c("cluster", "allele")) {
-  color_by <- match.arg(color_by)
-  graph <- result$graph
-  assignments <- result$assignments
-  if (!igraph::is_igraph(graph)) stop("The clustering result must contain its saved KNN graph")
-  stopifnot(all(c("RID", "cluster") %in% names(assignments)),
-    !igraph::is_directed(graph), igraph::vcount(graph) > 0L,
-    !anyNA(assignments$RID), !anyDuplicated(assignments$RID), !anyNA(assignments$cluster))
-  read_ids <- igraph::V(graph)$name
-  stopifnot(length(read_ids) == igraph::vcount(graph), !anyNA(read_ids),
-    !anyDuplicated(read_ids), setequal(read_ids, as.character(assignments$RID)))
-  assignments <- assignments[match(read_ids, assignments$RID), , drop = FALSE]
-  clusters <- if (is.factor(assignments$cluster)) levels(droplevels(assignments$cluster)) else
-    unique(as.character(assignments$cluster))
-  colors <- cluster_id_palette(clusters)
-  weights <- igraph::edge_attr(graph, "weight")
-  if (length(weights)) stopifnot(all(is.finite(weights)), all(weights > 0))
-  if (is.null(seed)) seed <- if (is.null(result$params$seed)) 1L else result$params$seed
-  stopifnot(length(seed) == 1L, is.finite(seed))
-  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  if (had_seed) previous_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
-  on.exit({
-    if (had_seed) {
-      assign(".Random.seed", previous_seed, envir = .GlobalEnv)
-    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
-      rm(".Random.seed", envir = .GlobalEnv)
-    }
-  }, add = TRUE)
-  set.seed(seed)
-  coordinates <- igraph::layout_with_fr(graph, weights = weights)
-  nodes <- data.frame(RID = read_ids, layout_x = coordinates[, 1], layout_y = coordinates[, 2],
-    cluster = factor(assignments$cluster, levels = clusters))
-  nodes$color_group <- nodes$cluster
-  color_levels <- clusters
-  legend_title <- "Leiden cluster"
-  if (color_by == "allele") {
-    summary <- knn_allele_summary(result)
-    color_levels <- summary$allele_levels
-    nodes$color_group <- factor(assignments$allele_label, levels = color_levels)
-    colors <- fiberseq_category_palette(color_levels)
-    legend_title <- "Focal SNP allele"
-  }
-  endpoints <- igraph::as_edgelist(graph, names = FALSE)
-  edges <- data.frame(from_x = coordinates[endpoints[, 1], 1],
-    from_y = coordinates[endpoints[, 1], 2], to_x = coordinates[endpoints[, 2], 1],
-    to_y = coordinates[endpoints[, 2], 2])
-  counts <- table(nodes$color_group)
-  labels <- paste0(color_levels, " (n=", as.integer(counts[color_levels]), ")")
-  if (is.null(main)) main <- paste(c(result$region$annotation,
-    paste("ACF correlation-neighbor graph colored by", if (color_by == "allele") "focal SNP allele" else "Leiden cluster")),
-    collapse = "\n")
-  neighbors <- if (is.null(result$params$k_eff)) result$params$k_neighbors else result$params$k_eff
-  settings <- c(paste(nrow(nodes), "reads"), paste(nrow(edges), "edges"),
-    if (!is.null(neighbors)) paste0("k = ", neighbors),
-    if (!is.null(result$params$resolution)) paste0("resolution = ", result$params$resolution))
-  ggplot2::ggplot() +
-    ggplot2::geom_segment(data = edges,
-      ggplot2::aes(x = from_x, y = from_y, xend = to_x, yend = to_y),
-      color = "grey60", linewidth = edge_width, alpha = edge_alpha) +
-    ggplot2::geom_point(data = nodes, ggplot2::aes(layout_x, layout_y, color = color_group),
-      size = vertex_size) +
-    ggplot2::scale_color_manual(values = colors, breaks = color_levels, labels = labels, drop = FALSE) +
-    ggplot2::coord_equal() +
-    ggplot2::labs(title = main, subtitle = paste(settings, collapse = " | "), color = legend_title) +
-    ggplot2::theme_void(base_size = 11) +
-    ggplot2::theme(legend.position = "right", plot.title = ggplot2::element_text(hjust = 0.5),
-      plot.subtitle = ggplot2::element_text(hjust = 0.5),
-      plot.margin = ggplot2::margin(12, 12, 12, 12))
-}
-```
-
-```{r function-knn-allele-summary, include=TRUE}
-knn_allele_summary <- function(result) {
-  graph <- result$graph
-  assignments <- result$assignments
-  focal <- result$focal
-  stopifnot(igraph::is_igraph(graph), !igraph::is_directed(graph), igraph::is_simple(graph),
-    nrow(assignments) > 1L, !is.null(focal), nrow(focal) == 1L,
-    all(c("RID", "cluster", "allele_label", "allele_status") %in% names(assignments)),
-    !anyNA(assignments$RID), !anyDuplicated(assignments$RID), !anyNA(assignments$cluster),
-    !anyNA(assignments$allele_label), all(assignments$allele_status == "phased_focal_genotype"))
-  alleles <- sort(paste0(focal$variant_id, ": ", c(focal$ref, focal$alt)))
-  stopifnot(length(alleles) == 2L, length(unique(alleles)) == 2L,
-    all(grepl("^rs[0-9]+: [ACGT]$", alleles)), all(assignments$allele_label %in% alleles))
-  read_ids <- igraph::V(graph)$name
-  stopifnot(length(read_ids) == igraph::vcount(graph), !anyNA(read_ids),
-    !anyDuplicated(read_ids), setequal(read_ids, as.character(assignments$RID)))
-  assignments <- assignments[match(read_ids, assignments$RID), , drop = FALSE]
-  clusters <- if (is.factor(assignments$cluster)) levels(droplevels(assignments$cluster)) else
-    unique(as.character(assignments$cluster))
-  stopifnot(!"All reads" %in% clusters)
-  allele <- factor(assignments$allele_label, levels = alleles)
-  composition <- as.data.frame(table(group = factor(assignments$cluster, levels = clusters),
-    allele = allele), stringsAsFactors = FALSE)
-  names(composition)[3] <- "n_reads"
-  overall <- data.frame(group = "All reads", allele = alleles, n_reads = as.integer(table(allele)))
-  composition <- dplyr::bind_rows(overall, composition)
-  composition$group <- factor(composition$group, levels = c("All reads", clusters))
-  composition$allele <- factor(composition$allele, levels = alleles)
-  composition$total_reads <- ave(composition$n_reads, composition$group, FUN = sum)
-  composition$fraction <- composition$n_reads / composition$total_reads
-  endpoints <- igraph::as_edgelist(graph, names = FALSE)
-  source_nodes <- c(endpoints[, 1], endpoints[, 2])
-  target_nodes <- c(endpoints[, 2], endpoints[, 1])
-  degree <- tabulate(source_nodes, nbins = length(read_ids))
-  same <- tabulate(source_nodes[allele[source_nodes] == allele[target_nodes]], nbins = length(read_ids))
-  reads <- data.frame(RID = read_ids, cluster = assignments$cluster, allele = allele,
-    degree = degree, same_allele_neighbors = same, opposite_allele_neighbors = degree - same)
-  reads$same_fraction <- ifelse(degree > 0L, same / degree, NA_real_)
-  reads$opposite_fraction <- ifelse(degree > 0L, (degree - same) / degree, NA_real_)
-  connectivity <- dplyr::bind_rows(lapply(alleles, function(label) {
-    selected <- reads$allele == label
-    connected <- selected & reads$degree > 0L
-    data.frame(allele = label, n_reads = sum(selected), n_reads_with_neighbors = sum(connected),
-      n_isolated_reads = sum(selected & reads$degree == 0L),
-      same_fraction = if (any(connected)) mean(reads$same_fraction[connected]) else NA_real_,
-      opposite_fraction = if (any(connected)) mean(reads$opposite_fraction[connected]) else NA_real_,
-      expected_same_fraction = if (any(selected)) (sum(selected) - 1L) / (nrow(reads) - 1L) else NA_real_)
-  }))
-  connectivity$allele <- factor(connectivity$allele, levels = alleles)
-  list(allele_levels = alleles, composition = composition, reads = reads, connectivity = connectivity)
-}
-```
-
-```{r function-cluster-site-profiles, include=TRUE}
-cluster_site_profiles <- function(res, met_mat) {
-  M  <- as.matrix(met_mat)
-  df <- res$assignments
-  df <- df[df$RID %in% rownames(M), ]
-  do.call(rbind, lapply(levels(df$cluster), function(cl) {
-    rids <- df$RID[df$cluster == cl]
-    met  <- colMeans(M[rids, , drop = FALSE], na.rm = TRUE)
-    met[is.nan(met)] <- NA
-    data.frame(cluster = cl, pos = as.numeric(colnames(M)), met = met,
-               n_reads = length(rids), row.names = NULL)
-  }))
-}
-```
-
-```{r function-window-snps, include=TRUE}
-window_snps <- function(variants, region) {
-  empty <- data.frame(pos = integer(), label = character())
-  if (is.null(variants) || !nrow(variants)) return(empty)
-  snps <- variants[variants$chr == region$chr & variants$pos >= region$analysis_start &
-    variants$pos <= region$analysis_end & nchar(variants$ref) == 1L &
-    grepl("^[ACGT](,[ACGT])*$", variants$alt), , drop = FALSE]
-  if (!nrow(snps)) return(empty)
-  snps$id <- ifelse(is.na(snps$variant_id) | snps$variant_id == ".", "SNP", snps$variant_id)
-  snps$label <- paste0(snps$id, " ", snps$pos, " ", snps$ref, ">", snps$alt)
-  labels <- tapply(snps$label, snps$pos, function(x) paste(unique(x), collapse = "; "))
-  data.frame(pos = as.integer(names(labels)), label = unname(labels))
-}
-```
-
-```{r function-focal-markers, include=TRUE}
-focal_markers <- function(result) {
-  focal <- result$focal
-  if (!is.null(focal) && nrow(focal))
-    return(data.frame(pos = focal$pos, end = focal$pos,
-      label = paste0(focal$variant_id, " ", focal$ref, ">", focal$alt)))
-  region <- result$region
-  if (!is.null(region$focal_pos) && !is.na(region$focal_pos))
-    return(data.frame(pos = region$focal_pos, end = region$focal_pos, label = region$focal_snp))
-  if (!is.null(region$tss) && !is.na(region$tss))
-    return(data.frame(pos = region$tss, end = region$tss, label = paste(region$gene, "TSS")))
-  data.frame(pos = integer(), end = integer(), label = character())
-}
-```
-
-```{r function-fiberseq-display-result, include=TRUE}
-fiberseq_display_result <- function(result) {
-  result$markers <- focal_markers(result)
-  a <- result$assignments
-  a$allele_display <- a$allele_label
-  anchored <- !is.null(result$region$focal_pos) && !is.na(result$region$focal_pos)
-  if (anchored) {
-    known <- a$allele_status == "phased_focal_genotype"
-    strict <- identical(result$region$region_type, "top_asfire_het")
-    if (strict && (!all(known) || !all(a$focal_genotype %in% c("0|1", "1|0"))))
-      stop("Top AS-FIRE plots require only resolved phased heterozygous reads")
-    a$allele_display[!known] <- "Unknown allele"
-    bases <- a$allele_label[known]
-    v <- result$variants
-    if (!is.null(v) && nrow(v)) {
-      v <- v[v$chr == result$region$chr & v$pos == result$region$focal_pos, , drop = FALSE]
-      bases <- c(bases, paste0(if (is.null(result$region$focal_snp)) result$region$region_id else result$region$focal_snp, ": ",
-        unique(c(v$ref, unlist(strsplit(v$alt, ",", fixed = TRUE))))))
-    }
-    bases <- sort(unique(bases[grepl("^rs[0-9]+: [ACGT]$", bases)]))
-    if (strict) {
-      bases <- sort(paste0(result$region$focal_snp, ": ", c(result$region$ref, result$region$alt)))
-      stopifnot(length(unique(bases)) == 2L, all(a$allele_label %in% bases))
-    }
-    result$allele_display_levels <- if (strict) bases else c(bases, "Unknown allele")
-  } else {
-    result$allele_display_levels <- if (is.null(result$allele_levels))
-      sort(unique(a$allele_label)) else result$allele_levels
-  }
-  a$allele_display <- factor(a$allele_display, levels = result$allele_display_levels)
-  stopifnot(!anyNA(a$allele_display))
-  result$assignments <- a
-  result
-}
-```
-
-```{r function-fiberseq-tables, include=TRUE}
-fiberseq_tables <- function(result, footprints) {
-  result <- fiberseq_display_result(result)
-  a <- result$assignments
-  groups <- if (is.factor(a$cluster)) levels(droplevels(a$cluster)) else unique(a$cluster)
-  group <- factor(a$cluster, levels = groups)
-  counts <- data.frame(cluster = groups, n_reads = as.integer(table(group)), total_reads = nrow(a))
-  counts$proportion <- counts$n_reads / counts$total_reads
-  view <- result
-  view$assignments$cluster <- group
-  nuc <- footprint_profiles(footprints, intersect("ft_nuc_130-160bp", result$footprint_tracks),
-    view$assignments, view$region)
-  met <- cluster_site_profiles(view, view$site_met_mat)
-  profiles <- dplyr::bind_rows(data.frame(cluster = met$cluster, pos = met$pos,
-    track = "m6A", fraction = met$met, n_reads = met$n_reads), nuc)
-  profiles$cluster <- factor(profiles$cluster, levels = groups)
-  profiles$chr <- result$region$chr
-  profiles$coordinate_system <- "1-based inclusive"
-  stopifnot(all(is.finite(profiles$fraction)), all(profiles$fraction >= 0 & profiles$fraction <= 1))
-  list(counts = counts, sample = fiberseq_composition_table(a, group, counts, "sample_name"),
-       allele = fiberseq_composition_table(a, group, counts, "allele_display"),
-       profiles = profiles, groups = groups)
-}
-```
-
-```{r function-m6a-intervals, include=TRUE}
-m6a_intervals <- function(result) {
-  sites <- Matrix::summary(as(result$site_met_mat, "dgCMatrix"))
-  sites <- sites[sites$x > 0, , drop = FALSE]
-  positions <- as.integer(colnames(result$site_met_mat)[sites$j])
-  identifiers <- rownames(result$site_met_mat)[sites$i]
-  data.frame(RID = identifiers,
-    original_RID = result$assignments$original_RID[match(identifiers, result$assignments$RID)],
-    chr = rep(result$region$chr, length(identifiers)), start = positions - 1L,
-    end = positions, size = rep(1L, length(identifiers)), track = rep("m6A", length(identifiers)))
-}
-```
-
-```{r function-plot-anchor, include=TRUE}
-plot_anchor <- function(region) {
-  promoter <- identical(region$region_type, "promoter") && !is.null(region$tss) && !is.na(region$tss)
-  focal <- !is.null(region$focal_pos) && !is.na(region$focal_pos)
-  anchor <- if (focal) region$focal_pos else if (promoter) region$tss else floor(mean(c(region$analysis_start, region$analysis_end)))
-  direction <- if (promoter && region$strand == "-") -1L else 1L
-  bounds <- sort(direction * (c(region$analysis_start, region$analysis_end) - anchor))
-  list(anchor = anchor, direction = direction, left = bounds[1], right = bounds[2],
-    x_label = if (focal) paste0("Position relative to ", region$focal_snp, " (bp)") else if (promoter) "Position relative to canonical TSS (bp)" else "Position relative to region centre (bp)")
-}
-```
-
-```{r function-prepare-read-tracks, include=TRUE}
-prepare_read_tracks <- function(result, records, sample_colors) {
-  anchor <- plot_anchor(result$region)
-  reads <- result$assignments
-  reads <- reads[order(reads$cluster, reads$start, reads$RID), , drop = FALSE]
-  reads$row <- as.integer(ave(seq_len(nrow(reads)), reads$cluster, FUN = seq_along))
-  reads$sample_label <- sub("_.*$", "", reads$sample_name)
-  stopifnot(all(reads$sample_label %in% names(sample_colors)))
-  if (!"haplotype" %in% names(reads)) reads$haplotype <- "pooled"
-  relative_start <- anchor$direction * (reads$start - anchor$anchor)
-  relative_end <- anchor$direction * (reads$end - anchor$anchor)
-  reads$left <- pmax(pmin(relative_start, relative_end), anchor$left)
-  reads$right <- pmin(pmax(relative_start, relative_end), anchor$right)
-  matched <- match(records$RID, reads$RID)
-  records <- records[!is.na(matched), , drop = FALSE]
-  matched <- matched[!is.na(matched)]
-  records$row <- reads$row[matched]
-  records$cluster <- reads$cluster[matched]
-  relative_start <- anchor$direction * (records$start + 1L - anchor$anchor)
-  relative_end <- anchor$direction * (records$end - anchor$anchor)
-  records$left <- pmax(pmin(relative_start, relative_end) - 0.5, anchor$left - 0.5)
-  records$right <- pmin(pmax(relative_start, relative_end) + 0.5, anchor$right + 0.5)
-  list(reads = reads, features = records, anchor = anchor, region = result$region)
-}
-```
-
-```{r function-occupancy-matrix, include=TRUE}
-occupancy_matrix <- function(records, assignments, region) {
-  occupancy <- matrix(0L, nrow(assignments), region$width,
-                       dimnames = list(assignments$RID, seq.int(region$analysis_start, region$analysis_end)))
-  if (!nrow(records)) return(occupancy)
-  for (record_index in seq_len(nrow(records))) {
-    read_index <- match(records$RID[record_index], assignments$RID)
-    if (is.na(read_index)) next
-    left <- max(records$start[record_index], region$start) - region$start + 1L
-    right <- min(records$end[record_index], region$end) - region$start
-    if (left <= right) occupancy[read_index, seq.int(left, right)] <- 1L
-  }
-  occupancy
-}
-```
-
-```{r function-footprint-profiles, include=TRUE}
-footprint_profiles <- function(records, tracks, assignments, region) {
-  dplyr::bind_rows(lapply(tracks, function(track) {
-    occupancy <- occupancy_matrix(records[records$track == track, ], assignments, region)
-    dplyr::bind_rows(lapply(levels(assignments$cluster), function(cluster) {
-      selected <- assignments$cluster == cluster
-      data.frame(cluster = cluster, pos = as.integer(colnames(occupancy)), track = track,
-                 fraction = colMeans(occupancy[selected, , drop = FALSE]), n_reads = sum(selected))
-    }))
-  }))
-}
-```
-
-```{r function-signal-profiles, include=TRUE}
-signal_profiles <- function(result, footprints) {
-  footprints <- footprints[footprints$track %in% LCL_FOOTPRINT_TRACKS, , drop = FALSE]
-  records <- dplyr::bind_rows(m6a_intervals(result), footprints)
-  fp <- footprint_profiles(footprints, result$footprint_tracks, result$assignments, result$region)
-  met <- cluster_site_profiles(result, result$site_met_mat)
-  met <- data.frame(cluster = met$cluster, pos = met$pos, track = "m6A",
-    fraction = met$met, n_reads = met$n_reads)
-  list(records = records, tracks = c("m6A", result$footprint_tracks),
-       profiles = dplyr::bind_rows(met, fp))
-}
-```
-
-```{r function-acf-local-peaks, include=TRUE}
+<!-- find local maxima of one ACF curve. Parameters: prominence >= 0.01, peaks at least 20 bp apart; spacing filter applied before prominence, as in scipy.signal.find_peaks -->
+```{r function-acf-local-peaks, include=FALSE}
 acf_local_peaks <- function(profile, prominence = 0.01, distance = 20L) {
-  # Plateau peaks use the midpoint rounded down; endpoints are never peaks.
+
   profile <- as.numeric(profile)
   n <- length(profile)
   if (n < 3L || any(!is.finite(profile))) return(integer())
@@ -1455,9 +877,10 @@ acf_local_peaks <- function(profile, prominence = 0.01, distance = 20L) {
 }
 ```
 
-```{r function-repeat-candidates, include=TRUE}
+<!-- estimate the repeat length of one ACF curve: primary = highest positive peak, higher order = peaks near its multiples. Parameters: primary band 120–250 bp, multiples within ±20 bp, needs at least 252 lags -->
+```{r function-repeat-candidates, include=FALSE}
 repeat_candidates <- function(profile) {
-  # Returned positions are lags in bp (lag 0 is R vector position 1).
+
   profile <- as.numeric(profile)
   missing <- list(primary = NA_real_, higher = integer())
   if (length(profile) <= 251L || any(!is.finite(profile))) return(missing)
@@ -1479,7 +902,8 @@ repeat_candidates <- function(profile) {
 }
 ```
 
-```{r function-summarize-repeats, include=TRUE}
+<!-- for REF and ALT: median ACF across valid reads, its repeat candidates, and each read's primary peak; reads sorted by peak lag -->
+```{r function-summarize-repeats, include=FALSE}
 summarize_repeats <- function(profiles, records, region, allele_tables) {
   profiles <- as.matrix(profiles)
   audit <- allele_tables$allele_read_audit
@@ -1522,7 +946,8 @@ summarize_repeats <- function(profiles, records, region, allele_tables) {
 }
 ```
 
-```{r function-repeat-summary-table, include=TRUE}
+<!-- one row per allele: read counts, number and fraction of reads with a peak, primary and higher-order repeat lengths -->
+```{r function-repeat-summary-table, include=FALSE}
 repeat_summary_table <- function(rows) {
   do.call(rbind, lapply(rows, function(row) {
     complete <- length(row$median) >= 252L
@@ -1543,7 +968,8 @@ repeat_summary_table <- function(rows) {
 }
 ```
 
-```{r function-repeat-counts-caption, include=TRUE}
+<!-- caption text with valid, undefined-ACF and duplicate read counts per allele -->
+```{r function-repeat-counts-caption, include=FALSE}
 repeat_counts_caption <- function(rows) {
   paste(vapply(rows, function(row) {
     sprintf("%s: %s valid, %s undefined ACF, %s duplicates removed",
@@ -1552,7 +978,8 @@ repeat_counts_caption <- function(rows) {
 }
 ```
 
-```{r function-plot-haplotype-median-acf, include=TRUE}
+<!-- plot the median ACF of REF and ALT reads with the detected peaks. Parameters: 120–250 bp search band shaded; stars = primary peak, circles = higher-order peaks; lower/upper set the lag range (default all lags) -->
+```{r function-plot-haplotype-median-acf, include=FALSE}
 plot_haplotype_median_acf <- function(rows, region, lower = 0, upper = NULL) {
   max_lag <- max(vapply(rows, function(row) length(row$median), integer(1))) - 1L
   if (is.null(upper)) upper <- max_lag
@@ -1602,7 +1029,7 @@ plot_haplotype_median_acf <- function(rows, region, lower = 0, upper = NULL) {
       caption = paste("Primary search: 120–250 bp (shading); stars: primary peaks; open circles: observed peaks near multiples.",
         "Positive maxima: prominence ≥0.01, spacing ≥20 bp; multiple tolerance ±20 bp. No smoothing.",
         repeat_counts_caption(rows), sep = "\n")) +
-    ggplot2::theme_bw() + ggplot2::theme(legend.position = "none", plot.caption = ggplot2::element_text(hjust = 0))
+    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(legend.position = "none", plot.caption = ggplot2::element_text(hjust = 0))
   if (!is.null(primary)) {
     primary <- subset(primary, lag >= lower & lag <= upper)
     p <- p + ggplot2::geom_point(data = primary, shape = 8, color = "#B8860B", size = 3.5)
@@ -1615,7 +1042,8 @@ plot_haplotype_median_acf <- function(rows, region, lower = 0, upper = NULL) {
 }
 ```
 
-```{r function-plot-haplotype-fiber-acf-heatmap, include=TRUE}
+<!-- heatmap of every valid read's ACF, ordered by allele and then primary peak lag; dots = primary peaks. Parameters: lag 0 omitted, color limits at the 99th percentile of |ACF|, upper = last lag shown (default all) -->
+```{r function-plot-haplotype-fiber-acf-heatmap, include=FALSE}
 plot_haplotype_fiber_acf_heatmap <- function(profiles, rows, region, upper = NULL) {
   profiles <- as.matrix(profiles)
   max_lag <- ncol(profiles) - 1L
@@ -1653,14 +1081,15 @@ plot_haplotype_fiber_acf_heatmap <- function(profiles, rows, region, upper = NUL
       caption = paste("All valid unique fibers, independent of cluster assignment. No-peak fibers sort last within each allele.",
         "Dots: primary peaks. Color limits clip the largest 1% of absolute ACF values for display.",
         repeat_counts_caption(rows), sep = "\n")) +
-    ggplot2::theme_bw() + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
+    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
   boundaries <- ends[ends > 0 & ends < length(ordered)] + 0.5
   if (length(boundaries)) p <- p + ggplot2::geom_hline(yintercept = boundaries, linewidth = 0.4)
   p
 }
 ```
 
-```{r function-plot-haplotype-repeat-boxplot, include=TRUE}
+<!-- boxplot of per-read repeat lengths by allele. Parameters: only reads with a peak in 120–250 bp; y axis 115–255 bp -->
+```{r function-plot-haplotype-repeat-boxplot, include=FALSE}
 plot_haplotype_repeat_boxplot <- function(rows, region) {
   values <- do.call(rbind, lapply(rows, function(row) {
     peaks <- row$peak_lags[is.finite(row$peak_lags)]
@@ -1684,11 +1113,12 @@ plot_haplotype_repeat_boxplot <- function(rows, region) {
       x = NULL, y = "Per-fiber candidate repeat length (bp)",
       caption = paste("Boxes include only fibers with a qualifying positive local maximum in 120–250 bp; no smoothing.",
         "No qualifying peak means no estimate.", repeat_counts_caption(rows), sep = "\n")) +
-    ggplot2::theme_bw() + ggplot2::theme(legend.position = "none", plot.caption = ggplot2::element_text(hjust = 0))
+    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(legend.position = "none", plot.caption = ggplot2::element_text(hjust = 0))
 }
 ```
 
-```{r function-plot-haplotype-repeat-histogram, include=TRUE}
+<!-- histogram of per-read repeat lengths by allele. Parameters: 5-bp bins over 120–250 bp; fractions are out of all valid reads -->
+```{r function-plot-haplotype-repeat-histogram, include=FALSE}
 plot_haplotype_repeat_histogram <- function(rows, region) {
   # Use all valid fibers as the denominator, including those without a peak.
   breaks <- seq(119.5, 254.5, by = 5)
@@ -1708,11 +1138,12 @@ plot_haplotype_repeat_histogram <- function(rows, region) {
       caption = paste("Strongest qualifying positive local maximum in 120–250 bp; no smoothing.",
         "Histogram denominators include all valid fibers, including those without an estimate.",
         repeat_counts_caption(rows), sep = "\n")) +
-    ggplot2::theme_bw() + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
+    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
 }
 ```
 
-```{r function-plot-locus-heatmap, include=TRUE}
+<!-- heatmap of the REF and ALT median ACF; stars = primary peaks. Parameters: lags 120–250 bp -->
+```{r function-plot-locus-heatmap, include=FALSE}
 plot_locus_heatmap <- function(rows, region = NULL) {
   region_ids <- unique(vapply(rows, function(row) as.character(row$region_id), character(1)))
   if (length(region_ids) != 1L) stop("Plot one region at a time.")
@@ -1740,11 +1171,12 @@ plot_locus_heatmap <- function(rows, region = NULL) {
       x = "Candidate repeat length / ACF lag (bp)", y = "Phased allele",
       caption = paste("120–250 bp; common color scale within this region. Stars: qualifying primary peaks. Gray: unavailable.",
         "Every unique retained fiber with a valid ACF contributes, including unclustered fibers.", sep = "\n")) +
-    ggplot2::theme_bw() + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
+    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(plot.caption = ggplot2::element_text(hjust = 0))
 }
 ```
 
-```{r function-plot-haplotype-repeats, include=TRUE}
+<!-- make all seven allele repeat figures for one region. Parameters: zoomed median ACF 100–500 bp, zoomed read heatmap 0–500 bp -->
+```{r function-plot-haplotype-repeats, include=FALSE}
 plot_haplotype_repeats <- function(region, profiles, rows) {
   # Return figures for the notebook; rendering and filenames belong to knitr.
   list(
@@ -1759,13 +1191,15 @@ plot_haplotype_repeats <- function(region, profiles, rows) {
 }
 ```
 
-```{r function-compact-locus-rows, include=TRUE}
+<!-- keep only the fields needed for the locus summary (region, allele, base, median ACF, primary peak, n valid) -->
+```{r function-compact-locus-rows, include=FALSE}
 compact_locus_rows <- function(rows) {
   lapply(rows, function(row) row[c("region_id", "allele", "base", "median", "primary", "n_valid")])
 }
 ```
 
-```{r load-region-results, include=TRUE, purl=TRUE}
+<!-- check that every region has report_data.rds, check the plotting packages, and load all regions -->
+```{r load-region-results, include=FALSE, purl=TRUE}
 missing_data <- region_dirs[!file.exists(file.path(region_dirs, "report_data.rds"))]
 if (length(missing_data)) stop(
   "Direct plotting requires report_data.rds for each region. Missing: ",
@@ -1775,139 +1209,207 @@ autocor_fiberseq_packages()
 region_results <- lapply(region_dirs, read_report_data)
 ```
 
+<style>
+.main-container { max-width: 1700px; padding: 0 24px; }
+table { display: block; overflow-x: auto; }
+</style>
+
+<!-- draw every figure the way leiden_LCL.Rmd does: save as PDF at a fixed size, convert to PNG with Liberation Sans fonts, embed in the report. The PNG is temporary and only embedded in the HTML; figure files are written as PDF only (report_pdf_figure with file = path keeps the PDF). Parameters: 120 dpi; fonts and converter copied from the gallery-helper chunk of leiden_LCL.Rmd -->
+```{r gallery-helper, include=FALSE}
+pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
+xpdfrc <- tempfile("xpdfrc-")
+sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
+mono <- "/usr/share/fonts/dejavu/DejaVuSansMono"
+writeLines(c(
+  paste0("fontFile Helvetica ", sans, "Regular.ttf"),
+  paste0("fontFile Helvetica-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Helvetica-Oblique ", sans, "Italic.ttf"),
+  paste0("fontFile Helvetica-BoldOblique ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Times-Roman ", sans, "Regular.ttf"),
+  paste0("fontFile Times-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Times-Italic ", sans, "Italic.ttf"),
+  paste0("fontFile Times-BoldItalic ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Courier ", mono, ".ttf"),
+  paste0("fontFile Courier-Bold ", mono, "-Bold.ttf"),
+  paste0("fontFile Courier-Oblique ", mono, "-Oblique.ttf"),
+  paste0("fontFile Courier-BoldOblique ", mono, "-BoldOblique.ttf"),
+  "fontFile Symbol /usr/share/fonts/dejavu/DejaVuSans.ttf",
+  "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
+
+inline_png <- function(path, label, dpi = 120) {
+  stopifnot(file.exists(path), file.info(path)$size > 0)
+  prefix <- tempfile("fig-")
+  status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
+    shQuote(path), shQuote(prefix)))
+  png <- paste0(prefix, "-000001.png")
+  stopifnot(status == 0, file.exists(png))
+  on.exit(unlink(png))
+  cat(as.character(htmltools::tags$figure(
+    htmltools::tags$img(
+      src = base64enc::dataURI(file = png, mime = "image/png"),
+      alt = label, loading = "lazy",
+      style = "display:block;max-width:100%;height:auto;"),
+    htmltools::tags$figcaption(label))), "\n\n")
+  invisible(NULL)
+}
+
+report_pdf_figure <- function(figure, width, height, label, file = NULL) {
+  # file = NULL: temporary PDF for the embedded preview only; otherwise the PDF is kept at that path.
+  pdf <- if (is.null(file)) tempfile("figure-", fileext = ".pdf") else file
+  if (is.null(file)) on.exit(unlink(pdf))
+  if (inherits(figure, c("Heatmap", "HeatmapList"))) {
+    grDevices::pdf(pdf, width = width, height = height)
+    tryCatch(ComplexHeatmap::draw(figure, newpage = FALSE), finally = grDevices::dev.off())
+  } else {
+    ggplot2::ggsave(pdf, figure, width = width, height = height, limitsize = FALSE, bg = "white")
+  }
+  inline_png(pdf, label)
+}
+
+# Figure sizes used by leiden_LCL.Rmd; n = clustered reads, k = clusters.
+fiberseq_figure_size <- function(entry, kind) {
+  n <- if (is.null(entry$fiberseq)) 0L else nrow(entry$fiberseq$assignments)
+  k <- if (is.null(entry$fiberseq)) 1L else entry$fiberseq$n_clusters
+  switch(kind,
+    reads = c(12, max(7, 0.03 * n + 3.5 + 0.3 * k)),
+    heatmap = c(14, 11 + 0.55 * k),
+    acf_heatmap = c(17, 11 + 0.55 * k),
+    occupancy = c(10, 1.4 * k + 2.5),
+    knn = c(12, 9),
+    proportions = c(8, 5),
+    stop("Unknown figure size: ", kind))
+}
+```
+
 # Autocorrelation figures
 
 ## Allele-average ACF
 
-```{r figure-allele-acf, results='asis', fig.height=10, purl=TRUE}
+```{r figure-allele-acf, echo=FALSE, results='asis', fig.height=10, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "allele_acf")
-  print(figure)
+  report_pdf_figure(figure, 12, 10, paste(entry$region_id, "Allele-average ACF", sep = " — "))
 }
 ```
 
 ## Median ACF by focal allele
 
-```{r figure-haplotype-median, results='asis', fig.height=8, purl=TRUE}
+```{r figure-haplotype-median, echo=FALSE, results='asis', fig.height=8, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_median_acf(entry$repeats, entry$data$region)
-  print(figure)
+  report_pdf_figure(figure, 12, 8, paste(entry$region_id, "Median ACF by focal allele", sep = " — "))
 }
 ```
 
 ## Median ACF: nucleosome-scale view
 
-```{r figure-haplotype-median-zoom, results='asis', fig.height=8, purl=TRUE}
+```{r figure-haplotype-median-zoom, echo=FALSE, results='asis', fig.height=8, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_median_acf(entry$repeats, entry$data$region, lower = 100, upper = 500)
-  print(figure)
+  report_pdf_figure(figure, 12, 8, paste(entry$region_id, "Median ACF: nucleosome-scale view", sep = " — "))
 }
 ```
 
 ## Allele median ACF: 120–250 bp
 
-```{r figure-region-repeat-heatmap, results='asis', fig.height=5, purl=TRUE}
+```{r figure-region-repeat-heatmap, echo=FALSE, results='asis', fig.height=5, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_locus_heatmap(entry$repeats, entry$data$region)
-  print(figure)
+  report_pdf_figure(figure, 12, 5, paste(entry$region_id, "Allele median ACF: 120–250 bp", sep = " — "))
 }
 ```
 
 ## Individual-fiber ACF by allele
 
-```{r figure-fiber-acf, results='asis', fig.height=9, purl=TRUE}
+```{r figure-fiber-acf, echo=FALSE, results='asis', fig.height=9, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_fiber_acf_heatmap(entry$data$acf, entry$repeats, entry$data$region)
-  print(figure)
+  report_pdf_figure(figure, 12, 9, paste(entry$region_id, "Individual-fiber ACF by allele", sep = " — "))
 }
 ```
 
 ## Individual-fiber ACF: first 500 bp
 
-```{r figure-fiber-acf-zoom, results='asis', fig.height=9, purl=TRUE}
+```{r figure-fiber-acf-zoom, echo=FALSE, results='asis', fig.height=9, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_fiber_acf_heatmap(entry$data$acf, entry$repeats, entry$data$region, upper = 500)
-  print(figure)
+  report_pdf_figure(figure, 12, 9, paste(entry$region_id, "Individual-fiber ACF: first 500 bp", sep = " — "))
 }
 ```
 
 ## Per-fiber repeat-length candidates
 
-```{r figure-repeat-boxplot, results='asis', fig.height=6, purl=TRUE}
+```{r figure-repeat-boxplot, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_repeat_boxplot(entry$repeats, entry$data$region)
-  print(figure)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Per-fiber repeat-length candidates", sep = " — "))
 }
 ```
 
 ## Per-fiber repeat-length frequencies
 
-```{r figure-repeat-histogram, results='asis', fig.height=6, purl=TRUE}
+```{r figure-repeat-histogram, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_repeat_histogram(entry$repeats, entry$data$region)
-  print(figure)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Per-fiber repeat-length frequencies", sep = " — "))
 }
 ```
 
 ## Allele positive-peak fractions
 
-```{r figure-allele-peak-features, results='asis', fig.height=6, purl=TRUE}
+```{r figure-allele-peak-features, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "allele_peaks")
-  print(figure)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele positive-peak fractions", sep = " — "))
 }
 ```
 
 ## Cluster-average ACF
 
-```{r figure-cluster-acf, results='asis', fig.height=7, purl=TRUE}
+```{r figure-cluster-acf, echo=FALSE, results='asis', fig.height=7, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "cluster_acf")
-  print(figure)
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF", sep = " — "))
 }
 ```
 
 ## ACF and genomic m6A heatmaps
 
-```{r figure-acf-m6a-heatmap, results='asis', fig.height=12, purl=TRUE}
+```{r figure-acf-m6a-heatmap, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, show_cluster_profiles = TRUE))
-  if (inherits(figure, c("Heatmap", "HeatmapList"))) {
-    ComplexHeatmap::draw(figure, newpage = TRUE)
-  } else {
-    print(figure)
-  }
+  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "ACF and genomic m6A heatmaps", sep = " — "))
 }
 ```
 
 ## ACF UMAP and m6A call fraction
 
-```{r figure-acf-umap, results='asis', fig.height=6, purl=TRUE}
+```{r figure-acf-umap, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_acf_umap(entry$data)
-  print(figure)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "ACF UMAP and m6A call fraction", sep = " — "))
 }
 ```
 
 ## Saved ACF neighbor graph
 
-```{r figure-knn-graph, results='asis', fig.height=9, purl=TRUE}
+```{r figure-knn-graph, echo=FALSE, results='asis', fig.height=9, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, plot_knn_graph)
-  print(figure)
+  figure <- report_fiberseq_figure(entry, function(result) plot_knn_graph(result, main = paste(result$region$annotation, "ACF correlation-neighbor graph colored by Leiden cluster", sep = "\n")))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "knn")[1], fiberseq_figure_size(entry, "knn")[2], paste(entry$region_id, "ACF neighbor graph colored by Leiden cluster", sep = " — "))
 }
 ```
 
@@ -1915,113 +1417,111 @@ for (entry in region_results) {
 
 ## Read footprints
 
-```{r figure-read-footprints, results='asis', fig.height=12, purl=TRUE}
+```{r figure-read-footprints, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) plot_smf_reads(result, result$footprints, sample_palette(result$assignments$sample_name), include_haplotype = TRUE))
-  print(figure)
+  figure <- report_fiberseq_figure(entry, function(result) plot_smf_reads(result, signal_profiles(result, result$footprints)$records, sample_palette(result$assignments$sample_name), include_haplotype = TRUE) + ggplot2::labs(subtitle = "One row per retained molecule; saved autocorrelation-defined Leiden clusters"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "reads")[1], fiberseq_figure_size(entry, "reads")[2], paste(entry$region_id, "Read-level footprints", sep = " — "))
 }
 ```
 
 ## Genomic m6A heatmap
 
-```{r figure-m6a-heatmap, results='asis', fig.height=12, purl=TRUE}
+```{r figure-m6a-heatmap, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, show_cluster_profiles = TRUE))
-  if (inherits(figure, c("Heatmap", "HeatmapList"))) {
-    ComplexHeatmap::draw(figure, newpage = TRUE)
-  } else {
-    print(figure)
-  }
+  figure <- report_fiberseq_figure(entry, function(result) plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "heatmap")[1], fiberseq_figure_size(entry, "heatmap")[2], paste(entry$region_id, "m6A and footprint heatmaps", sep = " — "))
 }
 ```
 
 ## Footprint occupancy by cluster
 
-```{r figure-occupancy, results='asis', fig.height=10, purl=TRUE}
+```{r figure-occupancy, echo=FALSE, results='asis', fig.height=10, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_signal_profile(signal_profiles(result, result$footprints)$profiles, result$region, levels(result$assignments$cluster)))
-  print(figure)
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "Occupancy profiles by cluster", sep = " — "))
 }
 ```
 
 ## Signal profiles and composition
 
-```{r figure-fiberseq-composition, results='asis', fig.height=12, purl=TRUE}
+```{r figure-fiberseq-composition, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) autocor_profile_composition(result)$plot)
-  print(figure)
+  panel <- if (is.null(entry$fiberseq)) NULL else autocor_profile_composition(entry$fiberseq)
+  figure <- if (is.null(panel)) report_fiberseq_figure(entry, identity) else panel$plot
+  report_pdf_figure(figure, 16, if (is.null(panel)) 7 else panel$height, paste(entry$region_id, "Signal profiles and composition", sep = " — "))
 }
 ```
 
 ## Cluster proportions
 
-```{r figure-cluster-proportions, results='asis', fig.height=6, purl=TRUE}
+```{r figure-cluster-proportions, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, autocor_cluster_proportions)
-  print(figure)
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "proportions")[1], fiberseq_figure_size(entry, "proportions")[2], paste(entry$region_id, "Cluster proportions", sep = " — "))
 }
 ```
 
 ## UMAP and allele overview
 
-```{r figure-umap-overview, results='asis', fig.height=12, purl=TRUE}
+```{r figure-umap-overview, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) autocor_umap_overview(result)$plot)
-  print(figure)
+  panel <- if (is.null(entry$fiberseq)) NULL else autocor_umap_overview(entry$fiberseq)
+  figure <- if (is.null(panel)) report_fiberseq_figure(entry, identity) else panel$plot
+  report_pdf_figure(figure, 16, if (is.null(panel)) 7 else panel$height, paste(entry$region_id, "UMAP and allele overview", sep = " — "))
 }
 ```
 
 ## Combined haplotype overview
 
-```{r figure-haplotype-overview, results='asis', fig.height=18, purl=TRUE}
+```{r figure-haplotype-overview, echo=FALSE, results='asis', fig.height=18, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  overview <- if (is.null(entry$fiberseq)) NULL else autocor_umap_overview(entry$fiberseq)
+  profiles <- if (is.null(entry$fiberseq)) NULL else autocor_profile_composition(entry$fiberseq)
   figure <- report_fiberseq_figure(entry, autocor_haplotype_example)
-  print(figure)
+  report_pdf_figure(figure, 16, if (is.null(overview)) 7 else overview$height + profiles$height, paste(entry$region_id, "Haplotype overview", sep = " — "))
 }
 ```
 
 ## Sample composition
 
-```{r figure-sample-composition, results='asis', fig.height=7, purl=TRUE}
+```{r figure-sample-composition, echo=FALSE, results='asis', fig.height=7, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "sample_composition")
-  print(figure)
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Sample composition", sep = " — "))
 }
 ```
 
 ## Allele coverage
 
-```{r figure-allele-coverage, results='asis', fig.height=6, purl=TRUE}
+```{r figure-allele-coverage, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "allele_coverage")
-  print(figure)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele coverage", sep = " — "))
 }
 ```
 
 ## Allele cluster proportions
 
-```{r figure-allele-proportions, results='asis', fig.height=6, purl=TRUE}
+```{r figure-allele-proportions, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "allele_proportions")
-  print(figure)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele cluster proportions", sep = " — "))
 }
 ```
 
 # Result tables
 
-## Saved analysis parameters
-
-```{r table-parameters, results='asis', purl=TRUE}
+```{r table-parameters, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(as.data.frame(entry$data$params), "Saved analysis parameters")
@@ -2030,7 +1530,7 @@ for (entry in region_results) {
 
 ## Genomic region
 
-```{r table-regions, results='asis', purl=TRUE}
+```{r table-regions, echo=FALSE, results='asis', purl=FALSE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(entry$data$region, "Genomic region")
@@ -2039,7 +1539,7 @@ for (entry in region_results) {
 
 ## Allele coverage
 
-```{r table-coverage, results='asis', purl=TRUE}
+```{r table-coverage, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(entry$data$tables$allele_coverage, "Allele coverage")
@@ -2048,7 +1548,7 @@ for (entry in region_results) {
 
 ## Cluster summaries
 
-```{r table-cluster-summary, results='asis', purl=TRUE}
+```{r table-cluster-summary, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(entry$data$tables$cluster_summary, "Cluster summaries")
@@ -2057,7 +1557,7 @@ for (entry in region_results) {
 
 ## Allele cluster proportions
 
-```{r table-allele-clusters, results='asis', purl=TRUE}
+```{r table-allele-clusters, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(entry$data$tables$allele_cluster_proportions, "Allele cluster proportions")
@@ -2066,7 +1566,7 @@ for (entry in region_results) {
 
 ## Positive local peaks: 140–250 bp
 
-```{r table-allele-peaks, results='asis', purl=TRUE}
+```{r table-allele-peaks, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(entry$data$tables$allele_peak_features, "Positive local peaks: 140–250 bp")
@@ -2075,7 +1575,7 @@ for (entry in region_results) {
 
 ## Repeat-length candidates: 120–250 bp
 
-```{r table-repeat-summary, results='asis', purl=TRUE}
+```{r table-repeat-summary, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(repeat_summary_table(entry$repeats), "Repeat-length candidates: 120–250 bp")
@@ -2084,10 +1584,159 @@ for (entry in region_results) {
 
 ## Sample composition
 
-```{r table-sample-composition, results='asis', purl=TRUE}
+```{r table-sample-composition, echo=FALSE, results='asis', purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   print_report_table(entry$data$tables$sample_composition, "Sample composition")
+}
+```
+
+# Leiden clusters directly on binary m6A
+
+The same reads are clustered directly on the binary m6A matrix with the Leiden_Manhattan code, the autocorrelation is not used to form these clusters
+
+  - `leiden_manhattan_cluster()` with the settings of `leiden_LCL.Rmd`: every m6A site is one feature (no windowing), Manhattan distance, k = 10, Leiden resolution 1, seed 1
+  - cluster1 is the largest cluster
+  - the ACF of each read is then averaged within each m6A cluster
+
+<!-- load the Leiden_Manhattan clustering functions (Manhattan kNN graph, exponential kernel, Leiden) so the m6A clusters come from the same code as the Leiden_Manhattan report -->
+```{r source-leiden-functions, include=FALSE}
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r", local = TRUE)
+```
+
+<!-- cluster one region's reads on the binary m6A matrix and swap the m6A clusters, Manhattan kNN graph, Manhattan UMAP and per-cluster mean ACF into a copy of the region's plotting object, so the existing figure functions draw them. Parameters: as in leiden_LCL.Rmd — window_size 0 (each m6A site is a feature), k = 10, resolution 1, seed 1 -->
+```{r function-autocor-m6a-leiden, include=FALSE}
+autocor_m6a_leiden <- function(entry) {
+  result <- entry$fiberseq
+  if (is.null(result)) return(entry)
+  clustering <- leiden_manhattan_cluster(result$site_met_mat, result$assignments,
+    result$region$analysis_start, result$region$analysis_end, window_size = 0L,
+    k_neighbors = 10L, resolution = 1, seed = 1L, impute_missing = FALSE, verbose = FALSE)
+  stopifnot(identical(clustering$assignments$RID, result$assignments$RID))
+  result$assignments$cluster <- clustering$assignments$cluster
+  result[c("feat_mat", "graph", "n_clusters", "params")] <- clustering[c("feat_mat", "graph", "n_clusters", "params")]
+  embedding <- fiberseq_umap(result, seed = 1L)
+  result$assignments$umap1 <- embedding$UMAP1
+  result$assignments$umap2 <- embedding$UMAP2
+  entry$fiberseq <- result
+  # Same layout as the saved cluster_acf_summary table, for plot_report_cluster_acf().
+  entry$data$tables$cluster_acf_summary <- do.call(rbind, lapply(levels(result$assignments$cluster), function(cluster) {
+    selected <- result$assignments$cluster == cluster
+    data.frame(cluster = sub("^cluster", "", cluster), lag_bp = seq_len(ncol(result$acf)) - 1L,
+      mean_acf = colMeans(result$acf[selected, , drop = FALSE]), n_reads = sum(selected))
+  }))
+  entry
+}
+```
+
+<!-- cluster every region on binary m6A -->
+```{r m6a-leiden-results, include=FALSE, purl=TRUE}
+m6a_results <- lapply(region_results, autocor_m6a_leiden)
+```
+
+## Cluster-average ACF
+
+```{r figure-m6a-leiden-cluster-acf, echo=FALSE, results='asis', fig.height=7, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- plot_report_cluster_acf(entry$data, title = "m6A-defined Leiden cluster averages; no smoothing")
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "m6A Leiden clusters: cluster-average ACF", sep = " — "), file.path(entry$folder, "m6a_leiden_cluster_average_acf.pdf"))
+}
+```
+
+## Cluster-average ACF: 25–750 bp
+
+```{r figure-m6a-leiden-cluster-acf-range, echo=FALSE, results='asis', fig.height=7, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- plot_report_cluster_acf(entry$data, lower = 25, upper = 750, title = "m6A-defined Leiden cluster averages; lags 25–750 bp; no smoothing")
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "m6A Leiden clusters: cluster-average ACF, 25–750 bp", sep = " — "), file.path(entry$folder, "m6a_leiden_cluster_average_acf_25_750bp.pdf"))
+}
+```
+
+## ACF and genomic m6A heatmaps
+
+```{r figure-m6a-leiden-acf-m6a-heatmap, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "m6A-defined Leiden clusters"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "m6A Leiden clusters: ACF and genomic m6A heatmaps", sep = " — "), file.path(entry$folder, "m6a_leiden_acf_and_m6a_heatmaps.pdf"))
+}
+```
+
+## Read footprints
+
+```{r figure-m6a-leiden-read-footprints, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- report_fiberseq_figure(entry, function(result) plot_smf_reads(result, signal_profiles(result, result$footprints)$records, sample_palette(result$assignments$sample_name), include_haplotype = TRUE) + ggplot2::labs(subtitle = "One row per retained molecule; m6A-defined Leiden clusters"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "reads")[1], fiberseq_figure_size(entry, "reads")[2], paste(entry$region_id, "m6A Leiden clusters: read-level footprints", sep = " — "), file.path(entry$folder, "m6a_leiden_read_footprints.pdf"))
+}
+```
+
+## Footprint occupancy by cluster
+
+```{r figure-m6a-leiden-occupancy, echo=FALSE, results='asis', fig.height=10, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- report_fiberseq_figure(entry, function(result) plot_signal_profile(signal_profiles(result, result$footprints)$profiles, result$region, levels(result$assignments$cluster)))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "m6A Leiden clusters: occupancy profiles by cluster", sep = " — "), file.path(entry$folder, "m6a_leiden_occupancy_by_cluster.pdf"))
+}
+```
+
+## Combined haplotype overview
+
+```{r figure-m6a-leiden-haplotype-overview, echo=FALSE, results='asis', fig.height=18, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  overview <- if (is.null(entry$fiberseq)) NULL else autocor_umap_overview(entry$fiberseq)
+  profiles <- if (is.null(entry$fiberseq)) NULL else autocor_profile_composition(entry$fiberseq)
+  figure <- report_fiberseq_figure(entry, autocor_haplotype_example)
+  report_pdf_figure(figure, 16, if (is.null(overview)) 7 else overview$height + profiles$height, paste(entry$region_id, "m6A Leiden clusters: haplotype overview (Manhattan UMAP)", sep = " — "), file.path(entry$folder, "m6a_leiden_haplotype_example.pdf"))
+}
+```
+
+## Manhattan neighbor graph
+
+```{r figure-m6a-leiden-knn-graph, echo=FALSE, results='asis', fig.height=9, purl=TRUE}
+for (entry in m6a_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- report_fiberseq_figure(entry, plot_knn_graph)
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "knn")[1], fiberseq_figure_size(entry, "knn")[2], paste(entry$region_id, "m6A Leiden clusters: Manhattan neighbor graph colored by Leiden cluster", sep = " — "), file.path(entry$folder, "m6a_leiden_knn_graph.pdf"))
+}
+```
+
+# Autocorrelation curves: 25–750 bp
+
+The existing ACF curve figures redrawn for lags 25–750 bp. The vertical scale is fit to these lags only, so the short-lag ACF near lag 0 no longer sets the scale
+
+## Allele-average ACF: 25–750 bp
+
+```{r figure-allele-acf-range, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
+for (entry in region_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- plot_report_allele_acf(entry$data, lower = 25, upper = 750)
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "allele_average_acf_25_750bp.pdf"))
+}
+```
+
+## Median ACF by focal allele: 25–750 bp
+
+```{r figure-haplotype-median-range, echo=FALSE, results='asis', fig.height=8, purl=TRUE}
+for (entry in region_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- plot_haplotype_median_acf(entry$repeats, entry$data$region, lower = 25, upper = 750)
+  report_pdf_figure(figure, 12, 8, paste(entry$region_id, "Median ACF by focal allele: 25–750 bp", sep = " — "), file.path(entry$folder, "haplotype_median_acf_25_750bp.pdf"))
+}
+```
+
+## Cluster-average ACF: 25–750 bp
+
+```{r figure-cluster-acf-range, echo=FALSE, results='asis', fig.height=7, purl=TRUE}
+for (entry in region_results) {
+  cat("\n\n### ", entry$region_id, "\n\n", sep = "")
+  figure <- plot_report_cluster_acf(entry$data, lower = 25, upper = 750, title = "Cluster averages; lags 25–750 bp; no smoothing")
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "cluster_average_acf_25_750bp.pdf"))
 }
 ```
 

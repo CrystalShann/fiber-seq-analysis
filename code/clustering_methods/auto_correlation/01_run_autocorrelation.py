@@ -77,12 +77,10 @@ def r_environment():
             continue
         checked.add(rscript)
         env = os.environ.copy()
-        # --vanilla skips ~/.Renviron, so supply the version-specific user
-        # library explicitly even when Rscript was found on PATH.
-        env.setdefault("R_LIBS_USER", str(Path.home() / "R/%p-library/%v"))
+        env.setdefault("R_LIBS_USER", "/project/spott/cshan/Rlibs/%p-library/%v")
         if Path(rscript) == rcc_rscript.resolve():
             env.pop("R_HOME", None)
-            user_lib = Path.home() / "R/x86_64-pc-linux-gnu-library/4.4"
+            user_lib = Path("/project/spott/cshan/Rlibs/x86_64-pc-linux-gnu-library/4.4")
             if user_lib.is_dir():
                 env["R_LIBS_USER"] = os.pathsep.join(dict.fromkeys(
                     [str(user_lib), env["R_LIBS_USER"]]))
@@ -241,7 +239,7 @@ def save_report_data(output, region, binary, profiles, records, edges, args, inf
     def table_data(table):
         return json.loads(table.to_json(orient="records", double_precision=15))
 
-    payload = dict(schema_version=1, region=table_data(pd.DataFrame([region._asdict()])),
+    region_data = dict(schema_version=1, region=table_data(pd.DataFrame([region._asdict()])),
                    records=json.loads(records.to_json(orient="records", double_precision=15)),
                    row_ids=ids.tolist(),
                    call_offsets=[np.flatnonzero(row).tolist() for row in binary],
@@ -260,17 +258,17 @@ def save_report_data(output, region, binary, profiles, records, edges, args, inf
     destination = result_directory(output, region.region_id) / "report_data.rds"
     # Select definition chunks explicitly: changing include/purl in the notebook
     # must never run setup, data loading, figures, or knitting during preparation.
-    payload["report_functions"] = report_function_code()
+    region_data["report_functions"] = report_function_code()
     prepare = ('args <- commandArgs(trailingOnly=TRUE); stopifnot(length(args) == 2L); '
-               'payload <- jsonlite::fromJSON(paste(readLines(file("stdin"), warn=FALSE), '
+               'region_data <- jsonlite::fromJSON(paste(readLines(file("stdin"), warn=FALSE), '
                'collapse="\\n"), simplifyMatrix=TRUE); '
-               'definitions <- payload$report_functions; payload$report_functions <- NULL; '
+               'definitions <- region_data$report_functions; region_data$report_functions <- NULL; '
                'eval(parse(text=definitions), envir=.GlobalEnv); '
-               'prepare_report_data(payload, project=args[[1L]], destination=args[[2L]])')
+               'prepare_report_data(region_data, project=args[[1L]], destination=args[[2L]])')
     # Rscript inserts --args itself; passing another --args shifts the values
     # returned by commandArgs() and can turn the project directory into the target.
     result = subprocess.run([rscript, "--vanilla", "-e", prepare,
-        str(PROJECT), str(destination)], input=json.dumps(payload, allow_nan=False),
+        str(PROJECT), str(destination)], input=json.dumps(region_data, allow_nan=False),
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     (result_directory(output, region.region_id) / "report_preparation.log").write_text(result.stdout + result.stderr)
     if result.returncode:
