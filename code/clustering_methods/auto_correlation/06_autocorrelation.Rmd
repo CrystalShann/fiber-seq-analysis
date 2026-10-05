@@ -366,7 +366,7 @@ prepare_report_data <- function(region_data, project, destination,
 }
 ```
 
-<!-- load one region's report_data.rds, check that reads and ACF rows line up, compute the repeat-length candidates and build the plotting object -->
+<!-- load one region's report_data.rds, check that reads and ACF rows line up, number the ACF clusters from 1 as Leiden_Manhattan does (saved Scanpy cluster 0, the largest, becomes cluster 1) in the reads and every summary table, compute the repeat-length candidates and build the plotting object -->
 ```{r read-report-data-function, include=FALSE}
 read_report_data <- function(folder) {
   path <- file.path(folder, "report_data.rds")
@@ -376,6 +376,15 @@ read_report_data <- function(folder) {
     nrow(region_data$region) == 1L, region_data$region$region_id == basename(folder),
     identical(region_data$row_ids, region_data$records$row_id),
     is.matrix(region_data$acf), nrow(region_data$acf) == nrow(region_data$records))
+  renumber <- function(table) {
+    if (is.data.frame(table) && "cluster" %in% names(table)) {
+      id <- suppressWarnings(as.integer(as.character(table$cluster)))
+      table$cluster <- ifelse(is.na(id), as.character(table$cluster), as.character(id + 1L))
+    }
+    table
+  }
+  region_data$records <- renumber(region_data$records)
+  region_data$tables <- lapply(region_data$tables, renumber)
   rows <- summarize_repeats(region_data$acf, region_data$records, region_data$region, region_data$tables)
   list(folder = folder, region_id = region_data$region$region_id, data = region_data,
     repeats = rows, fiberseq = autocor_fiberseq_result(region_data))
@@ -677,7 +686,9 @@ autocor_fiberseq_result <- function(region_data) {
   a$end <- a$read_end
   a$chr <- region$chr
   a$sample_label <- sub("_.*$", "", a$sample_name)
-  a$cluster <- factor(a$cluster, levels = as.character(sort(unique(as.integer(a$cluster)))))
+  # Cluster names as in Leiden_Manhattan: cluster1, cluster2, ...
+  a$cluster <- factor(paste0("cluster", a$cluster),
+    levels = paste0("cluster", sort(unique(as.integer(a$cluster)))))
   a$heatmap_included <- TRUE
   ids <- unlist(region_data$row_ids, use.names = FALSE)
   matched <- match(a$row_id, ids)
@@ -1214,7 +1225,7 @@ region_results <- lapply(region_dirs, read_report_data)
 table { display: block; overflow-x: auto; }
 </style>
 
-<!-- draw every figure the way leiden_LCL.Rmd does: save as PDF at a fixed size, convert to PNG with Liberation Sans fonts, embed in the report. The PNG is temporary and only embedded in the HTML; figure files are written as PDF only (report_pdf_figure with file = path keeps the PDF). Parameters: 120 dpi; fonts and converter copied from the gallery-helper chunk of leiden_LCL.Rmd -->
+<!-- draw every figure the way leiden_LCL.Rmd does: save as PDF at a fixed size, convert to PNG with Liberation Sans fonts, embed in the report. The PNG is temporary and only embedded in the HTML; figure files are written as PDF only (report_pdf_figure with file = path keeps the PDF), into the region's autocorrelation/ subfolder for the ACF clusters and leiden/ for the m6A Leiden clusters. Parameters: 120 dpi; fonts and converter copied from the gallery-helper chunk of leiden_LCL.Rmd -->
 ```{r gallery-helper, include=FALSE}
 pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
 xpdfrc <- tempfile("xpdfrc-")
@@ -1256,7 +1267,7 @@ inline_png <- function(path, label, dpi = 120) {
 report_pdf_figure <- function(figure, width, height, label, file = NULL) {
   # file = NULL: temporary PDF for the embedded preview only; otherwise the PDF is kept at that path.
   pdf <- if (is.null(file)) tempfile("figure-", fileext = ".pdf") else file
-  if (is.null(file)) on.exit(unlink(pdf))
+  if (is.null(file)) on.exit(unlink(pdf)) else dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
   if (inherits(figure, c("Heatmap", "HeatmapList"))) {
     grDevices::pdf(pdf, width = width, height = height)
     tryCatch(ComplexHeatmap::draw(figure, newpage = FALSE), finally = grDevices::dev.off())
@@ -1379,7 +1390,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "cluster_acf")
-  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF", sep = " — "))
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF", sep = " — "), file.path(entry$folder, "autocorrelation", "cluster_average_acf.pdf"))
 }
 ```
 
@@ -1389,7 +1400,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "ACF and genomic m6A heatmaps", sep = " — "))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "ACF and genomic m6A heatmaps", sep = " — "), file.path(entry$folder, "autocorrelation", "acf_and_m6a_heatmaps.pdf"))
 }
 ```
 
@@ -1399,7 +1410,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_acf_umap(entry$data)
-  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "ACF UMAP and m6A call fraction", sep = " — "))
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "ACF UMAP and m6A call fraction", sep = " — "), file.path(entry$folder, "autocorrelation", "umap.pdf"))
 }
 ```
 
@@ -1409,7 +1420,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_knn_graph(result, main = paste(result$region$annotation, "ACF correlation-neighbor graph colored by Leiden cluster", sep = "\n")))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "knn")[1], fiberseq_figure_size(entry, "knn")[2], paste(entry$region_id, "ACF neighbor graph colored by Leiden cluster", sep = " — "))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "knn")[1], fiberseq_figure_size(entry, "knn")[2], paste(entry$region_id, "ACF neighbor graph colored by Leiden cluster", sep = " — "), file.path(entry$folder, "autocorrelation", "knn_graph.pdf"))
 }
 ```
 
@@ -1421,7 +1432,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_smf_reads(result, signal_profiles(result, result$footprints)$records, sample_palette(result$assignments$sample_name), include_haplotype = TRUE) + ggplot2::labs(subtitle = "One row per retained molecule; saved autocorrelation-defined Leiden clusters"))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "reads")[1], fiberseq_figure_size(entry, "reads")[2], paste(entry$region_id, "Read-level footprints", sep = " — "))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "reads")[1], fiberseq_figure_size(entry, "reads")[2], paste(entry$region_id, "Read-level footprints", sep = " — "), file.path(entry$folder, "autocorrelation", "fig1_read_footprints.pdf"))
 }
 ```
 
@@ -1431,7 +1442,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "heatmap")[1], fiberseq_figure_size(entry, "heatmap")[2], paste(entry$region_id, "m6A and footprint heatmaps", sep = " — "))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "heatmap")[1], fiberseq_figure_size(entry, "heatmap")[2], paste(entry$region_id, "m6A and footprint heatmaps", sep = " — "), file.path(entry$folder, "autocorrelation", "heatmap_m6a_footprints.pdf"))
 }
 ```
 
@@ -1441,7 +1452,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_signal_profile(signal_profiles(result, result$footprints)$profiles, result$region, levels(result$assignments$cluster)))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "Occupancy profiles by cluster", sep = " — "))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "Occupancy profiles by cluster", sep = " — "), file.path(entry$folder, "autocorrelation", "fig2_occupancy_by_cluster.pdf"))
 }
 ```
 
@@ -1452,7 +1463,7 @@ for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   panel <- if (is.null(entry$fiberseq)) NULL else autocor_profile_composition(entry$fiberseq)
   figure <- if (is.null(panel)) report_fiberseq_figure(entry, identity) else panel$plot
-  report_pdf_figure(figure, 16, if (is.null(panel)) 7 else panel$height, paste(entry$region_id, "Signal profiles and composition", sep = " — "))
+  report_pdf_figure(figure, 16, if (is.null(panel)) 7 else panel$height, paste(entry$region_id, "Signal profiles and composition", sep = " — "), file.path(entry$folder, "autocorrelation", "fiberseq_profiles_composition.pdf"))
 }
 ```
 
@@ -1462,7 +1473,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, autocor_cluster_proportions)
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "proportions")[1], fiberseq_figure_size(entry, "proportions")[2], paste(entry$region_id, "Cluster proportions", sep = " — "))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "proportions")[1], fiberseq_figure_size(entry, "proportions")[2], paste(entry$region_id, "Cluster proportions", sep = " — "), file.path(entry$folder, "autocorrelation", "fiberseq_cluster_proportions.pdf"))
 }
 ```
 
@@ -1473,7 +1484,7 @@ for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   panel <- if (is.null(entry$fiberseq)) NULL else autocor_umap_overview(entry$fiberseq)
   figure <- if (is.null(panel)) report_fiberseq_figure(entry, identity) else panel$plot
-  report_pdf_figure(figure, 16, if (is.null(panel)) 7 else panel$height, paste(entry$region_id, "UMAP and allele overview", sep = " — "))
+  report_pdf_figure(figure, 16, if (is.null(panel)) 7 else panel$height, paste(entry$region_id, "UMAP and allele overview", sep = " — "), file.path(entry$folder, "autocorrelation", "fiberseq_umap_overview.pdf"))
 }
 ```
 
@@ -1485,7 +1496,7 @@ for (entry in region_results) {
   overview <- if (is.null(entry$fiberseq)) NULL else autocor_umap_overview(entry$fiberseq)
   profiles <- if (is.null(entry$fiberseq)) NULL else autocor_profile_composition(entry$fiberseq)
   figure <- report_fiberseq_figure(entry, autocor_haplotype_example)
-  report_pdf_figure(figure, 16, if (is.null(overview)) 7 else overview$height + profiles$height, paste(entry$region_id, "Haplotype overview", sep = " — "))
+  report_pdf_figure(figure, 16, if (is.null(overview)) 7 else overview$height + profiles$height, paste(entry$region_id, "Haplotype overview", sep = " — "), file.path(entry$folder, "autocorrelation", "fiberseq_haplotype_example.pdf"))
 }
 ```
 
@@ -1495,7 +1506,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "sample_composition")
-  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Sample composition", sep = " — "))
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Sample composition", sep = " — "), file.path(entry$folder, "autocorrelation", "sample_composition.pdf"))
 }
 ```
 
@@ -1515,7 +1526,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_table(entry$data, "allele_proportions")
-  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele cluster proportions", sep = " — "))
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele cluster proportions", sep = " — "), file.path(entry$folder, "autocorrelation", "allele_cluster_proportions.pdf"))
 }
 ```
 
@@ -1640,7 +1651,7 @@ m6a_results <- lapply(region_results, autocor_m6a_leiden)
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_cluster_acf(entry$data, title = "m6A-defined Leiden cluster averages; no smoothing")
-  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "m6A Leiden clusters: cluster-average ACF", sep = " — "), file.path(entry$folder, "m6a_leiden_cluster_average_acf.pdf"))
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "m6A Leiden clusters: cluster-average ACF", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_cluster_average_acf.pdf"))
 }
 ```
 
@@ -1650,7 +1661,7 @@ for (entry in m6a_results) {
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_cluster_acf(entry$data, lower = 25, upper = 750, title = "m6A-defined Leiden cluster averages; lags 25–750 bp; no smoothing")
-  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "m6A Leiden clusters: cluster-average ACF, 25–750 bp", sep = " — "), file.path(entry$folder, "m6a_leiden_cluster_average_acf_25_750bp.pdf"))
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "m6A Leiden clusters: cluster-average ACF, 25–750 bp", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_cluster_average_acf_25_750bp.pdf"))
 }
 ```
 
@@ -1660,7 +1671,7 @@ for (entry in m6a_results) {
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "m6A-defined Leiden clusters"))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "m6A Leiden clusters: ACF and genomic m6A heatmaps", sep = " — "), file.path(entry$folder, "m6a_leiden_acf_and_m6a_heatmaps.pdf"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "m6A Leiden clusters: ACF and genomic m6A heatmaps", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_acf_and_m6a_heatmaps.pdf"))
 }
 ```
 
@@ -1670,7 +1681,7 @@ for (entry in m6a_results) {
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_smf_reads(result, signal_profiles(result, result$footprints)$records, sample_palette(result$assignments$sample_name), include_haplotype = TRUE) + ggplot2::labs(subtitle = "One row per retained molecule; m6A-defined Leiden clusters"))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "reads")[1], fiberseq_figure_size(entry, "reads")[2], paste(entry$region_id, "m6A Leiden clusters: read-level footprints", sep = " — "), file.path(entry$folder, "m6a_leiden_read_footprints.pdf"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "reads")[1], fiberseq_figure_size(entry, "reads")[2], paste(entry$region_id, "m6A Leiden clusters: read-level footprints", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_read_footprints.pdf"))
 }
 ```
 
@@ -1680,7 +1691,7 @@ for (entry in m6a_results) {
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, function(result) plot_signal_profile(signal_profiles(result, result$footprints)$profiles, result$region, levels(result$assignments$cluster)))
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "m6A Leiden clusters: occupancy profiles by cluster", sep = " — "), file.path(entry$folder, "m6a_leiden_occupancy_by_cluster.pdf"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "m6A Leiden clusters: occupancy profiles by cluster", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_occupancy_by_cluster.pdf"))
 }
 ```
 
@@ -1692,7 +1703,7 @@ for (entry in m6a_results) {
   overview <- if (is.null(entry$fiberseq)) NULL else autocor_umap_overview(entry$fiberseq)
   profiles <- if (is.null(entry$fiberseq)) NULL else autocor_profile_composition(entry$fiberseq)
   figure <- report_fiberseq_figure(entry, autocor_haplotype_example)
-  report_pdf_figure(figure, 16, if (is.null(overview)) 7 else overview$height + profiles$height, paste(entry$region_id, "m6A Leiden clusters: haplotype overview (Manhattan UMAP)", sep = " — "), file.path(entry$folder, "m6a_leiden_haplotype_example.pdf"))
+  report_pdf_figure(figure, 16, if (is.null(overview)) 7 else overview$height + profiles$height, paste(entry$region_id, "m6A Leiden clusters: haplotype overview (Manhattan UMAP)", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_haplotype_example.pdf"))
 }
 ```
 
@@ -1702,7 +1713,7 @@ for (entry in m6a_results) {
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- report_fiberseq_figure(entry, plot_knn_graph)
-  report_pdf_figure(figure, fiberseq_figure_size(entry, "knn")[1], fiberseq_figure_size(entry, "knn")[2], paste(entry$region_id, "m6A Leiden clusters: Manhattan neighbor graph colored by Leiden cluster", sep = " — "), file.path(entry$folder, "m6a_leiden_knn_graph.pdf"))
+  report_pdf_figure(figure, fiberseq_figure_size(entry, "knn")[1], fiberseq_figure_size(entry, "knn")[2], paste(entry$region_id, "m6A Leiden clusters: Manhattan neighbor graph colored by Leiden cluster", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_knn_graph.pdf"))
 }
 ```
 
@@ -1716,7 +1727,7 @@ The existing ACF curve figures redrawn for lags 25–750 bp. The vertical scale 
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_allele_acf(entry$data, lower = 25, upper = 750)
-  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "allele_average_acf_25_750bp.pdf"))
+  report_pdf_figure(figure, 12, 6, paste(entry$region_id, "Allele-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "autocorrelation", "allele_average_acf_25_750bp.pdf"))
 }
 ```
 
@@ -1726,7 +1737,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_haplotype_median_acf(entry$repeats, entry$data$region, lower = 25, upper = 750)
-  report_pdf_figure(figure, 12, 8, paste(entry$region_id, "Median ACF by focal allele: 25–750 bp", sep = " — "), file.path(entry$folder, "haplotype_median_acf_25_750bp.pdf"))
+  report_pdf_figure(figure, 12, 8, paste(entry$region_id, "Median ACF by focal allele: 25–750 bp", sep = " — "), file.path(entry$folder, "autocorrelation", "haplotype_median_acf_25_750bp.pdf"))
 }
 ```
 
@@ -1736,7 +1747,7 @@ for (entry in region_results) {
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
   figure <- plot_report_cluster_acf(entry$data, lower = 25, upper = 750, title = "Cluster averages; lags 25–750 bp; no smoothing")
-  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "cluster_average_acf_25_750bp.pdf"))
+  report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "autocorrelation", "cluster_average_acf_25_750bp.pdf"))
 }
 ```
 

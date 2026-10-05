@@ -1,0 +1,1529 @@
+---
+title: "TF co-occupancy at enhancers"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# TF occupancy at enhancers over time
+
+Analyses 1–3 use hg38 FANTOM5 enhancer intervals and LPS 0, 5, 10 and 15 min.
+All interval tables use **0-based, half-open BED coordinates**. An enhancer is
+accessible if **more than 50% of its length overlaps one individual MSP block**
+at any timepoint. The denominator is the enhancer length; exactly 50% does not
+qualify. Adjacent MSPs or MSPs on different fibers are never joined to meet
+this criterion. FANTOM5 outer coordinates define each enhancer (not its BED12
+CAGE blocks).
+
+Defaults: compare active and inactive enhancers within the accessible universe;
+active means overlap with both baseline H3K27ac and ATAC peaks (at least one
+replicate per assay). Inactive means lacking either assay. Single-positive
+regions are therefore included in inactive. Baseline classes remain fixed across
+the time course. Settings below allow a stricter inactive definition or all
+FANTOM5 enhancers. Peak overlap defines activity; mean baseline bigWig signal is
+reported separately. Signal differences between these classes are descriptive
+because the same assays define the classes.
+
+“TF” here means a short protected footprint, not an identified TF protein.
+Co-occupancy means at least two distinct <60-bp footprints on the same fiber
+within an enhancer. Motif-based TF identities are not inferred from footprint
+size alone. Analyses 4–5 are not included.
+
+```{r setup, include=FALSE}
+project_root <- "/project/spott/cshan/fiber-seq"
+output_dir <- file.path(project_root, "macrophage_project/enhancer/TF_co-occ")
+plot_dir <- file.path(output_dir, "plots")
+table_dir <- file.path(output_dir, "tables")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      cache = FALSE, dev = "pdf", fig.path = paste0(plot_dir, "/"),
+                      fig.width = 8, fig.height = 5)
+options(scipen = 10)
+```
+
+```{r packages}
+suppressPackageStartupMessages({
+  suppressMessages({
+    library(data.table)
+    library(GenomicRanges)
+    library(Rsamtools)
+    library(ggplot2)
+    library(dplyr)
+    library(tidyr)
+    library(rtracklayer)
+    library(Matrix)
+    source(file.path(project_root, "code/topic_model/topic_modelling_functions.r"))
+  })
+})
+```
+
+```{r settings}
+extract_root <- file.path(project_root, "macrophage_project/FiberHMM/extract")
+ft_result_dir <- file.path(extract_root, "ft_result_dir")
+annotation_dir <- file.path(project_root, "macrophage_project/annotations/enhancer_public_data")
+fantom_file <- file.path(annotation_dir, "fantom5_enhancer_hg38/F5.hg38.enhancers.bed.gz")
+sample_table <- data.table(sample = paste0("LPS_", c(0, 5, 10, 15)),
+                           time_min = c(0L, 5L, 10L, 15L))
+standard_chromosomes <- paste0("chr", c(1:22, "X", "Y"))
+comparison_universe <- "accessible" # MSP-positive FANTOM5 subset; or "all_fantom"
+inactive_definition <- "not_active" # fails active criteria; or "neither_signal"
+minimum_peak_replicates <- 1L        # Active requires H3K27ac and ATAC peak overlap in at least one replicate per assay
+minimum_reads <- 10L                # full-enhancer-span reads at EVERY timepoint, analysis 3
+expected_background <- "genomewide" # expected footprint-length source; or "inactive"
+set.seed(1)
+```
+
+`comparison_universe = "accessible"` restricts the comparison to FANTOM5 enhancers
+passing the MSP rule at one or more timepoints. `"all_fantom"` includes all
+FANTOM5 enhancers on the selected chromosomes, including those failing the MSP
+rule. Accessibility and baseline activity are separate annotations.
+
+`inactive_definition = "not_active"` puts enhancers failing the active criteria
+into the inactive group. `"neither_signal"` requires zero baseline H3K27ac peak
+support and zero baseline ATAC peak support; partially supported enhancers are
+excluded from the comparison. Active always requires both assays to meet
+`minimum_peak_replicates`: 1 allows either replicate per assay, while 2 requires
+both replicates per assay. Peak support means any interval overlap, and the
+classes remain fixed from the 0-min baseline.
+
+`minimum_reads = 10L` requires at least 10 full-enhancer-span fibers at **each of
+all four timepoints** for the co-occupancy frequencies and Fisher comparisons in
+analysis 3. This keeps a consistent enhancer set across time. It does not filter
+the MSP universe, ACF clustering or the footprint-length summaries.
+
+`expected_background = "genomewide"` uses the same timepoint's genome-wide TF
+(<60 bp) and nucleosome (>90 bp) calls for expected footprint-length frequencies
+and the expected TF:nucleosome ratio. `"inactive"` uses those calls at the selected
+inactive enhancers instead. This setting does not change the active-versus-inactive
+Fisher comparison.
+
+# Shared input and output functions
+
+
+```{r save-table-function}
+save_table <- function(x, filename) {
+  path <- file.path(table_dir, filename)
+  data.table::fwrite(x, path, sep = "\t", na = "NA")
+  reloaded <- data.table::fread(path)
+  print(utils::head(reloaded, 6L))
+  invisible(reloaded)
+}
+```
+
+```{r save-pdf-function}
+save_pdf <- function(plot, filename, width = 8, height = 5) {
+  stopifnot(grepl("\\.pdf$", filename))
+  ggplot2::ggsave(file.path(plot_dir, filename), plot = plot,
+                 device = "pdf", width = width, height = height, limitsize = FALSE)
+  invisible(plot)
+}
+```
+
+```{r bed-ranges-function}
+bed_ranges <- function(x) {
+  stopifnot(all(x$start0 >= 0), all(x$end0 > x$start0))
+  GenomicRanges::GRanges(x$chr, IRanges::IRanges(x$start0 + 1L, x$end0))
+}
+```
+
+```{r tabix-bed-function}
+tabix_bed <- function(path, regions) {
+  if (!file.exists(path) || !file.exists(paste0(path, ".tbi")))
+    stop("Missing BED or tabix index: ", path)
+  if (!length(regions)) return(data.table())
+  tf <- Rsamtools::TabixFile(path)
+  open(tf)
+  on.exit(close(tf))
+  # A long fiber may overlap several query regions: remove duplicate lines.
+  lines <- unique(unlist(Rsamtools::scanTabix(tf, param = reduce(regions)),
+                         use.names = FALSE))
+  if (!length(lines)) return(data.table())
+  data.table::fread(text = paste(lines, collapse = "\n"), header = FALSE,
+                    sep = "\t", showProgress = FALSE)
+}
+```
+
+```{r expand-hmm-blocks-function}
+expand_hmm_blocks <- function(raw) {
+  empty <- data.table(chr = character(), start0 = integer(), end0 = integer(),
+                      read_id = character(), strand = character(), length = integer())
+  if (!nrow(raw)) return(empty)
+  if (ncol(raw) < 12L) stop("Expected FiberHMM BED12 or BED12+ input")
+  sizes <- strsplit(sub(",$", "", as.character(raw[[11L]])), ",", fixed = TRUE)
+  offsets <- strsplit(sub(",$", "", as.character(raw[[12L]])), ",", fixed = TRUE)
+  counts <- as.integer(raw[[10L]])
+  if (anyNA(counts) || any(lengths(sizes) != counts) || any(lengths(offsets) != counts))
+    stop("Invalid FiberHMM block counts")
+  parent <- rep(seq_len(nrow(raw)), counts)
+  size <- as.integer(unlist(sizes, use.names = FALSE))
+  offset <- as.integer(unlist(offsets, use.names = FALSE))
+  start0 <- as.integer(raw[[2L]][parent]) + offset
+  if (anyNA(size) || anyNA(offset) || any(size <= 0L) || any(offset < 0L) ||
+      any(start0 + size > as.integer(raw[[3L]][parent]))) stop("Invalid FiberHMM blocks")
+  unique(data.table(chr = as.character(raw[[1L]][parent]), start0 = start0,
+                    end0 = start0 + size, read_id = as.character(raw[[4L]][parent]),
+                    strand = as.character(raw[[6L]][parent]), length = size))
+}
+```
+
+```{r hmm-file-function}
+hmm_file <- function(sample, chr, kind) {
+  sample_dir <- gsub("_", "", sample)
+  file.path(extract_root, paste0("firehmm_", kind), sample_dir,
+            paste0(sample_dir, "_hmm_extracted_", kind, "_", chr, ".bed.gz"))
+}
+```
+
+# 1. Define the accessible enhancer universe
+
+```{r load-fantom}
+enhancers <- fread(fantom_file, header = FALSE, select = 1:4,
+                   col.names = c("chr", "start0", "end0", "enhancer_id"))
+enhancers <- unique(enhancers[chr %in% standard_chromosomes], by = c("chr", "start0", "end0"))
+stopifnot(!anyDuplicated(enhancers$enhancer_id))
+enhancers[, midpoint0 := as.integer(floor((start0 + end0) / 2))]
+head(enhancers)
+```
+
+Submit the four-timepoint accessibility job, then load its tables after it
+finishes. Input paths, samples, and chromosomes are configured in the script.
+
+```{r submit-accessible-universe, eval=FALSE}
+accessibility_script <- file.path(project_root, "code/enhancer/find_accessible_enhancers.sh")
+accessibility_status <- system2("sbatch", shQuote(accessibility_script))
+if (accessibility_status != 0L) stop("Slurm accessibility job submission failed")
+```
+
+`sbatch /project/spott/cshan/fiber-seq/code/enhancer/find_accessible_enhancers.sh`.
+
+```{r load-accessible-universe}
+accessibility_paths <- file.path(table_dir,
+  c("01_enhancer_accessibility.tsv", "01_accessible_counts.tsv"))
+if (!all(file.exists(accessibility_paths)))
+  stop("Accessibility tables are missing. Submit the Slurm job and wait for it to finish.")
+accessibility_export <- fread(file.path(table_dir, "01_enhancer_accessibility.tsv"))
+stopifnot(!anyDuplicated(accessibility_export$enhancer_id),
+          all(enhancers$enhancer_id %in% accessibility_export$enhancer_id))
+head(accessibility_export)
+accessibility <- accessibility_export[match(enhancers$enhancer_id, enhancer_id),
+  c("enhancer_id", sample_table$sample, "accessible"), with = FALSE]
+enhancers[, accessible := accessibility$accessible]
+accessibility_summary <- fread(file.path(table_dir, "01_accessible_counts.tsv"))
+head(accessibility_summary)
+```
+
+# 2. Chromatin signatures at baseline active and inactive enhancers
+
+```{r baseline-files-function}
+baseline_files <- function(directory, suffix) {
+  paths <- list.files(directory, pattern = paste0("_0000_.*", suffix, "$"), full.names = TRUE)
+  if (length(paths) != 2L) stop("Expected two baseline replicates: ", directory, " / ", suffix)
+  paths
+}
+```
+
+```{r baseline-peak-support-function}
+baseline_peak_support <- function(enhancers, files) {
+  support <- integer(nrow(enhancers))
+  for (path in files) {
+    peaks <- fread(path, header = FALSE, select = 1:3,
+                   col.names = c("chr", "start0", "end0"))
+    support <- support + (countOverlaps(bed_ranges(enhancers), bed_ranges(peaks)) > 0L)
+  }
+  support
+}
+```
+
+```{r baseline-signal-function}
+baseline_signal <- function(enhancers, files) {
+  signal <- matrix(NA_real_, nrow(enhancers), length(files))
+  for (j in seq_along(files)) {
+    bw <- rtracklayer::BigWigFile(files[j])
+    available <- names(GenomeInfoDb::seqlengths(bw))
+    for (chrom in intersect(unique(enhancers$chr), available)) {
+      idx <- which(enhancers$chr == chrom)
+      query <- bed_ranges(enhancers[idx])
+      track <- rtracklayer::import(bw, which = reduce(query), as = "GRanges")
+      # Uncovered bases on a represented chromosome contribute zero signal;
+      # an absent chromosome is NA, not zero.
+      hits <- findOverlaps(query, track)
+      signal[idx, j] <- 0
+      if (length(hits)) {
+        q <- queryHits(hits)
+        t <- subjectHits(hits)
+        bp <- width(pintersect(query[q], track[t]))
+        sums <- rowsum(bp * mcols(track)$score[t], q, reorder = FALSE)
+        k <- as.integer(rownames(sums))
+        signal[idx[k], j] <- as.numeric(sums) / width(query)[k]
+      }
+    }
+  }
+  values <- rowMeans(signal, na.rm = TRUE)
+  values[is.nan(values)] <- NA_real_
+  values
+}
+```
+
+```{r classify-enhancers}
+# Reload saved flags so this chunk also works after rerunning load-fantom.
+accessibility_flags <- fread(
+  file.path(table_dir, "01_enhancer_accessibility.tsv"),
+  select = c("enhancer_id", "accessible")
+)
+if (anyDuplicated(accessibility_flags$enhancer_id))
+  stop("Duplicate enhancer IDs in the accessibility table.")
+accessibility_idx <- match(enhancers$enhancer_id, accessibility_flags$enhancer_id)
+if (anyNA(accessibility_idx))
+  stop("Some enhancer IDs are missing from the accessibility table.")
+accessible_values <- as.logical(accessibility_flags$accessible[accessibility_idx])
+if (anyNA(accessible_values)) stop("Missing or invalid accessibility flags.")
+enhancers[, accessible := accessible_values]
+
+chip_dir <- file.path(annotation_dir, "chip_hg38")
+atac_dir <- file.path(annotation_dir, "atac_hg38")
+enhancers[, h3k27ac_reps := baseline_peak_support(.SD, baseline_files(chip_dir, "peaks\\.narrowPeak"))]
+enhancers[, atac_reps := baseline_peak_support(.SD, baseline_files(atac_dir, "peaks\\.narrowPeak"))]
+enhancers[, enhancer_class := fifelse(h3k27ac_reps >= minimum_peak_replicates &
+                                       atac_reps >= minimum_peak_replicates, "active", "inactive")]
+if (inactive_definition == "neither_signal") {
+  enhancers[enhancer_class == "inactive" & (h3k27ac_reps > 0 | atac_reps > 0),
+            enhancer_class := "excluded"]
+}
+stopifnot(comparison_universe %in% c("accessible", "all_fantom"),
+          inactive_definition %in% c("not_active", "neither_signal"))
+analysis_enhancers <- copy(enhancers[enhancer_class %in% c("active", "inactive") &
+                                    (accessible | comparison_universe == "all_fantom")])
+if (!nrow(analysis_enhancers)) stop("No enhancers meet the selected universe/class criteria")
+analysis_enhancers[, h3k27ac_signal := baseline_signal(.SD, baseline_files(chip_dir, "\\.bw"))]
+analysis_enhancers[, atac_signal := baseline_signal(.SD, baseline_files(atac_dir, "\\.bw"))]
+save_table(analysis_enhancers[, .(enhancer_id, chr, start0, end0, accessible,
+                                 enhancer_class, h3k27ac_reps, atac_reps,
+                                 h3k27ac_signal, atac_signal)], "02_enhancer_classes.tsv")
+class_summary <- analysis_enhancers[, .(n_enhancers = .N), by = .(accessible, enhancer_class)]
+save_table(class_summary, "02_class_counts.tsv")
+```
+
+### Sample a balanced enhancer set
+
+Sample 5,000 active and 5,000 inactive enhancers without replacement, using seed
+1. The full eligible classes remain in `02_enhancer_classes.tsv`; this chunk
+reloads that pool so rerunning it selects the same enhancers. All subsequent
+analyses use this sampled set across all four timepoints. The later read-coverage
+and ACF quality filters can reduce the number of usable enhancers or fibers.
+
+```{r sample-analysis-enhancers}
+enhancers_per_class <- 5000L
+enhancer_sampling_seed <- 1L
+analysis_pool <- fread(file.path(table_dir, "02_enhancer_classes.tsv"))
+stopifnot(!anyDuplicated(analysis_pool$enhancer_id))
+available_classes <- analysis_pool[, .(n_enhancers = .N), by = enhancer_class]
+if (!setequal(available_classes$enhancer_class, c("active", "inactive")) ||
+    any(available_classes$n_enhancers < enhancers_per_class))
+  stop("Need at least ", enhancers_per_class, " enhancers in each of the active and inactive classes.")
+data.table::setorder(analysis_pool, enhancer_class, enhancer_id)
+set.seed(enhancer_sampling_seed)
+analysis_enhancers <- analysis_pool[
+  , .SD[sample.int(.N, enhancers_per_class, replace = FALSE)], by = enhancer_class]
+analysis_enhancers[, midpoint0 := as.integer(floor((start0 + end0) / 2))]
+save_table(analysis_enhancers, "02_sampled_enhancer_classes.tsv")
+sampled_class_summary <- analysis_enhancers[
+  , .(n_enhancers = .N), by = .(accessible, enhancer_class)]
+save_table(sampled_class_summary, "02_sampled_class_counts.tsv")
+```
+
+### Aggregate FIRE profiles around sampled enhancer midpoints
+
+For each track, compare active and inactive enhancers in separate panels for
+LPS 0, 5, 10 and 15 minutes. Use the same sampled enhancers at every timepoint
+and the same midpoint-centered, 1,000-bp windows as the ACF analysis: BED offsets
+[-500, 500), at 1-bp resolution. Each enhancer contributes equally to its class
+mean at each position. Recorded zeros are included; missing bigWig values and
+windows extending outside a represented chromosome are excluded, with the
+number of contributing enhancers saved for each position.
+
+`all.percent.accessible.bw` contains the percentage of fibers carrying a FIRE
+at each position. The FIRE, linker/MSP and nucleosome coverage tracks contain
+fiber counts; these raw coverage values also depend on sequencing depth.
+
+```{r fire-profile-settings}
+fire_bw_root <- "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE"
+fire_profile_flank <- 500L
+fire_profile_tracks <- data.table(
+  track = c("percent_accessible", "fire_coverage", "linker_coverage", "nucleosome_coverage"),
+  filename = c("all.percent.accessible.bw", "all.fire.coverage.bw",
+               "all.linker.coverage.bw", "all.nucleosome.coverage.bw"),
+  title = c("FIRE accessibility", "FIRE coverage", "Linker/MSP coverage", "Nucleosome coverage"),
+  y_label = c("Mean accessible fibers (%)", rep("Mean coverage (fibers)", 3L))
+)
+```
+
+```{r aggregate-fire-profile-function}
+aggregate_fire_profile <- function(regions, path, flank = 500L) {
+  stopifnot(file.exists(path), flank > 0L,
+            !anyDuplicated(regions$enhancer_id),
+            !anyNA(regions[, .(chr, midpoint0, enhancer_class)]))
+  bw <- rtracklayer::BigWigFile(path)
+  chromosome_lengths <- GenomeInfoDb::seqlengths(GenomeInfoDb::seqinfo(bw))
+  left0 <- regions$midpoint0 - flank
+  right0 <- regions$midpoint0 + flank
+  chromosome_end <- unname(chromosome_lengths[regions$chr])
+  valid <- !is.na(chromosome_end) & left0 >= 0L & right0 <= chromosome_end
+  signal <- matrix(NA_real_, nrow(regions), 2L * flank)
+  for (chromosome in unique(regions$chr[valid])) {
+    idx <- which(valid & regions$chr == chromosome)
+    query <- GenomicRanges::GRanges(chromosome,
+      IRanges::IRanges(left0[idx] + 1L, right0[idx]))
+    # One summary value per genomic base; retain absent values as NA.
+    signal[idx, ] <- summary(bw, which = query, size = 2L * flank,
+                             type = "mean", defaultValue = NA_real_, as = "matrix")
+  }
+  signal[!is.finite(signal)] <- NA_real_
+  data.table::rbindlist(lapply(c("active", "inactive"), function(class_id) {
+    idx <- which(regions$enhancer_class == class_id)
+    values <- signal[idx, , drop = FALSE]
+    n <- colSums(!is.na(values))
+    means <- colMeans(values, na.rm = TRUE)
+    means[n == 0L] <- NA_real_
+    data.table(enhancer_class = class_id, position_bp = seq.int(-flank, flank - 1L),
+               mean_signal = means, n_enhancers = n,
+               n_sampled = length(idx), n_windows_in_bounds = sum(valid[idx]))
+  }))
+}
+```
+
+```{r calculate-fire-profiles}
+fire_profile_parts <- list()
+for (i in seq_len(nrow(fire_profile_tracks))) {
+  for (j in seq_len(nrow(sample_table))) {
+    bw_path <- file.path(fire_bw_root, sample_table$sample[j], "trackHub-v0.1/bw",
+                         fire_profile_tracks$filename[i])
+    message("Profiling ", sample_table$sample[j], ": ", fire_profile_tracks$track[i])
+    profile <- aggregate_fire_profile(analysis_enhancers, bw_path, fire_profile_flank)
+    profile[, `:=`(sample = sample_table$sample[j], time_min = sample_table$time_min[j],
+                   track = fire_profile_tracks$track[i])]
+    fire_profile_parts[[length(fire_profile_parts) + 1L]] <- profile
+  }
+}
+fire_profiles <- rbindlist(fire_profile_parts)
+save_table(fire_profiles, "02_fire_aggregate_profiles.tsv")
+```
+
+```{r plot-fire-profiles, fig.width=10, fig.height=7}
+for (i in seq_len(nrow(fire_profile_tracks))) {
+  plot_data <- copy(fire_profiles[track == fire_profile_tracks$track[i]])
+  plot_data[, timepoint := factor(paste0(time_min, " min"),
+                                  levels = paste0(sample_table$time_min, " min"))]
+  p_fire_profile <- ggplot(plot_data,
+    aes(position_bp, mean_signal, color = enhancer_class)) +
+    geom_vline(xintercept = 0, linetype = 2, color = "grey65") +
+    geom_line(linewidth = 0.7, na.rm = TRUE) +
+    facet_wrap(~timepoint, ncol = 2) +
+    scale_color_manual(values = c(active = "#D55E00", inactive = "#0072B2")) +
+    scale_x_continuous(breaks = c(-fire_profile_flank, 0, fire_profile_flank),
+                       limits = c(-fire_profile_flank, fire_profile_flank)) +
+    scale_y_continuous(limits = c(0, NA)) +
+    labs(title = fire_profile_tracks$title[i],
+         x = "Position relative to enhancer midpoint (bp)",
+         y = fire_profile_tracks$y_label[i], color = NULL,
+         caption = "Mean across sampled enhancers; missing values excluded.") +
+    theme_classic() + theme(legend.position = "bottom")
+  print(p_fire_profile)
+  save_pdf(p_fire_profile, paste0("02_aggregate_", fire_profile_tracks$track[i], ".pdf"),
+           width = 10, height = 7)
+}
+```
+
+```{r baseline-signal-plot}
+signal_long <- melt(analysis_enhancers, id.vars = c("enhancer_id", "enhancer_class"),
+                    measure.vars = c("h3k27ac_signal", "atac_signal"),
+                    variable.name = "assay", value.name = "signal")
+head(signal_long)
+p_signal <- ggplot(signal_long, aes(enhancer_class, signal, fill = enhancer_class)) +
+  geom_boxplot(outlier.shape = NA) + facet_wrap(~assay, scales = "free_y") +
+  scale_y_continuous(trans = "log1p") + theme_classic() +
+  labs(x = NULL, y = "Mean baseline bigWig signal (log1p scale)") +
+  theme(legend.position = "none")
+save_pdf(p_signal, "02_baseline_H3K27ac_ATAC.pdf")
+
+p_signal
+```
+
+
+### Pool unbinned single-fiber autocorrelation profiles within each enhancer class
+
+Each enhancer contributes all molecules fully spanning its midpoint +/- 500 bp,
+pooled across the four timepoints within its baseline active/inactive class. Each
+class pool is then uniformly sampled to **10,000 fibers without replacement**
+(seed 1); if fewer are available, all are used. This is the **same fiber sample**
+used by the Manhattan–Leiden analysis below: both jobs extract the pooled class in
+the same order and apply the same seed, and the loading chunk for the Manhattan
+results checks that the two fiber sets are identical. Each
+row contains **1,000 consecutive genomic bases**, with 1 for an m6A call and 0 for
+no call. This follows the binary input used by the autocorrelation workflow:
+G/C bases are also zero. There is no A/T normalization, binning, smoothing or
+imputation. A molecule spanning multiple enhancer windows contributes separately
+to each window, and enhancers with more full-span fibers contribute more rows.
+
+The batch worker imports `03_compute_autocorrelations.py` and
+`04_cluster_autocorrelations.py` directly from `code/clustering_methods/auto_correlation`
+through `reticulate`. Those files are read without modification. For each fiber,
+the first function computes the mean-centered, variance-normalized linear ACF:
+
+\[
+\mathrm{ACF}(k) =
+\frac{\sum_{t=0}^{999-k}(x_t-\bar{x})(x_{t+k}-\bar{x})}
+     {\sum_{t=0}^{999}(x_t-\bar{x})^2},\qquad k=0,\ldots,999.
+\]
+
+All 1,000 lag features are retained at **1-bp resolution**. Constant fibers
+(including all-zero fibers) remain in the QC counts; their ACF is undefined, so
+they are excluded from clustering. Lag 0 is retained for clustering and becomes
+a constant-zero feature when PCA centers the columns.
+
+The reference clustering function uses centered, unscaled PCA (up to 50 PCs),
+correlation-distance neighbors on the PCA scores (10 neighbors), the UMAP
+connectivity graph and Leiden at resolution 0.4, with seed 0. UMAP coordinates
+are for display. Each enhancer class is clustered independently; cluster numbers
+have no correspondence between active and inactive classes. All valid fibers
+among the 10,000 sampled per class enter clustering. ACF calculation is batched; the reference
+PCA/neighbors step still holds the sampled class in memory.
+
+```{r acf-job-files}
+acf_script <- file.path(project_root, "code/enhancer/run_enhancer_acf.sh")
+acf_results_file <- file.path(table_dir, "enhancer_acf_results.rds")
+acf_max_fibers <- 10000L  # same pooled-class fiber sample as the Manhattan job
+acf_sampling_seed <- 1L
+```
+
+The batch job reads `02_sampled_enhancer_classes.tsv`, pools all four timepoints
+within each class and samples 10,000 fibers per class. Its settings are in
+`code/enhancer/run_enhancer_acf.R`.
+
+
+```{r submit-enhancer-acf, eval=FALSE}
+acf_status <- system2("sbatch", shQuote(acf_script))
+if (acf_status != 0L) stop("Slurm enhancer ACF job submission failed")
+```
+
+```{r load-enhancer-acf-results}
+if (!file.exists(acf_results_file))
+  stop("ACF results are missing. Submit the Slurm job and wait for it to finish.")
+acf_saved <- readRDS(acf_results_file)
+current_acf_regions <- as.data.frame(analysis_enhancers[, .(
+  enhancer_id = as.character(enhancer_id), enhancer_class = as.character(enhancer_class),
+  chr = as.character(chr), midpoint0 = as.integer(midpoint0))])
+current_acf_regions <- current_acf_regions[order(current_acf_regions$enhancer_id), , drop = FALSE]
+rownames(current_acf_regions) <- NULL
+if (!identical(acf_saved$inputs$regions, current_acf_regions) ||
+    !identical(acf_saved$inputs$samples, as.character(sample_table$sample)) ||
+    !identical(acf_saved$parameters$max_fibers, acf_max_fibers) ||
+    !identical(acf_saved$parameters$sampling_seed, acf_sampling_seed))
+  stop("Saved ACF results do not match the current sampled enhancers/timepoints/fiber sampling. Resubmit the job.")
+enhancer_acf_results <- acf_saved$results
+stopifnot(setequal(names(enhancer_acf_results), unique(analysis_enhancers$enhancer_class)))
+rm(acf_saved, current_acf_regions)
+```
+
+```{r acf-qc-summary-function}
+summarize_acf_qc <- function(results) {
+  rbindlist(lapply(names(results), function(class_id) {
+    result <- results[[class_id]]
+    extraction <- copy(as.data.table(result$extraction_qc))
+    assignments <- as.data.table(result$assignments)
+    a <- extraction[, .(n_enhancers = uniqueN(enhancer_id),
+                        n_reads = sum(n_reads)), by = status]
+    a[, stage := "extraction"]
+    b <- assignments[, .(n_enhancers = uniqueN(enhancer_id), n_reads = .N),
+                       by = .(status = acf_status)]
+    b[, stage := "autocorrelation_clustering"]
+    out <- rbindlist(list(a, b), use.names = TRUE)
+    out[, enhancer_class := class_id]
+    out[, .(enhancer_class, stage, status, n_enhancers, n_reads)]
+  }), use.names = TRUE)
+}
+```
+
+```{r acf-cluster-counts-function}
+count_acf_clusters <- function(results) {
+  counts <- rbindlist(lapply(names(results), function(class_id) {
+    dt <- copy(as.data.table(results[[class_id]]$assignments))
+    dt[, cluster := as.character(cluster)]
+    dt[is.na(cluster), cluster := "unclustered"]
+    dt[, .(n_reads = .N, n_enhancers = uniqueN(enhancer_id)),
+       by = .(enhancer_class, sample_name, cluster)]
+  }), use.names = TRUE)
+  if (nrow(counts))
+    counts[, fraction := n_reads / sum(n_reads), by = .(enhancer_class, sample_name)]
+  else counts[, fraction := numeric()]
+  counts
+}
+```
+
+```{r acf-profile-table-function}
+acf_profile_table <- function(results, component = "acf_profiles") {
+  out <- rbindlist(lapply(names(results), function(class_id) {
+    mat <- results[[class_id]][[component]]
+    if (is.null(mat) || !nrow(mat)) return(NULL)
+    data.table(enhancer_class = class_id,
+               cluster = rep(rownames(mat), each = ncol(mat)),
+               position_bp = rep(as.integer(colnames(mat)), nrow(mat)),
+               mean_value = as.vector(t(mat)))
+  }), use.names = TRUE)
+  if (!ncol(out)) out <- data.table(enhancer_class = character(), cluster = character(),
+                                   position_bp = integer(), mean_value = numeric())
+  out
+}
+```
+
+```{r acf-profile-plot-function}
+plot_acf_profiles <- function(profiles, class_id, profile_type = "acf") {
+  dt <- copy(profiles[enhancer_class == class_id])
+  if (profile_type == "acf") dt <- dt[position_bp > 0L]
+  cluster_levels <- unique(dt$cluster)
+  cluster_levels <- cluster_levels[order(as.integer(sub("cluster", "", cluster_levels)))]
+  dt[, cluster := factor(cluster, levels = cluster_levels)]
+  p <- ggplot(dt, aes(position_bp, mean_value)) +
+    geom_hline(yintercept = 0, colour = "grey85", linewidth = 0.25) +
+    geom_line(linewidth = 0.3, colour = "#176B87") +
+    facet_wrap(~cluster, ncol = 1) + theme_bw(base_size = 11) +
+    labs(title = paste(class_id, "enhancers"),
+         x = if (profile_type == "acf") "Lag (bp)" else "Position relative to midpoint (bp)",
+         y = if (profile_type == "acf") "Mean autocorrelation" else "Fraction of fibers with m6A")
+  if (profile_type != "acf") p <- p + geom_vline(xintercept = 0, linetype = 2,
+                                                colour = "grey45", linewidth = 0.3)
+  p
+}
+```
+
+```{r acf-composition-plot-function}
+plot_acf_composition <- function(counts, class_id, samples) {
+  dt <- copy(counts[enhancer_class == class_id])
+  cluster_levels <- setdiff(unique(dt$cluster), "unclustered")
+  cluster_levels <- cluster_levels[order(as.integer(sub("cluster", "", cluster_levels)))]
+  if ("unclustered" %in% dt$cluster) cluster_levels <- c(cluster_levels, "unclustered")
+  dt[, cluster := factor(cluster, levels = cluster_levels)]
+  dt[, sample_name := factor(sample_name, levels = samples$sample)]
+  ggplot(dt, aes(sample_name, fraction, fill = cluster)) +
+    geom_col(width = 0.8) +
+    scale_x_discrete(drop = FALSE, labels = setNames(samples$time_min, samples$sample)) +
+    scale_y_continuous(limits = c(0, 1), labels = function(x) paste0(100 * x, "%")) +
+    theme_bw(base_size = 11) +
+    labs(title = paste(class_id, "enhancers"), x = "Time after LPS (min)",
+         y = "Fraction of extracted fibers", fill = "Cluster")
+}
+```
+
+```{r acf-umap-plot-function}
+plot_acf_umap <- function(assignments, class_id, samples, colour_by = "cluster") {
+  dt <- copy(as.data.table(assignments))[acf_status == "clustered" &
+                                         is.finite(UMAP1) & is.finite(UMAP2)]
+  if (!nrow(dt)) return(NULL)
+  if (colour_by == "sample_name") {
+    dt[, plot_group := factor(sample_name, levels = samples$sample,
+                               labels = paste0(samples$time_min, " min"))]
+  } else {
+    groups <- unique(as.character(dt$cluster))
+    groups <- groups[order(as.integer(sub("cluster", "", groups)))]
+    dt[, plot_group := factor(cluster, levels = groups)]
+  }
+  ggplot(dt, aes(UMAP1, UMAP2, colour = plot_group)) +
+    geom_point(size = 0.35, alpha = 0.45, stroke = 0) +
+    guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+    coord_equal() + theme_bw(base_size = 11) +
+    labs(title = paste(class_id, "enhancers"),
+         colour = if (colour_by == "sample_name") "Time after LPS" else "Cluster")
+}
+```
+
+```{r enhancer-acf-summary-tables}
+acf_fiber_sampling <- rbindlist(lapply(names(enhancer_acf_results), function(class_id) {
+  x <- as.data.table(enhancer_acf_results[[class_id]]$fiber_sampling)
+  x[, enhancer_class := class_id]
+  x
+}))
+save_table(acf_fiber_sampling, "acf_fiber_sampling.tsv")
+acf_qc_summary <- summarize_acf_qc(enhancer_acf_results)
+save_table(acf_qc_summary, "acf_qc.tsv")
+acf_cluster_counts <- count_acf_clusters(enhancer_acf_results)
+save_table(acf_cluster_counts, "acf_cluster_counts.tsv")
+acf_cluster_profiles <- acf_profile_table(enhancer_acf_results)
+acf_profiles_export <- copy(acf_cluster_profiles)
+setnames(acf_profiles_export, c("position_bp", "mean_value"), c("lag_bp", "mean_acf"))
+save_table(acf_profiles_export, "acf_cluster_profiles.tsv")
+m6a_base_profiles <- acf_profile_table(enhancer_acf_results, "m6a_profiles")
+head(m6a_base_profiles)
+```
+
+The ACF curves show every positive integer lag without binning or smoothing;
+lag zero is retained in the table. The m6A curves show each genomic base, with
+the proportion of fibers carrying an m6A call at that midpoint-relative base.
+Composition percentages include all sampled fibers in each timepoint's
+denominator; fibers excluded from clustering appear as **unclustered**, with
+the reasons summarized in the QC table. Extraction QC counts all eligible
+fibers; clustering QC and plots describe only the 10,000 sampled fibers. UMAP plots contain only fibers with
+computed coordinates. Cluster labels are specific to each enhancer class.
+
+```{r enhancer-acf-pdfs, results='hide'}
+for (class_id in names(enhancer_acf_results)) {
+  if (any(acf_cluster_profiles$enhancer_class == class_id)) {
+    n_clusters <- uniqueN(acf_cluster_profiles[enhancer_class == class_id, cluster])
+    save_pdf(plot_acf_profiles(acf_cluster_profiles, class_id),
+             paste0("acf_cluster_profiles_", class_id, ".pdf"),
+             width = 8, height = max(4, 1.5 * n_clusters + 1))
+    save_pdf(plot_acf_profiles(m6a_base_profiles, class_id, "m6a"),
+             paste0("acf_m6a_base_cluster_profiles_", class_id, ".pdf"),
+             width = 8, height = max(4, 1.5 * n_clusters + 1))
+  }
+  if (any(acf_cluster_counts$enhancer_class == class_id))
+    save_pdf(plot_acf_composition(acf_cluster_counts, class_id, sample_table),
+             paste0("acf_cluster_composition_", class_id, ".pdf"))
+  for (colour_by in c("cluster", "sample_name")) {
+    p <- plot_acf_umap(enhancer_acf_results[[class_id]]$assignments,
+                       class_id, sample_table, colour_by)
+    if (!is.null(p)) save_pdf(p, paste0("acf_umap_", colour_by, "_", class_id, ".pdf"))
+  }
+}
+```
+
+### Pool unbinned single-fiber patterns for Manhattan–Leiden clustering
+
+This is a second clustering analysis of the **raw binary m6A patterns** in the
+same midpoint +/- 500-bp windows. Each class pools eligible full-span fibers from its
+5,000 sampled enhancers and all four timepoints, then uniformly samples
+**10,000 fibers without replacement** (seed 1) before neighbor search. If fewer
+than 10,000 are available, all are used. Sampling is across the pooled class,
+without forcing equal numbers per enhancer or timepoint. Fiber samples match
+ACF only when both jobs use the same extraction order, enhancer set and seed. Active and inactive classes are
+clustered independently. The shared extractor retains **1,000 individual bases
+(-500 through +499)**, with 1 for a call and 0 for no call, including G/C bases.
+There is no binning, smoothing, PCA, imputation or A/T normalization. A fiber spanning multiple enhancers contributes once per
+window; enhancers with more fibers contribute more rows. All-zero and other
+constant fibers are included because Manhattan distance remains defined.
+
+For two fibers, Manhattan distance is the number of midpoint-relative bases
+where their binary calls differ. The graph method follows
+`code/clustering_methods/Leiden_Manhattan/marcophage_leiden_manhattan.Rmd`,
+with the requested neighbor count changed to **100**:
+100 neighbors per fiber, edge weight `exp(-distance / sigma)`, with `sigma` equal
+to the mean directed neighbor distance (1 if all distances are zero), and an
+undirected union graph. Leiden calls the original `leiden_partition()` function
+with the modularity objective, resolution 1, seed 1 and iterations to convergence.
+Clusters are numbered largest first within each class; their labels do not
+correspond across classes or to the ACF clusters.
+
+The default uses **approximate Manhattan neighbors** to avoid the
+reference's full pairwise distance matrix. All selected edge distances are
+recomputed exactly from the original 1-bp patterns. This can select different
+neighbors/clusters from the reference, including different ties among identical
+patterns. Set `manhattan_neighbor_method <- "exact"` below to use every pairwise
+distance with the reference's input-order tie handling. Exact search works in
+memory-limited blocks but still takes quadratic time. Both modes use the same sampled
+fibers; classes with fewer than three fibers are reported as unclustered.
+
+```{r manhattan-job-files}
+manhattan_script <- file.path(project_root, "code/enhancer/run_enhancer_manhattan.sh")
+manhattan_classes <- c("active", "inactive")
+manhattan_max_fibers <- 10000L
+manhattan_k_neighbors <- 100L
+manhattan_results_files <- setNames(file.path(table_dir,
+  paste0("enhancer_manhattan_", manhattan_classes, "_results.rds")), manhattan_classes)
+manhattan_neighbor_method <- "approximate" # or "exact" (much slower for the pooled set)
+manhattan_job_id_file <- file.path(table_dir, "manhattan_array_job_id.txt")
+if (file.exists(manhattan_job_id_file))
+  manhattan_job_id <- readLines(manhattan_job_id_file, n = 1L)
+```
+
+
+```{r submit-enhancer-manhattan, eval=FALSE}
+stopifnot(manhattan_neighbor_method %in% c("approximate", "exact"))
+manhattan_submission <- system2("sbatch", c("--parsable",
+  shQuote(paste0("--export=ALL,ENHANCER_MANHATTAN_NEIGHBORS=", manhattan_neighbor_method)),
+  shQuote(manhattan_script)), stdout = TRUE)
+if (!is.null(attr(manhattan_submission, "status")) ||
+    length(manhattan_submission) != 1L || !grepl("^[0-9]+(;.*)?$", manhattan_submission))
+  stop("Slurm enhancer Manhattan job submission failed")
+manhattan_job_id <- sub(";.*$", "", manhattan_submission)
+writeLines(manhattan_job_id, manhattan_job_id_file)
+message("Submitted Manhattan array ", manhattan_job_id, ". Wait for both tasks before loading.")
+```
+
+```{r load-enhancer-manhattan-results}
+missing_manhattan <- manhattan_results_files[!file.exists(manhattan_results_files)]
+if (length(missing_manhattan))
+  stop("Wait for both Manhattan array tasks. Missing: ", paste(basename(missing_manhattan), collapse = ", "))
+manhattan_saved <- lapply(manhattan_results_files, readRDS)
+for (class_id in manhattan_classes) {
+  saved <- manhattan_saved[[class_id]]
+  # The completed job's input snapshot defines this analysis, independently of
+  # any later resampling/reclassification in the interactive session.
+  regions <- as.data.table(saved$inputs$regions)
+  assignments <- as.data.table(saved$results[[class_id]]$assignments)
+  stopifnot(all(c("enhancer_id", "enhancer_class", "chr", "midpoint0") %in% names(regions)),
+            nrow(regions) > 0L, !anyNA(regions), !anyDuplicated(regions$enhancer_id),
+            all(regions$enhancer_class == class_id),
+            all(assignments$enhancer_id %in% regions$enhancer_id),
+            all(assignments$enhancer_class == class_id),
+            all(assignments$sample_name %in% saved$inputs$samples),
+            !anyDuplicated(assignments$RID),
+            nrow(assignments) == saved$results[[class_id]]$fiber_sampling$n_selected)
+  if (exists("analysis_enhancers", inherits = FALSE)) {
+    current_ids <- analysis_enhancers$enhancer_id[analysis_enhancers$enhancer_class == class_id]
+    if (!setequal(regions$enhancer_id, current_ids))
+      message("Manhattan ", class_id, ": using ", nrow(regions),
+              " enhancers recorded in the completed job; the current R-session sample differs.")
+  }
+  if (!identical(saved$parameters$k_neighbors, manhattan_k_neighbors))
+    stop("Saved Manhattan ", class_id, " results use k=", saved$parameters$k_neighbors,
+         "; submit the array for k=", manhattan_k_neighbors, ".")
+  if (!identical(saved$inputs$samples, as.character(sample_table$sample)) ||
+      !identical(saved$parameters$neighbor_method, manhattan_neighbor_method) ||
+      !identical(saved$parameters$max_fibers, manhattan_max_fibers) ||
+      !identical(saved$parameters$sampling_seed, 1L))
+    stop("Saved Manhattan ", class_id, " results do not match current timepoints/method/fiber sampling.")
+  stopifnot(identical(saved$enhancer_class, class_id), identical(names(saved$results), class_id),
+            identical(saved$parameters$position_bp, -500:499),
+            identical(saved$parameters$signal, "raw_binary_m6a"))
+}
+manhattan_array_ids <- vapply(manhattan_saved, function(x) x$array_job_id, character(1))
+if (length(unique(manhattan_array_ids)) != 1L)
+  stop("Class results come from different arrays. Wait for both tasks of the current array.")
+if (exists("manhattan_job_id", inherits = FALSE) &&
+    !all(manhattan_array_ids == manhattan_job_id))
+  warning("Loading validated results from completed array ", unique(manhattan_array_ids),
+          "; the latest submission record is ", manhattan_job_id,
+          ". A newer submission does not replace results until it completes.", call. = FALSE)
+enhancer_manhattan_results <- setNames(lapply(manhattan_classes,
+  function(class_id) manhattan_saved[[class_id]]$results[[class_id]]), manhattan_classes)
+manhattan_analysis_enhancers <- rbindlist(lapply(manhattan_saved, function(x) x$inputs$regions))
+# Standalone Manhattan plots remain valid when ACF used a different sample.
+manhattan_acf_same_fibers <- NULL
+if (exists("enhancer_acf_results", inherits = FALSE)) {
+  manhattan_acf_same_fibers <- setNames(vapply(manhattan_classes, function(class_id)
+    setequal(enhancer_manhattan_results[[class_id]]$assignments$RID,
+             enhancer_acf_results[[class_id]]$assignments$RID), logical(1)), manhattan_classes)
+  if (!all(manhattan_acf_same_fibers))
+    warning("ACF and Manhattan used different fiber samples. Standalone Manhattan plots are valid; do not treat the samples as paired.", call. = FALSE)
+}
+rm(manhattan_saved, manhattan_array_ids, regions, assignments, saved, missing_manhattan)
+```
+
+`manhattan_analysis_enhancers` is the enhancer input snapshot from the completed
+Manhattan jobs. It is independent of the current `analysis_enhancers`; loading
+results does not resample or change inputs for other analyses.
+
+The loaded `enhancer_manhattan_results` contains per-fiber assignments with
+original read IDs, enhancer IDs, classes, timepoints and coordinates;
+`m6a_profiles` contains the cluster means at each base. `fiber_sampling` records
+the eligible and selected fiber counts. Assignments contain only sampled fibers. `extraction_qc` records
+enhancers without usable full-span fibers, and `info` records the graph settings
+and any exact repairs of incomplete approximate neighbor lists. These R results
+include the sampled sparse 1-bp feature matrix and selected-fiber footprint
+records for plotting; the neighbor graph is omitted. Extraction QC counts
+all eligible fibers; clustering QC and plots describe only sampled fibers.
+
+```{r enhancer-manhattan-summary-tables}
+manhattan_sampling <- rbindlist(lapply(names(enhancer_manhattan_results), function(class_id) {
+  x <- as.data.table(enhancer_manhattan_results[[class_id]]$fiber_sampling)
+  x[, enhancer_class := class_id]
+  x
+}))
+save_table(manhattan_sampling, "manhattan_fiber_sampling.tsv")
+manhattan_qc <- rbindlist(lapply(names(enhancer_manhattan_results), function(class_id) {
+  result <- enhancer_manhattan_results[[class_id]]
+  extraction <- as.data.table(result$extraction_qc)[,
+    .(n_enhancers = uniqueN(enhancer_id), n_reads = sum(n_reads)), by = status]
+  extraction[, stage := "extraction"]
+  clustered <- as.data.table(result$assignments)[,
+    .(n_enhancers = uniqueN(enhancer_id), n_reads = .N), by = .(status = clustering_status)]
+  clustered[, stage := "manhattan_clustering"]
+  out <- rbindlist(list(extraction, clustered), use.names = TRUE)
+  out[, enhancer_class := class_id]
+  out[, .(enhancer_class, stage, status, n_enhancers, n_reads)]
+}))
+save_table(manhattan_qc, "manhattan_qc.tsv")
+# The summary/plot helpers above also accept these per-fiber cluster assignments.
+manhattan_cluster_counts <- count_acf_clusters(enhancer_manhattan_results)
+save_table(manhattan_cluster_counts, "manhattan_cluster_counts.tsv")
+manhattan_m6a_profiles <- acf_profile_table(enhancer_manhattan_results, "m6a_profiles")
+manhattan_profiles_export <- copy(manhattan_m6a_profiles)
+setnames(manhattan_profiles_export, "mean_value", "mean_m6a")
+save_table(manhattan_profiles_export, "manhattan_m6a_base_cluster_profiles.tsv")
+head(manhattan_cluster_counts)
+```
+
+Profiles show unsmoothed means at each base. Composition plots show the fiber
+proportions among sampled fibers within each timepoint, using clusters fitted to all timepoints
+pooled within that class. These are fiber-weighted summaries, so equal enhancer
+counts do not imply equal numbers of fibers across classes or timepoints.
+
+The m6A heatmap includes every sampled fiber, grouped by Manhattan cluster and
+annotated by timepoint. Footprint profiles use all sampled fibers and count
+per-base occupancy of FiberHMM nucleosomes >90 bp and TF footprints <60 bp.
+Single-fiber PDFs have one page per cluster, with up to 100 randomly selected
+fibers for legibility (display only; seed 1), split by timepoint. All tracks align
+to the enhancer midpoint at 1-bp resolution. **k=100 is the neighbor count**;
+profile curves are unsmoothed. Existing k=10 results must be reclustered.
+The array also saves these PDFs automatically; rerun this chunk to regenerate
+them from the saved result without extracting data or clustering again.
+
+```{r enhancer-manhattan-pdfs, results='hide'}
+suppressPackageStartupMessages({library(cowplot); library(grid); library(ComplexHeatmap)})
+manhattan_plot_helpers <- new.env(parent = globalenv())
+sys.source(file.path(project_root,
+  "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r"), envir = manhattan_plot_helpers)
+sys.source(file.path(project_root, "code/enhancer/enhancer_manhattan_plots.R"),
+           envir = manhattan_plot_helpers)
+for (class_id in names(enhancer_manhattan_results))
+  manhattan_plot_helpers$save_enhancer_manhattan_pdfs(
+    enhancer_manhattan_results[[class_id]], class_id, plot_dir, table_dir,
+    expected_k = manhattan_k_neighbors)
+```
+
+### Extract all TF footprints shorter than 60 bp
+
+This shell script expands every block in the complete FiberHMM TF BED12 files,
+retains lengths 1–59 bp, and writes sorted, bgzipped BED6 files with tabix indexes.
+The BED6 columns match `split_footprints_by_size.sh`:
+`chrom`, `start`, `end`, `read_name`, `size`, `strand`.
+
+Outputs use the existing TF folder layout:
+`firehmm_tf/ft_by_size/size0-60/LPS0/LPS0_tf_size0-60_chr1.bed.gz`
+(and the corresponding chromosomes/timepoints). These contain the same short
+TF calls selected from the parent files by the counting functions below.
+The R chunk saves the standalone script in `FiberHMM/extract/code`.
+The submission chunk is manual so knitting does not submit another extraction job.
+No log files are saved.
+
+```{r function-write-tf-lt60-script}
+write_tf_lt60_script <- function(path) {
+  script <- r"---(#!/bin/bash
+#SBATCH --job-name=extract_tf_lt60
+#SBATCH --account=pi-spott
+#SBATCH --partition=caslake
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
+#SBATCH --array=1-4
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
+
+# Expand the complete per-chromosome FiberHMM TF BED12+ files into BED6.
+# Keep every real block with 0 < length < 60 bp, including 1-9 and 30-39 bp.
+# FiberHMM has no first/last sentinel blocks; every block is inspected.
+#
+# Input : firehmm_tf/<LPSn>/<LPSn>_hmm_extracted_tf_<chrom>.bed.gz
+# Output: firehmm_tf/ft_by_size/size0-60/<LPSn>/
+#             <LPSn>_tf_size0-60_<chrom>.bed.gz (+ .tbi)
+# BED6  : chrom  start  end  read_name  size  strand
+# Coordinates are 0-based, half-open. No plots, logs or uncompressed BEDs are saved.
+#
+# Usage:
+#   sbatch extract_tf_lt60.sh          # four array tasks, one per timepoint
+#   bash extract_tf_lt60.sh LPS0       # one timepoint locally
+#   bash extract_tf_lt60.sh all        # all four timepoints locally
+#   bash extract_tf_lt60.sh LPS0 chrM  # one chromosome (small validation run)
+# Optional environment overrides: TF_EXTRACT_ROOT, TF_OUTPUT_ROOT,
+# TF_SORT_TMP, TF_SORT_MEMORY, TF_THREADS, TF_BGZIP, TF_TABIX.
+# Existing complete BED/index pairs are skipped; incomplete pairs are rebuilt.
+
+set -euo pipefail
+shopt -s nullglob
+
+CONDS=(LPS0 LPS5 LPS10 LPS15)
+EXTRACT_ROOT=${TF_EXTRACT_ROOT:-/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract}
+OUT_ROOT=${TF_OUTPUT_ROOT:-${EXTRACT_ROOT}/firehmm_tf/ft_by_size/size0-60}
+SORT_TMP=${TF_SORT_TMP:-${TMPDIR:-/scratch/midway3/cshan/tmp}}
+SORT_MEMORY=${TF_SORT_MEMORY:-2G}
+NCORE=${TF_THREADS:-${SLURM_CPUS_PER_TASK:-4}}
+BGZIP=${TF_BGZIP:-/project/spott/cshan/envs/dimelo/bin/bgzip}
+TABIX=${TF_TABIX:-/project/spott/cshan/envs/dimelo/bin/tabix}
+work_dir=""
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+cleanup() { if [[ -n "$work_dir" && -d "$work_dir" ]]; then rm -rf -- "$work_dir"; fi; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+[[ $# -le 2 ]] || die "Usage: bash $0 [LPS0|LPS5|LPS10|LPS15|all] [chromosome]"
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    [[ $# -eq 0 ]] || die "Submit the four-task Slurm array without positional arguments"
+    [[ "$SLURM_ARRAY_TASK_ID" =~ ^[1-4]$ ]] || die "Array task ID must be 1-4"
+    LABELS=("${CONDS[$((SLURM_ARRAY_TASK_ID - 1))]}")
+else
+    label=${1:-all}
+    label=${label/_/}
+    case "$label" in
+        all) LABELS=("${CONDS[@]}") ;;
+        LPS0|LPS5|LPS10|LPS15) LABELS=("$label") ;;
+        *) die "Unknown timepoint: $label" ;;
+    esac
+fi
+CHROMOSOME=${2:-}
+[[ "$NCORE" =~ ^[1-9][0-9]*$ ]] || die "TF_THREADS must be a positive integer"
+[[ -x "$BGZIP" && -x "$TABIX" ]] || die "bgzip or tabix executable is missing"
+mkdir -p "$SORT_TMP"
+
+for LABEL in "${LABELS[@]}"; do
+    IN_DIR="${EXTRACT_ROOT}/firehmm_tf/${LABEL}"
+    OUT_DIR="${OUT_ROOT}/${LABEL}"
+    [[ -d "$IN_DIR" ]] || die "Input directory not found: $IN_DIR"
+    if [[ -n "$CHROMOSOME" ]]; then
+        inputs=("${IN_DIR}/${LABEL}_hmm_extracted_tf_${CHROMOSOME}.bed.gz")
+    else
+        inputs=("${IN_DIR}/${LABEL}_hmm_extracted_tf_"*.bed.gz)
+    fi
+    [[ ${#inputs[@]} -gt 0 ]] || die "No TF BED12 inputs found in $IN_DIR"
+    mkdir -p "$OUT_DIR"
+
+    for in_gz in "${inputs[@]}"; do
+        [[ -s "$in_gz" ]] || die "Input missing or empty: $in_gz"
+        base=${in_gz##*/}
+        chrom=${base#"${LABEL}_hmm_extracted_tf_"}
+        chrom=${chrom%.bed.gz}
+        out="${OUT_DIR}/${LABEL}_tf_size0-60_${chrom}.bed.gz"
+        if [[ -s "$out" && -s "${out}.tbi" ]]; then
+            echo "Already extracted: $out"
+            continue
+        fi
+        work_dir=$(mktemp -d "${OUT_DIR}/.tf_lt60_${chrom}.XXXXXX")
+        partial="${work_dir}/footprints.bed.gz"
+
+        # All stages belong to this shell pipeline, so pipefail catches failures
+        # in decompression, validation, sorting and compression before publishing.
+        if ! gzip -cd -- "$in_gz" | awk -v expected_chr="$chrom" '
+        BEGIN { FS = OFS = "\t" }
+        function fail(message) {
+            printf "Invalid BED12 row %d: %s\n", NR, message > "/dev/stderr"
+            exit 2
+        }
+        {
+            if (NF < 12) fail("expected at least 12 columns")
+            if ($1 != expected_chr) fail("chromosome does not match input filename")
+            if ($2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $3 <= $2)
+                fail("invalid outer coordinates")
+            if ($10 !~ /^[0-9]+$/) fail("invalid blockCount")
+            if ($10 == 0) {
+                if (($11 != "" && $11 != ".") || ($12 != "" && $12 != "."))
+                    fail("nonempty blocks with blockCount zero")
+                next
+            }
+            sub(/,$/, "", $11); sub(/,$/, "", $12)
+            ns = split($11, sizes, ","); nt = split($12, offsets, ",")
+            if (ns != $10 || nt != $10) fail("block counts disagree")
+            for (i = 1; i <= ns; i++) {
+                if (sizes[i] !~ /^[0-9]+$/ || sizes[i] <= 0 || offsets[i] !~ /^[0-9]+$/)
+                    fail("invalid block size or offset")
+                size = sizes[i] + 0
+                start = $2 + offsets[i]
+                if (start + size > $3) fail("block extends outside outer interval")
+                if (size < 60) print $1, start, start + size, $4, size, $6
+            }
+        }' | LC_ALL=C sort -k1,1 -k2,2n -k3,3n -S "$SORT_MEMORY" -T "$SORT_TMP" \
+            | "$BGZIP" -@ "$NCORE" -c > "$partial"; then
+            die "Extraction failed for $LABEL $chrom"
+        fi
+        "$TABIX" -f -p bed "$partial"
+        mv -- "$partial" "$out"
+        mv -- "${partial}.tbi" "${out}.tbi"
+        rmdir -- "$work_dir"
+        work_dir=""
+        echo "Wrote: $out"
+    done
+done)---"
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  writeLines(script, path, useBytes = TRUE)
+  Sys.chmod(path, mode = "0755")
+  invisible(normalizePath(path, mustWork = TRUE))
+}
+```
+
+```{r save-tf-lt60-script}
+tf_lt60_script <- file.path(extract_root, "code/extract_tf_lt60.sh")
+write_tf_lt60_script(tf_lt60_script)
+```
+
+```{r submit-tf-lt60-extraction, eval=FALSE}
+# One Slurm array task per timepoint: LPS0, LPS5, LPS10 and LPS15.
+system2("sbatch", shQuote(tf_lt60_script))
+# For an interactive single-chromosome run instead:
+# system2("bash", c(shQuote(tf_lt60_script), "LPS0", "chrM"))
+```
+
+### Count enhancer footprints
+
+The existing size bins omit footprints below 10 bp and from 30–39 bp. Therefore,
+the counts below use their complete parent FiberHMM BED12 files and apply the
+requested strict cutoffs: TF footprints <60 bp and nucleosome footprints >90 bp.
+The 60–90-bp interval is excluded, including footprints exactly 60 or 90 bp.
+Every FiberHMM block is a real call; these files have no `ft extract` sentinels.
+
+A footprint is assigned to an enhancer when its midpoint lies inside that
+enhancer. This avoids favoring long footprints simply because they overlap more
+bases. Only reads spanning the entire enhancer contribute. Read denominators
+come from the matching, unfiltered m6A extraction and include reads with zero TF
+footprints. Two distinct short footprints on one enhancer–read observation are
+called co-occupied; these length-defined footprints do not identify named TFs.
+
+```{r function-footprint-length-bin}
+footprint_length_bin <- function(length_bp) {
+  # Lower bin edges: 0 = 1–9 bp, 10 = 10–19 bp, ..., 500 = >=500 bp.
+  pmin(500L, as.integer(length_bp %/% 10L) * 10L)
+}
+```
+
+```{r function-stream-footprint-lengths}
+stream_footprint_lengths <- function(path, footprint_type, chunk_lines = 5000L) {
+  stopifnot(footprint_type %in% c("TF", "nucleosome"), chunk_lines > 0L)
+  if (!file.exists(path)) stop("Missing footprint input: ", path)
+  con <- gzfile(path, open = "rt")
+  on.exit(close(con))
+  totals <- numeric(51L)
+  repeat {
+    lines <- readLines(con, n = chunk_lines, warn = FALSE)
+    if (!length(lines)) break
+    raw <- data.table::fread(text = paste(lines, collapse = "\n"),
+                            header = FALSE, sep = "\t", select = 11L,
+                            colClasses = "character", showProgress = FALSE)
+    sizes <- as.integer(unlist(strsplit(raw[[1L]], ",", fixed = TRUE),
+                               use.names = FALSE))
+    if (anyNA(sizes)) stop("Invalid footprint block size in ", path)
+    sizes <- if (footprint_type == "TF") sizes[sizes > 0L & sizes < 60L] else
+      sizes[sizes > 90L]
+    if (length(sizes)) {
+      bins <- footprint_length_bin(sizes)
+      totals <- totals + tabulate(bins %/% 10L + 1L, nbins = 51L)
+    }
+  }
+  data.table::data.table(length_bin = seq.int(0L, 500L, 10L), n = totals)
+}
+```
+
+```{r function-expected-footprint-lengths}
+expected_footprint_lengths <- function(sample_table, chromosomes, extract_root) {
+  result <- vector("list", nrow(sample_table))
+  for (s in seq_len(nrow(sample_table))) {
+    sample_name <- sample_table$sample[s]
+    compact_name <- gsub("_", "", sample_name, fixed = TRUE)
+    pieces <- list()
+    for (chromosome in chromosomes) {
+      for (kind in c("tf", "footprint")) {
+        path <- file.path(extract_root, paste0("firehmm_", kind), compact_name,
+                          paste0(compact_name, "_hmm_extracted_", kind, "_",
+                                 chromosome, ".bed.gz"))
+        pieces[[length(pieces) + 1L]] <- stream_footprint_lengths(
+          path, if (kind == "tf") "TF" else "nucleosome")
+      }
+    }
+    combined <- data.table::rbindlist(pieces)[, .(n = sum(n)), by = length_bin]
+    combined[, `:=`(sample = sample_name, time_min = sample_table$time_min[s])]
+    result[[s]] <- combined[, .(sample, time_min, length_bin, n)]
+  }
+  data.table::rbindlist(result)
+}
+```
+
+```{r function-count-enhancer-footprints}
+count_enhancer_footprints <- function(analysis_enhancers, sample_table,
+                                      extract_root, ft_result_dir,
+                                      batch_size = 100L) {
+  stopifnot(!anyDuplicated(analysis_enhancers$enhancer_id), batch_size > 0L)
+  enhancer_parts <- list()
+  length_parts <- list()
+  for (s in seq_len(nrow(sample_table))) {
+    sample_name <- sample_table$sample[s]
+    compact_name <- gsub("_", "", sample_name, fixed = TRUE)
+    for (chromosome in unique(analysis_enhancers$chr)) {
+      enh <- data.table::copy(analysis_enhancers[chr == chromosome])
+      m6a_path <- file.path(ft_result_dir, sample_name, "extracted_results",
+                           "m6a_by_chr", paste0(sample_name,
+                             ".ft_extracted_m6a.", chromosome, ".bed.gz"))
+      tf_path <- file.path(extract_root, "firehmm_tf", compact_name,
+                          paste0(compact_name, "_hmm_extracted_tf_",
+                                 chromosome, ".bed.gz"))
+      nuc_path <- file.path(extract_root, "firehmm_footprint", compact_name,
+                           paste0(compact_name, "_hmm_extracted_footprint_",
+                                  chromosome, ".bed.gz"))
+      for (first in seq.int(1L, nrow(enh), by = batch_size)) {
+        last <- min(nrow(enh), first + batch_size - 1L)
+        current <- enh[first:last]
+        enh_gr <- bed_ranges(current)
+        query_gr <- GenomicRanges::reduce(enh_gr)
+        raw_spans <- tabix_bed(m6a_path, query_gr)
+        coverage <- data.table::data.table(enhancer_id = character(),
+                                          read_id = character())
+        if (nrow(raw_spans)) {
+          spans <- unique(data.table::data.table(
+            chr = as.character(raw_spans[[1L]]), start0 = as.integer(raw_spans[[2L]]),
+            end0 = as.integer(raw_spans[[3L]]), read_id = as.character(raw_spans[[4L]])))
+          spans[, alignment_width := end0 - start0]
+          data.table::setorderv(spans, c("read_id", "alignment_width"), c(1L, -1L))
+          spans <- unique(spans, by = "read_id")
+          hits <- GenomicRanges::findOverlaps(enh_gr, bed_ranges(spans),
+                                               type = "within", ignore.strand = TRUE)
+          coverage <- unique(data.table::data.table(
+            enhancer_id = current$enhancer_id[S4Vectors::queryHits(hits)],
+            read_id = spans$read_id[S4Vectors::subjectHits(hits)]))
+        }
+        observed <- list()
+        for (kind in c("TF", "nucleosome")) {
+          raw <- tabix_bed(if (kind == "TF") tf_path else nuc_path, query_gr)
+          fp <- expand_hmm_blocks(raw)
+          fp <- if (kind == "TF") fp[length > 0L & length < 60L] else fp[length > 90L]
+          if (!nrow(fp) || !nrow(coverage)) next
+          fp <- unique(fp, by = c("chr", "read_id", "start0", "end0"))
+          # Convert BED midpoint to a 1-based point; length remains unclipped.
+          midpoint <- floor((fp$start0 + fp$end0) / 2) + 1L
+          mid_gr <- GenomicRanges::GRanges(fp$chr, IRanges::IRanges(midpoint, midpoint))
+          hits <- GenomicRanges::findOverlaps(mid_gr, enh_gr, ignore.strand = TRUE)
+          if (!length(hits)) next
+          assigned <- data.table::data.table(
+            enhancer_id = current$enhancer_id[S4Vectors::subjectHits(hits)],
+            read_id = fp$read_id[S4Vectors::queryHits(hits)],
+            length = fp$length[S4Vectors::queryHits(hits)])
+          assigned <- merge(assigned, coverage, by = c("enhancer_id", "read_id"),
+                            all = FALSE, sort = FALSE)
+          if (!nrow(assigned)) next
+          assigned[, footprint_type := kind]
+          observed[[kind]] <- assigned
+        }
+        summary <- current[, .(enhancer_id, enhancer_class)]
+        summary[, `:=`(n_reads = 0L, n_cooccupied = 0L, n_tf = 0L, n_nuc = 0L)]
+        if (nrow(coverage)) {
+          covered_counts <- coverage[, .(n_reads = .N), by = enhancer_id]
+          summary[covered_counts, n_reads := i.n_reads, on = "enhancer_id"]
+        }
+        if (length(observed)) {
+          calls <- data.table::rbindlist(observed)
+          tf_counts <- calls[footprint_type == "TF", .N, by = .(enhancer_id, read_id)]
+          if (nrow(tf_counts)) {
+            tf_summary <- tf_counts[, .(n_tf = sum(N), n_cooccupied = sum(N >= 2L)),
+                                     by = enhancer_id]
+            summary[tf_summary, `:=`(n_tf = i.n_tf, n_cooccupied = i.n_cooccupied),
+                    on = "enhancer_id"]
+          }
+          nuc_counts <- calls[footprint_type == "nucleosome", .(n_nuc = .N),
+                              by = enhancer_id]
+          if (nrow(nuc_counts)) summary[nuc_counts, n_nuc := i.n_nuc, on = "enhancer_id"]
+          calls <- merge(calls, current[, .(enhancer_id, enhancer_class)],
+                         by = "enhancer_id", all.x = TRUE, sort = FALSE)
+          calls[, length_bin := footprint_length_bin(length)]
+          lengths <- calls[, .(n = .N), by = .(enhancer_class, length_bin)]
+          lengths[, `:=`(sample = sample_name, time_min = sample_table$time_min[s])]
+          length_parts[[length(length_parts) + 1L]] <- lengths
+        }
+        summary[, `:=`(sample = sample_name, time_min = sample_table$time_min[s])]
+        stopifnot(all(summary$n_cooccupied <= summary$n_reads),
+                  all(summary$n_tf >= 2L * summary$n_cooccupied))
+        enhancer_parts[[length(enhancer_parts) + 1L]] <- summary[
+          , .(enhancer_id, sample, time_min, enhancer_class,
+              n_reads, n_cooccupied, n_tf, n_nuc)]
+      }
+    }
+  }
+  counts <- data.table::rbindlist(enhancer_parts)
+  if (length(length_parts)) {
+    lengths <- data.table::rbindlist(length_parts)[
+      , .(n = sum(n)), by = .(sample, time_min, enhancer_class, length_bin)]
+  } else {
+    lengths <- data.table::data.table(sample = character(), time_min = numeric(),
+                                     enhancer_class = character(),
+                                     length_bin = integer(), n = numeric())
+  }
+  list(footprint_counts = counts, length_counts = lengths)
+}
+```
+
+```{r count-footprints}
+footprint_result <- count_enhancer_footprints(
+  analysis_enhancers, sample_table, extract_root, ft_result_dir)
+footprint_counts <- footprint_result$footprint_counts
+length_counts <- footprint_result$length_counts
+save_table(footprint_counts, "enhancer_footprint_counts.tsv")
+
+# The expected length distribution is descriptive: genome-wide called TF
+# footprints <60 bp plus nucleosome footprints >90 bp on analyzed chromosomes.
+# It is not a genomic-position shuffle or an estimate of random TF binding.
+stopifnot(expected_background %in% c("genomewide", "inactive"))
+if (expected_background == "genomewide") {
+  expected_length_counts <- expected_footprint_lengths(
+    sample_table, standard_chromosomes, extract_root)
+} else {
+  expected_length_counts <- merge(
+    CJ(sample = sample_table$sample, length_bin = seq.int(0L, 500L, 10L)),
+    length_counts[enhancer_class == "inactive", .(sample, length_bin, n)],
+    by = c("sample", "length_bin"), all.x = TRUE)
+  expected_length_counts[is.na(n), n := 0]
+  expected_length_counts[, time_min := sample_table$time_min[match(sample, sample_table$sample)]]
+}
+head(length_counts)
+head(expected_length_counts)
+```
+
+### Compare short footprints and nucleosome footprints
+
+Frequencies below are normalized within each class and timepoint over the two
+requested footprint categories, <60 bp and >90 bp; lengths 60–90 bp are excluded.
+Genome-wide expected frequencies use the same call sources and chromosomes but
+are not restricted to enhancer-spanning fibers. This is an empirical reference,
+not a random-binding null. The final length bin pools all footprints >=500 bp.
+The alternate `inactive` background uses inactive-enhancer footprints at the same
+timepoint. Zero denominators are shown as missing, never as zero enrichment.
+
+```{r footprint-length-distributions}
+length_grid <- CJ(sample = sample_table$sample,
+                  enhancer_class = c("active", "inactive"),
+                  length_bin = seq.int(0L, 500L, 10L))
+observed_lengths <- merge(length_grid, length_counts,
+                          by = c("sample", "enhancer_class", "length_bin"), all.x = TRUE)
+observed_lengths[is.na(n), n := 0]
+observed_lengths[, time_min := sample_table$time_min[match(sample, sample_table$sample)]]
+observed_lengths[, observed_frequency := if (sum(n) > 0) n / sum(n) else NA_real_,
+                  by = .(sample, enhancer_class)]
+expected_length_counts[, expected_frequency := if (sum(n) > 0) n / sum(n) else NA_real_,
+                       by = sample]
+length_comparison <- merge(observed_lengths,
+  expected_length_counts[, .(sample, length_bin, expected_n = n, expected_frequency)],
+  by = c("sample", "length_bin"), all.x = TRUE)
+save_table(length_comparison[, .(sample, enhancer_class, length_bin, observed_n = n,
+                                 expected_n, observed_frequency, expected_frequency)],
+           "02_footprint_length_distribution.tsv")
+length_plot_data <- melt(length_comparison,
+  id.vars = c("time_min", "enhancer_class", "length_bin"),
+  measure.vars = c("observed_frequency", "expected_frequency"),
+  variable.name = "distribution", value.name = "frequency")
+head(length_plot_data)
+p_length <- ggplot(length_plot_data, aes(length_bin, frequency, color = distribution)) +
+  geom_line(na.rm = TRUE) + facet_grid(enhancer_class ~ time_min) + theme_classic() +
+  labs(x = "Footprint length (10-bp bin start; 500 = >=500 bp)",
+       y = "Normalized frequency", color = NULL,
+       subtitle = paste("Expected background:", expected_background))
+save_pdf(p_length, "02_footprint_length_observed_expected.pdf", width = 12, height = 6)
+```
+
+```{r tf-nucleosome-enrichment-summary}
+footprint_comparison <- footprint_counts[, .(n_tf = sum(n_tf), n_nuc = sum(n_nuc),
+                                            n_reads = sum(n_reads)),
+                                         by = .(sample, time_min, enhancer_class)]
+# Bins <60 are TF; bins >=90 contain only calls strictly >90 from the loader.
+expected_categories <- expected_length_counts[, .(
+  expected_tf = sum(n[length_bin < 60L]), expected_nuc = sum(n[length_bin >= 90L])), by = sample]
+footprint_comparison <- merge(footprint_comparison, expected_categories, by = "sample")
+footprint_comparison[, tf_fraction := fifelse(n_tf + n_nuc > 0, n_tf / (n_tf + n_nuc), NA_real_)]
+footprint_comparison[, tf_to_nuc := fifelse(n_nuc > 0, n_tf / n_nuc, NA_real_)]
+footprint_comparison[, expected_tf_to_nuc := fifelse(expected_nuc > 0,
+                                                    expected_tf / expected_nuc, NA_real_)]
+footprint_comparison[, enrichment := fifelse(expected_tf_to_nuc > 0,
+                                             tf_to_nuc / expected_tf_to_nuc, NA_real_)]
+save_table(footprint_comparison[, .(sample, enhancer_class, n_tf, n_nuc,
+                                   tf_fraction, tf_to_nuc, expected_tf_to_nuc, enrichment)],
+           "02_TF_to_nucleosome_enrichment.tsv")
+p_enrichment <- ggplot(footprint_comparison,
+  aes(time_min, enrichment, color = enhancer_class, group = enhancer_class)) +
+  geom_hline(yintercept = 1, linetype = 2, color = "grey60") +
+  geom_line(na.rm = TRUE) + geom_point(na.rm = TRUE) + theme_classic() +
+  scale_x_continuous(breaks = sample_table$time_min) +
+  labs(x = "LPS (min)", y = "TF:nucleosome ratio / expected ratio", color = NULL)
+save_pdf(p_enrichment, "02_TF_to_nucleosome_enrichment.pdf")
+```
+
+# 3. TF co-occupancy enrichment at active enhancers
+
+For each timepoint, the Fisher table contains active/inactive rows and
+co-occupied/not-co-occupied columns. A co-occupied observation is a full-span
+fiber with at least two short TF footprints assigned to the enhancer. Enhancers
+must have at least `minimum_reads` full-span fibers **at every timepoint** to
+enter this comparison, keeping the same enhancer set across the time course.
+All enhancer/timepoint counts, including lower coverage and zero calls, remain
+in the count table. Missing coverage is not evidence of no co-occupancy.
+
+The R test is one-sided (`alternative = "greater"`) for enrichment at active
+enhancers, uses integer counts without pseudocounts, and applies BH correction
+across the four timepoint tests. The odds ratio is Fisher's conditional estimate.
+The method follows the count-table approach in `code/fire_frequency`, implemented
+here in R. Observations are enhancer–fiber pairs; a fiber can cover multiple
+enhancers. P-values are therefore nominal molecule-level comparisons, not
+replicate-level inference. Enhancer length and locus composition can also affect
+these pooled comparisons; per-enhancer frequencies are plotted alongside them.
+
+```{r fisher-cooccupancy-function}
+fisher_cooccupancy <- function(x) {
+  active <- x[enhancer_class == "active"]
+  inactive <- x[enhancer_class == "inactive"]
+  a <- sum(active$n_cooccupied)
+  b <- sum(active$n_reads - active$n_cooccupied)
+  c <- sum(inactive$n_cooccupied)
+  d <- sum(inactive$n_reads - inactive$n_cooccupied)
+  table <- matrix(c(a, b, c, d), nrow = 2L, byrow = TRUE,
+                   dimnames = list(c("active", "inactive"), c("cooccupied", "not_cooccupied")))
+  result <- data.table(active_co = a, active_other = b, inactive_co = c, inactive_other = d,
+                       odds_ratio = NA_real_, p_value = NA_real_, status = "not_testable")
+  if (all(rowSums(table) > 0) && all(colSums(table) > 0)) {
+    fit <- fisher.test(table, alternative = "greater")
+    result[, `:=`(odds_ratio = unname(fit$estimate), p_value = fit$p.value, status = "tested")]
+  }
+  result
+}
+```
+
+```{r cooccupancy-fisher-tests}
+eligible_enhancers <- footprint_counts[, .(
+  keep = .N == nrow(sample_table) && all(n_reads >= minimum_reads)), by = enhancer_id][keep == TRUE, enhancer_id]
+coocc_counts <- copy(footprint_counts[enhancer_id %in% eligible_enhancers])
+coocc_counts[, cooccupied_fraction := n_cooccupied / n_reads]
+head(coocc_counts)
+coocc_tests <- rbindlist(lapply(sample_table$sample, function(s) {
+  result <- fisher_cooccupancy(coocc_counts[sample == s])
+  result[, sample := s]
+  result
+}))
+coocc_tests[, q_value := p.adjust(p_value, method = "BH")]
+save_table(coocc_tests[, .(sample, active_co, active_other, inactive_co, inactive_other,
+                          odds_ratio, p_value, q_value, status)], "03_cooccupancy_fisher.tsv")
+coocc_frequency <- coocc_counts[, .(n_enhancers = .N, n_reads = sum(n_reads),
+                                    n_cooccupied = sum(n_cooccupied)),
+                                 by = .(sample, time_min, enhancer_class)]
+coocc_frequency[, frequency := n_cooccupied / n_reads]
+save_table(coocc_frequency, "03_cooccupancy_frequency.tsv")
+```
+
+```{r cooccupancy-plots}
+if (nrow(coocc_frequency)) {
+  p_coocc <- ggplot(coocc_frequency, aes(time_min, frequency,
+                                        color = enhancer_class, group = enhancer_class)) +
+    geom_line() + geom_point() + scale_x_continuous(breaks = sample_table$time_min) +
+    scale_y_continuous(limits = c(0, 1)) + theme_classic() +
+    labs(x = "LPS (min)", y = "Fraction of fibers with >=2 TF footprints", color = NULL)
+  save_pdf(p_coocc, "03_cooccupancy_timecourse.pdf")
+  p_locus <- ggplot(coocc_counts,
+                    aes(factor(time_min, levels = sample_table$time_min), cooccupied_fraction,
+                        fill = enhancer_class)) +
+    geom_boxplot(outlier.shape = NA) + theme_classic() +
+    labs(x = "LPS (min)", y = "Per-enhancer co-occupied fiber fraction", fill = NULL)
+  save_pdf(p_locus, "03_cooccupancy_per_enhancer.pdf")
+}
+```
+
+### Example fibers at an active enhancer
+
+The example is the active enhancer with the largest total number of co-occupied
+fibers across time points. The panels reuse the BED12 m6A reader from
+`coaccess_plot_functions.R`; the display is adapted to a single enhancer. Gray
+lines are spanning fibers, blue marks are m6A, and magenta segments are complete
+FiberHMM TF calls shorter than 60 bp. Fibers are ordered by their number of TF
+footprints with midpoints inside the enhancer and capped at 100 per time point for display.
+This selected example is descriptive; all eligible fibers enter the tests above.
+
+```{r source-read-plot-helper}
+read_plot_helpers <- new.env(parent = globalenv())
+sys.source(file.path(project_root, "code/co-accessibility/coaccess_plot_functions.R"),
+           envir = read_plot_helpers)
+```
+
+```{r function-load-enhancer-example}
+load_enhancer_example <- function(enhancer, samples, max_reads = 100L) {
+  chromosome <- enhancer$chr[[1]]
+  lo <- enhancer$start0[[1]]
+  hi <- enhancer$end0[[1]]
+  window <- c(max(0L, lo - 100L), hi + 100L)
+  query <- GenomicRanges::GRanges(chromosome,
+    IRanges::IRanges(window[1] + 1L, window[2]))
+  spans <- m6a <- footprints <- vector("list", nrow(samples))
+  for (i in seq_len(nrow(samples))) {
+    sample_name <- samples$sample[i]
+    short_name <- gsub("_", "", sample_name, fixed = TRUE)
+    methylation_path <- file.path(ft_result_dir, sample_name, "extracted_results",
+      "m6a_by_chr", sprintf("%s.ft_extracted_m6a.%s.bed.gz", sample_name, chromosome))
+    raw <- tabix_bed(methylation_path, query)
+    if (!nrow(raw)) next
+    reads <- unique(raw[, .(read_id = as.character(V4),
+      start0 = as.numeric(V2), end0 = as.numeric(V3))])
+    reads[, span_width := end0 - start0]
+    data.table::setorder(reads, read_id, -span_width, start0, end0)
+    reads <- reads[!duplicated(read_id)][start0 <= lo & end0 >= hi]
+    if (!nrow(reads)) next
+    tf_path <- file.path(extract_root, "firehmm_tf", short_name,
+      sprintf("%s_hmm_extracted_tf_%s.bed.gz", short_name, chromosome))
+    tf <- expand_hmm_blocks(tabix_bed(tf_path, query))
+    tf <- unique(tf[length < 60L & length > 0L & read_id %in% reads$read_id &
+      start0 < window[2] & end0 > window[1]])
+    counts <- tf[(start0 + end0) / 2 >= lo & (start0 + end0) / 2 < hi,
+      .(n_tf = .N), by = read_id]
+    reads <- merge(reads, counts, by = "read_id", all.x = TRUE)
+    reads[is.na(n_tf), n_tf := 0L]
+    data.table::setorder(reads, -n_tf, read_id)
+    reads <- head(reads, max_reads)
+    reads[, `:=`(sample = sample_name, row = rev(seq_len(.N)))]
+    reads[, key := paste(sample, read_id)]
+    m <- read_plot_helpers$read_bed12_blocks(methylation_path, chromosome,
+      window[1], window[2], sample_name, keys = reads$key, sentinels = TRUE)
+    if (nrow(m)) {
+      m <- merge(m[, .(read_id = RID, start0 = start, end0 = end)],
+        reads[, .(read_id, sample, row)], by = "read_id")
+    }
+    tf <- merge(tf, reads[, .(read_id, sample, row)], by = "read_id")
+    spans[[i]] <- reads
+    m6a[[i]] <- m
+    footprints[[i]] <- tf
+  }
+  sp <- data.table::rbindlist(spans, fill = TRUE)
+  if (!nrow(sp)) stop("No spanning fibers found for the example enhancer")
+  list(spans = sp, m6a = data.table::rbindlist(m6a, fill = TRUE),
+    tf = data.table::rbindlist(footprints, fill = TRUE),
+    samples = samples, window = window, enhancer = enhancer)
+}
+```
+
+```{r function-plot-enhancer-example}
+plot_enhancer_example <- function(example) {
+  sp <- data.table::copy(example$spans)
+  m <- data.table::copy(example$m6a)
+  tf <- data.table::copy(example$tf)
+  samples <- example$samples$sample
+  sp[, sample := factor(sample, levels = samples)]
+  if (nrow(m)) m[, sample := factor(sample, levels = samples)]
+  if (nrow(tf)) tf[, sample := factor(sample, levels = samples)]
+  labels <- setNames(paste0(example$samples$time_min, " min"), samples)
+  base <- ggplot2::ggplot(sp) +
+    ggplot2::annotate("rect", xmin = example$enhancer$start0,
+      xmax = example$enhancer$end0, ymin = -Inf, ymax = Inf,
+      fill = "#44d6d8", alpha = 0.2) +
+    ggplot2::geom_segment(ggplot2::aes(x = start0, xend = end0,
+      y = row, yend = row), colour = "grey70", linewidth = 0.5) +
+    ggplot2::facet_grid(sample ~ ., scales = "free_y", drop = FALSE,
+      labeller = ggplot2::labeller(sample = labels)) +
+    ggplot2::coord_cartesian(xlim = example$window) +
+    ggplot2::theme_bw(base_size = 10) +
+    ggplot2::theme(axis.text.y = ggplot2::element_blank(),
+      axis.ticks.y = ggplot2::element_blank(),
+      panel.grid = ggplot2::element_blank()) +
+    ggplot2::labs(x = example$enhancer$chr, y = "Spanning fibers")
+  p_m6a <- base + ggplot2::labs(title = "m6A")
+  if (nrow(m)) p_m6a <- p_m6a + ggplot2::geom_segment(data = m,
+    ggplot2::aes(x = start0, xend = end0, y = row, yend = row),
+    colour = "blue", linewidth = 0.7)
+  p_tf <- base + ggplot2::labs(title = "TF footprints (<60 bp)")
+  if (nrow(tf)) p_tf <- p_tf + ggplot2::geom_segment(data = tf,
+    ggplot2::aes(x = start0, xend = end0, y = row, yend = row),
+    colour = "magenta", linewidth = 1)
+  patchwork::wrap_plots(p_m6a, p_tf, ncol = 2) +
+    patchwork::plot_annotation(title = example$enhancer$enhancer_id,
+      subtitle = "Enhancer shaded; at most 100 fibers/time point, ordered by TF count")
+}
+```
+
+```{r plot-example-enhancer, fig.width=12, fig.height=10}
+example_rank <- footprint_counts[enhancer_class == "active",
+  .(n_cooccupied = sum(n_cooccupied)), by = enhancer_id]
+data.table::setorder(example_rank, -n_cooccupied, enhancer_id)
+if (nrow(example_rank) && example_rank$n_cooccupied[1] > 0L) {
+  example_enhancer <- analysis_enhancers[enhancer_id == example_rank$enhancer_id[1]]
+  print(example_enhancer[, .(enhancer_id, chr, start0, end0)])
+  example_fibers <- load_enhancer_example(example_enhancer, sample_table)
+  example_plot <- plot_enhancer_example(example_fibers)
+  save_pdf(example_plot, "active_enhancer_example_fibers.pdf", width = 12, height = 10)
+}
+```

@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """Same-molecule co-accessibility of ENCODE cCRE pairs around gene TSSs, per LPS timepoint.
 
-Reimplements coaccess_fire_CREs_combined_samples_around_genes.R and its helper
-test_coaccess_fire_elements() from process_fiberseq_data.R. Nothing of Kevin's is
-sourced; this is an independent implementation of the same definitions.
 
     elements        ENCODE cCREs overlapping a FIRE peak, cCRE coordinates kept
                     CRE_ID = accession1.accession2.CRE_label

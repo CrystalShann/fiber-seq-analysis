@@ -43,8 +43,7 @@ for group in differential background; do
         exit 1
     fi
 
-    # Rebuild FASTA and rescan every group on each submission.
-    # --oc below overwrites the existing FIMO output for this group.
+    # Rebuild FASTA and rescan every group on each submission
     echo "Rebuilding FASTA from ${input_tsv}"
     awk 'BEGIN {FS=OFS="\t"}
          NR > 1 {

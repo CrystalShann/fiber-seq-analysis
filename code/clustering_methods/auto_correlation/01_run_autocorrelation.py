@@ -342,7 +342,7 @@ def prepare_run(output, selection, sample_table_path, args, n_features, regions)
 def write_allele_results(output, region, profiles, records):
     """Compute allele tables in memory and save only their final PDF plots."""
     tables = summaries.summarize_alleles(profiles, records, region)
-    summaries.plot_alleles(result_directory(output, region.region_id), region, tables)
+    summaries.plot_alleles(result_directory(output, region.region_id) / "autocorrelation", region, tables)
     return tables
 
 
@@ -419,7 +419,7 @@ def main(argv=None):
         if preserve_figures:
             allele_tables = summaries.summarize_alleles(profiles, records, region)
         else:
-            summaries.plot_region(result_directory(output, rid), region, binary, profiles, records, avg, counts)
+            summaries.plot_region(result_directory(output, rid) / "autocorrelation", region, binary, profiles, records, avg, counts)
             allele_tables = write_allele_results(output, region, profiles, records)
         report_data = save_report_data(output, region, binary, profiles, records, edges, args, info,
                                       avg, stats, counts, allele_tables)
