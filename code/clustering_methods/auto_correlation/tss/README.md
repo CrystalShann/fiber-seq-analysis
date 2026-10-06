@@ -27,14 +27,6 @@ Run from any working directory after creating the SLURM log directory:
 mkdir -p /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs
 ```
 
-Small real-data test (100 per bin, chromosome 22, all four LPS timepoints, all
-three regions, written to each region's `test/` subfolder, followed by the
-combined plots in `combined/test/`):
-
-```bash
-sbatch /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh --test
-```
-
 Full 10,000-molecule analysis on chromosomes 1–22, X and Y for all three regions:
 
 ```bash
@@ -52,7 +44,7 @@ When all three tasks run, the lowest task submits `08_plot_sliding_combined.R`
 as a dependent job (`afterok` on the whole array). It can also be run on its own:
 
 ```bash
-Rscript 08_plot_sliding_combined.R [--root /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss] [--test]
+Rscript 08_plot_sliding_combined.R [--root /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss]
 ```
 
 The `.sh` runner contains `#SBATCH` directives and requires a SLURM allocation.
@@ -62,8 +54,8 @@ windows were added. All numerical-library and Numba thread counts are capped at
 one. The disk-backed pool avoids keeping all reads or their m6A signals in memory.
 
 The full run writes to
-`/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/<region>/`;
-`--test` writes to its `test/` subdirectory. Runner options: `--out-dir`
+`/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/<region>/`.
+Runner options: `--out-dir`
 (replaces the region folder; disables the combined job), `--bins-tsv`,
 `--canonical-bed`, `--ft-root`, `--ref` (reference FASTA for the A/T control),
 `--per-bin`, `--seed`, `--max-lag`, `--n-pcs`, `--n-neighbors`, `--resolution`,
@@ -126,7 +118,6 @@ negative = upstream, end exclusive):
 eligibility (`read_start <= window_start` and `read_end >= window_end`) run on
 genomic coordinates; the pool scan anchors on the sorted genomic window starts,
 which is the same test on both strands because every window shares one width.
-`test_tss_windows.py` checks hand-made minus-strand reads at both window edges.
 Span coverage follows the existing BED extraction representation; BED12 does
 not provide a CIGAR with which to assess internal alignment gaps.
 
@@ -154,8 +145,7 @@ other covered bases are zero. Each row is built in genomic order and then
 **reversed for `-` strand genes**, so column `j` always equals TSS-relative
 offset `s + j` (`orientation = "transcriptional"` in the metadata). A check
 confirms on both strands that the column for offset 0 maps back to genomic
-base `tss`; in `--test` mode several real reads per strand are re-fetched and
-every m6A call is verified against its oriented column. No reference A/T
+base `tss`. No reference A/T
 filter, smoothing, tapering, detrending, binning or FFT is introduced.
 `m6a_count` is the number of ones **inside the window**. Zero-call and all-one
 signals remain in the balanced sample and are flagged downstream.
@@ -332,13 +322,6 @@ NRL scan). On the rescaled ACF:
    values cluster near `decay_max_lag`; a threshold relative to 1/√N would be
    needed for short windows and is left to `--flat-threshold`.
 
-`test_tss_nrl.py` runs on CPU in about 20 s: a regular 147 + 40 bp array with
-noise recovers NRL 187 ± 5 bp in 2,000 and 500 bp windows, the median decay
-length decreases monotonically with linker jitter, random Bernoulli rows are
-mostly `no_peak`, constant rows are `zero_variance`, and the calibrated
-prominence is larger for the shorter window. The runner executes it and
-`test_tss_windows.py` in `--test` mode.
-
 `04b_molecule_nrl.py` writes `tables/nrl_per_molecule.tsv` (one row per sampled
 molecule: `read_id, sample, timepoint, lps_minutes, gene_id, gene_name, chrom,
 tss, strand, expr_bin, mean_tpm, m6a_count, window, window_offset_start,
@@ -417,7 +400,7 @@ signal and the A/T control), `tables/sliding_at_control.tsv` and
 
 The runner publishes tables and plots only after all stages and their checks
 succeed, replacing each final file atomically. SLURM logs use the fixed paths in
-the runner's `#SBATCH` directives, including for `--test` or `--out-dir` runs;
+the runner's `#SBATCH` directives, including for `--out-dir` runs;
 override them with `sbatch --output ... --error ...` if needed. No persistent
 `intermediate/`, `validation/`, `inputs/`, plot manifest or lock file is
 created by the runner; existing artifacts from older runs are not deleted.

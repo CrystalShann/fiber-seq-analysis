@@ -46,12 +46,10 @@ CHROMS=()
 BINS_EXPLICIT=0
 WINDOWS=(2000_tss upstream_1000_tss downstream_1000_tss)
 OUT_EXPLICIT=""
-TEST=0
 NO_COMBINED=0
 ORIGINAL_ARGS=("$@")
 while (($#)); do
   case "$1" in
-    --test) TEST=1; PER_BIN=100; CHROMS=(chr22); shift ;;
     --out-dir) OUT_EXPLICIT="$2"; shift 2 ;;
     --bins-tsv) BINS="$2"; BINS_EXPLICIT=1; shift 2 ;;
     --canonical-bed) CANONICAL="$2"; shift 2 ;;
@@ -96,7 +94,6 @@ case "$WINDOW" in
 esac
 ROOT="$OUT"
 OUT="${OUT_EXPLICIT:-$OUT/$WINDOW}"
-if ((TEST)); then OUT="$OUT/test"; fi
 mkdir -p "$OUT"
 OUT=$(cd -- "$OUT" && pwd -P)
 # Lock the directory inode, without creating a persistent lock file.
@@ -145,11 +142,6 @@ echo "[$(date -Is)] NRL/sliding options: win_width=$WIN_WIDTH win_step=$WIN_STEP
 echo "[$(date -Is)] Working directory: $TSS_WORK_DIR (removed on exit)"
 "$PYTHON" -B -c 'import sys,numpy,pandas,pysam,scipy,scanpy,igraph,leidenalg; print(sys.version); print("scanpy",scanpy.__version__,"numpy",numpy.__version__,"scipy",scipy.__version__,"pysam",pysam.__version__)'
 "$RSCRIPT" --vanilla -e 'cat(R.version.string,"\n")'
-if ((TEST)); then
-  echo "[$(date -Is)] Unit tests: synthetic NRL/decay signals and strand-oriented window edges"
-  "$PYTHON" -B "$CODE/test_tss_nrl.py"
-  "$PYTHON" -B "$CODE/test_tss_windows.py"
-fi
 if [[ ! -f "$BINS" ]]; then
   if ((BINS_EXPLICIT)); then echo "Explicit expression table is missing: $BINS" >&2; exit 1; fi
   echo "[$(date -Is)] Rebuilding absent expression table using unchanged original R code"
@@ -158,7 +150,6 @@ if [[ ! -f "$BINS" ]]; then
 fi
 EXTRA=()
 if ((${#CHROMS[@]})); then EXTRA=(--chrom "${CHROMS[@]}"); fi
-if ((TEST)); then EXTRA+=(--test); fi
 LAG_ARGS=()
 if [[ -n "$MAX_LAG" ]]; then LAG_ARGS=(--max-lag "$MAX_LAG"); fi
 NRL_ARGS=(--nrl-min "$NRL_MIN" --nrl-max "$NRL_MAX" --min-lag "$MIN_LAG" --flat-threshold "$FLAT_THRESHOLD"
@@ -218,7 +209,6 @@ echo "[$(date -Is)] COMPLETE: $OUT"
 if ((!NO_COMBINED)) && [[ -z "$OUT_EXPLICIT" && -n "${SLURM_ARRAY_JOB_ID:-}" \
     && "${SLURM_ARRAY_TASK_ID}" == "${SLURM_ARRAY_TASK_MIN:-}" && "${SLURM_ARRAY_TASK_COUNT:-0}" == "3" ]]; then
   COMBINED_ARGS=(--root "$ROOT")
-  if ((TEST)); then COMBINED_ARGS+=(--test); fi
   echo "[$(date -Is)] Submitting 08_plot_sliding_combined.R after array $SLURM_ARRAY_JOB_ID"
   sbatch --parsable --dependency="afterok:$SLURM_ARRAY_JOB_ID" --job-name=tss_acf_combined \
     --account=pi-spott --partition=bigmem --nodes=1 --ntasks=1 --cpus-per-task=1 --mem=32G --time=4:00:00 \

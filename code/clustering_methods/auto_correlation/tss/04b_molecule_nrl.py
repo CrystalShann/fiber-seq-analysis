@@ -79,8 +79,6 @@ def main():
     if decay_max_lag >= profiles.shape[1]:
         raise ValueError("decay_max_lag exceeds the saved lags")
     window_name = args.window_name or out.name
-    if window_name == "test" and out.parent.name:
-        window_name = out.parent.name
     # min_prominence: calibrated on position-shuffled copies of this window's own
     # molecules at this window length (see tss_nrl.calibrate_prominence), unless overridden.
     acf_parent = load_parent("03_compute_autocorrelations.py")

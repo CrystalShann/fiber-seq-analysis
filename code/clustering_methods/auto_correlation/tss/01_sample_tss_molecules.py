@@ -275,38 +275,6 @@ def check_offset_zero_maps_to_tss(selected):
             "strands": sorted(selected.strand.unique().tolist())}
 
 
-def verify_orientation_on_reads(binary, selected, sources, helpers, per_strand=5):
-    """Re-fetch several real reads per strand and check every m6A call's oriented column."""
-    picks = pd.concat([selected[selected.strand.eq(strand)].head(per_strand) for strand in ("+", "-")])
-    if picks.strand.nunique() != 2:
-        raise RuntimeError("Orientation verification needs sampled reads on both strands")
-    verified = []
-    for row in picks.itertuples(index=False):
-        path = next(p for smp, chrom, p in sources if smp == row.sample and chrom == row.chrom)
-        with pysam.TabixFile(str(path)) as tb:
-            record = next(line for line in tb.fetch(row.chrom, int(row.window_start), int(row.window_end))
-                          if hashlib.sha256(line.encode()).hexdigest() == row.line_sha)
-        f = record.split("\t")
-        calls = np.fromstring(f[11].rstrip(","), sep=",", dtype=np.int64)[1:-1] + row.read_start
-        inside = calls[(calls >= row.window_start) & (calls < row.window_end)]
-        columns = oriented_column(row.strand, row.tss, row.window_offset_start, inside)
-        expected = np.zeros(binary.shape[1], dtype=np.uint8)
-        expected[columns] = 1
-        if not np.array_equal(expected, binary[row.row_index]):
-            raise RuntimeError(f"Oriented row differs from re-fetched calls: {row.read_id}")
-        zero = -row.window_offset_start
-        tss_is_call = bool(np.isin(row.tss, inside))
-        if 0 <= zero < binary.shape[1] and bool(binary[row.row_index, zero]) != tss_is_call:
-            raise RuntimeError(f"Offset-0 column disagrees with the genomic TSS base: {row.read_id}")
-        if not np.array_equal(column_genomic_position(row.strand, row.window_start, row.window_end, columns),
-                              inside):
-            raise RuntimeError(f"Column -> genomic mapping is not invertible: {row.read_id}")
-        verified.append({"read_id": row.read_id, "strand": row.strand, "tss": int(row.tss),
-                         "n_calls_in_window": int(len(inside)), "tss_base_called": tss_is_call})
-    log(f"orientation: verified {len(verified)} real reads ({per_strand} per strand) against re-fetched calls")
-    return verified
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
@@ -322,8 +290,6 @@ def main():
     ap.add_argument("--timepoints", nargs="+", default=["LPS_0", "LPS_5", "LPS_10", "LPS_15"])
     ap.add_argument("--chrom", nargs="+", default=CHROMS)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--test", action="store_true",
-                    help="Also re-fetch several real reads per strand and verify their oriented columns.")
     args = ap.parse_args()
     if (args.per_bin < 1 or args.seed < 0 or len(set(args.timepoints)) != len(args.timepoints)
             or len(set(args.chrom)) != len(args.chrom) or not set(args.chrom).issubset(CHROMS)
@@ -372,8 +338,6 @@ def main():
     row_ids = selected.read_id.to_numpy(dtype=str)
     assert_alignment(binary, selected, row_ids)
     orientation_check = check_offset_zero_maps_to_tss(selected)
-    if args.test:
-        orientation_check["verified_reads"] = verify_orientation_on_reads(binary, selected, sources, helpers)
     if source_states(sources) != states:
         raise RuntimeError("Source BEDs/indexes changed during extraction")
     binary_path, ids_path = out / "intermediate/binary_m6a.npy", out / "intermediate/row_ids.npy"

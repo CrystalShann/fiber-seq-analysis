@@ -2,33 +2,29 @@
 
 # Cross-region sliding-window plots and tests (base R only). Reads the
 # sliding tables of the three regions written by 04c_sliding_windows.py and
-# writes plots/ and tables/ under <root>/combined[/test]. Runs on its own or
+# writes plots/ and tables/ under <root>/combined. Runs on its own or
 # as the dependent job submitted by 06_run_tss_autocorrelation.sh.
 args <- commandArgs(trailingOnly = TRUE)
 root <- "/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss"
 out_dir <- NULL
-test_mode <- FALSE
 n_boot <- 1000L
 seed <- 0L
 i <- 1L
 while (i <= length(args)) {
   if (args[i] == "--root") { i <- i + 1L; root <- args[i] }
   else if (args[i] == "--out-dir") { i <- i + 1L; out_dir <- args[i] }
-  else if (args[i] == "--test") test_mode <- TRUE
   else if (args[i] == "--boot") { i <- i + 1L; n_boot <- as.integer(args[i]) }
   else if (args[i] == "--seed") { i <- i + 1L; seed <- as.integer(args[i]) }
   else if (args[i] %in% c("--help", "-h")) {
-    cat("Usage: Rscript 08_plot_sliding_combined.R [--root PATH] [--test] [--out-dir PATH] [--boot N] [--seed N]\n")
+    cat("Usage: Rscript 08_plot_sliding_combined.R [--root PATH] [--out-dir PATH] [--boot N] [--seed N]\n")
     quit(save = "no", status = 0L)
   } else stop("Unknown argument: ", args[i])
   i <- i + 1L
 }
 if (is.na(n_boot) || n_boot < 10L) stop("--boot must be at least 10")
 regions <- c(span_2kb = "2000_tss", upstream = "upstream_1000_tss", downstream = "downstream_1000_tss")
-suffix <- if (test_mode) "test" else ""
-region_dirs <- setNames(file.path(root, regions, suffix), names(regions))
-region_dirs <- sub("/$", "", region_dirs)
-if (is.null(out_dir)) out_dir <- sub("/$", "", file.path(root, "combined", suffix))
+region_dirs <- setNames(file.path(root, regions), names(regions))
+if (is.null(out_dir)) out_dir <- file.path(root, "combined")
 dir.create(file.path(out_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(out_dir, "validation"), recursive = TRUE, showWarnings = FALSE)

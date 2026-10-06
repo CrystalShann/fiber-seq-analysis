@@ -10,7 +10,6 @@ output:
 params:
   output_dir: "../../../../macrophage_project/auto_correlation/tss"
   windows: ["2000_tss", "upstream_1000_tss", "downstream_1000_tss"]
-  test: false
 ---
 
 # Analysis and parameters
@@ -20,8 +19,6 @@ same way `../06_autocorrelation.Rmd` does for the LCL regions. Each TSS region i
 one SLURM array task of `06_run_tss_autocorrelation.sh` and writes to its own
 folder under `params$output_dir`; the cross-region sliding-window figures are
 written by the dependent job `08_plot_sliding_combined.R` to `combined/`.
-With `params$test = TRUE` the `test/` subfolders of the chromosome-22 test run
-are shown instead.
 
 Offsets are TSS-relative and strand-oriented (transcriptional): negative =
 upstream, positive = downstream, end exclusive. For the interval `[s, e)` and the
@@ -47,7 +44,7 @@ Protein-coding Ensembl-canonical genes get a mean TPM pooled over the twelve RNA
 
 **Step 1: sample molecules** (`01_sample_tss_molecules.py`)
 
-TSS = canonical BED start + 10 (`/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed`). A read is eligible when it fully spans the strand-oriented genomic window of the region. Each physical read is assigned one gene and bin, and each bin contributes 2,500 reads chosen by an independent seeded hash (10,000 in total; 100 per bin on chromosome 22 in `--test`). Binary rows are built in genomic order and reversed for `-` genes; a check confirms that the column for offset 0 is the genomic TSS base on both strands.
+TSS = canonical BED start + 10 (`/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed`). A read is eligible when it fully spans the strand-oriented genomic window of the region. Each physical read is assigned one gene and bin, and each bin contributes 2,500 reads chosen by an independent seeded hash (10,000 in total). Binary rows are built in genomic order and reversed for `-` genes; a check confirms that the column for offset 0 is the genomic TSS base on both strands.
 
 **Step 2: per-read ACF** (`02_compute_tss_autocorrelations.py`, parent `autocorrelations()`)
 
@@ -94,9 +91,8 @@ output <- normalizePath(params$output_dir, mustWork = TRUE)
 windows <- c("2000_tss", "upstream_1000_tss", "downstream_1000_tss")
 unknown <- setdiff(params$windows, windows)
 if (length(unknown)) stop("Unknown windows: ", paste(unknown, collapse = ", "))
-suffix <- if (isTRUE(params$test)) "test" else ""
-window_dirs <- setNames(sub("/$", "", file.path(output, params$windows, suffix)), params$windows)
-combined_dir <- sub("/$", "", file.path(output, "combined", suffix))
+window_dirs <- setNames(file.path(output, params$windows), params$windows)
+combined_dir <- file.path(output, "combined")
 ```
 
 ## Run the pipeline
@@ -107,7 +103,6 @@ task submits the combined job after the array. Knitting never runs the pipeline.
 ```bash
 mkdir -p /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs
 sbatch /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh
-# chromosome-22 test: add --test and knit with params$test = TRUE
 ```
 
 ```{r check-results, include=FALSE}
