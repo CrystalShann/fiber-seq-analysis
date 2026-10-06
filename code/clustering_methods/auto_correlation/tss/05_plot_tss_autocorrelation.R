@@ -33,7 +33,10 @@ script_arg <- grep("^--file=", commandArgs(), value = TRUE)
 if (length(script_arg) != 1L) stop("Run this script with Rscript")
 script_path <- normalizePath(sub("^--file=", "", script_arg))
 input_paths <- file.path(table_dir, c("plot_metadata.tsv", "acf_heatmap.tsv.gz",
-  "cluster_acf.tsv", "expression_acf.tsv", "cluster_composition.tsv"))
+  "cluster_acf.tsv", "expression_acf.tsv", "cluster_composition.tsv", "nrl_per_molecule.tsv"))
+footprint_path <- file.path(out_dir, "intermediate", "footprint_categories.bin")
+footprint_shape_path <- file.path(out_dir, "intermediate", "footprint_categories_shape.tsv")
+input_paths <- c(input_paths, footprint_path, footprint_shape_path)
 if (!all(file.exists(input_paths))) stop("Missing inputs: ",
   paste(input_paths[!file.exists(input_paths)], collapse = ", "))
 signature <- list(input_md5 = tools::md5sum(c(input_paths, script_path)),
@@ -57,11 +60,15 @@ metadata <- read_tsv(input_paths[1])
 cluster_acf <- read_tsv(input_paths[3])
 expression_acf <- read_tsv(input_paths[4])
 composition <- read_tsv(input_paths[5])
+nrl <- read_tsv(input_paths[6])
 required <- c("row_index", "read_id", "sample", "timepoint", "gene_id", "gene_name",
   "chrom", "tss", "strand", "mean_tpm", "expr_bin", "m6a_count", "cluster",
-  "status", "acf_valid", "umap1", "umap2", "heatmap_rank", "window_start", "window_end")
+  "status", "acf_valid", "umap1", "umap2", "heatmap_rank", "window_start", "window_end",
+  "window_offset_start", "window_offset_end", "orientation")
 if (!all(required %in% names(metadata))) stop("Missing metadata columns: ",
   paste(setdiff(required, names(metadata)), collapse = ", "))
+window_label <- sprintf("[%d, %+d)", unique(metadata$window_offset_start), unique(metadata$window_offset_end))
+window_name <- unique(nrl$window)
 checks <- data.frame(check = character(), passed = logical(), details = character())
 check <- function(name, condition, details) {
   if (!isTRUE(condition)) stop("Plot validation failed [", name, "]: ", details)
@@ -85,6 +92,16 @@ check("balanced_bins", all(bin_counts > 0L) && length(unique(as.integer(bin_coun
 check("valid_m6a_counts", all(is.finite(metadata$m6a_count)) &&
   all(metadata$m6a_count >= 0 & metadata$m6a_count == floor(metadata$m6a_count)),
   "m6A counts are finite nonnegative integers")
+check("transcriptional_orientation", all(metadata$orientation == "transcriptional") &&
+  length(unique(metadata$window_offset_start)) == 1L && length(unique(metadata$window_offset_end)) == 1L &&
+  all(metadata$window_end - metadata$window_start ==
+    metadata$window_offset_end - metadata$window_offset_start),
+  paste("TSS-relative strand-oriented window", window_label))
+check("nrl_table_aligned", nrow(nrl) == n && identical(nrl$read_id, metadata$read_id) &&
+  all(c("nrl_bp", "nrl_status", "decay_length_bp", "damping_lag_bp", "cluster", "expr_bin") %in% names(nrl)) &&
+  all(nrl$nrl_status %in% c("ok", "no_peak", "zero_variance", "window_too_short", "peak_negative")) &&
+  identical(!is.na(nrl$nrl_bp), nrl$nrl_status == "ok") && length(window_name) == 1L,
+  paste(sum(!is.na(nrl$nrl_bp)), "molecules with a detected NRL peak"))
 valid_text <- tolower(as.character(metadata$acf_valid))
 check("valid_acf_flags", all(valid_text %in% c("true", "false", "1", "0")),
   "Every molecule has an explicit ACF validity flag")
@@ -189,6 +206,23 @@ check("composition_fractions", same_numeric(composition$fraction_within_bin,
   all(composition$n_bin_total == as.integer(bin_counts[composition$expr_bin])),
   "Fractions use all selected molecules as the appropriate denominators")
 
+# Raw uint8 is row-major, matching the oriented binary m6A matrix exactly.
+footprint_shape <- read_tsv(footprint_shape_path)
+check("footprint_shape", nrow(footprint_shape) == 1L &&
+  footprint_shape$n_rows == n && footprint_shape$n_cols == window_width &&
+  footprint_shape$dtype == "uint8" && footprint_shape$order == "C" &&
+  footprint_shape$orientation == "transcriptional" && file.info(footprint_path)$size == n * window_width,
+  "One oriented base per byte, original sampled row order")
+connection <- file(footprint_path, "rb")
+footprint_flat <- tryCatch(readBin(connection, what = "integer", n = n * window_width,
+  size = 1L, signed = FALSE), finally = close(connection))
+check("footprint_codes", length(footprint_flat) == n * window_width && all(footprint_flat %in% 0:3),
+  "Codes 0=no call, 1=nucleosome, 2=TF, 3=m6A")
+footprint_categories <- matrix(footprint_flat, nrow = n, ncol = window_width, byrow = TRUE)
+rm(footprint_flat)
+check("footprint_m6a_counts", all(rowSums(footprint_categories == 3L) == metadata$m6a_count),
+  "Category 3 count equals m6a_count for every molecule; per-base identity checked in Python")
+
 # Plots show clustered molecules only. The tables above keep the Unclustered
 # category, so the composition matrix is renormalized over clustered reads here.
 plot_levels <- cluster_levels[cluster_levels != "Unclustered"]
@@ -198,6 +232,12 @@ plot_counts <- count_matrix[plot_levels, , drop = FALSE]
 within_bin <- sweep(plot_counts, 2, colSums(plot_counts), "/")
 within_cluster <- within_cluster[plot_levels, , drop = FALSE]
 bin_colors <- setNames(c("#4477AA", "#66CCEE", "#EEAA33", "#CC6677"), bins)
+timepoint_colors <- c(LPS_0 = "#bdbdbd", LPS_5 = "#6baed6",
+                      LPS_10 = "#2171b5", LPS_15 = "#08306b")
+footprint_colors <- c("No call" = "white", "Nucleosome >90 bp" = "#4d4d4d",
+                      "TF <60 bp" = "#f16913", "m6A" = "#800080")
+check("footprint_timepoints", all(metadata$timepoint %in% names(timepoint_colors)),
+  "All molecule timepoints have defined strip colors")
 acf_palette <- grDevices::colorRampPalette(c("#2166AC", "#FFFFFF", "#B2182B"))(257)
 acf_limit <- max(0.01, unname(quantile(abs(acf[valid, -1, drop = FALSE]),
   probs = 0.99, na.rm = TRUE)))
@@ -242,7 +282,7 @@ heatmap_panel <- function(rows, title) {
   rect(-0.5 - strip_width, nr - bounds, -0.5,
     nr - bounds + groups$lengths, col = cluster_colors[groups$values], border = NA, xpd = NA)
   box()
-  title(main = title, xlab = "Lag (bp)", cex.main = 1)
+  title(main = paste0(title, " (", window_name, " ", window_label, ")"), xlab = "Lag (bp)", cex.main = 1)
   mtext(paste0(format(nr, big.mark = ","), " clustered molecules; descending m6A within each cluster"),
     side = 3, line = 0.25, cex = 0.65)
 }
@@ -268,6 +308,57 @@ save_plot("03_acf_heatmaps_by_expression", function() {
   acf_key()
 }, width = 16, height = 12)
 
+plot_tss_footprints_raster <- function(rows, title) {
+  check("footprint_display_order", identical(rows, heatmap_order) && all(clustered[rows]),
+    "Exact ACF heatmap order: numeric Leiden label then descending m6A count")
+  par(mar = c(4.5, 7, 3.7, 1.1), mgp = c(2.6, 0.7, 0))
+  nr <- length(rows)
+  left <- unique(metadata$window_offset_start)
+  right <- unique(metadata$window_offset_end) - 1L
+  values <- footprint_categories[rows, , drop = FALSE]
+  raster <- as.raster(matrix(footprint_colors[values + 1L], nrow = nr, ncol = window_width))
+  plot.new()
+  plot.window(xlim = c(left - .5, right + .5), ylim = c(0, nr), xaxs = "i", yaxs = "i")
+  # One full-resolution raster; the top image row is the first heatmap-order row.
+  rasterImage(raster, left - .5, 0, right + .5, nr, interpolate = FALSE)
+  groups <- rle(metadata$cluster[rows])
+  bounds <- cumsum(groups$lengths)
+  centers <- nr - bounds + groups$lengths / 2
+  labels <- paste0("C", groups$values, " (", format(groups$lengths, big.mark = ","), ")")
+  ticks <- sort(unique(c(left, pretty(c(left, right), n = 5), right)))
+  ticks <- ticks[ticks >= left & ticks <= right]
+  axis(1, at = ticks, cex.axis = .8)
+  if (length(bounds) > 1L) abline(h = nr - bounds[-length(bounds)], col = "#333333", lwd = .45)
+  if (left <= 0 && right >= 0) abline(v = 0, lty = "dashed", col = "grey40", lwd = .6)
+  strip_width <- window_width * .016
+  text(left - .5 - 4.3 * strip_width, centers, labels, adj = 1, cex = .7, xpd = NA)
+  strip_colors <- list(cluster_colors[metadata$cluster[rows]],
+    bin_colors[metadata$expr_bin[rows]], timepoint_colors[metadata$timepoint[rows]])
+  for (j in seq_along(strip_colors)) {
+    xright <- left - .5 - (3L - j) * strip_width * 1.3
+    rect(xright - strip_width, nr - seq_len(nr), xright, nr - seq_len(nr) + 1,
+      col = strip_colors[[j]], border = NA, xpd = NA)
+  }
+  box()
+  title(main = paste0(title, " (", window_name, " ", window_label, ")"),
+    xlab = "Position relative to TSS (bp; transcription direction)", cex.main = .9)
+  mtext(paste0(nr, " clustered molecules; negative = upstream; same row order as ACF heatmap"),
+    side = 3, line = .25, cex = .65)
+}
+save_plot("08_single_fiber_footprints", function() {
+  layout(matrix(c(rep(1, 4), 2:5), nrow = 2, byrow = TRUE), heights = c(1, .16))
+  plot_tss_footprints_raster(heatmap_order, "Single-molecule footprints")
+  keys <- list("Footprint / call" = footprint_colors, "Cluster strip" = cluster_colors,
+    "Expression strip" = bin_colors, "Timepoint strip" = timepoint_colors)
+  for (label in names(keys)) {
+    par(mar = c(0, 0, 0, 0)); plot.new()
+    cols <- keys[[label]]
+    labels <- if (label == "Cluster strip") paste0("C", names(cols)) else names(cols)
+    legend("center", legend = labels, fill = cols, border = "grey70", bty = "n",
+      title = label, cex = .65, ncol = if (length(cols) > 8) 2 else 1)
+  }
+}, width = 9, height = 12)
+
 curve_plot <- function(tab, grouping, levels, colors, title, min_lag = 0) {
   # min_lag = 0: two panels (full ACF, then lags > 0). min_lag > 0: one panel from that lag.
   lower_bounds <- if (min_lag > 0) min_lag else c(0, 1)
@@ -279,7 +370,8 @@ curve_plot <- function(tab, grouping, levels, colors, title, min_lag = 0) {
     yrange <- range(c(0, tab$mean_acf[use]), finite = TRUE)
     if (diff(yrange) == 0) yrange <- yrange + c(-0.01, 0.01)
     plot(NA, xlim = range(tab$lag_bp[use]), ylim = yrange,
-      xlab = "Lag (bp)", ylab = "Mean ACF", main = title, cex.main = 1)
+      xlab = "Lag (bp)", ylab = "Mean ACF", main = paste0(title, " (", window_name, " ", window_label, ")"),
+      cex.main = 1)
     abline(h = 0, col = "#BBBBBB", lty = 3)
     for (group in levels) {
       sub <- tab[as.character(tab[[grouping]]) == group & use, , drop = FALSE]
@@ -378,7 +470,90 @@ save_plot("06c_umap_by_m6a", function() {
   axis(4, at = pretty(limits), las = 1, cex.axis = 0.8)
   title(main = "m6A count", cex.main = 0.8)
 })
-check("plot_completion", length(output_paths) == 11L * (if (write_png) 2L else 1L) &&
+
+# Per-molecule NRL and regularity (04b_molecule_nrl.py). Violins are density
+# outlines around a box; decay lengths are shown on a log10 axis.
+violin_panel <- function(values, colors, ylab, main, log_y = FALSE) {
+  values <- lapply(values, function(v) { v <- v[is.finite(v)]; if (log_y) log10(v[v > 0]) else v })
+  k <- length(values)
+  all_values <- unlist(values)
+  par(mar = c(6.3, 4.6, 3.2, 0.8), mgp = c(2.8, 0.7, 0))
+  if (!length(all_values)) {
+    plot.new(); title(main = main, cex.main = 0.95); text(0.5, 0.5, "No values"); return(invisible(NULL))
+  }
+  ylim <- range(all_values)
+  if (diff(ylim) == 0) ylim <- ylim + c(-1, 1)
+  plot(NA, xlim = c(0.5, k + 0.5), ylim = ylim, xaxt = "n", xlab = "",
+    ylab = if (log_y) paste0("log10 ", ylab) else ylab, main = main, cex.main = 0.95)
+  axis(1, at = seq_len(k), labels = names(values), las = 2, cex.axis = 0.8)
+  for (i in seq_len(k)) {
+    v <- values[[i]]
+    if (length(v) >= 5L && diff(range(v)) > 0) {
+      d <- stats::density(v, from = min(v), to = max(v))
+      w <- 0.42 * d$y / max(d$y)
+      polygon(c(i - w, rev(i + w)), c(d$x, rev(d$x)), col = adjustcolor(colors[i], 0.45), border = colors[i])
+    }
+    if (length(v)) boxplot(v, at = i, add = TRUE, axes = FALSE, boxwex = 0.18, outline = FALSE, col = "white")
+    mtext(paste0("n=", length(v)), side = 3, at = i, line = 0.05, cex = 0.55)
+  }
+}
+nrl_metrics <- list(
+  list(column = "nrl_bp", ylab = "NRL (bp)", log_y = FALSE),
+  list(column = "decay_length_bp", ylab = "decay length (bp)", log_y = TRUE),
+  list(column = "damping_lag_bp", ylab = "Damping lag (bp)", log_y = FALSE))
+nrl_clustered <- nrl[clustered, , drop = FALSE]
+save_plot("08_nrl_metrics_by_expression", function() {
+  par(mfrow = c(1, 3))
+  for (m in nrl_metrics) violin_panel(
+    setNames(lapply(bins, function(b) nrl[[m$column]][nrl$expr_bin == b]), bins), bin_colors,
+    m$ylab, paste0(m$ylab, " by expression bin (", window_name, " ", window_label, ")"), m$log_y)
+}, width = 14, height = 6)
+save_plot("08b_nrl_metrics_by_cluster", function() {
+  par(mfrow = c(1, 3))
+  for (m in nrl_metrics) violin_panel(
+    setNames(lapply(plot_levels, function(cl) nrl_clustered[[m$column]][nrl_clustered$cluster == cl]),
+      paste0("C", plot_levels)), cluster_colors[plot_levels],
+    m$ylab, paste0(m$ylab, " by Leiden class (", window_name, " ", window_label, ")"), m$log_y)
+}, width = max(14, length(plot_levels) * 1.6), height = 6)
+save_plot("09_nrl_histogram_by_cluster", function() {
+  k <- length(plot_levels)
+  par(mfrow = c(ceiling(k / 3), min(3, k)), mar = c(4.4, 4.4, 3, 0.8), mgp = c(2.6, 0.7, 0))
+  breaks <- seq(floor(min(nrl$nrl_bp, 120, na.rm = TRUE) / 5) * 5,
+    ceiling(max(nrl$nrl_bp, 300, na.rm = TRUE) / 5) * 5, by = 5)
+  for (cl in plot_levels) {
+    v <- nrl_clustered$nrl_bp[nrl_clustered$cluster == cl]
+    v <- v[is.finite(v)]
+    total <- sum(nrl_clustered$cluster == cl)
+    if (length(v)) {
+      hist(v, breaks = breaks, col = cluster_colors[cl], border = "white", xlab = "Per-molecule NRL (bp)",
+        main = paste0("C", cl, ": ", length(v), "/", total, " with a peak (median ", round(median(v)), " bp)"),
+        cex.main = 0.85, xlim = range(breaks), xaxt = "n")
+      # Label every 20 bp across the whole NRL band so no tick is dropped.
+      axis(1, at = seq(min(breaks), max(breaks), by = 20), las = 2, cex.axis = 0.75)
+      abline(v = median(v), lty = 2)
+    } else {
+      plot.new(); title(main = paste0("C", cl, ": no NRL peaks"), cex.main = 0.85)
+    }
+  }
+  mtext(paste0("Per-molecule NRL histograms (", window_name, " ", window_label, ")"), side = 3,
+    outer = TRUE, line = -1.2, cex = 0.8)
+}, width = 12, height = 4 * ceiling(length(plot_levels) / 3) + 0.5)
+save_plot("10_nrl_peak_fraction", function() {
+  layout(matrix(c(1, 2), nrow = 1), widths = c(0.45, 1))
+  par(mar = c(6, 4.6, 3.5, 0.8))
+  by_bin <- vapply(bins, function(b) mean(!is.na(nrl$nrl_bp[nrl$expr_bin == b])), numeric(1))
+  bp <- barplot(by_bin, col = bin_colors, border = NA, ylim = c(0, 1), las = 2,
+    ylab = "Fraction of molecules with a detected NRL peak",
+    main = paste0("Peak fraction by expression bin\n(", window_name, " ", window_label, ")"), cex.main = 0.9)
+  text(bp, by_bin, sprintf("%.2f", by_bin), pos = 3, cex = 0.75, xpd = NA)
+  by_cluster <- vapply(plot_levels, function(cl)
+    mean(!is.na(nrl_clustered$nrl_bp[nrl_clustered$cluster == cl])), numeric(1))
+  bp <- barplot(by_cluster, names.arg = paste0("C", plot_levels), col = cluster_colors[plot_levels],
+    border = NA, ylim = c(0, 1), las = 2, ylab = "Fraction of molecules with a detected NRL peak",
+    main = "Peak fraction by Leiden class (clustered molecules)", cex.main = 0.9)
+  text(bp, by_cluster, sprintf("%.2f", by_cluster), pos = 3, cex = 0.75, xpd = NA)
+}, width = max(12, 4 + length(plot_levels) * 0.6), height = 6)
+check("plot_completion", length(output_paths) == 16L * (if (write_png) 2L else 1L) &&
   all(file.exists(output_paths)) && all(file.info(output_paths)$size > 0L),
   paste(length(output_paths), "plots exported successfully"))
 write.table(checks, paste0(validation_path, ".tmp"), sep = "\t", row.names = FALSE, quote = FALSE)

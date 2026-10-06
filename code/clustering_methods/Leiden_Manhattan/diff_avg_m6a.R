@@ -78,7 +78,7 @@ plot_m6a_delta <- function(delta, region = NULL, ylim = c(-1, 1), shade = TRUE, 
   stopifnot(length(ylim) == 2L, ylim[1] < 0, ylim[2] > 0)
   if (!is.null(region)) {
     anchor <- plot_anchor(region)
-    delta$x <- anchor$direction * (delta$pos - anchor$anchor)
+    delta$x <- plot_positions(delta$pos, region)
     x_label <- anchor$x_label
     xlim <- c(anchor$left - 0.5, anchor$right + 0.5)
     title <- paste0(region$annotation, " | ", region$chr, ":", region$analysis_start, "-", region$analysis_end)

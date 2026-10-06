@@ -1147,7 +1147,7 @@ local({
       tryCatch({
         ComplexHeatmap::draw(heatmap, newpage = FALSE)
         # Column centers occupy (index - 0.5) / width of each heatmap slice.
-        tss_x <- (region$tss - region$analysis_start + 0.5) / region$width
+        tss_x <- (match(as.character(region$tss), colnames(heatmap@matrix)) - 0.5) / region$width
         for (slice in seq_len(result$n_clusters)) {
           ComplexHeatmap::decorate_heatmap_body("m6A", {
             grid::grid.lines(x = c(tss_x, tss_x), y = c(0, 1),

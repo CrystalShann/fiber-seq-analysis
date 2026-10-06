@@ -67,16 +67,22 @@ def main():
                out / "validation/acf_validation.json"]
     np.save(outputs[0], profiles, allow_pickle=False)
     np.save(outputs[1], valid, allow_pickle=False)
+    saved = np.load(outputs[0], mmap_mode="r", allow_pickle=False)
+    if saved.shape != (len(metadata), args.max_lag + 1):
+        raise ValueError(f"Saved ACF rows must have exactly max_lag + 1 = {args.max_lag + 1} columns")
     report = {
         "n_reads": len(metadata), "n_valid": int(valid.sum()),
         "n_zero_variance": int((~valid).sum()), "matrix_shape": list(profiles.shape),
         "window_width_bp": width, "max_lag_bp": args.max_lag, "lag0_equals_one": True,
+        "saved_columns_equal_max_lag_plus_one": True, "lag_resolution_bp": 1,
         "lag0_max_absolute_error": float(np.max(np.abs(profiles[valid, 0] - 1))) if valid.any() else None,
         "zero_variance_flagged": True, "invalid_rows_all_nan": True,
         "metadata_and_matrix_row_order_preserved": True,
         "parent_function": str(PARENT) + ":autocorrelations",
         "acf_definition": "sum((x[t]-mean(x))*(x[t+k]-mean(x))) / (N*var(x))",
-        "binary_orientation": "increasing genomic coordinate; no strand reversal",
+        "binary_orientation": "transcriptional (column j = TSS-relative offset window_offset_start + j)",
+        "acf_orientation_note": ("the ACF is invariant to sequence reversal, so per-read ACF values change "
+                                 "only through which reads and bases fall in each strand-oriented window"),
     }
     write_json(outputs[2], report)
     finish_stage(out, "02_acf", signature, outputs, details=report)

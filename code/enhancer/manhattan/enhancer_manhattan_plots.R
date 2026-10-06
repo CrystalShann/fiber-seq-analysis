@@ -1,5 +1,7 @@
 # Selected-fiber signals and plots for pooled enhancer Manhattan clusters.
 # Coordinates in records are midpoint-relative, 0-based half-open [-500, 500).
+ENHANCER_TRACK_COLORS <- c("m6A" = "#800080", "Nucleosome >90 bp" = "#4d4d4d",
+                           "TF <60 bp" = "#f16913")
 ENHANCER_CLASS_COLORS <- c(active = "#E69F00", inactive = "#009E73")
 
 enhancer_manhattan_plot_view <- function(result) {
@@ -81,13 +83,21 @@ plot_enhancer_manhattan_signals <- function(profiles, class_id) {
   levels <- unique(profiles$cluster)
   profiles <- data.table::copy(profiles)
   profiles[, cluster := factor(cluster, levels = levels)]
-  ggplot2::ggplot(profiles, ggplot2::aes(position_bp, fraction, colour = track)) +
-    ggplot2::geom_line(linewidth = 0.35) +
-    ggplot2::geom_vline(xintercept = 0, linetype = 2, colour = "grey55") +
-    ggplot2::facet_wrap(~cluster, ncol = 1) +
-    ggplot2::scale_colour_manual(values = c("m6A" = "black", "Nucleosome >90 bp" = "#6488A3", "TF <60 bp" = "#CC3377")) +
-    ggplot2::scale_y_continuous(limits = c(0, 1)) +
-    ggplot2::theme_bw(base_size = 10) +
+  profiles[, track := factor(track, levels = names(ENHANCER_TRACK_COLORS))]
+  counts <- unique(profiles[, .(cluster, n_reads)])
+  labels <- stats::setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
+  ggplot2::ggplot(profiles, ggplot2::aes(position_bp, fraction, colour = track, group = track)) +
+    ggplot2::geom_ribbon(data = profiles[track == "Nucleosome >90 bp"],
+      ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", colour = NA, alpha = .18) +
+    ggplot2::geom_line(linewidth = 0.5) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30", linewidth = 0.4) +
+    ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
+    ggplot2::scale_colour_manual(values = ENHANCER_TRACK_COLORS) +
+    ggplot2::scale_x_continuous(limits = c(-500.5, 499.5), expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1),
+      expand = ggplot2::expansion(mult = c(0, .02))) +
+    cowplot::theme_cowplot(font_size = 8) + cowplot::panel_border() +
+    ggplot2::theme(strip.text = ggplot2::element_text(size = 7), legend.position = "bottom") +
     ggplot2::labs(title = paste(class_id, "enhancers: Manhattan-Leiden"),
       x = "Position relative to enhancer midpoint (bp)", y = "Fraction of sampled fibers", colour = NULL)
 }
@@ -119,7 +129,7 @@ plot_enhancer_manhattan_footprints <- function(result, class_id) {
   class_cols <- if (has_class) ENHANCER_CLASS_COLORS else character()
   if (has_class && anyNA(match(a$enhancer_class, names(class_cols))))
     stop("Unknown enhancer class in saved Manhattan assignments")
-  track_cols <- c("Nucleosome >90 bp" = "#6488A3", "TF <60 bp" = "#CC3377")
+  track_cols <- ENHANCER_TRACK_COLORS[c("Nucleosome >90 bp", "TF <60 bp")]
   r <- data.table::copy(data.table::as.data.table(result$footprints))[RID %in% a$RID]
   r[, `:=`(row = a$row[match(RID, a$RID)], cluster = a$cluster[match(RID, a$RID)])]
   r[, track := factor(track, levels = c("Nucleosome >90 bp", "TF <60 bp"))]
@@ -140,7 +150,7 @@ plot_enhancer_manhattan_footprints <- function(result, class_id) {
     ggplot2::geom_segment(data = a, ggplot2::aes(x = -500, xend = 500, y = row, yend = row),
       colour = "grey80", linewidth = 0.15 * density_scale) +
     ggplot2::geom_rect(data = r, ggplot2::aes(xmin = start, xmax = end, ymin = row - .38, ymax = row + .38, fill = track)) +
-    ggplot2::geom_segment(data = m, ggplot2::aes(x = position, xend = position, y = row - .3, yend = row + .3), colour = "black", linewidth = 0.2) +
+    ggplot2::geom_segment(data = m, ggplot2::aes(x = position, xend = position, y = row - .3, yend = row + .3), colour = ENHANCER_TRACK_COLORS[["m6A"]], linewidth = 0.2) +
     ggplot2::geom_rect(data = bars, ggplot2::aes(xmin = xmin, xmax = xmax,
       ymin = row - .5, ymax = row + .5, fill = value)) +
     ggplot2::geom_vline(xintercept = 0, linetype = 2, colour = "grey45", linewidth = .25) +
@@ -160,7 +170,7 @@ plot_enhancer_manhattan_footprints <- function(result, class_id) {
     ggplot2::labs(title = paste(class_id, "enhancers | Manhattan-Leiden k =", result$info$k_neighbors),
       subtitle = paste0("All ", nrow(a), " selected fibers in ", length(cluster_levels),
         " clusters; left bars: ", if (has_class) "class, " else "",
-        "cluster, timepoint; black marks: m6A\n",
+        "cluster, timepoint; purple marks: m6A\n",
         "Within each cluster: timepoint, enhancer, read; dashed line: enhancer midpoint"),
       x = "Position relative to enhancer midpoint (bp)", y = "Fibers", fill = NULL)
 }
@@ -182,14 +192,13 @@ save_enhancer_manhattan_pdfs <- function(result, class_id, plot_dir, table_dir,
   tryCatch(ComplexHeatmap::draw(plot_enhancer_manhattan_heatmap(view, main = title)), finally = grDevices::dev.off())
   ggplot2::ggsave(pdf_path("cluster_composition"), plot_enhancer_manhattan_composition(view, main = title),
     width = 10, height = if ("enhancer_class" %in% names(view$assignments)) 14 else 8)
-  ggplot2::ggsave(pdf_path("cluster_structure"), plot_cluster_structure(view, main = title), width = 9, height = 3)
   p <- plot_met_fraction_lines(view, tss = 0, main = title, smooth_k = 1) +
     ggplot2::labs(x = "Position relative to enhancer midpoint (bp)")
   ggplot2::ggsave(pdf_path("m6a_base_cluster_profiles"), p, width = 8, height = max(4, 1.4 * view$n_clusters + 1), limitsize = FALSE)
   profiles <- enhancer_manhattan_signal_profiles(result)
   data.table::fwrite(profiles, file.path(table_dir, paste0("manhattan_signal_profiles_", class_id, suffix, ".tsv")), sep = "\t")
   ggplot2::ggsave(pdf_path("footprint_profiles"), plot_enhancer_manhattan_signals(profiles, class_id),
-    width = 9, height = max(4, 1.5 * view$n_clusters + 1), limitsize = FALSE)
+    width = 6, height = max(2.5, 0.8 * view$n_clusters + 1.2), limitsize = FALSE)
   ggplot2::ggsave(pdf_path("single_fiber_footprints"),
     plot_enhancer_manhattan_footprints(result, class_id), width = 11,
     height = enhancer_manhattan_footprint_height(result), limitsize = FALSE)

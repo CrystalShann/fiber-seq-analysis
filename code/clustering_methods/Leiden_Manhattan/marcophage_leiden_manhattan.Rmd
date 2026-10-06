@@ -323,22 +323,35 @@ for (region_id in names(res)) {
               file.path(tables_dir, paste0("run_parameters_", region_id, ".tsv")),
               sep = "\t", quote = FALSE, row.names = FALSE)
 
-  gg <- plot_cluster_met_profiles(region_res, region_res$site_met_mat, main = region_id)
+  # Plot-only metadata: clustering inputs and saved results stay unchanged.
+  # These windows (unlike BED intervals) are already 1-based inclusive.
+  plot_region <- region_res$region
+  plot_region$analysis_start <- plot_region$start
+  plot_region$analysis_end <- plot_region$end
+  plot_region$annotation <- region_id
+  promoter_index <- match(region_id, promoters$gene)
+  if (!is.na(promoter_index)) {
+    plot_region$region_type <- "promoter"
+    plot_region$strand <- promoters$gene_strand[promoter_index]
+    plot_region$tss <- promoters$canonical_tss[promoter_index]
+    plot_region$annotation <- paste(region_id, "canonical promoter")
+  }
+
+  gg <- plot_cluster_met_profiles(region_res, region_res$site_met_mat, main = region_id,
+                                  region = plot_region)
   ggsave(file.path(plots_dir, paste0("cluster_met_profiles_", region_id, ".pdf")), gg,
          width = 6, height = 1.4 * region_res$n_clusters + 1.4, limitsize = FALSE)
 
   gg <- plot_cluster_composition(region_res, main = region_id)
   ggsave(file.path(plots_dir, paste0("cluster_composition_", region_id, ".pdf")), gg,
          width = 7, height = 8)
-  gg <- plot_cluster_structure(region_res, main = region_id)
-  ggsave(file.path(plots_dir, paste0("cluster_structure_", region_id, ".pdf")), gg,
-         width = 9, height = 3)
 
   pdf(file.path(plots_dir, paste0("heatmap_", region_id, ".pdf")), width = 8, height = 9)
-  ComplexHeatmap::draw(plot_cluster_heatmap(region_res, main = region_id))
+  ComplexHeatmap::draw(plot_cluster_heatmap(region_res, main = region_id, region = plot_region))
   dev.off()
 
-  gg <- plot_met_fraction_lines(region_res, main = region_id, smooth_k = line_smooth_k)
+  gg <- plot_met_fraction_lines(region_res, main = region_id, smooth_k = line_smooth_k,
+                                region = plot_region)
   ggsave(file.path(plots_dir, paste0("met_fraction_lines_", region_id, ".pdf")), gg,
          width = 8, height = 1.4 * region_res$n_clusters + 1, limitsize = FALSE)
 }

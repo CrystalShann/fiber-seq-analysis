@@ -9,84 +9,112 @@ output:
     mathjax: null
 params:
   output_dir: "../../../../macrophage_project/auto_correlation/tss"
-  windows: ["2000_tss", "left_1000_tss", "right_1000_tss"]
+  windows: ["2000_tss", "upstream_1000_tss", "downstream_1000_tss"]
+  test: false
 ---
 
 # Analysis and parameters
 
-This notebook runs the numbered scripts in this folder together and shows their
-results, in the same way `../06_autocorrelation.Rmd` does for the LCL regions.
-Each TSS window is one SLURM array task of `06_run_tss_autocorrelation.sh` and
-writes to its own folder under `params$output_dir`:
+This notebook shows the results of the numbered scripts in this folder, in the
+same way `../06_autocorrelation.Rmd` does for the LCL regions. Each TSS region is
+one SLURM array task of `06_run_tss_autocorrelation.sh` and writes to its own
+folder under `params$output_dir`; the cross-region sliding-window figures are
+written by the dependent job `08_plot_sliding_combined.R` to `combined/`.
+With `params$test = TRUE` the `test/` subfolders of the chromosome-22 test run
+are shown instead.
 
-| Folder | Window (genomic offsets from the canonical TSS, end exclusive) | Width |
-|---|---|---|
-| `2000_tss` | `[TSS - 1000, TSS + 1000)` | 2,000 bp |
-| `left_1000_tss` | `[TSS - 1000, TSS - 100)` | 900 bp |
-| `right_1000_tss` | `[TSS + 100, TSS + 1000)` | 900 bp |
+Offsets are TSS-relative and strand-oriented (transcriptional): negative =
+upstream, positive = downstream, end exclusive. For the interval `[s, e)` and the
+zero-based TSS base `tss` (canonical BED start + 10), the genomic window is
+`[tss + s, tss + e)` on the `+` strand and `[tss - e + 1, tss - s + 1)` on the
+`-` strand; minus-strand rows are reversed so that column `j` is offset `s + j`.
 
-Left and right are genomic directions on both gene strands; no strand reversal is
-applied anywhere in the pipeline.
+| Folder | Window (TSS-relative) | Width | Sliding windows (500 bp, step 100) |
+|---|---|---|---|
+| `2000_tss` | `[-1000, +1000)` | 2,000 bp | 16 (6 overlap the NDR core `[-100, +100)`) |
+| `upstream_1000_tss` | `[-1000, -100)` | 900 bp | 5 |
+| `downstream_1000_tss` | `[+100, +1000)` | 900 bp | 5 |
+
+The ACF is invariant to sequence reversal, so per-read ACF values change only
+through which reads and bases fall in each window; heatmaps, sliding windows
+and other position-based outputs depend on the orientation.
 
 # Method
 
-**Step 0: expression bins** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/00_prepare_expression_bins.R`)
+**Step 0: expression bins** (`00_prepare_expression_bins.R`)
 
 Protein-coding Ensembl-canonical genes get a mean TPM pooled over the twelve RNA samples (LPS 0, 5, 10, 15 min) and a quartile bin `Q1_low` to `Q4_high`. `not_expressed` genes are excluded. The bins are fixed and shared by all four Fiber-seq samples.
 
-**Step 1: sample molecules** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/01_sample_tss_molecules.py`)
+**Step 1: sample molecules** (`01_sample_tss_molecules.py`)
 
-TSS = canonical BED start + 10 `/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed` contains bed region interval. A read is eligible when it fully spans the TSS window we are testing. Each bin then contributes 2,500 reads chosen by an independent seeded hash (10,000 in total).
+TSS = canonical BED start + 10 (`/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed`). A read is eligible when it fully spans the strand-oriented genomic window of the region. Each physical read is assigned one gene and bin, and each bin contributes 2,500 reads chosen by an independent seeded hash (10,000 in total; 100 per bin on chromosome 22 in `--test`). Binary rows are built in genomic order and reversed for `-` genes; a check confirms that the column for offset 0 is the genomic TSS base on both strands.
 
+**Step 2: per-read ACF** (`02_compute_tss_autocorrelations.py`, parent `autocorrelations()`)
 
-**Step 2: per-read ACF** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/02_compute_tss_autocorrelations.py`)
+$ACF(k) = \sum_t (x_t-\bar x)(x_{t+k}-\bar x) / (N \cdot var(x))$
 
-$ACF(k) = sum((x[t]-mean(x))*(x[t+k]-mean(x))) / (N * var(x))$
+on the unbinned per-base 0/1 signal at every integer lag 0 … width − 1 (1 bp resolution; no smoothing, binning, tapering or FFT truncation). Zero-variance reads have undefined ACFs.
 
-for every nonnegative lag of the window. Zero-variance reads have undefined ACFs
+**Step 3: joint Leiden clustering** (`03_leiden_cluster_autocorrelations.py`, parent `cluster_profiles()`)
 
-**Step 3: joint Leiden clustering**
+All four expression bins are clustered together: PCA (50 PCs) → correlation-distance kNN (10 neighbors) → Leiden (resolution 0.4, seed 0) → UMAP for display only. Reads that cannot be clustered keep the label `Unclustered` in the tables and are left out of the cluster figures.
 
-(`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/03_leiden_cluster_autocorrelations.py`). 
-All four expression bins are clustered together:
-PCA (50 PCs) -> correlation-distance kNN (10 neighbors) -> Leiden (resolution 0.4, seed 0) -> UMAP for display only
+**Step 4: plot tables** (`04_prepare_plot_tables.py`)
 
-Reads that cannot be clustered keep the label `Unclustered` in the tables and are left out of every figure
+Mean/median ACF per cluster and per expression bin, cluster × bin composition in both directions, cluster summary with the descriptive 140–250 bp positive peak, and the heatmap row order.
 
-**Step 4: plot tables** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/04_prepare_plot_tables.py`)
+**Step 4b: single-molecule footprints** (`04b_extract_tss_footprints.py`)
 
-Mean/median ACF per cluster and per expression bin, cluster × bin composition in both directions, cluster
-summary with the descriptive 140-250 bp positive peak, and the heatmap row order.
+Match FiberHMM BED12 records by sample, chromosome and read ID; use the exact
+sampled read span to resolve multiple records. Unique trimmed records are accepted.
+Retain nucleosomes >90 bp and TF footprints <60 bp; clip genomic calls to each
+window, then map their included endpoints with the sampler's coordinate helper.
+The category matrix retains the original rows and transcriptional orientation;
+m6A comes directly from the saved binary matrix. White = no call, dark grey =
+nucleosome, orange = TF, purple = m6A (highest precedence). Checks enforce
+base-for-base m6A identity and mirrored minus-strand footprint intervals.
 
-**Step 5: figures** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/05_plot_tss_autocorrelation.R`)
+**Step 4b: per-molecule NRL and regularity** (`04b_molecule_nrl.py`, `tss_nrl.py`)
 
-make the plots for each selected window, and the lags start at 25 bp
+NRL = lag of the first positive local maximum of the raw ACF in 120–300 bp (lags ≥ 60; SAMOSA secondary-peak scan, Abdulhay et al. 2020 eLife), with `scipy.signal.find_peaks` and a prominence threshold **calibrated per window length**: the 95th percentile of the largest in-band peak prominence obtained from position-shuffled copies of the same molecules (`tables/nrl_prominence_calibration.tsv`). Regularity follows Baldi et al. 2018 Mol Cell: on the unbiased rescaling `ACF(k)·N/(N−k)` restricted to lags ≤ N/2 (decay metrics only), a damped cosine `A·exp(−k/λ)·cos(2πk/P+φ)+c` gives the decay length λ, and the damping lag is the lag after which the one-period rolling |ACF| envelope stays below 0.05.
+
+**Step 4c: sliding windows** (`04c_sliding_windows.py`)
+
+500 bp windows stepped by 100 bp over each region's own span and molecules (no resampling), parent ACF at lags 0–499, the step-4b metrics per (read, window), the NDR-core overlap flag (Clarkson et al. 2019 NAR), and an A/T reference-sequence control of the same windows.
+
+**Step 5: per-region figures** (`05_plot_tss_autocorrelation.R`); **step 8: combined sliding figures and tests** (`08_plot_sliding_combined.R`)
+
+Base R. Combined panels show read-level statistics per window with bootstrap 95% CIs over genes; upstream versus downstream is an unpaired Wilcoxon test on gene-level medians, mirror windows within the 2 kb span are paired by read, BH-corrected within each family.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = TRUE, message = TRUE, out.width = "100%")
 options(scipen = 999)
 code_dir <- normalizePath(".", mustWork = TRUE)
 output <- normalizePath(params$output_dir, mustWork = TRUE)
-windows <- c("2000_tss", "left_1000_tss", "right_1000_tss")
+windows <- c("2000_tss", "upstream_1000_tss", "downstream_1000_tss")
 unknown <- setdiff(params$windows, windows)
 if (length(unknown)) stop("Unknown windows: ", paste(unknown, collapse = ", "))
-window_dirs <- setNames(file.path(output, params$windows), params$windows)
+suffix <- if (isTRUE(params$test)) "test" else ""
+window_dirs <- setNames(sub("/$", "", file.path(output, params$windows, suffix)), params$windows)
+combined_dir <- sub("/$", "", file.path(output, "combined", suffix))
 ```
 
 ## Run the pipeline
 
-Submit all three windows as one array job (one task per window):
+Submit all three regions as one array job (one task per region); the lowest
+task submits the combined job after the array. Knitting never runs the pipeline.
 
 ```bash
 mkdir -p /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs
 sbatch /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh
+# chromosome-22 test: add --test and knit with params$test = TRUE
 ```
-
 
 ```{r check-results, include=FALSE}
 missing <- window_dirs[!file.exists(file.path(window_dirs, "tables", "cluster_summary.tsv"))]
 if (length(missing)) stop("No results for: ", paste(names(missing), collapse = ", "),
   ". Submit 06_run_tss_autocorrelation.sh first.")
+have_combined <- file.exists(file.path(combined_dir, "tables", "sliding_tests.tsv"))
 ```
 
 ```{r gallery-helper, include=FALSE}
@@ -112,7 +140,10 @@ writeLines(c(
   "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
 
 inline_png <- function(path, label, dpi = 120) {
-  stopifnot(file.exists(path), file.info(path)$size > 0)
+  if (!file.exists(path) || file.info(path)$size == 0) {
+    cat("\n\n*Missing figure:* `", path, "`\n\n", sep = "")
+    return(invisible(NULL))
+  }
   prefix <- tempfile("fig-")
   status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
     shQuote(path), shQuote(prefix)))
@@ -126,7 +157,9 @@ inline_png <- function(path, label, dpi = 120) {
   invisible(NULL)
 }
 
+# All sixteen per-region figures, grouped into `##` subsections.
 figures <- list(
+  "Single-molecule footprints" = c("08_single_fiber_footprints" = "Strand-oriented single-molecule footprints, in ACF heatmap order"),
   "ACF heatmap: all clustered molecules" = c("01_acf_heatmap_all" = "ACF heatmap by global Leiden class"),
   "ACF heatmaps by expression bin" = c("03_acf_heatmaps_by_expression" = "ACF heatmaps by expression bin"),
   "Mean ACF by cluster" = c("02_mean_acf_by_cluster" = "Mean ACF by global Leiden class"),
@@ -140,9 +173,25 @@ figures <- list(
   "UMAP" = c(
     "06_umap_by_cluster" = "UMAP by global Leiden class",
     "06b_umap_by_expression" = "UMAP by expression bin",
-    "06c_umap_by_m6a" = "UMAP by m6A count"))
+    "06c_umap_by_m6a" = "UMAP by m6A count"),
+  "Per-molecule NRL and regularity" = c(
+    "08_nrl_metrics_by_expression" = "NRL, decay length and damping lag by expression bin",
+    "08b_nrl_metrics_by_cluster" = "NRL, decay length and damping lag by Leiden class",
+    "09_nrl_histogram_by_cluster" = "Per-molecule NRL histograms by Leiden class (SAMOSA Fig. 3D style)",
+    "10_nrl_peak_fraction" = "Fraction of molecules with a detected NRL peak, by bin and by class"))
 
-# All figures of one window, one `##` subsection per figure group.
+combined_figures <- list(
+  "Median NRL" = c("01_sliding_nrl" = "Median NRL per sliding window",
+    "01_sliding_nrl_by_timepoint" = "Median NRL per sliding window, by LPS timepoint"),
+  "Fraction with a detected NRL peak" = c("02_sliding_peak_fraction" = "Fraction of molecules with an NRL peak",
+    "02_sliding_peak_fraction_by_timepoint" = "Fraction with an NRL peak, by LPS timepoint"),
+  "Decay length and damping lag" = c("03_sliding_decay_damping" = "Median decay length and damping lag",
+    "03_sliding_decay_damping_by_timepoint" = "Median decay length and damping lag, by LPS timepoint"),
+  "m6A density" = c("04_sliding_m6a_density" = "Mean m6A density per sliding window",
+    "04_sliding_m6a_density_by_timepoint" = "Mean m6A density, by LPS timepoint"),
+  "Mean ACF heatmaps per window" = c("05_sliding_acf_heatmap_2kb" = "Mean ACF (lags 0-499) x window centre, 2 kb span",
+    "05b_sliding_acf_heatmap_one_sided" = "Mean ACF (lags 0-499) x window centre, one-sided regions"))
+
 show_region <- function(window) {
   if (!window %in% names(window_dirs)) {
     cat("\n\nWindow `", window, "` is not in `params$windows`.\n\n", sep = "")
@@ -157,11 +206,31 @@ show_region <- function(window) {
   }
 }
 
-show_table <- function(name, label, digits = 3) {
+show_combined <- function() {
+  if (!have_combined) {
+    cat("\n\nNo combined results in `", combined_dir, "`; run `08_plot_sliding_combined.R` after all three regions.\n\n", sep = "")
+    return(invisible(NULL))
+  }
+  for (group in names(combined_figures)) {
+    cat("\n\n## ", group, "\n\n", sep = "")
+    for (name in names(combined_figures[[group]])) {
+      inline_png(file.path(combined_dir, "plots", paste0(name, ".pdf")),
+        paste("combined", combined_figures[[group]][[name]], sep = " — "))
+    }
+  }
+}
+
+read_table <- function(path) read.delim(path, check.names = FALSE, stringsAsFactors = FALSE,
+  na.strings = c("NA", "NaN", "nan", ""), quote = "")
+
+show_table <- function(name, label, digits = 3, columns = NULL, filter = NULL) {
   for (window in names(window_dirs)) {
     cat("\n\n### ", window, "\n\n", sep = "")
-    tab <- read.delim(file.path(window_dirs[[window]], "tables", paste0(name, ".tsv")),
-      check.names = FALSE, stringsAsFactors = FALSE)
+    path <- file.path(window_dirs[[window]], "tables", paste0(name, ".tsv"))
+    if (!file.exists(path)) { cat("*Missing table:* `", path, "`\n\n", sep = ""); next }
+    tab <- read_table(path)
+    if (!is.null(filter)) tab <- filter(tab)
+    if (!is.null(columns)) tab <- tab[, intersect(columns, names(tab)), drop = FALSE]
     print(knitr::kable(tab, digits = digits, caption = paste(window, label, sep = " — ")))
   }
 }
@@ -174,28 +243,39 @@ table { display: block; overflow-x: auto; }
 
 # Region 1: 2 kb centred on the TSS (`2000_tss`)
 
-Window `[TSS - 1000, TSS + 1000)`, 2,000 bp; lags 0–1999.
+Window `[-1000, +1000)`, 2,000 bp, strand-oriented; lags 0–1999.
 
 ```{r region-2000, results='asis'}
 show_region("2000_tss")
 ```
 
-# Region 2: left flank, TSS −1000 to −100 (`left_1000_tss`)
+# Region 2: upstream flank, −1000 to −100 (`upstream_1000_tss`)
 
-Window `[TSS - 1000, TSS - 100)`, 900 bp (genomic left of the TSS on both
-strands, stopping 100 bp short of it); lags 0–899.
+Window `[-1000, -100)`, 900 bp upstream of the TSS in the transcriptional
+direction, stopping 100 bp short of it; lags 0–899.
 
-```{r region-left, results='asis'}
-show_region("left_1000_tss")
+```{r region-upstream, results='asis'}
+show_region("upstream_1000_tss")
 ```
 
-# Region 3: right flank, TSS +100 to +1000 (`right_1000_tss`)
+# Region 3: downstream flank, +100 to +1000 (`downstream_1000_tss`)
 
-Window `[TSS + 100, TSS + 1000)`, 900 bp (genomic right of the TSS on both
-strands, starting 100 bp past it); lags 0–899.
+Window `[+100, +1000)`, 900 bp downstream of the TSS in the transcriptional
+direction, starting 100 bp past it; lags 0–899.
 
-```{r region-right, results='asis'}
-show_region("right_1000_tss")
+```{r region-downstream, results='asis'}
+show_region("downstream_1000_tss")
+```
+
+# Sliding windows across regions (`combined`)
+
+Window centre relative to the TSS on the x axis (upstream left), one line per
+expression bin, bootstrap 95% CI over genes. Pink shading marks 2 kb-span
+windows overlapping the NDR core `[-100, +100)`; grey marks the gap between the
+one-sided regions. Dashed grey: A/T reference control.
+
+```{r combined, results='asis'}
+show_combined()
 ```
 
 # Result tables
@@ -216,4 +296,51 @@ show_table("cluster_summary", "Cluster summaries")
 
 ```{r table-composition, results='asis'}
 show_table("cluster_composition", "Cluster × expression-bin composition")
+```
+
+## Per-molecule NRL by expression bin
+
+```{r table-nrl-bin, results='asis'}
+show_table("nrl_summary_by_bin", "NRL and regularity by expression bin", columns = c("expr_bin", "n",
+  "n_with_nrl_peak", "fraction_with_nrl_peak", "median_nrl_bp", "iqr_low_nrl_bp", "iqr_high_nrl_bp",
+  "median_decay_length_bp", "median_damping_lag_bp", "median_peak_ratio", "fraction_fit_converged", "min_prominence"))
+```
+
+## Per-molecule NRL by cluster
+
+```{r table-nrl-cluster, results='asis'}
+show_table("nrl_summary_by_cluster", "NRL and regularity by Leiden class", columns = c("cluster", "n",
+  "n_with_nrl_peak", "fraction_with_nrl_peak", "median_nrl_bp", "iqr_low_nrl_bp", "iqr_high_nrl_bp",
+  "median_decay_length_bp", "median_damping_lag_bp", "median_peak_ratio", "fraction_fit_converged"))
+```
+
+## Prominence calibration
+
+```{r table-calibration, results='asis'}
+show_table("nrl_prominence_calibration", "Calibrated min_prominence for the fixed window", digits = 4)
+show_table("sliding_prominence_calibration", "Calibrated min_prominence for the 500 bp sliding windows", digits = 4)
+```
+
+## Sliding-window summaries (all timepoints pooled)
+
+```{r table-sliding, results='asis'}
+show_table("sliding_summary", "Per bin × window (timepoint = all)", filter = function(tab) tab[tab$timepoint == "all", ],
+  columns = c("expr_bin", "win_start", "win_end", "overlaps_ndr_core", "n", "n_genes", "fraction_with_nrl_peak",
+    "median_nrl_bp", "iqr_low_nrl_bp", "iqr_high_nrl_bp", "median_decay_length_bp", "median_damping_lag_bp",
+    "mean_m6a_density"))
+```
+
+## A/T sequence control
+
+```{r table-at, results='asis'}
+show_table("sliding_at_control", "A/T indicator ACF per window (all bins)", filter = function(tab) tab[tab$expr_bin == "all", ])
+```
+
+## Sliding-window tests
+
+```{r table-tests, results='asis'}
+if (have_combined) {
+  tests <- read_table(file.path(combined_dir, "tables", "sliding_tests.tsv"))
+  print(knitr::kable(tests, digits = 4, caption = "Upstream vs downstream (unpaired, gene-level medians) and 2 kb mirror windows (paired by read); BH within each family"))
+} else cat("\n\nNo combined results available.\n\n")
 ```

@@ -3,7 +3,15 @@
 
 Only the selected molecules have their m6A blocks parsed or a binary row built.
 The disk-backed pool is resumable at chromosome/sample transaction boundaries.
-The window is [tss + window_start, tss + window_end) in genomic coordinates.
+
+Windows are TSS-relative and strand-oriented: offsets are transcriptional,
+negative = upstream, positive = downstream. For the interval [s, e), end
+exclusive, with tss the zero-based TSS base (BED start + 10):
+    + strand: genomic [tss + s, tss + e)
+    - strand: genomic [tss - e + 1, tss - s + 1)
+Tabix scans, interval merging and full-span eligibility run on these genomic
+intervals. Binary rows are built in genomic order and reversed for - genes, so
+column j always equals TSS-relative offset s + j.
 """
 import argparse
 import hashlib
@@ -39,6 +47,38 @@ def stable_key(seed, domain, *values):
     return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
 
 
+def genomic_window(strand, tss, offset_start, offset_end):
+    """Genomic [start, end) of the TSS-relative interval [offset_start, offset_end)."""
+    plus = np.asarray(strand) == "+"
+    tss = np.asarray(tss)
+    start = np.where(plus, tss + offset_start, tss - offset_end + 1)
+    end = np.where(plus, tss + offset_end, tss - offset_start + 1)
+    return start, end
+
+
+def oriented_column(strand, tss, offset_start, position):
+    """Column of genomic base ``position`` in the oriented row (offset - offset_start)."""
+    offset = np.where(np.asarray(strand) == "+", np.asarray(position) - tss, tss - np.asarray(position))
+    return offset - offset_start
+
+
+def column_genomic_position(strand, window_start, window_end, column):
+    """Genomic base shown in oriented column ``column``."""
+    return np.where(np.asarray(strand) == "+", np.asarray(window_start) + column,
+                    np.asarray(window_end) - 1 - column)
+
+
+def eligible_gene_range(window_starts, width, read_start, read_end):
+    """[lo, hi) indices of genes whose genomic window the read fully spans.
+
+    window_starts must be sorted; all windows share ``width``. A read spans
+    [ws, ws + width) iff read_start <= ws and ws <= read_end - width.
+    """
+    lo = np.searchsorted(window_starts, read_start, side="left")
+    hi = np.searchsorted(window_starts, read_end - width, side="right")
+    return lo, hi
+
+
 def canonical_genes(bed_path, bins_path, chromosomes, window_start, window_end):
     bed = pd.read_csv(bed_path, sep="\t", header=None,
                       names=["chrom", "start", "end", "name", "score", "strand"])
@@ -66,11 +106,14 @@ def canonical_genes(bed_path, bins_path, chromosomes, window_start, window_end):
     if (not np.isfinite(joined.mean_tpm).all() or (joined.mean_tpm < 1).any()
             or not joined.strand.isin(["+", "-"]).all()):
         raise ValueError("Invalid expression/strand metadata")
-    joined = joined[joined.tss + window_start >= 0].drop(columns="_merge")
+    joined = joined.drop(columns="_merge")
+    # TSS-relative, strand-oriented offsets [s, e): negative upstream, positive downstream.
+    joined["window_offset_start"], joined["window_offset_end"] = window_start, window_end
+    joined["window_start"], joined["window_end"] = genomic_window(
+        joined.strand, joined.tss, window_start, window_end)
+    joined = joined[joined.window_start >= 0]
     joined = joined.sort_values(["chrom", "tss", "gene_id"]).reset_index(drop=True)
     joined["gene_index"] = np.arange(len(joined))
-    # Genomic offsets relative to the TSS on both gene strands; end is exclusive.
-    joined["window_start"], joined["window_end"] = joined.tss + window_start, joined.tss + window_end
     return joined
 
 
@@ -119,8 +162,13 @@ def build_pool(out, genes, sources, signature, seed, helpers, window_start, wind
         if str(path) in completed:
             log(f"pool: resume completed {sample} {chrom}")
             continue
-        sub = genes[genes.chrom.eq(chrom)].sort_values("tss")
-        anchors = sub.tss.to_numpy()
+        # Anchor on the genomic window start: both strands share one width, so
+        # full-span eligibility is the same test on genomic coordinates.
+        sub = genes[genes.chrom.eq(chrom)].sort_values(["window_start", "gene_id"])
+        anchors = sub.window_start.to_numpy()
+        width = window_end - window_start
+        if not (sub.window_end.to_numpy() - anchors == width).all():
+            raise ValueError("All genomic windows must share the TSS-relative width")
         indices = sub.gene_index.to_numpy()
         gene_ids = sub.gene_id.to_numpy()
         bins = sub.expr_bin.to_numpy()
@@ -135,9 +183,8 @@ def build_pool(out, genes, sources, signature, seed, helpers, window_start, wind
                     st, en, rid = int(f[1]), int(f[2]), f[3]
                     if not rid or rid == "." or st < 0 or en <= st or f[5] not in ("+", "-", "."):
                         raise ValueError(f"Malformed read ID/span/strand in {path}: {rid}")
-                    # Read spans [tss+window_start, tss+window_end) <=> st-window_start <= tss <= en-window_end
-                    lo = np.searchsorted(anchors, st - window_start, side="left")
-                    hi = np.searchsorted(anchors, en - window_end, side="right")
+                    # Read spans genomic [ws, ws + width) <=> st <= ws <= en - width
+                    lo, hi = eligible_gene_range(anchors, width, st, en)
                     if hi <= lo:
                         continue
                     line_sha = hashlib.sha256(line.encode()).hexdigest()
@@ -201,11 +248,63 @@ def sampled_binary(selected, sources, helpers, width):
                         raise ValueError(f"Non-base/interior m6A call outside read span: {row.read_id}")
                     offsets = calls[(calls >= row.window_start) & (calls < row.window_end)] - row.window_start
                     binary[row.row_index, offsets] = 1
+                    if row.strand == "-":
+                        # Genomic order -> transcriptional order: column j = offset s + j.
+                        binary[row.row_index] = binary[row.row_index][::-1]
                     found[row.row_index] = True
         log(f"binary: extracted {sample} {chrom}, {int(found[sub.row_index].sum())}/{len(sub)} selected molecules")
     if not found.all():
         raise RuntimeError(f"Could not recover {int((~found).sum())} selected exact BED records")
     return binary
+
+
+def check_offset_zero_maps_to_tss(selected):
+    """Pure-arithmetic check: on both strands, the column of offset 0 is genomic base tss."""
+    s = selected.window_offset_start.to_numpy()
+    column = oriented_column(selected.strand, selected.tss.to_numpy(), s, selected.tss.to_numpy())
+    if not np.array_equal(column, -s):
+        raise RuntimeError("Offset 0 does not map to column -window_offset_start")
+    back = column_genomic_position(selected.strand, selected.window_start.to_numpy(),
+                                   selected.window_end.to_numpy(), column)
+    if not np.array_equal(back, selected.tss.to_numpy()):
+        raise RuntimeError("The column for offset 0 does not map back to the genomic TSS base")
+    for strand in ("+", "-"):
+        if not selected.strand.eq(strand).any():
+            raise RuntimeError(f"No sampled {strand}-strand molecules; orientation check needs both strands")
+    return {"offset0_column": "-window_offset_start", "checked_rows": int(len(selected)),
+            "strands": sorted(selected.strand.unique().tolist())}
+
+
+def verify_orientation_on_reads(binary, selected, sources, helpers, per_strand=5):
+    """Re-fetch several real reads per strand and check every m6A call's oriented column."""
+    picks = pd.concat([selected[selected.strand.eq(strand)].head(per_strand) for strand in ("+", "-")])
+    if picks.strand.nunique() != 2:
+        raise RuntimeError("Orientation verification needs sampled reads on both strands")
+    verified = []
+    for row in picks.itertuples(index=False):
+        path = next(p for smp, chrom, p in sources if smp == row.sample and chrom == row.chrom)
+        with pysam.TabixFile(str(path)) as tb:
+            record = next(line for line in tb.fetch(row.chrom, int(row.window_start), int(row.window_end))
+                          if hashlib.sha256(line.encode()).hexdigest() == row.line_sha)
+        f = record.split("\t")
+        calls = np.fromstring(f[11].rstrip(","), sep=",", dtype=np.int64)[1:-1] + row.read_start
+        inside = calls[(calls >= row.window_start) & (calls < row.window_end)]
+        columns = oriented_column(row.strand, row.tss, row.window_offset_start, inside)
+        expected = np.zeros(binary.shape[1], dtype=np.uint8)
+        expected[columns] = 1
+        if not np.array_equal(expected, binary[row.row_index]):
+            raise RuntimeError(f"Oriented row differs from re-fetched calls: {row.read_id}")
+        zero = -row.window_offset_start
+        tss_is_call = bool(np.isin(row.tss, inside))
+        if 0 <= zero < binary.shape[1] and bool(binary[row.row_index, zero]) != tss_is_call:
+            raise RuntimeError(f"Offset-0 column disagrees with the genomic TSS base: {row.read_id}")
+        if not np.array_equal(column_genomic_position(row.strand, row.window_start, row.window_end, columns),
+                              inside):
+            raise RuntimeError(f"Column -> genomic mapping is not invertible: {row.read_id}")
+        verified.append({"read_id": row.read_id, "strand": row.strand, "tss": int(row.tss),
+                         "n_calls_in_window": int(len(inside)), "tss_base_called": tss_is_call})
+    log(f"orientation: verified {len(verified)} real reads ({per_strand} per strand) against re-fetched calls")
+    return verified
 
 
 def main():
@@ -216,13 +315,15 @@ def main():
     ap.add_argument("--ft-root", type=Path, default=FT_ROOT)
     ap.add_argument("--per-bin", type=int, default=2500)
     ap.add_argument("--window-start", type=int, default=-1000,
-                    help="Window start as a genomic offset from the TSS (inclusive); default -1000.")
+                    help="Window start as a TSS-relative transcriptional offset (inclusive; negative = upstream).")
     ap.add_argument("--window-end", type=int, default=1000,
-                    help="Window end as a genomic offset from the TSS (exclusive); default 1000.")
+                    help="Window end as a TSS-relative transcriptional offset (exclusive; positive = downstream).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--timepoints", nargs="+", default=["LPS_0", "LPS_5", "LPS_10", "LPS_15"])
     ap.add_argument("--chrom", nargs="+", default=CHROMS)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--test", action="store_true",
+                    help="Also re-fetch several real reads per strand and verify their oriented columns.")
     args = ap.parse_args()
     if (args.per_bin < 1 or args.seed < 0 or len(set(args.timepoints)) != len(args.timepoints)
             or len(set(args.chrom)) != len(args.chrom) or not set(args.chrom).issubset(CHROMS)
@@ -263,12 +364,16 @@ def main():
     selected.insert(0, "row_index", np.arange(len(selected)))
     selected["timepoint"] = selected["sample"]
     selected["lps_minutes"] = selected["sample"].str.extract(r"LPS_(\d+)$", expand=False).astype(int)
+    selected["orientation"] = "transcriptional"
     if not ((selected.read_start <= selected.window_start) & (selected.read_end >= selected.window_end)).all():
         raise RuntimeError("Sampling admitted a partially spanning molecule")
     binary = sampled_binary(selected, sources, helpers, width)
     selected["m6a_count"] = binary.sum(axis=1)
     row_ids = selected.read_id.to_numpy(dtype=str)
     assert_alignment(binary, selected, row_ids)
+    orientation_check = check_offset_zero_maps_to_tss(selected)
+    if args.test:
+        orientation_check["verified_reads"] = verify_orientation_on_reads(binary, selected, sources, helpers)
     if source_states(sources) != states:
         raise RuntimeError("Source BEDs/indexes changed during extraction")
     binary_path, ids_path = out / "intermediate/binary_m6a.npy", out / "intermediate/row_ids.npy"
@@ -283,7 +388,16 @@ def main():
                   "n_molecules": len(selected), "binary_shape": list(binary.shape),
                   "row_order_verified": True, "seed": args.seed,
                   "window_offsets_from_tss": [args.window_start, args.window_end],
-                  "orientation": "ascending genomic positions; no strand reversal; no reference-base filtering",
+                  "orientation": "transcriptional",
+                  "orientation_definition": ("column j = TSS-relative offset window_offset_start + j; negative = "
+                                             "upstream, positive = downstream; + strand genomic [tss+s, tss+e), "
+                                             "- strand genomic [tss-e+1, tss-s+1) with the row reversed"),
+                  "acf_orientation_note": ("the ACF is invariant to sequence reversal, so per-read ACF values "
+                                           "change only through which reads and bases fall in each window; "
+                                           "heatmaps, sliding windows and other position-based outputs depend "
+                                           "on orientation"),
+                  "reference_base_filtering": "none",
+                  "offset_zero_check": orientation_check,
                   "pool_counts": counts}
     validation_path = out / "validation/sampling_validation.json"
     write_json(validation_path, validation)

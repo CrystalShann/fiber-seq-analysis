@@ -14,9 +14,6 @@
 #                                clusterings can be compared panel for panel
 #   plot_cluster_composition()   cluster proportions per timepoint and
 #                                timepoint proportions per cluster
-#   plot_cluster_structure()     one column per read, grouped by timepoint and
-#                                coloured by cluster (the hard-assignment
-#                                analogue of the topic model's structure plot)
 #   plot_cluster_heatmap()       read x feature methylation heatmap, rows split
 #                                by cluster, with cluster and timepoint
 #                                annotations
@@ -114,12 +111,17 @@ as_timepoint_factor <- function(x, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
 # ---------------------------------------------------------------------------
 # 1. Per-cluster m6A methylation proportion at each m6A site 
 
-# One panel per cluster, x = genomic coordinate, y = methylation proportion.
+# One panel per cluster; promoters use strand-oriented positions from the TSS.
 # ---------------------------------------------------------------------------
-plot_cluster_met_profiles <- function(res, met_mat, tss = NULL, main = NULL) {
+plot_cluster_met_profiles <- function(res, met_mat, tss = NULL, main = NULL, region = res$region) {
   # cluster_site_profiles() takes cluster labels and computes mean m6a value at every 
   # position for each cluster
   prof <- cluster_site_profiles(res, met_mat)
+  anchor <- plot_anchor(region)
+  if (anchor$promoter) {
+    prof$pos <- plot_positions(prof$pos, region)
+    tss <- 0
+  }
   lv   <- levels(res$assignments$cluster)
   pal  <- cluster_palette(lv)
 
@@ -128,7 +130,7 @@ plot_cluster_met_profiles <- function(res, met_mat, tss = NULL, main = NULL) {
     gg <- ggplot(d, aes(x = pos, y = met)) +
       geom_col(fill = pal[cl]) +
       ylim(0, 1) +
-      ylab("met prop.") + xlab("pos") +
+      ylab("met prop.") + xlab(if (anchor$promoter) anchor$x_label else "pos") +
       ggtitle(sprintf("%s (n=%d)", cl, d$n_reads[1])) +
       theme_cowplot(font_size = 10) +
       theme(plot.title = element_text(hjust = 0.5))
@@ -181,39 +183,15 @@ plot_cluster_composition <- function(res, main = NULL,
 
 
 # ---------------------------------------------------------------------------
-# 2b. Cluster structure: one column per read, grouped by timepoint, coloured by
-# cluster (the hard-assignment analogue of the topic model's structure plot).
-# ---------------------------------------------------------------------------
-plot_cluster_structure <- function(res, main = NULL,
-                                   timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
-  df <- res$assignments
-  df$sample_name <- as_timepoint_factor(df$sample_name, timepoint_cols)
-  df <- df[order(df$sample_name, df$cluster), ]
-  df$x <- stats::ave(seq_len(nrow(df)), df$sample_name, FUN = seq_along)
-
-  ggplot(df, aes(x = x, y = 1, fill = cluster)) +
-    geom_col(width = 1) +
-    facet_grid(~ sample_name, scales = "free_x", space = "free_x") +
-    scale_fill_manual(values = cluster_palette(levels(df$cluster))) +
-    scale_y_continuous(expand = c(0, 0)) +
-    scale_x_continuous(expand = c(0, 0)) +
-    labs(x = "reads (grouped by timepoint)", y = NULL, title = main) +
-    theme_cowplot(font_size = 10) +
-    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
-          axis.text.x = element_blank(), axis.ticks.x = element_blank())
-}
-
-
-# ---------------------------------------------------------------------------
 # 3. Read x feature methylation heatmap: 
 
 # rows = reads split by cluster (each and ordered by read start within cluster,
-# columns = features in genomic order, left annotation = cluster + timepoint.
+# columns = features in plot order, left annotation = cluster + timepoint.
 # No colour gradient: a feature with any m6A call is black, none is white,
 
 # ---------------------------------------------------------------------------
 plot_cluster_heatmap <- function(res, main = NULL,
-                                 timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
+                                 timepoint_cols = LEIDEN_TIMEPOINT_COLORS, region = res$region) {
   # takes per read assignment from the clustering result
   df <- res$assignments
   df$sample_name <- as_timepoint_factor(df$sample_name, timepoint_cols)
@@ -224,6 +202,8 @@ plot_cluster_heatmap <- function(res, main = NULL,
   # Takes the feature matrix used for  clustering
   # and puts its rows in exactly the same order as df
   mat <- res$feat_mat[df$RID, , drop = FALSE]
+  if (plot_anchor(region)$direction == -1L)
+    mat <- mat[, rev(seq_len(ncol(mat))), drop = FALSE]
   mat <- matrix(ifelse(is.na(mat), NA, ifelse(mat > 0, "m6A", "no m6A")),
                 nrow(mat), ncol(mat), dimnames = dimnames(mat))
 
@@ -255,9 +235,15 @@ plot_cluster_heatmap <- function(res, main = NULL,
 # ---------------------------------------------------------------------------
 # 4. m6A fraction per feature, one panel per cluster 
 # ---------------------------------------------------------------------------
-plot_met_fraction_lines <- function(res, tss = NULL, main = NULL, smooth_k = 1) {
+plot_met_fraction_lines <- function(res, tss = NULL, main = NULL, smooth_k = 1, region = res$region) {
   P   <- res$profiles
   pos <- as.numeric(colnames(P))
+  anchor <- plot_anchor(region)
+  if (anchor$promoter) {
+    # Column names are genomic window midpoints; keep the original bins.
+    pos <- plot_positions(pos, region)
+    tss <- 0
+  }
 
   smooth_row <- function(v) {
     if (smooth_k <= 1) return(v)
@@ -279,7 +265,7 @@ plot_met_fraction_lines <- function(res, tss = NULL, main = NULL, smooth_k = 1) 
     scale_color_manual(values = setNames(cluster_palette(rownames(P)), levels(df$cluster)),
                        guide = "none") +
     facet_wrap(~ cluster, ncol = 1, strip.position = "right") +
-    labs(x = "genomic position", y = ylab, title = main, subtitle = sub) +
+    labs(x = if (anchor$promoter) anchor$x_label else "genomic position", y = ylab, title = main, subtitle = sub) +
     theme_cowplot(font_size = 10)
   if (!is.null(tss))
     gg <- gg + geom_vline(xintercept = tss, linetype = "dashed", color = "grey40")
@@ -377,7 +363,7 @@ plot_signal_profile <- function(profiles, region, clusters,
                                      title = region$annotation) {
   profiles <- profiles[profiles$track %in% names(LCL_TRACK_COLORS), , drop = FALSE]
   anchor <- plot_anchor(region)
-  profiles$relative_pos <- anchor$direction * (profiles$pos - anchor$anchor)
+  profiles$relative_pos <- plot_positions(profiles$pos, region)
   profiles$cluster <- factor(profiles$cluster, levels = clusters)
   profiles$track <- factor(profiles$track, levels = names(LCL_TRACK_COLORS)[names(LCL_TRACK_COLORS) %in% profiles$track])
   profiles <- profiles[order(profiles$cluster, profiles$track, profiles$relative_pos), ]
@@ -411,7 +397,7 @@ sample_palette <- function(sample_names) {
   setNames(grDevices::hcl.colors(length(labels), "Dynamic"), labels)
 }
 
-plot_genomic_cluster_heatmap <- function(res, region, sample_colors,
+plot_genomic_cluster_heatmap <- function(res, region = res$region, sample_colors,
                                      include_haplotype = FALSE, variants = NULL,
                                      show_cluster_profiles = FALSE, split_alleles = FALSE,
                                      cluster_label = "Saved m6A-defined clusters") {
@@ -438,6 +424,8 @@ plot_genomic_cluster_heatmap <- function(res, region, sample_colors,
   met <- matrix(0L, nrow(assignments), region$width,
                   dimnames = list(assignments$RID, seq.int(region$analysis_start, region$analysis_end)))
   met[, match(colnames(res$site_met_mat), colnames(met))] <- as.matrix(res$site_met_mat[assignments$RID, , drop = FALSE])
+  anchor <- plot_anchor(region)
+  if (anchor$direction == -1L) met <- met[, rev(seq_len(ncol(met))), drop = FALSE]
   display <- met
   colors <- c("0" = "white", "1" = "black")
   legend <- list(at = c(0, 1), labels = c("no m6A call", "m6A"))
@@ -458,21 +446,24 @@ plot_genomic_cluster_heatmap <- function(res, region, sample_colors,
       list(annotation_name_gp = grid::gpar(fontsize = 8), gap = grid::unit(1.5, "mm"))))
   }
   ticks <- unique(round(seq(1, ncol(display), length.out = 5L)))
+  coordinates <- as.integer(colnames(display))
+  tick_positions <- if (anchor$promoter) plot_positions(coordinates[ticks], region) else coordinates[ticks]
   bottom_parts <- list(coordinate = ComplexHeatmap::anno_mark(at = ticks,
-    labels = format(as.integer(colnames(display)[ticks]), scientific = FALSE, trim = TRUE),
+    labels = format(tick_positions, scientific = FALSE, trim = TRUE),
     which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 8)))
   if (identical(region$region_type, "promoter") && !is.null(region$tss) &&
       !is.na(region$tss) && region$tss >= region$analysis_start && region$tss <= region$analysis_end) {
     bottom_parts$TSS <- ComplexHeatmap::anno_mark(
-      at = region$tss - region$analysis_start + 1L,
-      labels = paste0("TSS: ", region$chr, ":", region$tss),
+      at = match(region$tss, coordinates),
+      labels = if (anchor$promoter) "TSS: 0" else paste0("TSS: ", region$chr, ":", region$tss),
       which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 8, col = "#D55E00"))
   }
   snps <- if (!is.null(region$focal_snp)) data.frame(pos = region$focal_pos,
     label = paste0(region$focal_snp, " ", region$ref, ">", region$alt)) else window_snps(variants, region)
   if (nrow(snps)) {
     bottom_parts$SNP <- ComplexHeatmap::anno_mark(
-      at = snps$pos - region$analysis_start + 1L, labels = snps$label,
+      at = match(snps$pos, coordinates),
+      labels = if (anchor$promoter) paste0(snps$label, " (", plot_positions(snps$pos, region), " bp from TSS)") else snps$label,
       which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 7),
       link_gp = grid::gpar(col = "#984EA3"))
   }
@@ -493,6 +484,7 @@ plot_genomic_cluster_heatmap <- function(res, region, sample_colors,
       if (include_haplotype) paste0(cluster_label, "; focal allele annotated per sample"),
       if (split_alleles) "Rows split by focal allele, then cluster",
       if (show_cluster_profiles) "Top: m6A call fraction per cluster (all full-span reads)",
+      if (anchor$promoter) anchor$x_label,
       if (include_haplotype && !nrow(snps)) "No phased heterozygous SNP in this window",
       paste0(region$chr, ":", region$analysis_start, "-", region$analysis_end)), collapse = "\n"),
     column_title_gp = grid::gpar(fontsize = 11))
@@ -556,10 +548,15 @@ fiberseq_legend_height <- function(legend) {
 
 plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, sample_colors, allele_colors,
                                   title = region$annotation) {
+  anchor <- plot_anchor(region)
+  limits <- if (anchor$promoter) c(anchor$left, anchor$right) else c(region$analysis_start, region$analysis_end)
+  x_label <- if (anchor$promoter) anchor$x_label else paste0(region$chr, " (1-based bp)")
+  if (anchor$promoter) markers$pos <- plot_positions(markers$pos, region)
   allele_heading <- if (identical(region$region_type, "top_asfire_het"))
     "Focal SNP allele" else "Allele / local haplotype"
   rows <- lapply(tables$groups, function(cluster) {
     d <- tables$profiles[tables$profiles$cluster == cluster, ]
+    if (anchor$promoter) d$pos <- plot_positions(d$pos, region)
     n <- tables$counts$n_reads[match(cluster, tables$counts$cluster)]
     nuc <- d[d$track == "ft_nuc_130-160bp", , drop = FALSE]
     met <- d[d$track == "m6A", , drop = FALSE]
@@ -568,12 +565,14 @@ plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, samp
         fill = "#808080", alpha = .18, color = NA) +
       ggplot2::geom_line(data = nuc, color = "#666666", linewidth = .55) +
       ggplot2::geom_line(data = met, color = cluster_colors[[cluster]], linewidth = .45) +
-      ggplot2::scale_x_continuous(limits = c(region$analysis_start, region$analysis_end),
+      ggplot2::scale_x_continuous(limits = limits,
         labels = function(x) format(x, scientific = FALSE, trim = TRUE), expand = ggplot2::expansion(mult = 0)) +
       ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1)) +
-      ggplot2::labs(title = paste0(cluster, " (n = ", n, ")"), x = paste0(region$chr, " (1-based bp)"), y = "Read fraction") +
+      ggplot2::labs(title = paste0(cluster, " (n = ", n, ")"), x = x_label, y = "Read fraction") +
       ggplot2::theme_bw(base_size = 9) + ggplot2::theme(legend.position = "none",
         plot.title = ggplot2::element_text(color = cluster_colors[[cluster]], face = "bold"))
+    if (anchor$promoter) p <- p + ggplot2::geom_vline(xintercept = 0,
+      color = "grey40", linetype = "dashed", linewidth = .35)
     if (nrow(markers)) {
       p <- p +
         ggplot2::geom_vline(data = markers, ggplot2::aes(xintercept = pos),
@@ -959,14 +958,27 @@ m6a_intervals <- function(result) {
     end = positions, size = rep(1L, length(identifiers)), track = rep("m6A", length(identifiers)))
 }
 
+# Focal SNPs always retain genome order, even when promoter metadata is present.
+# Only a promoter with a known +/- strand and TSS is TSS-anchored.
 plot_anchor <- function(region) {
-  promoter <- region$region_type == "promoter" && !is.na(region$tss)
   focal <- !is.null(region$focal_pos) && !is.na(region$focal_pos)
-  anchor <- if (focal) region$focal_pos else if (promoter) region$tss else floor(mean(c(region$analysis_start, region$analysis_end)))
-  direction <- if (promoter && region$strand == "-") -1L else 1L
-  bounds <- sort(direction * (c(region$analysis_start, region$analysis_end) - anchor))
+  promoter <- !focal && isTRUE(region$region_type == "promoter") &&
+    !is.null(region$tss) && !is.na(region$tss) && isTRUE(region$strand %in% c("+", "-"))
+  start <- if (!is.null(region$analysis_start)) region$analysis_start else region$start
+  end <- if (!is.null(region$analysis_end)) region$analysis_end else region$end
+  anchor <- if (focal) region$focal_pos else if (promoter) region$tss else if (length(c(start, end))) floor(mean(c(start, end))) else NA_real_
+  direction <- if (promoter && isTRUE(region$strand == "-")) -1L else 1L
+  bounds <- sort(direction * (c(start, end) - anchor))
   list(anchor = anchor, direction = direction, left = bounds[1], right = bounds[2],
-    x_label = if (focal) paste0("Position relative to ", region$focal_snp, " (bp)") else if (promoter) "Position relative to canonical TSS (bp)" else "Position relative to region centre (bp)")
+    promoter = promoter,
+    x_label = if (focal) paste0("Position relative to ", region$focal_snp, " (bp)") else if (promoter) "Position relative to canonical TSS (bp); upstream < 0" else "Position relative to region centre (bp)")
+}
+
+# Positions are 1-based inclusive. Convert BED starts with +1 before calling;
+# BED exclusive ends already equal the last included 1-based position.
+plot_positions <- function(pos, region) {
+  anchor <- plot_anchor(region)
+  anchor$direction * (pos - anchor$anchor)
 }
 
 prepare_read_tracks <- function(result, records, sample_colors) {
@@ -977,8 +989,8 @@ prepare_read_tracks <- function(result, records, sample_colors) {
   reads$sample_label <- sub("_.*$", "", reads$sample_name)
   stopifnot(all(reads$sample_label %in% names(sample_colors)))
   if (!"haplotype" %in% names(reads)) reads$haplotype <- "pooled"
-  relative_start <- anchor$direction * (reads$start - anchor$anchor)
-  relative_end <- anchor$direction * (reads$end - anchor$anchor)
+  relative_start <- plot_positions(reads$start, result$region)
+  relative_end <- plot_positions(reads$end, result$region)
   reads$left <- pmax(pmin(relative_start, relative_end), anchor$left)
   reads$right <- pmin(pmax(relative_start, relative_end), anchor$right)
   matched <- match(records$RID, reads$RID)
@@ -986,8 +998,8 @@ prepare_read_tracks <- function(result, records, sample_colors) {
   matched <- matched[!is.na(matched)]
   records$row <- reads$row[matched]
   records$cluster <- reads$cluster[matched]
-  relative_start <- anchor$direction * (records$start + 1L - anchor$anchor)
-  relative_end <- anchor$direction * (records$end - anchor$anchor)
+  relative_start <- plot_positions(records$start + 1L, result$region)
+  relative_end <- plot_positions(records$end, result$region)
   records$left <- pmax(pmin(relative_start, relative_end) - 0.5, anchor$left - 0.5)
   records$right <- pmin(pmax(relative_start, relative_end) + 0.5, anchor$right + 0.5)
   list(reads = reads, features = records, anchor = anchor, region = result$region)
