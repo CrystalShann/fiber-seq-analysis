@@ -7,8 +7,11 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=300G
 #SBATCH --time=30:00:00
-#SBATCH --output=/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs/slurm_%j.out
-#SBATCH --error=/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs/slurm_%j.err
+#SBATCH --array=0-2
+#SBATCH --output=/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs/slurm_%A_%a.out
+#SBATCH --error=/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs/slurm_%A_%a.err
+# Array task -> TSS window: 0 = 2000_tss, 1 = left_1000_tss, 2 = right_1000_tss.
+# Run one window only with e.g. `sbatch --array=2 06_run_tss_autocorrelation.sh`.
 
 set -euo pipefail
 PROJECT=/project/spott/cshan/fiber-seq
@@ -21,16 +24,19 @@ CANONICAL=/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
 FT_ROOT="$PROJECT/macrophage_project/FiberHMM/extract/ft_result_dir"
 PER_BIN=2500
 SEED=0
-MAX_LAG=1999
+MAX_LAG=""   # empty = all nonnegative lags of the window
 N_PCS=50
 N_NEIGHBORS=10
 RESOLUTION=0.4
 CHROMS=()
 BINS_EXPLICIT=0
+WINDOWS=(2000_tss left_1000_tss right_1000_tss)
+OUT_EXPLICIT=""
+TEST=0
 while (($#)); do
   case "$1" in
-    --test) OUT="$OUT/test"; PER_BIN=100; CHROMS=(chr22); shift ;;
-    --out-dir) OUT="$2"; shift 2 ;;
+    --test) TEST=1; PER_BIN=100; CHROMS=(chr22); shift ;;
+    --out-dir) OUT_EXPLICIT="$2"; shift 2 ;;
     --bins-tsv) BINS="$2"; BINS_EXPLICIT=1; shift 2 ;;
     --canonical-bed) CANONICAL="$2"; shift 2 ;;
     --ft-root) FT_ROOT="$2"; shift 2 ;;
@@ -48,6 +54,19 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "Submit this pipeline with sbatch; heavy computation requires a SLURM allocation." >&2
   exit 2
 fi
+if [[ -z "${SLURM_ARRAY_TASK_ID:-}" || -z "${WINDOWS[$SLURM_ARRAY_TASK_ID]:-}" ]]; then
+  echo "SLURM_ARRAY_TASK_ID must be 0 (2000_tss), 1 (left_1000_tss) or 2 (right_1000_tss)" >&2
+  exit 2
+fi
+WINDOW=${WINDOWS[$SLURM_ARRAY_TASK_ID]}
+# Genomic offsets from the TSS (end exclusive); each window has its own output folder.
+case "$WINDOW" in
+  2000_tss) WINDOW_START=-1000; WINDOW_END=1000 ;;
+  left_1000_tss) WINDOW_START=-1000; WINDOW_END=-100 ;;
+  right_1000_tss) WINDOW_START=100; WINDOW_END=1000 ;;
+esac
+OUT="${OUT_EXPLICIT:-$OUT/$WINDOW}"
+if ((TEST)); then OUT="$OUT/test"; fi
 mkdir -p "$OUT"
 OUT=$(cd -- "$OUT" && pwd -P)
 # Lock the directory inode, without creating a persistent lock file.
@@ -91,7 +110,7 @@ mkdir -p "$TSS_WORK_DIR/tmp"
 export TMPDIR="$TSS_WORK_DIR/tmp"
 export R_LIBS_USER="${R_LIBS_USER:-/project/spott/cshan/Rlibs/x86_64-pc-linux-gnu-library/4.4}"
 export LD_LIBRARY_PATH="/software/openblas-0.3.29-el8-x86_64/lib:/software/glpk-5.0-el8-x86_64/lib:${LD_LIBRARY_PATH:-}"
-echo "[$(date -Is)] Start job $SLURM_JOB_ID on $(hostname); output=$OUT; per_bin=$PER_BIN"
+echo "[$(date -Is)] Start job $SLURM_JOB_ID task $SLURM_ARRAY_TASK_ID on $(hostname); output=$OUT; per_bin=$PER_BIN; window=$WINDOW [TSS${WINDOW_START}, TSS+${WINDOW_END})"
 echo "[$(date -Is)] Temporary workspace: $TSS_WORK_DIR (removed on exit)"
 "$PYTHON" -B -c 'import sys,numpy,pandas,pysam,scanpy,igraph,leidenalg; print(sys.version); print("scanpy",scanpy.__version__,"numpy",numpy.__version__,"pysam",pysam.__version__)'
 "$RSCRIPT" --vanilla -e 'cat(R.version.string,"\n")'
@@ -103,11 +122,14 @@ if [[ ! -f "$BINS" ]]; then
 fi
 EXTRA=()
 if ((${#CHROMS[@]})); then EXTRA=(--chrom "${CHROMS[@]}"); fi
+LAG_ARGS=()
+if [[ -n "$MAX_LAG" ]]; then LAG_ARGS=(--max-lag "$MAX_LAG"); fi
 echo "[$(date -Is)] 01: survey, deduplicate, balanced sample, then binary matrix"
 "$PYTHON" -B "$CODE/01_sample_tss_molecules.py" --out-dir "$TSS_WORK_DIR" --bins-tsv "$BINS" \
-  --canonical-bed "$CANONICAL" --ft-root "$FT_ROOT" --per-bin "$PER_BIN" --seed "$SEED" "${EXTRA[@]}"
+  --canonical-bed "$CANONICAL" --ft-root "$FT_ROOT" --per-bin "$PER_BIN" --seed "$SEED" \
+  --window-start "$WINDOW_START" --window-end "$WINDOW_END" "${EXTRA[@]}"
 echo "[$(date -Is)] 02: unchanged parent ACF"
-"$PYTHON" -B "$CODE/02_compute_tss_autocorrelations.py" --out-dir "$TSS_WORK_DIR" --max-lag "$MAX_LAG"
+"$PYTHON" -B "$CODE/02_compute_tss_autocorrelations.py" --out-dir "$TSS_WORK_DIR" "${LAG_ARGS[@]}"
 echo "[$(date -Is)] 03: joint parent PCA / correlation kNN / Leiden / UMAP"
 "$PYTHON" -B "$CODE/03_leiden_cluster_autocorrelations.py" --out-dir "$TSS_WORK_DIR" \
   --n-pcs "$N_PCS" --n-neighbors "$N_NEIGHBORS" --resolution "$RESOLUTION" --seed "$SEED"

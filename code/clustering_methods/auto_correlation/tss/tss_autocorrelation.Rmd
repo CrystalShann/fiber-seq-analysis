@@ -1,0 +1,219 @@
+---
+title: "Macrophage TSS Fiber-seq autocorrelation"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    self_contained: true
+    mathjax: null
+params:
+  output_dir: "../../../../macrophage_project/auto_correlation/tss"
+  windows: ["2000_tss", "left_1000_tss", "right_1000_tss"]
+---
+
+# Analysis and parameters
+
+This notebook runs the numbered scripts in this folder together and shows their
+results, in the same way `../06_autocorrelation.Rmd` does for the LCL regions.
+Each TSS window is one SLURM array task of `06_run_tss_autocorrelation.sh` and
+writes to its own folder under `params$output_dir`:
+
+| Folder | Window (genomic offsets from the canonical TSS, end exclusive) | Width |
+|---|---|---|
+| `2000_tss` | `[TSS - 1000, TSS + 1000)` | 2,000 bp |
+| `left_1000_tss` | `[TSS - 1000, TSS - 100)` | 900 bp |
+| `right_1000_tss` | `[TSS + 100, TSS + 1000)` | 900 bp |
+
+Left and right are genomic directions on both gene strands; no strand reversal is
+applied anywhere in the pipeline.
+
+# Method
+
+**Step 0: expression bins** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/00_prepare_expression_bins.R`)
+
+Protein-coding Ensembl-canonical genes get a mean TPM pooled over the twelve RNA samples (LPS 0, 5, 10, 15 min) and a quartile bin `Q1_low` to `Q4_high`. `not_expressed` genes are excluded. The bins are fixed and shared by all four Fiber-seq samples.
+
+**Step 1: sample molecules** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/01_sample_tss_molecules.py`)
+
+TSS = canonical BED start + 10 `/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed` contains bed region interval. A read is eligible when it fully spans the TSS window we are testing. Each bin then contributes 2,500 reads chosen by an independent seeded hash (10,000 in total).
+
+
+**Step 2: per-read ACF** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/02_compute_tss_autocorrelations.py`)
+
+$ACF(k) = sum((x[t]-mean(x))*(x[t+k]-mean(x))) / (N * var(x))$
+
+for every nonnegative lag of the window. Zero-variance reads have undefined ACFs
+
+**Step 3: joint Leiden clustering**
+
+(`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/03_leiden_cluster_autocorrelations.py`). 
+All four expression bins are clustered together:
+PCA (50 PCs) -> correlation-distance kNN (10 neighbors) -> Leiden (resolution 0.4, seed 0) -> UMAP for display only
+
+Reads that cannot be clustered keep the label `Unclustered` in the tables and are left out of every figure
+
+**Step 4: plot tables** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/04_prepare_plot_tables.py`)
+
+Mean/median ACF per cluster and per expression bin, cluster × bin composition in both directions, cluster
+summary with the descriptive 140-250 bp positive peak, and the heatmap row order.
+
+**Step 5: figures** (`/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/05_plot_tss_autocorrelation.R`)
+
+make the plots for each selected window, and the lags start at 25 bp
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = TRUE, message = TRUE, out.width = "100%")
+options(scipen = 999)
+code_dir <- normalizePath(".", mustWork = TRUE)
+output <- normalizePath(params$output_dir, mustWork = TRUE)
+windows <- c("2000_tss", "left_1000_tss", "right_1000_tss")
+unknown <- setdiff(params$windows, windows)
+if (length(unknown)) stop("Unknown windows: ", paste(unknown, collapse = ", "))
+window_dirs <- setNames(file.path(output, params$windows), params$windows)
+```
+
+## Run the pipeline
+
+Submit all three windows as one array job (one task per window):
+
+```bash
+mkdir -p /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs
+sbatch /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh
+```
+
+
+```{r check-results, include=FALSE}
+missing <- window_dirs[!file.exists(file.path(window_dirs, "tables", "cluster_summary.tsv"))]
+if (length(missing)) stop("No results for: ", paste(names(missing), collapse = ", "),
+  ". Submit 06_run_tss_autocorrelation.sh first.")
+```
+
+```{r gallery-helper, include=FALSE}
+# Embed the published PDFs as PNG previews (fonts and converter as in 06_autocorrelation.Rmd).
+pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
+xpdfrc <- tempfile("xpdfrc-")
+sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
+mono <- "/usr/share/fonts/dejavu/DejaVuSansMono"
+writeLines(c(
+  paste0("fontFile Helvetica ", sans, "Regular.ttf"),
+  paste0("fontFile Helvetica-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Helvetica-Oblique ", sans, "Italic.ttf"),
+  paste0("fontFile Helvetica-BoldOblique ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Times-Roman ", sans, "Regular.ttf"),
+  paste0("fontFile Times-Bold ", sans, "Bold.ttf"),
+  paste0("fontFile Times-Italic ", sans, "Italic.ttf"),
+  paste0("fontFile Times-BoldItalic ", sans, "BoldItalic.ttf"),
+  paste0("fontFile Courier ", mono, ".ttf"),
+  paste0("fontFile Courier-Bold ", mono, "-Bold.ttf"),
+  paste0("fontFile Courier-Oblique ", mono, "-Oblique.ttf"),
+  paste0("fontFile Courier-BoldOblique ", mono, "-BoldOblique.ttf"),
+  "fontFile Symbol /usr/share/fonts/dejavu/DejaVuSans.ttf",
+  "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
+
+inline_png <- function(path, label, dpi = 120) {
+  stopifnot(file.exists(path), file.info(path)$size > 0)
+  prefix <- tempfile("fig-")
+  status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
+    shQuote(path), shQuote(prefix)))
+  png <- paste0(prefix, "-000001.png")
+  stopifnot(status == 0, file.exists(png))
+  on.exit(unlink(png))
+  cat(as.character(htmltools::tags$figure(
+    htmltools::tags$img(src = base64enc::dataURI(file = png, mime = "image/png"),
+      alt = label, loading = "lazy", style = "display:block;max-width:100%;height:auto;"),
+    htmltools::tags$figcaption(label))), "\n\n")
+  invisible(NULL)
+}
+
+figures <- list(
+  "ACF heatmap: all clustered molecules" = c("01_acf_heatmap_all" = "ACF heatmap by global Leiden class"),
+  "ACF heatmaps by expression bin" = c("03_acf_heatmaps_by_expression" = "ACF heatmaps by expression bin"),
+  "Mean ACF by cluster" = c("02_mean_acf_by_cluster" = "Mean ACF by global Leiden class"),
+  "Mean ACF by expression bin (from 25 bp)" = c("07_mean_acf_by_expression" = "Mean ACF by expression bin, lags from 25 bp"),
+  "Cluster composition across expression bins" = c(
+    "04_cluster_fraction_within_expression" = "Cluster fraction within each expression bin",
+    "04b_expression_fraction_within_cluster" = "Expression-bin fraction within each cluster"),
+  "m6A counts by cluster" = c(
+    "05_m6a_by_cluster_and_expression" = "m6A counts by cluster within each expression bin",
+    "05b_m6a_by_cluster" = "m6A counts by cluster, all bins"),
+  "UMAP" = c(
+    "06_umap_by_cluster" = "UMAP by global Leiden class",
+    "06b_umap_by_expression" = "UMAP by expression bin",
+    "06c_umap_by_m6a" = "UMAP by m6A count"))
+
+# All figures of one window, one `##` subsection per figure group.
+show_region <- function(window) {
+  if (!window %in% names(window_dirs)) {
+    cat("\n\nWindow `", window, "` is not in `params$windows`.\n\n", sep = "")
+    return(invisible(NULL))
+  }
+  for (group in names(figures)) {
+    cat("\n\n## ", group, "\n\n", sep = "")
+    for (name in names(figures[[group]])) {
+      inline_png(file.path(window_dirs[[window]], "plots", paste0(name, ".pdf")),
+        paste(window, figures[[group]][[name]], sep = " — "))
+    }
+  }
+}
+
+show_table <- function(name, label, digits = 3) {
+  for (window in names(window_dirs)) {
+    cat("\n\n### ", window, "\n\n", sep = "")
+    tab <- read.delim(file.path(window_dirs[[window]], "tables", paste0(name, ".tsv")),
+      check.names = FALSE, stringsAsFactors = FALSE)
+    print(knitr::kable(tab, digits = digits, caption = paste(window, label, sep = " — ")))
+  }
+}
+```
+
+<style>
+.main-container { max-width: 1700px; padding: 0 24px; }
+table { display: block; overflow-x: auto; }
+</style>
+
+# Region 1: 2 kb centred on the TSS (`2000_tss`)
+
+Window `[TSS - 1000, TSS + 1000)`, 2,000 bp; lags 0–1999.
+
+```{r region-2000, results='asis'}
+show_region("2000_tss")
+```
+
+# Region 2: left flank, TSS −1000 to −100 (`left_1000_tss`)
+
+Window `[TSS - 1000, TSS - 100)`, 900 bp (genomic left of the TSS on both
+strands, stopping 100 bp short of it); lags 0–899.
+
+```{r region-left, results='asis'}
+show_region("left_1000_tss")
+```
+
+# Region 3: right flank, TSS +100 to +1000 (`right_1000_tss`)
+
+Window `[TSS + 100, TSS + 1000)`, 900 bp (genomic right of the TSS on both
+strands, starting 100 bp past it); lags 0–899.
+
+```{r region-right, results='asis'}
+show_region("right_1000_tss")
+```
+
+# Result tables
+
+## Eligible pool counts
+
+```{r table-pool, results='asis'}
+show_table("eligible_pool_counts", "Unique eligible molecules per expression bin")
+```
+
+## Cluster summaries
+
+```{r table-cluster-summary, results='asis'}
+show_table("cluster_summary", "Cluster summaries")
+```
+
+## Cluster composition
+
+```{r table-composition, results='asis'}
+show_table("cluster_composition", "Cluster × expression-bin composition")
+```

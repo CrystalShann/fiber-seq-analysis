@@ -9,7 +9,7 @@
 # plot_genomic_cluster_heatmap() displays genomic m6A with sample/allele tracks.
 #
 #   plot_cluster_met_profiles()  per-cluster m6A methylation proportion at each
-#                                m6A site, one panel per cluster - the topic
+#                                bp, one panel per cluster - the topic
 #                                model's cluster_met_profiles plot, so the
 #                                clusterings can be compared panel for panel
 #   plot_cluster_composition()   cluster proportions per timepoint and
@@ -445,12 +445,10 @@ plot_genomic_cluster_heatmap <- function(res, region, sample_colors,
   top <- NULL
   if (show_cluster_profiles) {
     cluster_colors <- cluster_id_palette(levels(assignments$cluster))
-    observed <- match(colnames(res$site_met_mat), colnames(met))
     profile_annotations <- lapply(levels(assignments$cluster), function(cluster) {
       selected <- assignments$cluster == cluster
       ComplexHeatmap::anno_lines(
-        stats::approx(observed, colMeans(met[selected, observed, drop = FALSE]),
-          xout = seq_len(ncol(met)), rule = 1)$y,
+        colMeans(met[selected, , drop = FALSE]),
         ylim = c(0, 1), gp = grid::gpar(col = cluster_colors[[cluster]], lwd = 0.7),
         axis_param = list(at = c(0, 0.5, 1), labels = c("0", ".5", "1")),
         height = grid::unit(12, "mm"))
@@ -808,18 +806,26 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
 
 
 # ---------------------------------------------------------------------------
-# Per-cluster mean m6A call at each m6A site, computed at site resolution
-# straight from met_mat 
+# Per-cluster mean m6A call at every bp of the region. Columns of met_mat are
+# the positions with at least one call; every other bp is 0 because all reads
+# are full-span and have no call there.
 # ---------------------------------------------------------------------------
 cluster_site_profiles <- function(res, met_mat) {
   M  <- as.matrix(met_mat)
+  bounds <- if (!is.null(res$region$analysis_start)) c(res$region$analysis_start, res$region$analysis_end) else
+    c(res$params$region_start, res$params$region_end)
+  positions <- seq.int(bounds[1], bounds[2])
+  at <- match(as.integer(colnames(M)), positions)
+  stopifnot(!anyNA(at))
   df <- res$assignments
   df <- df[df$RID %in% rownames(M), ]
   do.call(rbind, lapply(levels(df$cluster), function(cl) {
     rids <- df$RID[df$cluster == cl]
-    met  <- colMeans(M[rids, , drop = FALSE], na.rm = TRUE)
-    met[is.nan(met)] <- NA
-    data.frame(cluster = cl, pos = as.numeric(colnames(M)), met = met,
+    site_met <- colMeans(M[rids, , drop = FALSE], na.rm = TRUE)
+    site_met[is.nan(site_met)] <- NA
+    met <- numeric(length(positions))
+    met[at] <- site_met
+    data.frame(cluster = cl, pos = as.numeric(positions), met = met,
                n_reads = length(rids), row.names = NULL)
   }))
 }
@@ -1104,7 +1110,7 @@ footprint_profiles <- function(records, tracks, assignments, region) {
 }
 
 
-# Footprints use per-base occupancy; m6A profiles use the observed-site matrix
+# Footprints use per-base occupancy; m6A profiles are per-bp cluster means (0 where no read has a call)
 signal_profiles <- function(result, footprints) {
   footprints <- footprints[footprints$track %in% LCL_FOOTPRINT_TRACKS, , drop = FALSE]
   records <- dplyr::bind_rows(m6a_intervals(result), footprints)

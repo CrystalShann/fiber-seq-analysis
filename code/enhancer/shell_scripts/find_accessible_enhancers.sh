@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=enhancer_accessibility
+#SBATCH --job-name=find_msp_accessible_enhancers
 #SBATCH --account=pi-spott
 #SBATCH --partition=caslake
 #SBATCH --nodes=1
@@ -8,10 +8,10 @@
 #SBATCH --mem=16G
 #SBATCH --time=12:00:00
 #SBATCH --chdir=/project/spott/cshan/fiber-seq
-#SBATCH --output=/project/spott/cshan/fiber-seq/code/enhancer_%j.out
-#SBATCH --error=/project/spott/cshan/fiber-seq/code/enhancer_%j.err
+#SBATCH --output=/project/spott/cshan/fiber-seq/code/enhancer/logs/enhancer_%j.out
+#SBATCH --error=/project/spott/cshan/fiber-seq/code/enhancer/logs/enhancer_%j.err
 
-# Submit: sbatch code/enhancer/find_accessible_enhancers.sh
+# Submit: sbatch code/enhancer/shell_scripts/find_accessible_enhancers.sh
 # Accessible: ONE MSP block overlaps strictly >50% of the enhancer length.
 set -euo pipefail
 export LC_ALL=C

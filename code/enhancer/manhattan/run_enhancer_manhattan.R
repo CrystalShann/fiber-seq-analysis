@@ -1,5 +1,7 @@
 #!/usr/bin/env Rscript
-# Pool raw 1-bp m6A patterns within each enhancer class, then Manhattan + Leiden.
+# Pool active and inactive fibers from the shared capped sample for Manhattan + Leiden.
+# Extraction and sampling are performed once by prepare_enhancer_shared_fibers.R.
+
 suppressPackageStartupMessages({
   library(data.table)
   library(dplyr)
@@ -83,19 +85,19 @@ cluster_enhancer_manhattan <- function(binary, metadata, neighbor_builder, parti
 
 run_enhancer_manhattan <- function() {
   project_root <- Sys.getenv("ENHANCER_PROJECT_ROOT", "/project/spott/cshan/fiber-seq")
+  source(file.path(project_root, "code/enhancer/shared_functions/enhancer_fiber_sampling.R"), local = TRUE)
+  source(file.path(project_root, "code/enhancer/shared_functions/enhancer_shared_sampling.R"), local = TRUE)
   table_dir <- file.path(project_root, "macrophage_project/enhancer/TF_co-occ/tables")
-  enhancer_file <- Sys.getenv("ENHANCER_MANHATTAN_ENHANCERS",
-    file.path(table_dir, "02_sampled_enhancer_classes.tsv"))
-  class_id <- Sys.getenv("ENHANCER_MANHATTAN_CLASS")
-  if (!class_id %in% c("active", "inactive"))
-    stop("ENHANCER_MANHATTAN_CLASS must be active or inactive; submit the array script")
+  shared_path <- Sys.getenv("ENHANCER_SHARED_FIBERS",
+    file.path(table_dir, "enhancer_shared_fibers_pooled_capped.rds"))
+  shared <- load_shared_enhancer_fibers(shared_path)
   result_file <- Sys.getenv("ENHANCER_MANHATTAN_OUTPUT",
-    file.path(table_dir, paste0("enhancer_manhattan_", class_id, "_results.rds")))
-  ft_result_dir <- Sys.getenv("ENHANCER_MANHATTAN_FT_ROOT",
-    file.path(project_root, "macrophage_project/FiberHMM/extract/ft_result_dir"))
-  reference <- Sys.getenv("ENHANCER_MANHATTAN_REFERENCE", "/project/spott/reference/human/GRCh38/hg38.fa")
+    file.path(table_dir, "enhancer_manhattan_results_pooled_capped.rds"))
+  dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+  diagnostic_file <- function(kind) file.path(dirname(result_file),
+    paste0("manhattan_", kind, "_pooled_capped.tsv"))
   python_path <- Sys.getenv("ENHANCER_MANHATTAN_PYTHON", "/project/spott/cshan/envs/Jupyter-notebook/bin/python")
-  samples <- strsplit(Sys.getenv("ENHANCER_MANHATTAN_SAMPLES", "LPS_0,LPS_5,LPS_10,LPS_15"), ",", fixed = TRUE)[[1L]]
+  samples <- as.character(shared$inputs$samples)
   neighbor_method <- match.arg(Sys.getenv("ENHANCER_MANHATTAN_NEIGHBORS", "approximate"),
                                c("approximate", "exact"))
   # Manhattan graph method follows the macrophage reference; requested k=100.
@@ -103,24 +105,10 @@ run_enhancer_manhattan <- function() {
   stopifnot(!is.na(k_neighbors), k_neighbors >= 1L)
   resolution <- 1
   kernel_sigma <- NULL  # mean of directed retained neighbor distances
-  seed <- 1L
-  max_fibers <- as.integer(Sys.getenv("ENHANCER_MANHATTAN_MAX_FIBERS", "10000"))
-  stopifnot(length(max_fibers) == 1L, !is.na(max_fibers), max_fibers >= 3L)
+  leiden_seed <- 1L
   n_jobs <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "4"))
-  stopifnot(file.exists(reference), file.exists(paste0(reference, ".fai")),
-    file.exists(python_path), !anyDuplicated(samples), length(samples) > 0L,
-    all(nzchar(samples)), is.finite(n_jobs), n_jobs >= 1L)
-  analysis_enhancers <- fread(enhancer_file)
-  required_columns <- c("enhancer_id", "enhancer_class", "chr", "midpoint0")
-  stopifnot(all(required_columns %in% names(analysis_enhancers)), nrow(analysis_enhancers) > 0L,
-    !anyDuplicated(analysis_enhancers$enhancer_id),
-    !anyNA(analysis_enhancers[, ..required_columns]),
-    setequal(analysis_enhancers$enhancer_class, c("active", "inactive")))
-  analysis_enhancers <- analysis_enhancers[enhancer_class == class_id]
-  message("Array class: ", class_id, "; sampled enhancers: ", nrow(analysis_enhancers))
-  source(file.path(project_root, "code/topic_model/topic_modelling_functions.r"), local = TRUE)
-  source(file.path(project_root, "code/enhancer/enhancer_read_functions.R"), local = TRUE)
-  source(file.path(project_root, "code/enhancer/enhancer_manhattan_plots.R"), local = TRUE)
+  stopifnot(file.exists(python_path), is.finite(n_jobs), n_jobs >= 1L)
+  source(file.path(project_root, "code/enhancer/manhattan/enhancer_manhattan_plots.R"), local = TRUE)
   source(file.path(project_root, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r"), local = TRUE)
   source(file.path(project_root, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r"), local = TRUE)
   if (!requireNamespace("igraph", quietly = TRUE) || !requireNamespace("reticulate", quietly = TRUE))
@@ -131,65 +119,48 @@ run_enhancer_manhattan <- function() {
   py_sys <- reticulate::import("sys", convert = FALSE)
   py_sys$dont_write_bytecode <- TRUE
   neighbor_builder <- reticulate::import_from_path("enhancer_manhattan_neighbors",
-    path = file.path(project_root, "code/enhancer"), convert = TRUE)
-  # Check dependencies before spending time on extraction.
+    path = file.path(project_root, "code/enhancer/manhattan"), convert = TRUE)
   if (neighbor_method == "approximate") invisible(reticulate::import("pynndescent", convert = FALSE))
 
-  results <- list()
-  for (class_id in unique(analysis_enhancers$enhancer_class)) {
-    message("Starting ", class_id, " enhancer extraction at ", Sys.time())
-    inputs <- collect_enhancer_read_inputs(analysis_enhancers[enhancer_class == class_id],
-                                           samples, ft_result_dir, reference)
-    n_eligible <- nrow(inputs$mat)
-    set.seed(seed)
-    selected <- if (n_eligible > max_fibers) sort(sample.int(n_eligible, max_fibers)) else seq_len(n_eligible)
-    inputs$mat <- inputs$mat[selected, , drop = FALSE]
-    inputs$metadata <- inputs$metadata[selected]
-    invisible(gc())
-    message("Fiber sampling: ", length(selected), " of ", n_eligible,
-            " eligible fibers; seed = ", seed)
-    result <- cluster_enhancer_manhattan(inputs$mat, inputs$metadata, neighbor_builder, leiden_partition,
-      k_neighbors = k_neighbors, resolution = resolution, sigma = kernel_sigma,
-      seed = seed, neighbor_method = neighbor_method, n_jobs = n_jobs)
-    result$feat_mat <- inputs$mat
-    result$footprints <- collect_enhancer_footprints(result$assignments,
-      analysis_enhancers, dirname(ft_result_dir))
-    result$extraction_qc <- inputs$qc
-    result$fiber_sampling <- list(n_eligible = n_eligible, n_selected = length(selected),
-      max_fibers = max_fibers, seed = seed, method = "uniform_without_replacement")
-    results[[class_id]] <- result
-    message("Finished ", class_id, " at ", Sys.time())
-    rm(inputs, result)
-    invisible(gc())
-  }
-  input_regions <- as.data.frame(analysis_enhancers[, .(
-    enhancer_id = as.character(enhancer_id), enhancer_class = as.character(enhancer_class),
-    chr = as.character(chr), midpoint0 = as.integer(midpoint0))])
-  input_regions <- input_regions[order(input_regions$enhancer_id), , drop = FALSE]
-  rownames(input_regions) <- NULL
-  saved <- list(results = results,
-    inputs = list(regions = input_regions, samples = samples,
-      enhancer_file = normalizePath(enhancer_file), ft_result_dir = ft_result_dir, reference = reference),
-    parameters = list(n_features = 1000L, position_bp = -500:499,
-      signal = "raw_binary_m6a", neighbor_method = neighbor_method,
-      max_fibers = max_fibers, sampling_seed = seed,
-      k_neighbors = k_neighbors, resolution = resolution, sigma = kernel_sigma,
-      seed = seed, n_jobs = n_jobs, igraph_version = as.character(packageVersion("igraph"))),
+  message("Clustering the shared active/inactive sample: ", nrow(shared$metadata), " fibers")
+  message("Shared sample: ", shared$sample_id, "; MD5: ", shared$md5)
+  print(shared$fiber_sampling)
+  fwrite(shared$sampling_diagnostics, diagnostic_file("sampling_diagnostics"), sep = "\t")
+  fwrite(shared$fiber_sampling, diagnostic_file("fiber_sampling"), sep = "\t")
+  result <- cluster_enhancer_manhattan(shared$mat, shared$metadata, neighbor_builder, leiden_partition,
+    k_neighbors = k_neighbors, resolution = resolution, sigma = kernel_sigma,
+    seed = leiden_seed, neighbor_method = neighbor_method, n_jobs = n_jobs)
+  result$sampling_diagnostics <- shared$sampling_diagnostics
+  result$cluster_diagnostics <- enhancer_cluster_diagnostics(result$assignments, "pooled", samples)
+  message("Cluster contributions (>10% from one enhancer or <50 enhancers are flagged):")
+  print(result$cluster_diagnostics)
+  fwrite(result$cluster_diagnostics, diagnostic_file("cluster_diagnostics"), sep = "\t")
+  if (any(result$cluster_diagnostics$flagged))
+    warning("Pooled Manhattan: flagged clusters: ",
+      paste(result$cluster_diagnostics[flagged == TRUE, cluster], collapse = ", "), call. = FALSE)
+  result$feat_mat <- shared$mat
+  result$footprints <- shared$footprints
+  result$extraction_qc <- shared$qc
+  result$fiber_sampling <- shared$fiber_sampling
+  results <- list(pooled = result)
+  saved <- list(results = results, inputs = shared$inputs,
+    shared_sample = list(path = normalizePath(shared_path), md5 = shared$md5, sample_id = shared$sample_id),
+    parameters = c(shared$parameters,
+      list(n_features = 1000L, neighbor_method = neighbor_method,
+        k_neighbors = k_neighbors, resolution = resolution, sigma = kernel_sigma,
+        seed = leiden_seed, n_jobs = n_jobs, igraph_version = as.character(packageVersion("igraph")))),
     job_id = Sys.getenv("SLURM_JOB_ID", "interactive"),
-    array_job_id = Sys.getenv("SLURM_ARRAY_JOB_ID", "interactive"),
-    array_task_id = Sys.getenv("SLURM_ARRAY_TASK_ID", ""),
-    enhancer_class = class_id, completed_at = Sys.time())
-  dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+    enhancer_class = "pooled", completed_at = Sys.time())
   partial <- tempfile(".enhancer_manhattan_results_", tmpdir = dirname(result_file), fileext = ".rds")
   on.exit(unlink(partial), add = TRUE)
   saveRDS(saved, partial)
   if (!file.rename(partial, result_file)) stop("Could not publish Manhattan results: ", result_file)
-  message("Saved completed Manhattan results: ", result_file)
+  message("Saved completed pooled Manhattan results: ", result_file)
   plot_dir <- Sys.getenv("ENHANCER_MANHATTAN_PLOT_DIR",
     file.path(dirname(dirname(result_file)), "plots"))
-  save_enhancer_manhattan_pdfs(results[[class_id]], class_id, plot_dir,
-                              dirname(result_file), expected_k = k_neighbors)
-  message("Saved Manhattan heatmap and footprint PDFs: ", plot_dir)
+  save_enhancer_manhattan_pdfs(result, "pooled", plot_dir,
+                              dirname(result_file), expected_k = k_neighbors, suffix = "_capped")
+  message("Saved pooled Manhattan heatmap and footprint PDFs: ", plot_dir)
 }
 
 if (sys.nframe() == 0L) run_enhancer_manhattan()

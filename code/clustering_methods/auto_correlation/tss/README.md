@@ -5,6 +5,19 @@ calculating autocorrelations. The full run selects exactly 10,000 distinct raw
 read IDs: 2,500 each from `Q1_low`, `Q2`, `Q3`, and `Q4_high`. All expression bins
 are clustered together. Parent scripts are imported and remain unchanged.
 
+Three TSS windows are analysed, one per SLURM array task, each in its own output
+folder (genomic offsets from the TSS, end exclusive, no strand reversal):
+
+| Array task | Folder | Window | Width |
+|---|---|---|---|
+| 0 | `2000_tss` | `[TSS - 1000, TSS + 1000)` | 2,000 bp |
+| 1 | `left_1000_tss` | `[TSS - 1000, TSS - 100)` | 900 bp |
+| 2 | `right_1000_tss` | `[TSS + 100, TSS + 1000)` | 900 bp |
+
+`tss_autocorrelation.Rmd` describes the method and embeds every window's
+published PDFs and summary tables in one report, like `../06_autocorrelation.Rmd`.
+Knitting it never runs the pipeline; submit the runner first.
+
 ## Submit
 
 Run from any working directory after creating the SLURM log directory:
@@ -13,16 +26,23 @@ Run from any working directory after creating the SLURM log directory:
 mkdir -p /project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/logs
 ```
 
-Small real-data test (100 per bin, chromosome 22, all four LPS timepoints):
+Small real-data test (100 per bin, chromosome 22, all four LPS timepoints, all
+three windows, written to each window's `test/` subfolder):
 
 ```bash
 sbatch /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh --test
 ```
 
-Full 10,000-molecule analysis on chromosomes 1–22, X and Y:
+Full 10,000-molecule analysis on chromosomes 1–22, X and Y for all three windows:
 
 ```bash
 sbatch /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh
+```
+
+One window only, e.g. `right_1000_tss`:
+
+```bash
+sbatch --array=2 /project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/tss/06_run_tss_autocorrelation.sh
 ```
 
 The analysis was validated on 2026-09-28: SLURM job `59660099` completed the chromosome-22 test
@@ -43,13 +63,15 @@ copies, and full-resolution plot rasters. Resource requests reflect the current
 runner settings.
 
 The full run writes to
-`/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/`;
-`--test` writes to its `test/` subdirectory. Put `--test` before explicit overrides.
-Supported runner options include `--out-dir`, `--bins-tsv`, `--canonical-bed`,
+`/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss/<window>/`;
+`--test` writes to its `test/` subdirectory. Supported runner options include
+`--out-dir` (replaces the window folder), `--bins-tsv`, `--canonical-bed`,
 `--ft-root`, `--per-bin`, `--seed`, `--max-lag`, `--n-pcs`, `--n-neighbors`,
 `--resolution`, and `--chrom chr21,chr22`. Omit `--chrom` for the full genome.
-`--max-lag` is **inclusive** and defaults to 1999; the joint clustering pipeline
-requires at least three lag features, so use a maximum of at least 2.
+`--max-lag` is **inclusive** and defaults to all lags of the window (width - 1);
+the joint clustering pipeline requires at least three lag features, so use a
+maximum of at least 2. SLURM logs are shared by all windows as
+`logs/slurm_<job-id>_<task>.out`.
 
 ## Inputs and expression-table recovery
 
@@ -85,7 +107,9 @@ and contain `Ensembl_canonical`. As in the existing expression code, the BED's
 20 bp interval defines `tss = start + 10` in zero-based coordinates.
 `not_expressed` and other bins are excluded.
 
-Each window is exactly `[tss - 1000, tss + 1000)`. A BED alignment must satisfy
+Each window is `[tss + window_start, tss + window_end)` with the offsets of the
+table above (`--window-start`/`--window-end` of `01_sample_tss_molecules.py`).
+A BED alignment must satisfy
 `read_start <= window_start` and `read_end >= window_end`. Span coverage follows
 the existing BED extraction representation; BED12 does not provide a CIGAR with
 which to assess internal alignment gaps.
@@ -113,7 +137,7 @@ parent autocorrelation representation, positions run in ascending genomic order
 on both gene strands. Interior BED12 m6A blocks produce ones; first/last sentinel
 blocks are dropped, and all other covered bases are zero. No reference A/T filter,
 strand reversal, smoothing, tapering, detrending, binning or FFT is introduced.
-`m6a_count` is the number of ones **inside the 2 kb window**. Zero-call and all-one
+`m6a_count` is the number of ones **inside the window**. Zero-call and all-one
 signals remain in the balanced sample and are flagged downstream.
 
 Metadata includes `read_id`, `sample`, `timepoint`, numeric `lps_minutes`, gene ID
@@ -130,8 +154,8 @@ and name, `chrom`, `tss`, gene `strand`, `read_strand`, `gene_type`, canonical f
 ACF(k) = sum((x[t]-mean(x)) * (x[t+k]-mean(x))) / (N * var(x))
 ```
 
-It retains all nonnegative lags 0–1999 by default, matching the parent's
-full-window default. Valid reads must have lag 0 equal to one within `1e-10`.
+It retains all nonnegative lags of the window by default (0–1999 for `2000_tss`,
+0–899 for the one-sided windows), matching the parent's full-window default. Valid reads must have lag 0 equal to one within `1e-10`.
 Zero-variance rows have all-NaN ACFs and a false validity flag.
 
 `03_leiden_cluster_autocorrelations.py` imports `cluster_profiles()` from
@@ -191,15 +215,19 @@ R creates eleven PDFs covering the requested views:
 Heatmaps embed full-resolution rasters with no interpolation. They include lag 0;
 their symmetric color range uses the 99th percentile of absolute nonzero-lag ACFs
 to keep nonzero-lag structure visible. Values outside that display range saturate
-and the legend says so; saved ACF values are unchanged. Undefined ACF rows are
-gray. Aggregate plots show unsmoothed curves, with separate panels including
-and omitting lag 0 so that the nonzero-lag structure is visible.
+and the legend says so; saved ACF values are unchanged. The cluster mean-ACF plot
+shows unsmoothed curves with separate panels including and omitting lag 0; the
+expression-bin mean-ACF plot shows a single panel starting at lag 25 bp.
 
-Cluster fractions use **all sampled reads within each expression bin** as their
-denominator, including an explicit `Unclustered` category. Cluster mean curves
-use their cluster's members; expression-bin curves use all valid ACFs in that
-bin, including any valid reads excluded from clustering. Means and medians are
-both available in the TSVs.
+**Figures show clustered molecules only.** `Unclustered` molecules (zero variance
+or otherwise unclusterable) stay in `tables/` with that label, but are dropped
+from the heatmaps, boxplots, UMAPs and composition bars; the composition bars are
+renormalized over clustered reads within each expression bin. In the TSVs,
+`cluster_composition.tsv` keeps the original denominator of **all sampled reads
+within each expression bin** including the explicit `Unclustered` category.
+Cluster mean curves use their cluster's members; expression-bin curves use all
+valid ACFs in that bin, including any valid reads excluded from clustering.
+Means and medians are both available in the TSVs.
 
 Final plotting uses base R; Python produces matrices and tables only.
 The individual worker scripts retain their working-file behavior when invoked

@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# Run through run_enhancer_acf.sh; preserve the notebook's extraction and ACF methods.
+# Pool both enhancer classes from the shared capped cohort; preserve ACF methods.
 suppressPackageStartupMessages({
   library(data.table)
   library(dplyr)
@@ -11,25 +11,17 @@ suppressPackageStartupMessages({
 run_enhancer_acf <- function() {
   project_root <- Sys.getenv("ENHANCER_PROJECT_ROOT", "/project/spott/cshan/fiber-seq")
   table_dir <- file.path(project_root, "macrophage_project/enhancer/TF_co-occ/tables")
-  enhancer_file <- Sys.getenv("ENHANCER_ACF_ENHANCERS",
-                             file.path(table_dir, "02_sampled_enhancer_classes.tsv"))
   result_file <- Sys.getenv("ENHANCER_ACF_OUTPUT",
-                           file.path(table_dir, "enhancer_acf_results.rds"))
-  ft_result_dir <- Sys.getenv("ENHANCER_ACF_FT_ROOT",
-    file.path(project_root, "macrophage_project/FiberHMM/extract/ft_result_dir"))
-  sample_table <- data.table(sample = strsplit(Sys.getenv("ENHANCER_ACF_SAMPLES",
-    "LPS_0,LPS_5,LPS_10,LPS_15"), ",", fixed = TRUE)[[1L]])
-  analysis_enhancers <- fread(enhancer_file)
-  required_columns <- c("enhancer_id", "enhancer_class", "chr", "midpoint0")
-  stopifnot(all(required_columns %in% names(analysis_enhancers)),
-            nrow(analysis_enhancers) > 0L,
-            !anyDuplicated(analysis_enhancers$enhancer_id),
-            !anyNA(analysis_enhancers[, ..required_columns]),
-            setequal(analysis_enhancers$enhancer_class, c("active", "inactive")),
-            !anyDuplicated(sample_table$sample), all(nzchar(sample_table$sample)))
-  source(file.path(project_root, "code/topic_model/topic_modelling_functions.r"), local = TRUE)
-  source(file.path(project_root, "code/enhancer/enhancer_read_functions.R"), local = TRUE)
-  acf_reference <- Sys.getenv("ENHANCER_ACF_REFERENCE", "/project/spott/reference/human/GRCh38/hg38.fa") # chromosome lengths only
+                           file.path(table_dir, "enhancer_acf_results_pooled_capped.rds"))
+  shared_file <- Sys.getenv("ENHANCER_SHARED_FIBERS",
+    file.path(table_dir, "enhancer_shared_fibers_pooled_capped.rds"))
+  source(file.path(project_root, "code/enhancer/shared_functions/enhancer_shared_sampling.R"), local = TRUE)
+  source(file.path(project_root, "code/enhancer/shared_functions/enhancer_fiber_sampling.R"), local = TRUE)
+  source(file.path(project_root, "code/enhancer/acf/enhancer_acf_plots.R"), local = TRUE)
+  shared <- load_shared_enhancer_fibers(shared_file)
+  stopifnot(identical(as.character(rownames(shared$mat)), as.character(shared$metadata$RID)),
+            !anyDuplicated(shared$metadata$RID), ncol(shared$mat) == 1000L,
+            all(shared$metadata$enhancer_class %in% c("active", "inactive")))
   acf_python_path <- Sys.getenv("ENHANCER_ACF_PYTHON", "/project/spott/cshan/envs/Jupyter-notebook/bin/python")
   acf_source_dir <- file.path(project_root, "code/clustering_methods/auto_correlation")
   acf_n_features <- 1000L  # every lag 0:999 for the 1000-bp window
@@ -38,12 +30,7 @@ run_enhancer_acf <- function() {
   acf_resolution <- 0.4
   acf_seed <- 0L
   acf_batch_size <- 512L
-  # Same pooled-class fiber sample as run_enhancer_manhattan.R: identical
-  # extraction order, max_fibers and seed select the identical fibers.
-  acf_max_fibers <- 10000L
-  acf_sampling_seed <- 1L
-  stopifnot(file.exists(acf_reference), file.exists(paste0(acf_reference, ".fai")),
-            file.exists(acf_python_path), acf_n_features == 1000L)
+  stopifnot(file.exists(acf_python_path), acf_n_features == 1000L)
 
   if (!requireNamespace("reticulate", quietly = TRUE)) stop("R package reticulate is required")
   Sys.setenv(PYTHONDONTWRITEBYTECODE = "1",
@@ -54,7 +41,7 @@ run_enhancer_acf <- function() {
   reticulate::use_python(acf_python_path, required = TRUE)
   acf_sys <- reticulate::import("sys", convert = FALSE)
   acf_sys$dont_write_bytecode <- TRUE
-  # Check clustering dependencies before extracting the full enhancer universe.
+  # Both methods consume this saved cohort; neither extracts or samples again.
   invisible(reticulate::import("scanpy", convert = FALSE))
   invisible(reticulate::import("leidenalg", convert = FALSE))
   acf_compute <- reticulate::import_from_path("03_compute_autocorrelations",
@@ -110,48 +97,31 @@ run_enhancer_acf <- function() {
          m6a_profiles = mean_m6a, info = fit[[4L]])
   }
 
-  enhancer_acf_results <- list()
-  for (class_id in unique(analysis_enhancers$enhancer_class)) {
-    message("Starting ", class_id, " enhancer extraction at ", Sys.time())
-    inputs <- collect_enhancer_read_inputs(
-      analysis_enhancers[enhancer_class == class_id], as.character(sample_table$sample),
-      ft_result_dir, reference = acf_reference)
-    n_eligible <- nrow(inputs$mat)
-    set.seed(acf_sampling_seed)
-    selected <- if (n_eligible > acf_max_fibers) sort(sample.int(n_eligible, acf_max_fibers)) else seq_len(n_eligible)
-    inputs$mat <- inputs$mat[selected, , drop = FALSE]
-    inputs$metadata <- inputs$metadata[selected]
-    invisible(gc())
-    message("Fiber sampling: ", length(selected), " of ", n_eligible,
-            " eligible fibers; seed = ", acf_sampling_seed)
-    message("Computing ACF for ", nrow(inputs$mat), " fibers in ", class_id)
-    result <- cluster_enhancer_acf(
-      inputs$mat, inputs$metadata, n_features = acf_n_features, n_pcs = acf_n_pcs,
-      n_neighbors = acf_n_neighbors, resolution = acf_resolution, seed = acf_seed,
-      batch_size = acf_batch_size)
-    result$extraction_qc <- inputs$qc
-    result$fiber_sampling <- list(n_eligible = n_eligible, n_selected = length(selected),
-      max_fibers = acf_max_fibers, seed = acf_sampling_seed, method = "uniform_without_replacement")
-    enhancer_acf_results[[class_id]] <- result
-    message("Finished ", class_id, " at ", Sys.time())
-    rm(inputs, result)
-    invisible(gc())
-  }
-
-  input_regions <- as.data.frame(analysis_enhancers[, .(
-    enhancer_id = as.character(enhancer_id), enhancer_class = as.character(enhancer_class),
-    chr = as.character(chr), midpoint0 = as.integer(midpoint0))])
-  input_regions <- input_regions[order(input_regions$enhancer_id), , drop = FALSE]
-  rownames(input_regions) <- NULL
+  message("Computing pooled ACF for ", nrow(shared$mat),
+          " shared fibers from active and inactive enhancers at ", Sys.time())
+  result <- cluster_enhancer_acf(
+    shared$mat, shared$metadata, n_features = acf_n_features, n_pcs = acf_n_pcs,
+    n_neighbors = acf_n_neighbors, resolution = acf_resolution, seed = acf_seed,
+    batch_size = acf_batch_size)
+  stopifnot(identical(as.character(result$assignments$RID), as.character(shared$metadata$RID)))
+  result$extraction_qc <- shared$qc
+  result$fiber_sampling <- shared$fiber_sampling
+  result$sampling_diagnostics <- shared$sampling_diagnostics
+  result$cluster_diagnostics <- enhancer_cluster_diagnostics(
+    result$assignments, "pooled", shared$inputs$samples)
+  message("Pooled ACF cluster contributions (constant fibers remain unclustered):")
+  print(result$cluster_diagnostics)
+  if (any(result$cluster_diagnostics$flagged))
+    warning("Pooled ACF contribution flags: ",
+      paste(result$cluster_diagnostics[flagged == TRUE, cluster], collapse = ", "), call. = FALSE)
   saved <- list(
-    results = enhancer_acf_results,
-    inputs = list(regions = input_regions, samples = as.character(sample_table$sample),
-                  enhancer_file = normalizePath(enhancer_file), ft_result_dir = ft_result_dir,
-                  reference = acf_reference),
-    parameters = list(n_features = acf_n_features, n_pcs = acf_n_pcs,
+    results = list(pooled = result), inputs = shared$inputs,
+    shared_sample = list(path = normalizePath(shared_file), md5 = shared$md5,
+                         sample_id = shared$sample_id),
+    parameters = utils::modifyList(shared$parameters, list(
+      pooling = "active_inactive_combined", n_features = acf_n_features, n_pcs = acf_n_pcs,
       n_neighbors = acf_n_neighbors, resolution = acf_resolution,
-      seed = acf_seed, batch_size = acf_batch_size,
-      max_fibers = acf_max_fibers, sampling_seed = acf_sampling_seed),
+      seed = acf_seed, batch_size = acf_batch_size)),
     job_id = Sys.getenv("SLURM_JOB_ID", "interactive"), completed_at = Sys.time())
   dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
   partial <- tempfile(".enhancer_acf_results_", tmpdir = dirname(result_file), fileext = ".rds")
@@ -159,6 +129,10 @@ run_enhancer_acf <- function() {
   saveRDS(saved, partial)
   if (!file.rename(partial, result_file)) stop("Could not publish ACF results: ", result_file)
   message("Saved completed ACF results: ", result_file)
+  plot_dir <- Sys.getenv("ENHANCER_ACF_PLOT_DIR", file.path(dirname(dirname(result_file)), "plots"))
+  save_enhancer_acf_outputs(result, plot_dir, dirname(result_file),
+    samples = shared$inputs$samples, suffix = "_pooled_capped")
+  message("Saved pooled ACF tables and PDFs: ", plot_dir)
 }
 
-run_enhancer_acf()
+if (sys.nframe() == 0L) run_enhancer_acf()

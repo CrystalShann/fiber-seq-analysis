@@ -3,6 +3,7 @@
 
 Only the selected molecules have their m6A blocks parsed or a binary row built.
 The disk-backed pool is resumable at chromosome/sample transaction boundaries.
+The window is [tss + window_start, tss + window_end) in genomic coordinates.
 """
 import argparse
 import hashlib
@@ -38,7 +39,7 @@ def stable_key(seed, domain, *values):
     return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
 
 
-def canonical_genes(bed_path, bins_path, chromosomes):
+def canonical_genes(bed_path, bins_path, chromosomes, window_start, window_end):
     bed = pd.read_csv(bed_path, sep="\t", header=None,
                       names=["chrom", "start", "end", "name", "score", "strand"])
     fields = bed.name.str.split(";", expand=True)
@@ -65,10 +66,11 @@ def canonical_genes(bed_path, bins_path, chromosomes):
     if (not np.isfinite(joined.mean_tpm).all() or (joined.mean_tpm < 1).any()
             or not joined.strand.isin(["+", "-"]).all()):
         raise ValueError("Invalid expression/strand metadata")
-    joined = joined[joined.tss >= 1000].drop(columns="_merge")
+    joined = joined[joined.tss + window_start >= 0].drop(columns="_merge")
     joined = joined.sort_values(["chrom", "tss", "gene_id"]).reset_index(drop=True)
     joined["gene_index"] = np.arange(len(joined))
-    joined["window_start"], joined["window_end"] = joined.tss - 1000, joined.tss + 1000
+    # Genomic offsets relative to the TSS on both gene strands; end is exclusive.
+    joined["window_start"], joined["window_end"] = joined.tss + window_start, joined.tss + window_end
     return joined
 
 
@@ -90,7 +92,7 @@ WHERE excluded.span>pool.span OR
 (excluded.span=pool.span AND excluded.assignment_key<pool.assignment_key)"""
 
 
-def build_pool(out, genes, sources, signature, seed, helpers, force=False):
+def build_pool(out, genes, sources, signature, seed, helpers, window_start, window_end, force=False):
     target = out / "intermediate/eligible_pool.sqlite"
     if not force and stage_valid(out, "01_pool", signature):
         return target
@@ -133,8 +135,9 @@ def build_pool(out, genes, sources, signature, seed, helpers, force=False):
                     st, en, rid = int(f[1]), int(f[2]), f[3]
                     if not rid or rid == "." or st < 0 or en <= st or f[5] not in ("+", "-", "."):
                         raise ValueError(f"Malformed read ID/span/strand in {path}: {rid}")
-                    lo = np.searchsorted(anchors, st + 1000, side="left")
-                    hi = np.searchsorted(anchors, en - 1000, side="right")
+                    # Read spans [tss+window_start, tss+window_end) <=> st-window_start <= tss <= en-window_end
+                    lo = np.searchsorted(anchors, st - window_start, side="left")
+                    hi = np.searchsorted(anchors, en - window_end, side="right")
                     if hi <= lo:
                         continue
                     line_sha = hashlib.sha256(line.encode()).hexdigest()
@@ -167,8 +170,8 @@ def build_pool(out, genes, sources, signature, seed, helpers, force=False):
     return target
 
 
-def sampled_binary(selected, sources, helpers):
-    binary = np.zeros((len(selected), 2000), dtype=np.uint8)
+def sampled_binary(selected, sources, helpers, width):
+    binary = np.zeros((len(selected), width), dtype=np.uint8)
     found = np.zeros(len(selected), dtype=bool)
     lookup = {row.read_id: row for row in selected.itertuples(index=False)}
     for sample, chrom, path in sources:
@@ -212,6 +215,10 @@ def main():
     ap.add_argument("--canonical-bed", type=Path, default=Path(CANONICAL))
     ap.add_argument("--ft-root", type=Path, default=FT_ROOT)
     ap.add_argument("--per-bin", type=int, default=2500)
+    ap.add_argument("--window-start", type=int, default=-1000,
+                    help="Window start as a genomic offset from the TSS (inclusive); default -1000.")
+    ap.add_argument("--window-end", type=int, default=1000,
+                    help="Window end as a genomic offset from the TSS (exclusive); default 1000.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--timepoints", nargs="+", default=["LPS_0", "LPS_5", "LPS_10", "LPS_15"])
     ap.add_argument("--chrom", nargs="+", default=CHROMS)
@@ -221,19 +228,24 @@ def main():
             or len(set(args.chrom)) != len(args.chrom) or not set(args.chrom).issubset(CHROMS)
             or not set(args.timepoints).issubset({"LPS_0", "LPS_5", "LPS_10", "LPS_15"})):
         ap.error("Require positive per-bin count, nonnegative seed, unique chr1-22/X/Y and LPS_0/5/10/15")
+    width = args.window_end - args.window_start
+    if width < 3:
+        ap.error("--window-end must exceed --window-start by at least three bases")
     out = args.out_dir.resolve()
     prepare_dirs(out)
     helpers = extraction_helpers()
-    genes = canonical_genes(args.canonical_bed, args.bins_tsv, args.chrom)
+    genes = canonical_genes(args.canonical_bed, args.bins_tsv, args.chrom, args.window_start, args.window_end)
     sources = [(sample, chrom, helpers.m6a_path(args.ft_root, sample, chrom).resolve())
                for sample in args.timepoints for chrom in args.chrom if chrom in set(genes.chrom)]
     states = source_states(sources)  # fails clearly if any required BED/index is missing
     params = {"seed": args.seed, "chromosomes": args.chrom, "samples": args.timepoints,
-              "width": 2000, "source_states": states, "pysam": pysam.__version__}
+              "window_start": args.window_start, "window_end": args.window_end, "width": width,
+              "source_states": states, "pysam": pysam.__version__}
     pool_signature = fingerprint([args.canonical_bed, args.bins_tsv, __file__, common.__file__, EXTRACT_SCRIPT], params)
     gene_path = out / "tables/eligible_genes.tsv"
     genes.to_csv(gene_path, sep="\t", index=False)
-    pool = build_pool(out, genes, sources, pool_signature, args.seed, helpers, args.force)
+    pool = build_pool(out, genes, sources, pool_signature, args.seed, helpers,
+                      args.window_start, args.window_end, args.force)
     signature = fingerprint([pool, gene_path, __file__, common.__file__], {"per_bin": args.per_bin, **params})
     if not args.force and stage_valid(out, "01_sampling", signature):
         return
@@ -253,7 +265,7 @@ def main():
     selected["lps_minutes"] = selected["sample"].str.extract(r"LPS_(\d+)$", expand=False).astype(int)
     if not ((selected.read_start <= selected.window_start) & (selected.read_end >= selected.window_end)).all():
         raise RuntimeError("Sampling admitted a partially spanning molecule")
-    binary = sampled_binary(selected, sources, helpers)
+    binary = sampled_binary(selected, sources, helpers, width)
     selected["m6a_count"] = binary.sum(axis=1)
     row_ids = selected.read_id.to_numpy(dtype=str)
     assert_alignment(binary, selected, row_ids)
@@ -270,6 +282,7 @@ def main():
                   "balanced_counts": selected.expr_bin.value_counts().to_dict(),
                   "n_molecules": len(selected), "binary_shape": list(binary.shape),
                   "row_order_verified": True, "seed": args.seed,
+                  "window_offsets_from_tss": [args.window_start, args.window_end],
                   "orientation": "ascending genomic positions; no strand reversal; no reference-base filtering",
                   "pool_counts": counts}
     validation_path = out / "validation/sampling_validation.json"

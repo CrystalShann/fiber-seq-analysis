@@ -59,7 +59,7 @@ expression_acf <- read_tsv(input_paths[4])
 composition <- read_tsv(input_paths[5])
 required <- c("row_index", "read_id", "sample", "timepoint", "gene_id", "gene_name",
   "chrom", "tss", "strand", "mean_tpm", "expr_bin", "m6a_count", "cluster",
-  "status", "acf_valid", "umap1", "umap2", "heatmap_rank")
+  "status", "acf_valid", "umap1", "umap2", "heatmap_rank", "window_start", "window_end")
 if (!all(required %in% names(metadata))) stop("Missing metadata columns: ",
   paste(setdiff(required, names(metadata)), collapse = ", "))
 checks <- data.frame(check = character(), passed = logical(), details = character())
@@ -70,6 +70,9 @@ check <- function(name, condition, details) {
 bins <- c("Q1_low", "Q2", "Q3", "Q4_high")
 n <- nrow(metadata)
 check("nonempty_metadata", n > 0L, paste(n, "selected molecules"))
+window_width <- unique(metadata$window_end - metadata$window_start)
+check("single_window_width", length(window_width) == 1L && is.finite(window_width) && window_width >= 3,
+  paste(window_width, "bp window around the TSS"))
 check("unique_physical_reads", !anyNA(metadata$read_id) && !anyDuplicated(metadata$read_id),
   "Each physical read ID appears once")
 check("original_metadata_order", identical(as.integer(metadata$row_index), seq_len(n) - 1L),
@@ -186,9 +189,14 @@ check("composition_fractions", same_numeric(composition$fraction_within_bin,
   all(composition$n_bin_total == as.integer(bin_counts[composition$expr_bin])),
   "Fractions use all selected molecules as the appropriate denominators")
 
-cluster_colors <- setNames(grDevices::hcl.colors(length(cluster_ids), "Dark 3"),
-  cluster_levels[cluster_levels != "Unclustered"])
-if ("Unclustered" %in% cluster_levels) cluster_colors <- c(cluster_colors, Unclustered = "#A0A0A0")
+# Plots show clustered molecules only. The tables above keep the Unclustered
+# category, so the composition matrix is renormalized over clustered reads here.
+plot_levels <- cluster_levels[cluster_levels != "Unclustered"]
+cluster_colors <- setNames(grDevices::hcl.colors(length(plot_levels), "Dark 3"), plot_levels)
+heatmap_order <- heatmap_order[clustered[heatmap_order]]
+plot_counts <- count_matrix[plot_levels, , drop = FALSE]
+within_bin <- sweep(plot_counts, 2, colSums(plot_counts), "/")
+within_cluster <- within_cluster[plot_levels, , drop = FALSE]
 bin_colors <- setNames(c("#4477AA", "#66CCEE", "#EEAA33", "#CC6677"), bins)
 acf_palette <- grDevices::colorRampPalette(c("#2166AC", "#FFFFFF", "#B2182B"))(257)
 acf_limit <- max(0.01, unname(quantile(abs(acf[valid, -1, drop = FALSE]),
@@ -218,7 +226,6 @@ heatmap_panel <- function(rows, title) {
   indices <- as.integer(round((pmax(-acf_limit, pmin(acf_limit, values)) /
     acf_limit + 1) * 128)) + 1L
   colors <- acf_palette[indices]
-  colors[is.na(colors)] <- "#A0A0A0"
   raster <- as.raster(matrix(colors, nrow = nr, ncol = length(lags)))
   rm(values, indices, colors)
   plot.new()
@@ -227,8 +234,7 @@ heatmap_panel <- function(rows, title) {
   groups <- rle(metadata$cluster[rows])
   bounds <- cumsum(groups$lengths)
   centers <- nr - bounds + groups$lengths / 2
-  labels <- paste0(ifelse(groups$values == "Unclustered", "Unclustered", paste0("C", groups$values)),
-    " (", format(groups$lengths, big.mark = ","), ")")
+  labels <- paste0("C", groups$values, " (", format(groups$lengths, big.mark = ","), ")")
   axis(1, at = pretty(range(lags), n = 5), cex.axis = 0.8)
   axis(2, at = centers, labels = labels, las = 1, tick = FALSE, cex.axis = 0.7)
   if (length(bounds) > 1L) abline(h = nr - bounds[-length(bounds)], col = "#333333", lwd = 0.45)
@@ -237,7 +243,7 @@ heatmap_panel <- function(rows, title) {
     nr - bounds + groups$lengths, col = cluster_colors[groups$values], border = NA, xpd = NA)
   box()
   title(main = title, xlab = "Lag (bp)", cex.main = 1)
-  mtext(paste0(format(nr, big.mark = ","), " molecules; descending m6A within each cluster"),
+  mtext(paste0(format(nr, big.mark = ","), " clustered molecules; descending m6A within each cluster"),
     side = 3, line = 0.25, cex = 0.65)
 }
 acf_key <- function() {
@@ -250,7 +256,6 @@ acf_key <- function() {
     labels = formatC(c(-acf_limit, 0, acf_limit), digits = 3, format = "fg"), las = 1, cex.axis = 0.7)
   title(main = "ACF", cex.main = 0.9)
   mtext("Colors saturate at 99th percentile of |ACF| at lags > 0", side = 4, line = 2.7, cex = 0.6)
-  mtext("Gray: undefined ACF\n(zero variance)", side = 1, line = 1.7, cex = 0.65)
 }
 save_plot("01_acf_heatmap_all", function() {
   layout(matrix(c(1, 2), nrow = 1), widths = c(1, 0.16))
@@ -263,11 +268,14 @@ save_plot("03_acf_heatmaps_by_expression", function() {
   acf_key()
 }, width = 16, height = 12)
 
-curve_plot <- function(tab, grouping, levels, colors, title) {
-  layout(matrix(c(1, 2, 3, 3), nrow = 2, byrow = TRUE), heights = c(1, 0.25))
-  for (positive_only in c(FALSE, TRUE)) {
+curve_plot <- function(tab, grouping, levels, colors, title, min_lag = 0) {
+  # min_lag = 0: two panels (full ACF, then lags > 0). min_lag > 0: one panel from that lag.
+  lower_bounds <- if (min_lag > 0) min_lag else c(0, 1)
+  k <- length(lower_bounds)
+  layout(matrix(c(seq_len(k), rep(k + 1, k)), nrow = 2, byrow = TRUE), heights = c(1, 0.25))
+  for (lower in lower_bounds) {
     par(mar = c(4.3, 4.5, 3.5, 1), mgp = c(2.7, 0.7, 0))
-    use <- if (positive_only) tab$lag_bp > 0 else rep(TRUE, nrow(tab))
+    use <- tab$lag_bp >= lower
     yrange <- range(c(0, tab$mean_acf[use]), finite = TRUE)
     if (diff(yrange) == 0) yrange <- yrange + c(-0.01, 0.01)
     plot(NA, xlim = range(tab$lag_bp[use]), ylim = yrange,
@@ -278,8 +286,9 @@ curve_plot <- function(tab, grouping, levels, colors, title) {
       sub <- sub[order(sub$lag_bp), , drop = FALSE]
       lines(sub$lag_bp, sub$mean_acf, col = colors[group], lwd = 1.25)
     }
-    mtext(if (positive_only) "Positive-lag detail; lag 0 omitted from this panel" else
-      "Full ACF, including lag 0", side = 3, line = 0.25, cex = 0.7)
+    mtext(if (lower == 0) "Full ACF, including lag 0" else
+      paste0("Lags from ", lower, " bp; shorter lags omitted from this panel"),
+      side = 3, line = 0.25, cex = 0.7)
   }
   par(mar = rep(0, 4))
   plot.new()
@@ -293,43 +302,43 @@ curve_plot <- function(tab, grouping, levels, colors, title) {
   mtext("Means use valid ACF rows only; raw per-base curves, without smoothing", side = 1, line = -0.9, cex = 0.7)
 }
 save_plot("02_mean_acf_by_cluster", function() curve_plot(cluster_acf, "cluster",
-  cluster_levels[cluster_levels != "Unclustered"], cluster_colors, "Mean ACF by global Leiden class"))
+  plot_levels, cluster_colors, "Mean ACF by global Leiden class"))
 save_plot("07_mean_acf_by_expression", function() curve_plot(expression_acf, "expr_bin",
-  bins, bin_colors, "Mean ACF by expression bin"))
+  bins, bin_colors, "Mean ACF by expression bin", min_lag = 25))
 
 save_plot("04_cluster_fraction_within_expression", function() {
   layout(matrix(c(1, 2), nrow = 1), widths = c(1, 0.35))
   par(mar = c(4.5, 5, 3, 1))
   barplot(within_bin, col = cluster_colors[rownames(within_bin)], border = NA,
-    ylim = c(0, 1), ylab = "Fraction of molecules within expression bin",
+    ylim = c(0, 1), ylab = "Fraction of clustered molecules within expression bin",
     main = "Global Leiden-class composition across expression bins")
   par(mar = rep(0, 4)); plot.new()
-  legend("center", legend = ifelse(cluster_levels == "Unclustered", "Unclustered",
-    paste0("C", cluster_levels)), fill = cluster_colors[cluster_levels], bty = "n", cex = 0.9)
+  legend("center", legend = paste0("C", plot_levels), fill = cluster_colors[plot_levels], bty = "n", cex = 0.9)
 })
 save_plot("04b_expression_fraction_within_cluster", function() {
   par(mar = c(5.5, 5, 4, 1))
-  nonempty <- rowSums(count_matrix) > 0L
+  nonempty <- rowSums(plot_counts) > 0L
   barplot(t(within_cluster[nonempty, , drop = FALSE]), col = bin_colors, border = NA, ylim = c(0, 1),
     ylab = "Fraction of molecules within Leiden class", xlab = "Global Leiden class",
     main = "Expression-bin composition of global Leiden classes", las = 2)
   legend("top", legend = bins, fill = bin_colors, horiz = TRUE, bty = "n", inset = c(0, -0.12), xpd = NA)
 })
 boxplot_panel <- function(rows, title) {
-  values <- lapply(cluster_levels, function(group) metadata$m6a_count[rows][metadata$cluster[rows] == group])
-  names(values) <- ifelse(cluster_levels == "Unclustered", "Unclustered", paste0("C", cluster_levels))
-  boxplot(values, col = cluster_colors[cluster_levels], border = "#333333", las = 2,
-    ylab = "m6A count per 2-kb window", main = title, outline = TRUE, pch = 16, cex = 0.35,
-    ylim = range(c(0, metadata$m6a_count)), cex.axis = 0.75)
+  rows <- rows[clustered[rows]]
+  values <- lapply(plot_levels, function(group) metadata$m6a_count[rows][metadata$cluster[rows] == group])
+  names(values) <- paste0("C", plot_levels)
+  boxplot(values, col = cluster_colors[plot_levels], border = "#333333", las = 2,
+    ylab = paste0("m6A count per ", window_width, "-bp window"), main = title, outline = TRUE,
+    pch = 16, cex = 0.35, ylim = range(c(0, metadata$m6a_count[clustered])), cex.axis = 0.75)
 }
 save_plot("05_m6a_by_cluster_and_expression", function() {
   par(mfrow = c(2, 2), mar = c(6.3, 4.6, 2.8, 0.8), mgp = c(2.8, 0.7, 0))
   for (bin in bins) boxplot_panel(which(metadata$expr_bin == bin), bin)
-}, width = max(12, length(cluster_levels) * 0.75), height = 10)
+}, width = max(12, length(plot_levels) * 0.75), height = 10)
 save_plot("05b_m6a_by_cluster", function() {
   par(mar = c(6.3, 4.6, 3, 1))
   boxplot_panel(seq_len(n), "m6A counts by global Leiden class: all expression bins")
-}, width = max(10, length(cluster_levels) * 0.6), height = 7)
+}, width = max(10, length(plot_levels) * 0.6), height = 7)
 
 set.seed(0L) # Reproducible drawing order only; does not affect analysis or row order.
 umap_rows <- sample(which(clustered))
@@ -338,16 +347,13 @@ umap_panel <- function(point_colors, title) {
   plot(metadata$umap1[umap_rows], metadata$umap2[umap_rows],
     col = adjustcolor(point_colors[umap_rows], alpha.f = 0.65), pch = 16,
     cex = if (n > 2000) 0.4 else 0.7, xlab = "UMAP 1", ylab = "UMAP 2", main = title)
-  mtext(paste0(sum(clustered), " clustered molecules; ", sum(!clustered),
-    " excluded (", sum(!valid), " zero variance)"),
-    side = 3, line = 0.3, cex = 0.7)
+  mtext(paste0(sum(clustered), " clustered molecules"), side = 3, line = 0.3, cex = 0.7)
 }
 save_plot("06_umap_by_cluster", function() {
   layout(matrix(c(1, 2), nrow = 1), widths = c(1, 0.3))
   umap_panel(cluster_colors[metadata$cluster], "UMAP: global Leiden classes")
   par(mar = rep(0, 4)); plot.new()
-  plotted_clusters <- cluster_levels[cluster_levels != "Unclustered"]
-  legend("center", legend = paste0("C", plotted_clusters), col = cluster_colors[plotted_clusters],
+  legend("center", legend = paste0("C", plot_levels), col = cluster_colors[plot_levels],
     pch = 16, bty = "n", cex = 0.85)
 })
 save_plot("06b_umap_by_expression", function() {

@@ -92,9 +92,16 @@ def read_metadata(path):
                        dtype={"cluster": str, "read_id": str, "gene_id": str})
 
 
+def window_width(metadata):
+    widths = (metadata.window_end - metadata.window_start).unique()
+    if len(widths) != 1 or widths[0] < 3:
+        raise ValueError("All sampled molecules must share one window of at least three bases")
+    return int(widths[0])
+
+
 def assert_alignment(binary, metadata, row_ids):
-    if binary.shape != (len(metadata), 2000):
-        raise ValueError("Binary matrix must have one 2000-base row per molecule")
+    if binary.shape != (len(metadata), window_width(metadata)):
+        raise ValueError("Binary matrix must have one window-width row per molecule")
     if not np.array_equal(metadata.row_index.to_numpy(), np.arange(len(metadata))):
         raise ValueError("Metadata row_index must match matrix order exactly")
     if metadata.read_id.duplicated().any() or not np.array_equal(

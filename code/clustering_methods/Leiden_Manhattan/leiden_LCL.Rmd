@@ -1180,6 +1180,29 @@ Each of the ten region folders contains `bin0/k10/resolution1/plots` and `tables
 
 Selection follows [Kevin's heterozygous AS-FIRE examples](https://kevinlkx.github.io/fiber-seq-analysis/example_figures_with_merged_samples.html#AS-fire_results).
 
+# Compute difference in methylation signal
+
+Per-bp difference in mean m6A between every pair of Leiden clusters for the top
+5 AS-FIRE regions, using the saved `clustering.rds` objects. `delta = A − B`
+(positive = A more methylated), with a centred 25 bp rolling mean drawn on top of
+the raw per-bp line. Outputs go to `diff_avg_m6a/<region_id>/tables/pairwise_m6a_delta.tsv`
+and `diff_avg_m6a/<region_id>/plots/pairwise_m6a_delta.pdf` under
+`/project/spott/cshan/fiber-seq/LCL_project/Leiden_manhattan`.
+
+```{r diff-avg-m6a, results='asis'}
+source(file.path(code_dir, "diff_avg_m6a.R"), local = TRUE)
+diff_root <- lcl_output_path(file.path(output_dir, "diff_avg_m6a"))
+top5 <- regions$region_id[order(regions$rank)][1:5]
+top5_paths <- file.path(output_dir, top5, "bin0", "k10", "resolution1", "tables", "clustering.rds")
+stopifnot(all(file.exists(top5_paths)))
+run_all_m6a_delta(top5_paths, diff_root, smooth_bp = 25)
+for (rid in top5) {
+  cat("\n## ", rid, "\n\n", sep = "")
+  inline_png(file.path(diff_root, rid, "plots", "pairwise_m6a_delta.pdf"),
+    paste(rid, "pairwise m6A delta", sep = " — "))
+}
+```
+
 ```{r session}
 sessionInfo()
 ```

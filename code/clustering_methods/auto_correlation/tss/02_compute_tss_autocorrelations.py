@@ -9,7 +9,7 @@ import numpy as np
 import tss_common
 from tss_common import (
     assert_alignment, fingerprint, finish_stage, load_parent, log,
-    prepare_dirs, read_metadata, stage_valid, write_json,
+    prepare_dirs, read_metadata, stage_valid, window_width, write_json,
 )
 
 
@@ -20,17 +20,21 @@ PARENT = Path(__file__).resolve().parent.parent / "03_compute_autocorrelations.p
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--max-lag", type=int, default=1999,
-                        help="Inclusive maximum lag; default returns all 2,000 nonnegative lags.")
+    parser.add_argument("--max-lag", type=int, default=None,
+                        help="Inclusive maximum lag; default returns all nonnegative lags (window width - 1).")
     parser.add_argument("--force", action="store_true", help="Recompute this stage even if its cache is valid.")
     args = parser.parse_args()
-    if not 0 <= args.max_lag <= 1999:
-        parser.error("--max-lag must be in [0, 1999] for the 2-kb input window")
     out = args.out_dir.resolve()
     prepare_dirs(out)
     binary_path = out / "intermediate/binary_m6a.npy"
     metadata_path = out / "tables/sampled_molecules.tsv"
     rows_path = out / "intermediate/row_ids.npy"
+    metadata = read_metadata(metadata_path)
+    width = window_width(metadata)
+    if args.max_lag is None:
+        args.max_lag = width - 1
+    if not 0 <= args.max_lag < width:
+        parser.error(f"--max-lag must be in [0, {width - 1}] for the {width}-bp input window")
     signature = fingerprint(
         [binary_path, metadata_path, rows_path, Path(__file__), Path(tss_common.__file__), PARENT],
         {"max_lag": args.max_lag, "numpy_version": np.__version__},
@@ -40,11 +44,10 @@ def main():
         return
 
     binary = np.load(binary_path, mmap_mode="r", allow_pickle=False)
-    metadata = read_metadata(metadata_path)
     row_ids = np.load(rows_path, allow_pickle=False)
     assert_alignment(binary, metadata, row_ids)
-    if binary.shape[1] != 2000 or not len(binary):
-        raise ValueError("ACF input must contain sampled molecules in exactly 2,000 genomic bases")
+    if not len(binary):
+        raise ValueError("ACF input must contain sampled molecules")
     log(f"02 ACF: computing parent autocorrelations() for {len(binary):,} sampled reads, "
         f"lags 0–{args.max_lag}; no signal transformations")
     parent = load_parent("03_compute_autocorrelations.py")
@@ -67,7 +70,7 @@ def main():
     report = {
         "n_reads": len(metadata), "n_valid": int(valid.sum()),
         "n_zero_variance": int((~valid).sum()), "matrix_shape": list(profiles.shape),
-        "max_lag_bp": args.max_lag, "lag0_equals_one": True,
+        "window_width_bp": width, "max_lag_bp": args.max_lag, "lag0_equals_one": True,
         "lag0_max_absolute_error": float(np.max(np.abs(profiles[valid, 0] - 1))) if valid.any() else None,
         "zero_variance_flagged": True, "invalid_rows_all_nan": True,
         "metadata_and_matrix_row_order_preserved": True,
