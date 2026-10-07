@@ -1,153 +1,93 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
+  <meta name="description" content="Fiber-seq reports on macrophage FIRE frequency, LCL AS-FIRE clustering, and autocorrelation.">
   <title>Fiber-seq Analysis</title>
-
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      max-width: 1000px;
-      margin: 60px auto;
-      padding: 0 30px;
-      line-height: 1.6;
-    }
-
-    h1 {
-      margin-bottom: 10px;
-    }
-
-    .subtitle {
-      color: #666;
-      margin-bottom: 40px;
-    }
-
-    .section {
-      margin-top: 40px;
-    }
-
-    .analysis {
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      padding: 20px;
-      margin-bottom: 15px;
-    }
-
-    .analysis h3 {
-      margin-top: 0;
-    }
-
-    a {
-      text-decoration: none;
-    }
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 48px auto; padding: 0 24px; line-height: 1.65; color: #243447; background: #f7f9fc; }
+    h1, h2, h3 { line-height: 1.3; }
+    h1 { margin-bottom: 12px; font-size: 2.5rem; }
+    .subtitle, .description { color: #526174; }
+    nav { display: flex; flex-wrap: wrap; gap: 12px 24px; margin: 28px 0 40px; }
+    a { color: #165ca3; text-underline-offset: 4px; }
+    a:hover { color: #103e70; }
+    a:focus-visible { outline: 3px solid #165ca3; outline-offset: 5px; }
+    section { margin-top: 40px; scroll-margin-top: 24px; }
+    section > h2 { font-size: 1.6rem; margin-bottom: 12px; }
+    .reports { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 18px; }
+    article { border: 1px solid #d8e1eb; border-radius: 12px; padding: 24px; background: white; }
+    article h3 { margin-top: 0; font-size: 1.15rem; }
+    article p { margin-bottom: 0; }
+    .archive { border-top: 1px solid #d8e1eb; padding-top: 24px; }
+    footer { margin-top: 48px; color: #526174; font-size: .9rem; }
+    @media (max-width: 600px) { body { margin: 28px auto; padding: 0 18px; } h1 { font-size: 2rem; } article { padding: 20px; } }
   </style>
 </head>
-
 <body>
-
-  <h1>Fiber-seq Analysis</h1>
-
-  <p class="subtitle">
-    Single-molecule chromatin accessibility and regulatory analysis.
-  </p>
-
-
-  <div class="section">
-
-    <h2>Fiber-seq Analyses</h2>
-
-
-    <div class="analysis">
-      <h3>FIRE Frequency Analysis</h3>
-
-      <p>
-        Analysis and visualization of dynamic FIRE frequencies
-        during the macrophage LPS time course.
-      </p>
-
-      <a href="https://crystalshann.github.io/fiber-seq-analysis/03_vis_fire_freq.html">
-        View analysis →
-      </a>
-    </div>
-
-
-    <div class="analysis">
-      <h3>TF Motif Enrichment Analysis</h3>
-
-      <p>
-        Test which TF motifs are enriched in regions that have differential FIRE
-        frequency in pairwise comparisons between 0, 5, 10, and 15 min in
-        macrophages treated with LPS.
-      </p>
-
-      <a href="TF_enrichment.html">
-        View analysis →
-      </a>
-    </div>
-
-
-    <div class="analysis">
-      <h3>AS-FIRE Manhattan-Leiden Clustering</h3>
-
-      <p>
-        Manhattan-distance and Leiden clustering of Fiber-seq reads
-        at the top allele-specific FIRE regions.
-      </p>
-
-      <a href="https://crystalshann.github.io/fiber-seq-analysis/LCL_top10_AS-FIRE_2kb_Manhattan_Leiden.html">
-        View analysis →
-      </a>
-    </div>
-
-
-    <div class="analysis">
-      <h3>Leiden Clustering Parameter Comparison</h3>
-
-      <p>
-        Compare five neighbour-count and resolution pairs at the top-ranked
-        AS-FIRE region (rs12470189), with a fixed UMAP, cluster-count heatmap,
-        haplotype examples, and per-read m6A heatmaps.
-      </p>
-
-      <a href="testing_clustering_parameters.html">
-        View analysis →
-      </a>
-    </div>
-
-
-    <div class="analysis">
-      <h3>Fourier Transform Analysis</h3>
-
-      <p>
-        Fourier analysis of single-molecule m6A patterns to characterize
-        chromatin periodicity, nucleosome repeat length, and Fourier-based clustering.
-      </p>
-
-      <a href="https://crystalshann.github.io/fiber-seq-analysis/fourier_transformation.html">
-        View analysis →
-      </a>
-    </div>
-
-
-    <div class="analysis">
-      <h3>Autocorrelation Analysis</h3>
-
-      <p>
-        Single-molecule autocorrelation of m6A patterns at the top
-        allele-specific FIRE regions, with Leiden clustering of the
-        autocorrelation profiles and nucleosome repeat-length estimates by allele.
-      </p>
-
-      <a href="https://crystalshann.github.io/fiber-seq-analysis/autocorrelation.html">
-        View analysis →
-      </a>
-    </div>
-
-
-  </div>
-
+  <header>
+    <h1>Fiber-seq Analysis</h1>
+    <p class="subtitle">Single-molecule chromatin accessibility and regulatory analyses, organized by analysis approach.</p>
+    <nav aria-label="Analysis categories">
+      <a href="#fire-frequency">Macrophage FIRE frequency</a>
+      <a href="#manhattan-leiden">Manhattan distance &amp; Leiden clustering</a>
+      <a href="#autocorrelation">Autocorrelation</a>
+      <a href="#archived">Archived analyses</a>
+    </nav>
+  </header>
+  <main>
+    <section id="fire-frequency" aria-labelledby="fire-heading">
+      <h2 id="fire-heading">FIRE frequency analysis in macrophages</h2>
+      <p class="description">Using the union of FIRE peaks across all time points, differential FIRE regions were identified with Fisher’s exact test for pairwise time-point comparisons during the macrophage LPS time course. Transcription factor motif enrichment was then assessed in the differential FIRE regions.</p>
+      <div class="reports">
+        <article>
+          <h3><a href="03_vis_fire_freq.html">Differential FIRE frequency</a></h3>
+          <p>Genome-wide analysis and visualization of changes in FIRE frequency between time points.</p>
+        </article>
+        <article>
+          <h3><a href="TF_enrichment.html">Transcription factor motif enrichment</a></h3>
+          <p>Motif enrichment in differential FIRE regions from pairwise comparisons between 0, 5, 10, and 15 minutes after LPS treatment.</p>
+        </article>
+      </div>
+    </section>
+    <section id="manhattan-leiden" aria-labelledby="clustering-heading">
+      <h2 id="clustering-heading">Manhattan distance and Leiden clustering</h2>
+      <p class="description">Fiber-seq reads from the top 10 allele-specific FIRE (AS-FIRE) examples in lymphoblastoid cell lines (LCLs) were clustered using Manhattan distances computed from binary methylation matrices centered on the focal AS-FIRE region, followed by Leiden clustering.</p>
+      <div class="reports">
+        <article>
+          <h3><a href="LCL_top10_AS-FIRE_2kb_Manhattan_Leiden.html">Top 10 LCL AS-FIRE examples</a></h3>
+          <p>Read-level clustering of binary methylation patterns in 2-kb windows centered on the focal AS-FIRE regions.</p>
+        </article>
+        <article>
+          <h3><a href="testing_clustering_parameters.html">Clustering parameter comparison</a></h3>
+          <p>Comparison of neighbor-count and Leiden resolution settings to assess their effects on clustering at the top-ranked AS-FIRE region.</p>
+        </article>
+      </div>
+    </section>
+    <section id="autocorrelation" aria-labelledby="autocorrelation-heading">
+      <h2 id="autocorrelation-heading">Autocorrelation</h2>
+      <p class="description">Autocorrelation of single-molecule methylation patterns was analyzed for the top 10 LCL AS-FIRE examples. Autocorrelation profiles were reduced using principal component analysis (PCA), followed by Leiden clustering.</p>
+      <div class="reports">
+        <article>
+          <h3><a href="autocorrelation.html">LCL AS-FIRE autocorrelation and clustering</a></h3>
+          <p>Analysis of methylation-pattern periodicity, clustering of autocorrelation profiles, and allele-specific nucleosome repeat-length estimates.</p>
+        </article>
+      </div>
+    </section>
+    <section id="archived" class="archive" aria-labelledby="archive-heading">
+      <h2 id="archive-heading">Archived analyses</h2>
+      <p class="description">Previous exploratory analyses retained for reference.</p>
+      <div class="reports">
+        <article>
+          <h3><a href="archived/fourier_transformation.html">Fourier transform analysis</a></h3>
+          <p>Fourier analysis of single-molecule m6A patterns to explore chromatin periodicity, nucleosome repeat length, and Fourier-based clustering.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+  <footer>Fiber-seq analysis reports</footer>
 </body>
 </html>
