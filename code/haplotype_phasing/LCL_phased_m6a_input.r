@@ -65,17 +65,7 @@ lcl_build_phased_m6a_input <- function(region, sample_table, ft_result_dir,
     temporary <- tempfile(pattern = "lcl_phased_input_")
     dir.create(temporary)
     on.exit(unlink(temporary, recursive = TRUE), add = TRUE)
-    # Give the unchanged LCL cache loader a guard scoped to this disposable
-    # metadata directory. No methylation/feature matrices are written.
-    lcl_output_path <- function(path) {
-      path <- normalizePath(path, mustWork = FALSE)
-      root <- normalizePath(temporary)
-      if (!(identical(path, root) || startsWith(path, paste0(root, "/")))) stop("Invalid temporary phasing path")
-      path
-    }
-    loader <- cache_lcl_haplotags
-    environment(loader) <- environment()
-    phases[refresh] <- loader(samples[samples$sample_name %in% refresh, , drop = FALSE],
+    phases[refresh] <- cache_lcl_haplotags(samples[samples$sample_name %in% refresh, , drop = FALSE],
       list(list(rids_df = reads)), phasing_root, temporary, reuse = FALSE)[refresh]
   }
   filtered <- lcl_filter_focal_heterozygotes(list(rids_df = reads, met_mat = mat),

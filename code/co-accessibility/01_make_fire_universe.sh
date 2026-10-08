@@ -93,14 +93,14 @@ cut -f5 "$cre_universe" | sort | uniq -c | sort -rn | sed 's/^/    /'
 ###########################
 # 3. Gene windows: TSS +/- WINDOW
 ###########################
-# The TSS bed holds 20 bp intervals centred on each canonical TSS, so TSS = start+10.
+# The TSS bed holds 1 bp intervals at each canonical TSS, so TSS = start.
 # col4 = gene_id;transcript_id;gene_name;transcript_type;tags
 # Output BED7: chrom, start, end, gene_id, gene_name, transcript_type, strand
 
 echo "Building gene windows..."
 awk -F'\t' -v OFS='\t' -v W="$WINDOW" -v re="$CHROM_RE" '
     $1 ~ re {
-        tss = $2 + 10
+        tss = $2
         s = tss - W; if (s < 0) s = 0
         split($4, a, ";")
         print $1, s, tss + W, a[1], a[3], a[4], $6

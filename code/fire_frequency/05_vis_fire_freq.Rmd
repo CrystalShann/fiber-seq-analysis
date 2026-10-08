@@ -582,8 +582,9 @@ the same window, the tested FIRE region +/- `pad` bp (`window_start`-`window_end
 and marks the tested region itself.
 
 Molecules are the full-span reads of the Leiden + Manhattan workflow
-(`assemble_region_m6a()` + `filter_met_mat()`: reads covering every m6A-called
-site in the window), so panels A-D all describe the same reads. Each timepoint
+(`assemble_region_m6a(full_span = TRUE)`: reads whose longest alignment
+physically spans the complete analysis window, including reads with zero m6A
+calls in the window), so panels A-D all describe the same reads. Each timepoint
 is one merged sample (`LPS_0` ... `LPS_15`, biological replicates already
 pooled), as in the rest of this notebook.
 
@@ -633,8 +634,6 @@ k_neighbors       <- 10
 leiden_resolution <- 1
 leiden_seed       <- 1
 kernel_sigma      <- NULL
-impute_missing    <- FALSE
-impute_k          <- 5
 
 time_levels <- c("0 min", "5 min", "10 min", "15 min")
 time_labels <- setNames(time_levels, sample_names)
@@ -691,8 +690,6 @@ top10_leiden <- leiden_manhattan_cluster_regions(
   window_size    = window_size,
   k_neighbors    = k_neighbors,
   resolution     = leiden_resolution,
-  impute_missing = impute_missing,
-  impute_k       = impute_k,
   sigma          = kernel_sigma,
   seed           = leiden_seed,
   sample_table   = sample_table,

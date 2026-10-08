@@ -1,0 +1,5 @@
+sample_name	sample_label	condition	timepoint	fire_dir	fiberhmm_label
+LPS_0	LPS_0	LPS	0	/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir/LPS_0	LPS0
+LPS_5	LPS_5	LPS	5	/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir/LPS_5	LPS5
+LPS_10	LPS_10	LPS	10	/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir/LPS_10	LPS10
+LPS_15	LPS_15	LPS	15	/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir/LPS_15	LPS15

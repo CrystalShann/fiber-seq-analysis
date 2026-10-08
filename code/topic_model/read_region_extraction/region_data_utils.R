@@ -1,9 +1,5 @@
 # Readers and feature helpers for read-level region plots.
 #
-# Self-contained: nothing here sources or depends on the fiberhub code. Every input is
-# a small file already sliced to the region by extract_region_result_macrophage.sh, so
-# these are plain reads of plain files - no tabix querying from R.
-#
 # Requires: data.table, dplyr, GenomicRanges, IRanges
 
 suppressPackageStartupMessages({
@@ -12,6 +8,8 @@ suppressPackageStartupMessages({
   library(GenomicRanges)
   library(IRanges)
 })
+
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
 
 FT_BED12_COLS <- c("chr", "start", "end", "RID", "score", "strand",
                    "read_start", "read_end", "rgb", "blockCount",
@@ -41,64 +39,6 @@ read_bed <- function(file, col_names = NULL) {
 }
 
 
-#' Expand the blocks of a BED12(+) frame into one row per block.
-#'
-#' @param df BED12 frame with blockCount/blockSizes/blockStarts (and optionally
-#'   blockScores) columns.
-#' @param drop_flanking drop the first and last block of every record. `ft extract`
-#'   brackets each read with zero-length sentinel blocks at the alignment ends;
-#'   FiberHMM's footprint/tf beds do not, so this is TRUE for the former only.
-#' @return data.frame with one row per block: chr, RID, strand, read_start, read_end,
-#'   block_start (0-based), block_end, size, and block_score when available.
-expand_bed12_blocks <- function(df, drop_flanking = FALSE) {
-  if (nrow(df) == 0) return(data.frame())
-
-  sizes  <- strsplit(as.character(df$blockSizes), ",", fixed = TRUE)
-  starts <- strsplit(as.character(df$blockStarts), ",", fixed = TRUE)
-  n_blk  <- lengths(starts)
-
-  if (any(n_blk != lengths(sizes)))
-    stop("blockSizes and blockStarts have different lengths")
-
-  has_scores <- "blockScores" %in% colnames(df)
-  if (has_scores) {
-    scores <- strsplit(as.character(df$blockScores), ",", fixed = TRUE)
-    if (any(lengths(scores) != n_blk))
-      stop("blockScores length does not match blockStarts")
-  }
-
-  keep_row <- n_blk > 0
-  if (drop_flanking) keep_row <- n_blk > 2
-  if (!any(keep_row)) return(data.frame())
-
-  row_idx <- rep(which(keep_row), n_blk[keep_row])
-  blk_start <- as.integer(unlist(starts[keep_row], use.names = FALSE))
-  blk_size  <- as.integer(unlist(sizes[keep_row], use.names = FALSE))
-
-  out <- data.frame(
-    chr         = df$chr[row_idx],
-    RID         = as.character(df$RID)[row_idx],
-    strand      = df$strand[row_idx],
-    read_start  = df$read_start[row_idx],
-    read_end    = df$read_end[row_idx],
-    block_start = df$start[row_idx] + blk_start,
-    size        = blk_size,
-    stringsAsFactors = FALSE)
-  out$block_end <- out$block_start + out$size
-  if (has_scores)
-    out$block_score <- as.numeric(unlist(scores[keep_row], use.names = FALSE))
-
-  if (drop_flanking) {
-    # position of each block within its record
-    pos_in_rec <- sequence(n_blk[keep_row])
-    last_of_rec <- rep(n_blk[keep_row], n_blk[keep_row])
-    out <- out[pos_in_rec != 1L & pos_in_rec != last_of_rec, , drop = FALSE]
-  }
-  rownames(out) <- NULL
-  out
-}
-
-
 #' Read `ft extract --m6a`/`--cpg` output for a region into one row per modified base.
 #'
 #' @return data.frame: chr, RID, strand, read_start (1-based), read_end, pos (1-based
@@ -116,18 +56,20 @@ read_ft_mod_region <- function(file, region_start, region_end) {
       as.data.frame()
   }
 
-  blocks <- expand_bed12_blocks(df, drop_flanking = TRUE)
+  blocks <- convert_ft_bed12_to_bed6(df, include_read_start_end = TRUE,
+                                    drop_sentinels = TRUE)
   if (nrow(blocks) == 0) return(data.frame())
+  blocks <- blocks[order(match(blocks$RID, df$RID)), , drop = FALSE]
 
   # blocks are 0-based half-open and 1 bp wide for a modification call, so the
   # block end is the 1-based coordinate of the modified base
   out <- data.frame(
     chr        = blocks$chr,
-    RID        = blocks$RID,
+    RID        = as.character(blocks$RID),
     strand     = blocks$strand,
     read_start = blocks$read_start + 1L,
     read_end   = blocks$read_end,
-    pos        = blocks$block_end,
+    pos        = blocks$end,
     stringsAsFactors = FALSE)
 
   out[out$pos >= region_start & out$pos <= region_end, , drop = FALSE]
@@ -201,21 +143,24 @@ read_fiberhmm_region <- function(file,
   colnames(df) <- cols
 
   # FiberHMM beds have no sentinel blocks, unlike `ft extract` output
-  blocks <- expand_bed12_blocks(df, drop_flanking = FALSE)
+  # The two TF edge columns are not block scores and were never used here.
+  blocks <- convert_ft_bed12_to_bed6(df[, seq_len(min(ncol(df), 13L)), drop = FALSE],
+                                    include_read_start_end = TRUE,
+                                    drop_sentinels = FALSE, keep_block_scores = TRUE)
   if (nrow(blocks) == 0) return(data.frame())
 
   if ("block_score" %in% colnames(blocks) && min_score > 0)
     blocks <- blocks[blocks$block_score >= min_score, , drop = FALSE]
 
   data.frame(chr        = blocks$chr,
-             start      = blocks$block_start,
-             end        = blocks$block_end,
-             RID        = blocks$RID,
-             size       = blocks$size,
+             start      = blocks$start,
+             end        = blocks$end,
+             RID        = as.character(blocks$RID),
+             size       = as.integer(blocks$end - blocks$start),
              score      = if ("block_score" %in% colnames(blocks)) blocks$block_score else NA_real_,
              read_start = blocks$read_start,
              read_end   = blocks$read_end,
-             class      = assign_size_class(blocks$size, size_breaks),
+             class      = assign_size_class(blocks$end - blocks$start, size_breaks),
              stringsAsFactors = FALSE)
 }
 

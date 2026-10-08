@@ -186,7 +186,7 @@ save_plots <- function(result, footprints, sample_colors, output_dir, include_ha
 
 save_all_plots <- function(result, footprints, output_dir, sample_colors,
                                embedding = NULL) {
-  plotted <- save_fiberseq_plots(result, footprints, output_dir, sample_colors,
+  plotted <- save_fiberseq_plots(result, footprints, lcl_output_path(output_dir), sample_colors,
     embedding = embedding)
   view <- fiberseq_display_result(result)
   short_colors <- setNames(unname(sample_colors), sub("_.*$", "", names(sample_colors)))
@@ -365,7 +365,7 @@ if (params$regenerate_plots) {
       stopifnot(all(signature$regions$region_id %in% names(paths)))
       paths <- paths[signature$regions$region_id]
       caches <- cache_footprint_tracks(signature$regions, tracks_dir,
-        file.path(output_dir, "footprint_summary"), workers = 3L, reuse = TRUE)
+        lcl_output_path(file.path(output_dir, "footprint_summary")), workers = 3L, reuse = TRUE)
       colors <- sample_palette(signature$sample_table$sample_name)
       audit <- list()
       for (rid in names(paths)) {
@@ -449,7 +449,7 @@ if (params$regenerate_plots) {
       sample_colors <- setNames(unname(short_colors[sub("_.*$", "", sample_table$sample_name)]), sample_table$sample_name)
       footprint_summaries <- cache_footprint_tracks(regions,
         "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks",
-        file.path(output_dir, "footprint_summary"), workers = 3L, reuse = reuse_cache)
+        lcl_output_path(file.path(output_dir, "footprint_summary")), workers = 3L, reuse = reuse_cache)
       paths <- main_paths
       audit <- list()
       for (rid in names(main_paths)) {
@@ -521,42 +521,7 @@ knitr::kable(data.table::fread(validation_file))
 - Nucleosome occupancy is the fraction covered by a 130–160 bp footprint at each base, counting overlapping footprints on a read once
 
 ```{r gallery-helper, include = FALSE}
-pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
-xpdfrc <- tempfile("xpdfrc-")
-sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
-mono <- "/usr/share/fonts/dejavu/DejaVuSansMono"
-writeLines(c(
-  paste0("fontFile Helvetica ", sans, "Regular.ttf"),
-  paste0("fontFile Helvetica-Bold ", sans, "Bold.ttf"),
-  paste0("fontFile Helvetica-Oblique ", sans, "Italic.ttf"),
-  paste0("fontFile Helvetica-BoldOblique ", sans, "BoldItalic.ttf"),
-  paste0("fontFile Times-Roman ", sans, "Regular.ttf"),
-  paste0("fontFile Times-Bold ", sans, "Bold.ttf"),
-  paste0("fontFile Times-Italic ", sans, "Italic.ttf"),
-  paste0("fontFile Times-BoldItalic ", sans, "BoldItalic.ttf"),
-  paste0("fontFile Courier ", mono, ".ttf"),
-  paste0("fontFile Courier-Bold ", mono, "-Bold.ttf"),
-  paste0("fontFile Courier-Oblique ", mono, "-Oblique.ttf"),
-  paste0("fontFile Courier-BoldOblique ", mono, "-BoldOblique.ttf"),
-  "fontFile Symbol /usr/share/fonts/dejavu/DejaVuSans.ttf",
-  "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
-
-inline_png <- function(path, label, dpi = 120) {
-  stopifnot(file.exists(path), file.info(path)$size > 0)
-  prefix <- tempfile("fig-")
-  status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
-    shQuote(path), shQuote(prefix)))
-  png <- paste0(prefix, "-000001.png")
-  stopifnot(status == 0, file.exists(png))
-  on.exit(unlink(png))
-  cat(as.character(htmltools::tags$figure(
-    htmltools::tags$img(
-      src = base64enc::dataURI(file = png, mime = "image/png"),
-      alt = label, loading = "lazy",
-      style = "display:block;max-width:100%;height:auto;"),
-    htmltools::tags$figcaption(label))), "\n\n")
-  invisible(NULL)
-}
+source(file.path(code_dir, "report_helpers.r"), local = TRUE)
 
 figure_gallery <- function(name, title) {
   cat("\n## ", title, "\n\n", sep = "")
@@ -800,7 +765,7 @@ example_inputs <- local({
   if (example_regenerate) {
     tf_caches <- cache_footprint_tracks(example_regions,
       "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks",
-      file.path(cache_dir, "tf_tracks"), workers = 3L, reuse = TRUE)
+      lcl_output_path(file.path(cache_dir, "tf_tracks")), workers = 3L, reuse = TRUE)
   }
   lapply(seq_along(example_saved), function(i) {
     saved <- example_saved[[i]]
@@ -815,7 +780,7 @@ example_inputs <- local({
       full_span = TRUE, matrix_dir = NULL, reuse = FALSE)
     pooled <- leiden_manhattan_cluster(dat$met_mat, dat$rids_df,
       region$analysis_start, region$analysis_end, window_size = 0L,
-      k_neighbors = 10L, resolution = 1, seed = 1L, impute_missing = FALSE)
+      k_neighbors = 10L, resolution = 1, seed = 1L)
     pooled$region <- region
     pooled$region$region_type <- "asfire_all_reads"
     pooled$site_met_mat <- dat$met_mat
@@ -1035,8 +1000,8 @@ allele filtering is applied, and reads are not downsampled. Clustering uses
 the existing m6A Manhattan/Leiden helpers with `window_size = 0`, `k = 10`,
 resolution 1 and seed 1, as in the selected AS-FIRE figures.
 
-The canonical TSS BED encodes 20 bp intervals `[TSS - 10, TSS + 10)` in
-zero-based coordinates. Use their centers (`start + 11` in one-based coordinates)
+The canonical TSS BED encodes 1 bp intervals `[TSS, TSS + 1)` in
+zero-based coordinates. Use `start` as TSS0 (`start + 1` in one-based coordinates)
 and the exactly 2,000 bp half-open window `[TSS0 - 1000, TSS0 + 1000)`.
 Read-footprint and occupancy plots orient the coordinates by gene strand.
 Dashed lines mark the TSS (0 bp on these relative axes), including each
@@ -1054,9 +1019,9 @@ local({
   tss_bed$gene <- vapply(strsplit(tss_bed$annotation, ";", fixed = TRUE), `[`, character(1), 3L)
   selected <- tss_bed[tss_bed$gene %in% genes, , drop = FALSE]
   stopifnot(nrow(selected) == length(genes), !anyDuplicated(selected$gene),
-    all(selected$end - selected$start == 20L))
+    all(selected$end - selected$start == 1L))
   selected <- selected[match(genes, selected$gene), , drop = FALSE]
-  tss0 <- selected$start + 10L
+  tss0 <- selected$start
   promoters <- data.frame(region_id = genes, gene = genes, chr = selected$chr,
     start = tss0 - 1000L, end = tss0 + 1000L,
     analysis_start = tss0 - 999L, analysis_end = tss0 + 1000L,
@@ -1083,14 +1048,14 @@ local({
   tryCatch({
     caches <- cache_footprint_tracks(promoters,
       "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks",
-      cache_dir, workers = 2L, reuse = FALSE)
+      lcl_output_path(cache_dir), workers = 2L, reuse = FALSE)
     for (i in seq_len(nrow(promoters))) {
       region <- promoters[i, , drop = FALSE]
       dat <- assemble_region_m6a(sample_table = samples, region = region,
         full_span = TRUE, matrix_dir = NULL, reuse = FALSE)
       result <- leiden_manhattan_cluster(dat$met_mat, dat$rids_df,
         region$analysis_start, region$analysis_end, window_size = 0L,
-        k_neighbors = 10L, resolution = 1, seed = 1L, impute_missing = FALSE)
+        k_neighbors = 10L, resolution = 1, seed = 1L)
       result$region <- region
       result$site_met_mat <- dat$met_mat
       result$assignments$original_RID <- dat$rids_df$original_RID[

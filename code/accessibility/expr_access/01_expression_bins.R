@@ -9,7 +9,7 @@
 #'     fiber-seq m6A) enter the mean;
 #'   * TPM from union-exon gene lengths (gencode v46, the STAR annotation);
 #'   * TSS: Ensembl_canonical transcript TSS (gencodev46_Ensembl_canonical_TSS
-#'     .bed; the 20 bp interval is TSS +/- 10, so tss0 = start + 10, 0-based);
+#'     .bed; 1 bp interval, so tss0 = start, 0-based);
 #'   * bins: mean TPM < 1 = not_expressed, else quartiles Q1(low)..Q4(high).
 #'
 #' Output: <OUT_DIR>/tss_expression_bins.tsv
@@ -77,7 +77,7 @@ bed <- fread(TSS_BED, header = FALSE,
              col.names = c("chrom", "start", "end", "name", "score", "strand"))
 bed[, c("gene_id", "tx_id", "gene_name", "gene_type") :=
       tstrsplit(name, ";", keep = 1:4)]
-bed[, tss := start + 10L]  # interval is TSS +/- 10 (verified against the GTF)
+bed[, tss := start]  # 1 bp interval: start is the 0-based TSS base
 pc <- bed[gene_type == "protein_coding" & chrom %in% KEEP_CHROM,
           .(gene_id, gene_name, chrom, tss, strand)]
 message(nrow(pc), " protein-coding genes on ", uniqueN(pc$chrom), " chromosomes")

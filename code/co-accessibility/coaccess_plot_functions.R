@@ -38,6 +38,8 @@ suppressPackageStartupMessages({
   library(patchwork)
 })
 
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+
 TABIX_BIN <- "/project/spott/cshan/envs/dimelo/bin/tabix"
 
 # per-fiber m6A and nucleosome calls, from the existing `ft extract` run. These are
@@ -135,51 +137,6 @@ load_region <- function(region, samples, root, fire_root, fire_ver = "v0.1") {
 }
 
 
-#' Expand a BED12 `ft extract` slice into one row per block.
-#'
-#' In `ft extract` output the first and last block of every row are format
-#' sentinels ft adds so the blocks span chromStart..chromEnd (verified on m6a and
-#' nuc: first block size 0 at offset 0, last block size 1 ending exactly at
-#' chromEnd). Both are dropped when `sentinels = TRUE`, matching
-#' convert_ft_bed12_to_bed6() in topic_modelling_functions.r - kept, the trailing
-#' one draws a fake 1-bp feature at every fiber's end. The FiberHMM extracts
-#' (firehmm_tf / firehmm_footprint) have NO sentinels - every block is a real
-#' footprint - so those are read with `sentinels = FALSE`.
-#'
-#' @param keys optional character vector of `paste(sample, RID)` to keep.
-#' @return data.table(key, RID, start, end) in BED coordinates.
-read_bed12_blocks <- function(path, chrom, start, end, sample_name, keys = NULL,
-                              sentinels = TRUE) {
-  # `key` is a reserved argument of data.table(), so a column of that name must be
-  # assigned after construction, never passed to the constructor.
-  empty <- function() {
-    d <- data.table(RID = character(0), start = numeric(0), end = numeric(0))
-    d[, key := character(0)][]
-  }
-  lo <- start; hi <- end        # region bounds, renamed so the column names below
-                                # (also start/end) cannot shadow them
-
-  cols <- c("chrom", "chromStart", "chromEnd", "RID", "score", "strand",
-            "thickStart", "thickEnd", "rgb", "blockCount", "blockSizes", "blockStarts")
-  dt <- tabix_region(path, chrom, lo, hi, cols)
-  if (nrow(dt) == 0) return(empty())
-  dt[, key := paste(sample_name, RID)]
-  if (!is.null(keys)) dt <- dt[key %in% keys]
-  if (nrow(dt) == 0) return(empty())
-
-  out <- dt[, {
-    sz <- as.numeric(strsplit(blockSizes, ",", fixed = TRUE)[[1]])
-    st <- as.numeric(strsplit(blockStarts, ",", fixed = TRUE)[[1]])
-    n <- min(length(sz), length(st))
-    ok <- if (sentinels) setdiff(seq_len(n), c(1L, n)) else seq_len(n)
-    ok <- ok[sz[ok] > 0]                  # drop any residual empty block
-    .(start = chromStart + st[ok], end = chromStart + st[ok] + sz[ok])
-  }, by = .(key, RID)]
-
-  out[end > lo & start < hi]
-}
-
-
 #' Attach the per-fiber m6A track (`ft extract`), the FiberHMM nucleosome calls
 #' (firehmm_footprint), and the size-binned FiberHMM footprints
 #' (firehmm_tf/ft_by_size).
@@ -193,32 +150,39 @@ read_bed12_blocks <- function(path, chrom, start, end, sample_name, keys = NULL,
 load_ft_tracks <- function(res, keys = NULL, ft_root = FT_RESULT_DIR,
                            hmm_root = FIREHMM_DIR) {
   region <- res$region
-  grab <- function(kind) {
+  grab <- function(kind, fiberhmm = FALSE) {
     rbindlist(lapply(res$samples, function(s) {
-      p <- file.path(ft_root, s, "extracted_results", paste0(kind, "_by_chr"),
-                     sprintf("%s.ft_extracted_%s.%s.bed.gz", s, kind, region$chrom))
+      if (fiberhmm) {
+        # Only the file names drop the underscore; read keys retain sample_name.
+        s2 <- gsub("_", "", s, fixed = TRUE)
+        p <- file.path(hmm_root, paste0("firehmm_", kind), s2,
+                       sprintf("%s_hmm_extracted_%s_%s.bed.gz", s2, kind, region$chrom))
+      } else {
+        p <- file.path(ft_root, s, "extracted_results", paste0(kind, "_by_chr"),
+                       sprintf("%s.ft_extracted_%s.%s.bed.gz", s, kind, region$chrom))
+      }
       if (!file.exists(p)) {
-        warning("missing ft extract track: ", p, call. = FALSE)
+        warning(if (fiberhmm) "missing FiberHMM track: " else "missing ft extract track: ",
+                p, call. = FALSE)
         return(NULL)
       }
-      d <- read_bed12_blocks(p, region$chrom, region$start, region$end, s, keys)
-      if (nrow(d)) d[, sample_name := s]
-      d
-    }), fill = TRUE)
-  }
-  # FiberHMM sample dirs drop the underscore (LPS_0 -> LPS0); keys/sample_name
-  # keep the canonical name so they match the spans
-  grab_hmm <- function(kind) {
-    rbindlist(lapply(res$samples, function(s) {
-      s2 <- gsub("_", "", s, fixed = TRUE)
-      p <- file.path(hmm_root, paste0("firehmm_", kind), s2,
-                     sprintf("%s_hmm_extracted_%s_%s.bed.gz", s2, kind, region$chrom))
-      if (!file.exists(p)) {
-        warning("missing FiberHMM track: ", p, call. = FALSE)
-        return(NULL)
+      rows <- read_tabix_region(p, GenomicRanges::GRanges(
+        region$chrom, IRanges::IRanges(region$start + 1L, region$end)))
+      if (nrow(rows) && !is.null(keys))
+        rows <- rows[paste(s, rows[[4]]) %in% keys, , drop = FALSE]
+      if (!nrow(rows)) {
+        d <- data.table(RID = character(0), start = numeric(0), end = numeric(0))
+        d[, key := character(0)]
+        return(d)
       }
-      d <- read_bed12_blocks(p, region$chrom, region$start, region$end, s, keys,
-                             sentinels = FALSE)
+      d <- as.data.table(convert_ft_bed12_to_bed6(rows, drop_sentinels = !fiberhmm))
+      # LCL sentinel removal groups by RID; retain this track's original read
+      # order, and its rule excluding any remaining zero-width blocks.
+      d <- d[order(match(RID, rows[[4]]))]
+      d <- d[end > start & end > region$start & start < region$end,
+             .(RID, start = as.numeric(start), end = as.numeric(end))]
+      d[, key := paste(s, RID)]
+      setcolorder(d, c("key", "RID", "start", "end"))
       if (nrow(d)) d[, sample_name := s]
       d
     }), fill = TRUE)
@@ -244,7 +208,7 @@ load_ft_tracks <- function(res, keys = NULL, ft_root = FT_RESULT_DIR,
     }), fill = TRUE)
   }
   res$m6a <- grab("m6a")
-  res$nuc <- grab_hmm("footprint")   # the FiberHMM nucleosome calls
+  res$nuc <- grab("footprint", fiberhmm = TRUE)   # the FiberHMM nucleosome calls
   res$size_fps <- rbindlist(lapply(FP_SIZE_BINS, grab_size), fill = TRUE)
   res
 }

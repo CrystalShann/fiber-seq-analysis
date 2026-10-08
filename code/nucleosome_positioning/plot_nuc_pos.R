@@ -21,25 +21,12 @@ suppressPackageStartupMessages({
   library(cowplot)
 })
 
-# 25-colour cluster palette of the Leiden / topic-model notebooks
-CLUSTER_COLORS <- c(
-  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00", "black", "gold1",
-  "skyblue2", "#FB9A99", "palegreen2", "#CAB2D6", "#FDBF6F", "gray70", "khaki2",
-  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4", "darkturquoise",
-  "green1", "yellow4", "yellow3", "darkorange4", "brown"
-)
-
-# "clusterN" -> colour N of CLUSTER_COLORS (position in `levels` otherwise)
-cluster_palette <- function(levels) {
-  idx <- suppressWarnings(as.integer(sub("^cluster", "", levels)))
-  if (anyNA(idx)) idx <- seq_along(levels)
-  cols <- if (max(idx) <= length(CLUSTER_COLORS)) CLUSTER_COLORS[idx]
-          else grDevices::colorRampPalette(CLUSTER_COLORS)(max(idx))[idx]
-  setNames(cols, levels)
-}
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
+       local = TRUE)
 
 # timepoint colours keyed by LPS minutes (sequential, as in the Leiden notebook)
-TP_COLORS <- c("0" = "#bdbdbd", "5" = "#6baed6", "10" = "#2171b5", "15" = "#08306b")
+TP_COLORS <- setNames(LEIDEN_TIMEPOINT_COLORS,
+                     sub("^LPS_", "", names(LEIDEN_TIMEPOINT_COLORS)))
 TP_LABELS <- setNames(paste0("LPS ", names(TP_COLORS), " min"), names(TP_COLORS))
 
 # footprint classes drawn in the read tracks (NUC_ prefix: the topic-model
@@ -110,7 +97,7 @@ plot_read_footprints <- function(fp_r, reads_r, pos_r, meta) {
   ord[, cluster := droplevels(cluster)]
   setorder(ord, cluster, timepoint, plus1_mid, RID, na.last = TRUE)
   ord[, row := seq_len(.N), by = cluster]
-  pal <- cluster_palette(levels(ord$cluster))
+  pal <- cluster_id_palette(levels(ord$cluster))
 
   spans <- ord[, .(cluster, row, x0 = pmax(rel_read_start, lo),
                    x1 = pmin(rel_read_end, hi))][x0 <= x1]
@@ -161,7 +148,7 @@ plot_occupancy_by_cluster <- function(occ_cl, reads_r, meta) {
   ggplot(d, aes(pos, fraction, colour = cluster)) +
     anchor_line() +
     geom_line(linewidth = 0.6) +
-    scale_colour_manual(values = cluster_palette(levels(d$cluster)), guide = "none") +
+    scale_colour_manual(values = cluster_id_palette(levels(d$cluster)), guide = "none") +
     position_scale(meta) +
     scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
                        expand = expansion(mult = c(0, 0.02))) +

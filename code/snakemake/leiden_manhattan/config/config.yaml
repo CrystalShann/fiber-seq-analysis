@@ -1,0 +1,151 @@
+project_root: /project/spott/cshan/fiber-seq
+code_dir: /project/spott/cshan/fiber-seq/code
+results_dir: /project/spott/cshan/fiber-seq/snakemake_results/leiden_man_clustering
+
+# Clustering: every combination of the lists below is run (keep one value each
+# for the standard run; add values for a parameter sweep).
+clustering:
+  window_size: [0]        # 0 = each m6A site is a feature
+  k_neighbors: [10]
+  resolution: [1]
+  seed: [1]
+  kernel_sigma: null      # null = mean of retained KNN distances
+
+umap:
+  n_neighbors: 15
+  min_dist: 0.1
+  seed: 1
+
+# Nucleosome size filter. Inclusive bounds in bp; null = no bound on that side.
+# Each dataset may override these under footprints.nucleosome.
+# Track name is derived from the bounds: nuc_130-160bp, nuc_gt100bp (min 101, max null),
+# nuc_all (both null).
+nucleosome_size_defaults:
+  min_size: 130
+  max_size: 160
+
+datasets:
+
+  macrophage:
+    sample_sheet: config/samples_macrophage.tsv
+    m6a: "{fire_dir}/extracted_results/m6a_by_chr/{sample_name}.ft_extracted_m6a.{chr}.bed.gz"
+    read_filter: [window_span]        # physical whole-window coverage; retain zero-m6A reads
+    annotate_by: [timepoint]          # sample_name colours = LEIDEN_TIMEPOINT_COLORS
+    regions:
+      tss:
+        tss_bed: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
+        flank_bp: 1000                # analysis: TSS - 1000 through TSS + 999 (2000 bp)
+        width_convention: half_open_2000bp
+        genes:                        # region_id: GENCODE gene name
+          IL1B: IL1B
+          TNF: TNF
+          IL1A: IL1A
+          PTGS2: PTGS2
+          IL8: CXCL8
+          CXCL2: CXCL2
+          IL6: IL6
+          RELB: RELB
+      bed: config/macrophage_custom_regions.bed  # BED: 0-based, half-open; IDs from column 4
+    footprints:
+      nucleosome:
+        source: "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/firehmm_footprint/{fiberhmm_label}/{fiberhmm_label}_hmm_extracted_footprint_{chr}.bed.gz"
+        format: bed13_fiberhmm        # 13 columns; keep every block (no sentinels)
+        min_size: null                # current macrophage setting (nucleosome_positioning): no size filter
+        max_size: null
+      tf:
+        source: "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/firehmm_tf/ft_by_size/size{size}/{fiberhmm_label}/{fiberhmm_label}_tf_size{size}_{chr}.bed.gz"
+        format: bed6_per_sample
+        sizes: ["10-30", "40-60", "60-80"]
+    plots:                            # current macrophage notebook outputs
+      - cluster_met_profiles
+      - cluster_composition
+      - heatmap
+      - met_fraction_lines
+      # available once footprints are wired in:
+      # - read_footprints
+      # - occupancy_by_cluster
+      # - knn_graph
+      # - umap_overview
+    plot_options:
+      line_smooth_k: 1
+
+  lcl_asfire:
+    sample_sheet: config/samples_lcl.tsv          # build with config/make_lcl_sample_sheet.R
+    m6a: "{fire_dir}/extracted_results/m6a_by_chr/{sample_name}.ft_extracted_m6a.{chr}.bed.gz"
+    read_filter: [window_span, phased_heterozygous] # whole-window coverage + focal-SNP phasing
+    annotate_by: [sample, allele]
+    phasing:
+      cache_dir: phase_summary                     # under results_dir/lcl_asfire/
+    regions:
+      asfire_top:
+        asfire_file: /project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds
+        top_n: 10
+        width_bp: 2000
+        q_cutoff: 0.1
+        min_coverage: 20
+        min_fire_freq: 0.1
+        samples: contributing                      # cluster only the LCLs listed for each SNP
+    footprints:
+      nucleosome:
+        source: "{fire_dir}/extracted_results/nuc_by_chr/{sample_name}.ft_extracted_nuc.{chr}.bed.gz"
+        format: bed12_fibertools                   # 12 columns; drop first/last sentinel blocks
+        min_size: 130                              # current LCL main setting
+        max_size: 160                              # rank 1/2/5 examples used min 101, max null
+      tf:
+        source: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks/{chr}/combined_{chr}_{size}bp_fps.bed.gz"
+        format: bed4_pooled                        # no sample ID: matched by original read name
+        sizes: ["10-30", "40-60", "60-80"]
+    plots:                                         # current leiden_LCL.Rmd top-10 outputs
+      - fiberseq_profiles_composition
+      - cluster_proportions
+      - umap_overview
+      - haplotype_example
+      - knn_graph
+      - knn_graph_by_allele
+      - knn_allele_composition
+      - knn_allele_connectivity
+      - methylation_proportion_by_cluster
+      - heatmap_m6a_footprints
+      - read_footprints                            # fig1_read_footprints
+      - occupancy_by_cluster                       # fig2_occupancy_by_cluster
+      - cluster_sample_composition
+      - pairwise_m6a_delta
+    plot_options:
+      delta_smooth_bp: 25
+      delta_top_n: 5                               # pairwise_m6a_delta only for ranks 1-5
+
+  lcl_promoters:                                   # PRDX1 / ALAS1: all reads, no phasing
+    sample_sheet: config/samples_lcl.tsv
+    m6a: "{fire_dir}/extracted_results/m6a_by_chr/{sample_name}.ft_extracted_m6a.{chr}.bed.gz"
+    read_filter: [window_span]
+    annotate_by: [sample]
+    regions:
+      tss:
+        tss_bed: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
+        flank_bp: 1000                             # current: exactly 2000 bp [TSS0 - 1000, TSS0 + 1000)
+        width_convention: half_open_2000bp
+        genes: {PRDX1: PRDX1, ALAS1: ALAS1}
+        samples: all
+    footprints:
+      nucleosome:
+        source: "{fire_dir}/extracted_results/nuc_by_chr/{sample_name}.ft_extracted_nuc.{chr}.bed.gz"
+        format: bed12_fibertools
+        min_size: 130
+        max_size: 160
+      tf:
+        source: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks/{chr}/combined_{chr}_{size}bp_fps.bed.gz"
+        format: bed4_pooled
+        sizes: ["10-30", "40-60", "60-80"]
+    plots:
+      - umap_overview
+      - cluster_proportions
+      - read_footprints
+      - occupancy_by_cluster
+      - heatmap_m6a_footprints
+
+slurm:
+  account: pi-spott
+  partition: caslake
+  default_mem_mb: 32000
+  default_runtime_min: 240
+  r_module: R/4.4.1

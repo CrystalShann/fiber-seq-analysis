@@ -53,11 +53,12 @@ make_gencode_v46_all_tss.sh  ->  01_make_fire_universe.sh  ->  02_read_spans.sh
 
 ### 0. `make_gencode_v46_all_tss.sh` — unchanged
 
-The only script carried over. Builds 20 bp TSS intervals from the GENCODE v46 GTF
-and the `Ensembl_canonical` subset used as gene anchors:
+The only script carried over. Builds 20 bp TSS intervals from the GENCODE v46 GTF,
+the `Ensembl_canonical` subset, and the 1 bp canonical TSS bed used as gene anchors:
 
-- `/project/spott/cshan/annotations/gencode.v46.annotation_all_tss.bed` (254,070 transcript TSSs)
-- `/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed` (63,086 canonical TSSs, one per gene)
+- `/project/spott/cshan/annotations/gencode.v46.annotation_all_tss.bed` (254,070 transcript TSSs, 20 bp)
+- `/project/spott/cshan/annotations/TSS_interval_gencodev46_Ensembl_canonical.bed` (63,086 canonical TSSs, one per gene, 20 bp)
+- `/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed` (same 63,086 TSSs as 1 bp rows, start = 0-based TSS)
 
 ### 1. `01_make_fire_universe.sh` — the shared element universe
 
@@ -182,7 +183,7 @@ m6A and nucleosomes come from the **existing** `ft extract` run under
 `macrophage_project/FiberHMM/extract/ft_result_dir` — no `ft` invocation is needed
 anywhere in this pipeline. Those files are BED12 with one row per fiber and the
 features as blocks; note every row carries a leading **size-0 sentinel block** at
-offset 0, which `read_bed12_blocks()` drops.
+offset 0, which the shared `convert_ft_bed12_to_bed6()` drops.
 
 They are **display only**. The accessibility call the 2×2 is built from is always
 the FIRE elements from `lizarraga_FIRE`. `ft_result_dir` has no FIRE scoring at all
@@ -201,7 +202,7 @@ function.
 |---|---|
 | `load_region()` | tabix fiber spans + FIRE elements for a window, across timepoints |
 | `load_ft_tracks()` | attach m6A + nucleosome blocks from `ft_result_dir` (display only) |
-| `read_bed12_blocks()` | expand a BED12 slice to one row per block, dropping sentinels |
+| `read_tabix_region()` + `convert_ft_bed12_to_bed6()` | read and expand a BED12 slice using the shared LCL helpers |
 | `label_reads()` | per-fiber configuration at the pair, under the same rules as the table |
 | `order_reads()` | sort fibers by timepoint, then configuration, then position |
 | `plot_pair_panels()` | the four stacked panels, pair shaded on each |

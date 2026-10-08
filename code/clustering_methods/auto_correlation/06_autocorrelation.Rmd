@@ -160,6 +160,7 @@ if (!length(region_dirs)) stop("No region results found under ", output)
 
 <!-- load the shared Leiden_Manhattan plotting functions (read plot, m6A heatmap, signal profiles, UMAP, kNN graph, colors) so the figures use the same code, layout and fonts as the Leiden_Manhattan report -->
 ```{r source-leiden-plots, include=FALSE}
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r", local = TRUE)
 ```
 
@@ -186,49 +187,51 @@ nuc_bed12_ex <- read_tsv("/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/re
 
 nuc_bed12_ex <- nuc_bed12_ex[1:1000,]
 
-bed12_col_names <- c("chr", "start", "end", "read_id", "score", "strand", "thickstart", "thickend",
-                     "itemRgb", "blockCount", "blockSizes", "blockStarts")
-
-extract_bed12 <- function(bed12) {
-  
-  colnames(bed12) <- bed12_col_names
-  
-  bed12 %>%
-    # split nucleosome starts and sizes by comma
-    mutate(
-      blockSizes = str_split(blockSizes, ","),
-      blockStarts = str_split(blockStarts, ",")) %>%
-    
-    # One row per nucleosome
-    unnest(c(blockSizes, blockStarts)) %>%
-    
-    mutate(
-      blockSizes = as.integer(blockSizes),
-      blockStarts = as.integer(blockStarts)) %>%
-    
-    # remove the first and last block for each read, 0 and 1 do not contain any info
-    group_by(read_id) %>%
-    mutate(
-      block_index = row_number(),
-      n_blocks = n()
-    ) %>%
-    filter(block_index >1,
-           block_index < n_blocks) %>%
-    
-    # get coordinates of each nucleosome
-    mutate(
-      nuc_start = start + blockStarts + 1,
-      nuc_end = nuc_start + blockSizes,
-      nuc_size = blockSizes
-    ) %>%
-    
-    # keep only nuc start, end and read metadata
-    select(chr, start, end, read_id, strand, nuc_start, nuc_end, nuc_size) %>%
-    
-    ungroup()
+# Preserve this example's historical trailing-comma behavior: its old unnest
+# created a blank block before removing the read's first and last entries.
+# Represent blanks as temporary zero-size blocks for the shared converter.
+nuc_bed12_parse <- as.data.frame(nuc_bed12_ex)
+nuc_trailing <- grepl(",$", nuc_bed12_parse[[11L]])
+stopifnot(identical(nuc_trailing, grepl(",$", nuc_bed12_parse[[12L]])))
+nuc_bed12_parse[[10L]] <- as.integer(nuc_bed12_parse[[10L]]) + as.integer(nuc_trailing)
+for (column in c(11L, 12L)) {
+  nuc_bed12_parse[[column]][nuc_trailing] <-
+    paste0(nuc_bed12_parse[[column]][nuc_trailing], "0")
+}
+nuc_blocks <- convert_ft_bed12_to_bed6(nuc_bed12_parse)
+if (!nrow(nuc_blocks)) {
+  nuc_blocks <- data.frame(chr = character(), start = numeric(), end = numeric(),
+    RID = character(), strand = character())
 }
 
-processed_bed12 <- extract_bed12(nuc_bed12_ex)
+# Recover the example's alignment metadata and input order. The shared converter
+# groups blocks by read ID; each read's first/last entries are sentinel blocks.
+# Keep the metadata in that same order before returning to the input row order.
+nuc_block_rows <- rep(seq_len(nrow(nuc_bed12_ex)), nuc_bed12_parse[[10L]])
+nuc_block_reads <- nuc_bed12_ex[[4L]][nuc_block_rows]
+nuc_block_order <- which(duplicated(nuc_block_reads) &
+  duplicated(nuc_block_reads, fromLast = TRUE))
+# Follow the converter's actual group order, independent of the R locale.
+nuc_block_order <- nuc_block_order[order(match(nuc_block_reads[nuc_block_order],
+  unique(nuc_blocks$RID)))]
+stopifnot(nrow(nuc_blocks) == length(nuc_block_order),
+  identical(as.character(nuc_blocks$RID), as.character(nuc_block_reads[nuc_block_order])))
+nuc_alignment_rows <- nuc_block_rows[nuc_block_order]
+processed_bed12 <- tibble::tibble(
+  chr = nuc_blocks$chr,
+  start = nuc_bed12_ex[[2L]][nuc_alignment_rows],
+  end = nuc_bed12_ex[[3L]][nuc_alignment_rows],
+  read_id = nuc_blocks$RID,
+  strand = nuc_blocks$strand,
+  nuc_start = nuc_blocks$start + 1,
+  nuc_end = nuc_blocks$end + 1,
+  nuc_size = as.integer(nuc_blocks$end - nuc_blocks$start))
+# Repeated read IDs can leave an earlier alignment's blank block inside the
+# read group. Restore the missing coordinates and size produced by old unnest.
+nuc_blank_blocks <- cumsum(nuc_bed12_parse[[10L]])[nuc_trailing]
+nuc_missing <- nuc_block_order %in% nuc_blank_blocks
+processed_bed12[nuc_missing, c("nuc_start", "nuc_end", "nuc_size")] <- NA
+processed_bed12 <- processed_bed12[order(nuc_block_order), ]
 head(processed_bed12, 20)
   
 ```
@@ -755,28 +758,6 @@ autocor_acf_heatmap <- function(result) {
 }
 ```
 
-<!-- pie chart of the number and percent of reads per cluster. Parameters: percent labels drawn for clusters >= 3% -->
-```{r function-autocor-cluster-proportions, include=FALSE}
-autocor_cluster_proportions <- function(result) {
-  groups <- levels(result$assignments$cluster)
-  counts <- data.frame(cluster = factor(groups, levels = groups),
-    n_reads = as.integer(table(result$assignments$cluster)))
-  counts$proportion <- counts$n_reads / sum(counts$n_reads)
-  counts$label <- sprintf("%s\nn=%d (%.1f%%)", counts$cluster, counts$n_reads, 100 * counts$proportion)
-  colors <- cluster_id_palette(groups)
-  rgb <- grDevices::col2rgb(colors) / 255
-  text_colors <- setNames(ifelse(colSums(rgb * c(.299, .587, .114)) < .5, "white", "black"), names(colors))
-  ggplot2::ggplot(counts, ggplot2::aes(x = "", y = proportion, fill = cluster)) +
-    ggplot2::geom_col(width = 1, color = "white", position = ggplot2::position_stack(reverse = TRUE)) +
-    ggplot2::geom_text(ggplot2::aes(label = ifelse(proportion >= .03, sprintf("%.1f%%", 100 * proportion), ""), color = cluster),
-      position = ggplot2::position_stack(vjust = .5, reverse = TRUE), size = 3) +
-    ggplot2::scale_color_manual(values = text_colors, guide = "none") +
-    ggplot2::coord_polar(theta = "y") + ggplot2::scale_fill_manual(values = colors, labels = counts$label) +
-    ggplot2::labs(title = paste0("Cluster proportions: ", nrow(result$assignments), " reads"), fill = NULL) +
-    ggplot2::theme_void() + ggplot2::theme(legend.position = "right", legend.text = ggplot2::element_text(size = 8))
-}
-```
-
 <!-- combine UMAPs colored by cluster, LCL sample and focal SNP allele with the cluster pie chart -->
 ```{r function-autocor-umap-overview, include=FALSE}
 autocor_umap_overview <- function(result) {
@@ -800,7 +781,7 @@ autocor_umap_overview <- function(result) {
   heights <- vapply(legends, fiberseq_legend_height, numeric(1))
   heading <- cowplot::ggdraw() + cowplot::draw_label(result$region$annotation, size = 12)
   plot <- cowplot::plot_grid(plotlist = c(list(heading,
-    cowplot::plot_grid(cluster_plot, sample_plot, allele_plot, autocor_cluster_proportions(result), ncol = 2)), legends),
+    cowplot::plot_grid(cluster_plot, sample_plot, allele_plot, plot_cluster_pie(result), ncol = 2)), legends),
     ncol = 1, rel_heights = c(.45, 8, heights))
   list(plot = plot, height = 8.45 + sum(heights))
 }
@@ -1225,44 +1206,9 @@ region_results <- lapply(region_dirs, read_report_data)
 table { display: block; overflow-x: auto; }
 </style>
 
-<!-- draw every figure the way leiden_LCL.Rmd does: save as PDF at a fixed size, convert to PNG with Liberation Sans fonts, embed in the report. The PNG is temporary and only embedded in the HTML; figure files are written as PDF only (report_pdf_figure with file = path keeps the PDF), into the region's autocorrelation/ subfolder for the ACF clusters and leiden/ for the m6A Leiden clusters. Parameters: 120 dpi; fonts and converter copied from the gallery-helper chunk of leiden_LCL.Rmd -->
+<!-- draw every figure the way leiden_LCL.Rmd does: save as PDF at a fixed size, convert to PNG with Liberation Sans fonts, embed in the report. The PNG is temporary and only embedded in the HTML; figure files are written as PDF only (report_pdf_figure with file = path keeps the PDF), into the region's autocorrelation/ subfolder for the ACF clusters and leiden/ for the m6A Leiden clusters. Parameters: 120 dpi; fonts and converter shared with leiden_LCL.Rmd via report_helpers.r -->
 ```{r gallery-helper, include=FALSE}
-pdftopng <- "/software/xpdf-4.05-el8-x86_64/bin/pdftopng"
-xpdfrc <- tempfile("xpdfrc-")
-sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
-mono <- "/usr/share/fonts/dejavu/DejaVuSansMono"
-writeLines(c(
-  paste0("fontFile Helvetica ", sans, "Regular.ttf"),
-  paste0("fontFile Helvetica-Bold ", sans, "Bold.ttf"),
-  paste0("fontFile Helvetica-Oblique ", sans, "Italic.ttf"),
-  paste0("fontFile Helvetica-BoldOblique ", sans, "BoldItalic.ttf"),
-  paste0("fontFile Times-Roman ", sans, "Regular.ttf"),
-  paste0("fontFile Times-Bold ", sans, "Bold.ttf"),
-  paste0("fontFile Times-Italic ", sans, "Italic.ttf"),
-  paste0("fontFile Times-BoldItalic ", sans, "BoldItalic.ttf"),
-  paste0("fontFile Courier ", mono, ".ttf"),
-  paste0("fontFile Courier-Bold ", mono, "-Bold.ttf"),
-  paste0("fontFile Courier-Oblique ", mono, "-Oblique.ttf"),
-  paste0("fontFile Courier-BoldOblique ", mono, "-BoldOblique.ttf"),
-  "fontFile Symbol /usr/share/fonts/dejavu/DejaVuSans.ttf",
-  "fontFile ZapfDingbats /usr/share/fonts/dejavu/DejaVuSans.ttf"), xpdfrc)
-
-inline_png <- function(path, label, dpi = 120) {
-  stopifnot(file.exists(path), file.info(path)$size > 0)
-  prefix <- tempfile("fig-")
-  status <- system2(pdftopng, c("-cfg", shQuote(xpdfrc), "-q", "-r", dpi, "-f", 1, "-l", 1,
-    shQuote(path), shQuote(prefix)))
-  png <- paste0(prefix, "-000001.png")
-  stopifnot(status == 0, file.exists(png))
-  on.exit(unlink(png))
-  cat(as.character(htmltools::tags$figure(
-    htmltools::tags$img(
-      src = base64enc::dataURI(file = png, mime = "image/png"),
-      alt = label, loading = "lazy",
-      style = "display:block;max-width:100%;height:auto;"),
-    htmltools::tags$figcaption(label))), "\n\n")
-  invisible(NULL)
-}
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/report_helpers.r", local = TRUE)
 
 report_pdf_figure <- function(figure, width, height, label, file = NULL) {
   # file = NULL: temporary PDF for the embedded preview only; otherwise the PDF is kept at that path.
@@ -1472,7 +1418,7 @@ for (entry in region_results) {
 ```{r figure-cluster-proportions, echo=FALSE, results='asis', fig.height=6, purl=TRUE}
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, autocor_cluster_proportions)
+  figure <- report_fiberseq_figure(entry, plot_cluster_pie)
   report_pdf_figure(figure, fiberseq_figure_size(entry, "proportions")[1], fiberseq_figure_size(entry, "proportions")[2], paste(entry$region_id, "Cluster proportions", sep = " — "), file.path(entry$folder, "autocorrelation", "fiberseq_cluster_proportions.pdf"))
 }
 ```
@@ -1622,7 +1568,7 @@ autocor_m6a_leiden <- function(entry) {
   if (is.null(result)) return(entry)
   clustering <- leiden_manhattan_cluster(result$site_met_mat, result$assignments,
     result$region$analysis_start, result$region$analysis_end, window_size = 0L,
-    k_neighbors = 10L, resolution = 1, seed = 1L, impute_missing = FALSE, verbose = FALSE)
+    k_neighbors = 10L, resolution = 1, seed = 1L, verbose = FALSE)
   stopifnot(identical(clustering$assignments$RID, result$assignments$RID))
   result$assignments$cluster <- clustering$assignments$cluster
   result[c("feat_mat", "graph", "n_clusters", "params")] <- clustering[c("feat_mat", "graph", "n_clusters", "params")]
@@ -1750,4 +1696,3 @@ for (entry in region_results) {
   report_pdf_figure(figure, 12, 7, paste(entry$region_id, "Cluster-average ACF: 25–750 bp", sep = " — "), file.path(entry$folder, "autocorrelation", "cluster_average_acf_25_750bp.pdf"))
 }
 ```
-

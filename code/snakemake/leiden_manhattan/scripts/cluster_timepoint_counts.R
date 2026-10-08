@@ -1,0 +1,5 @@
+source(file.path(snakemake@params[["scripts_dir"]], "common.R"))
+load_shared(snakemake@config)
+assignments <- utils::read.delim(snakemake@input[["assignments"]], stringsAsFactors = FALSE)
+if (!"timepoint" %in% names(assignments)) stop("Timepoint annotations require a timepoint sample-sheet column")
+write_tsv(dplyr::count(assignments, cluster, sample_name, timepoint), snakemake@output[["counts"]])

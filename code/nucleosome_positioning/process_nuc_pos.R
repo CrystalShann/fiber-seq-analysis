@@ -17,7 +17,7 @@
 #'   * FiberHMM TF footprints split by size class: BED6 with the footprint size
 #'     in the score column, one tabix-indexed file per size class x sample x
 #'     chromosome.
-#'   * GENCODE v46 Ensembl-canonical TSS BED: one 20-bp interval per gene with
+#'   * GENCODE v46 Ensembl-canonical TSS BED: one 1-bp interval per gene with
 #'     the annotation "gene_id;transcript_id;gene_name;gene_type;tags".
 #'   * The promoter table written by make_promoter_table.R (genes, ENSG,
 #'     strand; its own v49 windows are not used) and the Leiden read-cluster
@@ -40,6 +40,10 @@ suppressPackageStartupMessages({
   library(IRanges)
   library(Rsamtools)
 })
+
+source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
+       local = TRUE)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -71,14 +75,6 @@ sample_dir <- function(sample_name) gsub("_", "", sample_name, fixed = TRUE)
 # "ENSG00000125538.12" -> "ENSG00000125538"
 strip_ensembl_version <- function(x) sub("\\.[0-9]+$", "", x)
 
-# Lines of a tabix-indexed BED overlapping chr:start-end (1-based, closed).
-tabix_lines <- function(bed, chr, start, end) {
-  if (!file.exists(bed)) stop("missing BED: ", bed)
-  tryCatch(
-    scanTabix(TabixFile(bed), param = GRanges(chr, IRanges(start, end)))[[1]],
-    error = function(e) character(0))
-}
-
 # 1-based closed genomic interval -> closed interval in bp relative to the
 # anchor, transcription to the right (mirrored on the minus strand).
 rel_interval <- function(start1, end1, anchor, strand) {
@@ -94,16 +90,16 @@ rel_interval <- function(start1, end1, anchor, strand) {
 # One row per gene: 1-based TSS, strand and the parsed annotation field
 # (gene_id, transcript_id, gene_name, gene_type, transcript_tags) plus the
 # version-stripped `ensg`, so gene_id -> gene_name and ENSG -> TSS lookups are
-# a merge on `ensg`. The 20-bp BED interval is [TSS - 10, TSS + 10) in 0-based
+# a merge on `ensg`. The 1-bp BED interval is [TSS, TSS + 1) in 0-based
 # coordinates (it reproduces the single-base GENCODE v49 TSS of TNF and IL1A
-# exactly), so the 1-based TSS base is start + 11.
+# exactly), so the 1-based TSS base is start + 1.
 load_gencode_tss <- function(path = GENCODE_TSS_PATH) {
   dt <- fread(path, header = FALSE,
               col.names = c("chrom", "start", "end", "annotation", "score", "strand"))
   dt[, c("gene_id", "transcript_id", "gene_name", "gene_type", "transcript_tags") :=
        tstrsplit(annotation, ";", fixed = TRUE)]
   dt[, ensg := strip_ensembl_version(gene_id)]
-  dt[, tss  := start + 11L]
+  dt[, tss  := start + 1L]
   dt[, .(chrom, tss, strand, gene_id, ensg, transcript_id, gene_name, gene_type,
          transcript_tags)]
 }
@@ -249,41 +245,6 @@ build_read_table <- function(assignments, anchors) {
 # Footprint extraction (tabix, per region, RID preserved)
 # ---------------------------------------------------------------------------
 
-# BED12 block lists -> one row per block (0-based half-open), RID preserved.
-expand_bed12_blocks <- function(rows) {
-  sizes_l  <- strsplit(rows$blockSizes,  ",", fixed = TRUE)
-  starts_l <- strsplit(rows$blockStarts, ",", fixed = TRUE)
-  n        <- lengths(sizes_l)
-  sizes    <- as.integer(unlist(sizes_l,  use.names = FALSE))
-  starts   <- as.integer(unlist(starts_l, use.names = FALSE))
-  stopifnot(length(sizes) == length(starts))
-  fp_start <- rep(rows$chromStart, n) + starts
-  data.table(RID = rep(rows$RID, n), fp_start = fp_start,
-             fp_end = fp_start + sizes, fp_size = sizes)[!is.na(fp_size)]
-}
-
-# FiberHMM nucleosome footprints (every block, no size filter) of `reads`
-# (RID, sample_name) that overlap chr:view_start-view_end, read through tabix
-# from each read's own sample BED12.
-extract_nuc_footprints <- function(reads, chr, view_start, view_end) {
-  out <- list()
-  for (sn in unique(reads$sample_name)) {
-    sd  <- sample_dir(sn)
-    bed <- file.path(FP_ROOT, sd, sprintf("%s_hmm_extracted_footprint_%s.bed.gz", sd, chr))
-    txt <- tabix_lines(bed, chr, view_start, view_end)
-    if (!length(txt)) next
-    rows <- fread(text = txt, header = FALSE, select = c(2, 4, 11, 12),
-                  col.names = c("chromStart", "RID", "blockSizes", "blockStarts"),
-                  colClasses = list(character = c(4, 11, 12)))
-    rows <- rows[RID %in% reads[sample_name == sn, RID]]
-    if (!nrow(rows)) next
-    fp <- expand_bed12_blocks(rows)
-    fp <- fp[fp_start < view_end & fp_end > view_start - 1L]
-    if (nrow(fp)) out[[sn]] <- fp[, `:=`(sample_name = sn, fp_class = "nucleosome")]
-  }
-  rbindlist(out)
-}
-
 # TF footprints of `reads` by size class (BED6, size in column 5) overlapping
 # the view window; tabix returns exactly the overlapping intervals.
 extract_tf_footprints <- function(reads, chr, view_start, view_end,
@@ -292,11 +253,11 @@ extract_tf_footprints <- function(reads, chr, view_start, view_end,
   for (cls in size_classes) for (sn in unique(reads$sample_name)) {
     sd  <- sample_dir(sn)
     bed <- file.path(TF_ROOT, cls, sd, sprintf("%s_tf_%s_%s.bed.gz", sd, cls, chr))
-    txt <- tabix_lines(bed, chr, view_start, view_end)
-    if (!length(txt)) next
-    fp <- fread(text = txt, header = FALSE, select = 2:5,
-                col.names = c("fp_start", "fp_end", "RID", "fp_size"),
-                colClasses = list(character = 4))
+    rows <- read_tabix_region(bed, GRanges(chr, IRanges(view_start, view_end)))
+    if (!nrow(rows)) next
+    fp <- as.data.table(rows[, 2:5, drop = FALSE])
+    setnames(fp, c("fp_start", "fp_end", "RID", "fp_size"))
+    fp[, RID := as.character(RID)]
     fp <- fp[RID %in% reads[sample_name == sn, RID]]
     if (nrow(fp))
       out[[paste(cls, sn)]] <- fp[, `:=`(sample_name = sn, fp_class = sub("^size", "tf_", cls))]
@@ -313,8 +274,25 @@ extract_region_footprints <- function(reads, anchors) {
     m  <- anchors[i]
     rr <- reads[region_id == m$region_id, .(RID, sample_name)]
     if (!nrow(rr)) next
+    nuc <- rbindlist(lapply(unique(rr$sample_name), function(sn) {
+      blocks <- as.data.table(extract_nucleosomes(
+        sample_table = data.frame(sample_name = sn),
+        region = list(chr = m$chr, start = m$view_start - 1L, end = m$view_end,
+                      analysis_start = m$view_start, analysis_end = m$view_end),
+        assignments = as.data.frame(rr[sample_name == sn]),
+        input_path = function(sample, chromosome) {
+          sd <- sample_dir(sample$sample_name)
+          path <- file.path(FP_ROOT, sd, sprintf("%s_hmm_extracted_footprint_%s.bed.gz", sd, chromosome))
+          if (!file.exists(paste0(path, ".tbi"))) stop("Missing tabix index for ", path)
+          path
+        },
+        format = "bed13_fiberhmm", min_size = NULL, max_size = NULL))
+      if (!nrow(blocks)) return(NULL)
+      blocks[, .(RID, fp_start = start, fp_end = end, fp_size = as.integer(size),
+                 sample_name = sn, fp_class = "nucleosome")]
+    }))
     fp <- rbindlist(list(
-      extract_nuc_footprints(rr, m$chr, m$view_start, m$view_end),
+      nuc,
       extract_tf_footprints(rr, m$chr, m$view_start, m$view_end)),
       use.names = TRUE)
     if (!nrow(fp)) next

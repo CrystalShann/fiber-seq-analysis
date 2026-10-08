@@ -60,12 +60,19 @@ read_ft_bed12 <- function(bed_file, region = NULL, longest_alignment = FALSE) {
 
 ################################################
 
-convert_ft_bed12_to_bed6 <- function(bed12_df, include_read_start_end = FALSE) {
+convert_ft_bed12_to_bed6 <- function(bed12_df, include_read_start_end = FALSE,
+                                   drop_sentinels = TRUE, keep_block_scores = FALSE) {
   if (nrow(bed12_df) == 0) {
     return(data.frame())
   }
-  if (ncol(bed12_df) != 12L) stop("Expected 12 BED columns")
-  colnames(bed12_df) <- c('chr','start','end','RID','score','strand','read_start','read_end','rgb','blockCount','blockSizes','blockStarts')
+  # Existing calls retain the BED12-only contract. FiberHMM callers opt in by
+  # keeping all blocks or requesting its per-block scores.
+  legacy <- isTRUE(drop_sentinels) && !isTRUE(keep_block_scores)
+  if (legacy && ncol(bed12_df) != 12L) stop("Expected 12 BED columns")
+  if (!ncol(bed12_df) %in% c(12L, 13L)) stop("Expected 12 or 13 BED columns")
+  has_block_scores <- ncol(bed12_df) == 13L
+  colnames(bed12_df) <- c('chr','start','end','RID','score','strand','read_start','read_end','rgb','blockCount','blockSizes','blockStarts',
+                         if (has_block_scores) 'blockScores')
 
   # expand BED12 into one row per block
   block_sizes_list  <- strsplit(sub(",$", "", bed12_df$blockSizes),  ",", fixed = TRUE)
@@ -87,12 +94,28 @@ convert_ft_bed12_to_bed6 <- function(bed12_df, include_read_start_end = FALSE) {
     stringsAsFactors = FALSE
   )
 
-  # remove the first and last rows for each RID (they are added by ft to make the bed12 format work)
-  bed6_df <- bed6_df %>% dplyr::group_by(RID) %>% dplyr::slice(-c(1, n())) %>% dplyr::ungroup()
+  if (keep_block_scores && has_block_scores) {
+    block_scores_list <- strsplit(sub(",$", "", bed12_df$blockScores), ",", fixed = TRUE)
+    if (any(lengths(block_scores_list) != n_blocks))
+      stop("blockScores length does not match blockStarts")
+    bed6_df$block_score <- as.numeric(unlist(block_scores_list, use.names = FALSE))
+  }
+
+  # Preserve the original RID grouping and ordering for every existing LCL
+  # call. Keeping all blocks instead preserves alignment/block order.
+  if (drop_sentinels) {
+    bed6_df <- dplyr::ungroup(dplyr::slice(dplyr::group_by(bed6_df, RID),
+                                         -c(1, dplyr::n())))
+  }
 
   if (include_read_start_end) {
-    read_start_end_df <- bed12_df %>% dplyr::select(RID, read_start, read_end)
-    bed6_df <- bed6_df %>% dplyr::left_join(read_start_end_df, by = "RID")
+    if (drop_sentinels) {
+      read_start_end_df <- dplyr::select(bed12_df, RID, read_start, read_end)
+      bed6_df <- dplyr::left_join(bed6_df, read_start_end_df, by = "RID")
+    } else {
+      bed6_df$read_start <- rep(bed12_df$read_start, n_blocks)
+      bed6_df$read_end <- rep(bed12_df$read_end, n_blocks)
+    }
   }
   return(as.data.frame(bed6_df))
 }

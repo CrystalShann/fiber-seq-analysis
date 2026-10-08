@@ -9,7 +9,7 @@
 
 #   1. bin the per-read accessibility signal into indows across the 2-kb
 #      region; a read's bin value is the mean methylation call in the bin;
-#   2. impute the bins still missing after binning by KNN imputation - optional
+#   2. optionally fill bins still missing after binning by KNN;
 #   3. balance conditions - sample an equal number of reads per condition -
 #      and pool the sampled reads before clustering 
 #   4. read-read similarity = Manhattan distance over the bins
@@ -20,8 +20,10 @@
 #   8. cluster profiles = mean accessibility over the reads of each cluster
 #
 # Method:
-#   * Reads: the full-span read set (filter_met_mat(), the topic model's row
-#     filter. All four LPS timepoints are pooled
+#   * Reads: longest alignments physically spanning the complete analysis
+#     window, including reads with zero m6A calls in that window. Read IDs are
+#     sample-prefixed, with original_RID retained. All LPS timepoints are pooled.
+#   * No KNN imputation (step 2)
 #   * No condition balancing (step 3)
 
 
@@ -37,18 +39,28 @@ suppressMessages({
 # ---------------------------------------------------------------------------
 assemble_region_m6a <- function(sample_names = NULL, region_chr = NULL, region_start = NULL, region_end = NULL,
                                 ft_result_dir = NULL, verbose = TRUE, full_span = FALSE,
-                                sample_table = NULL, region = NULL, matrix_dir = NULL, reuse = TRUE) {
+                                sample_table = NULL, region = NULL, matrix_dir = NULL, reuse = TRUE,
+                                m6a_paths = NULL) {
+  if (!full_span && !is.null(m6a_paths)) stop("m6a_paths requires full_span = TRUE")
   if (full_span) {
     stopifnot(!is.null(sample_table), !is.null(region), nrow(region) == 1L,
       all(c("sample_name", "fire_dir") %in% names(sample_table)),
       !anyDuplicated(sample_table$sample_name),
       region$analysis_start == region$start + 1L, region$analysis_end == region$end,
       region$analysis_start <= region$analysis_end)
-    paths <- file.path(sample_table$fire_dir, "extracted_results", "m6a_by_chr",
-      paste0(sample_table$sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
+    if (is.null(m6a_paths)) {
+      paths <- file.path(sample_table$fire_dir, "extracted_results", "m6a_by_chr",
+        paste0(sample_table$sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
+    } else {
+      if (!is.character(m6a_paths) || length(m6a_paths) != nrow(sample_table) ||
+          anyNA(m6a_paths) || any(!nzchar(m6a_paths)))
+        stop("m6a_paths must contain one nonempty path per sample, in sample_table order")
+      paths <- unname(m6a_paths)
+    }
     required <- c(paths, paste0(paths, ".tbi"))
     if (!all(file.exists(required))) stop("Missing input: ", paste(required[!file.exists(required)], collapse = ", "))
     signature <- list(version = 1L, region = region, samples = sample_table)
+    if (!is.null(m6a_paths)) signature$m6a_paths <- paths
     cache <- NULL
     if (!is.null(matrix_dir)) {
       region_matrix_dir <- file.path(matrix_dir, region$region_id)
@@ -127,15 +139,13 @@ assemble_region_m6a <- function(sample_names = NULL, region_chr = NULL, region_s
 
 # ---------------------------------------------------------------------------
 # run the full Leiden + Manhattan workflow across a table
-# of explicit regions. Regions must contain chr/start/end, and may optionally
-# carry a region_id column; otherwise coordinate-based IDs are created.
+# of explicit regions. Regions must contain 1-based inclusive chr/start/end,
+# and may carry a region_id column; otherwise coordinate-based IDs are created.
 # ---------------------------------------------------------------------------
 leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_dir,
                                              window_size = 0,
                                              k_neighbors = 10,
                                              resolution = 1,
-                                             impute_missing = FALSE,
-                                             impute_k = 5,
                                              sigma = NULL,
                                              seed = 1,
                                              sample_table = NULL,
@@ -176,6 +186,11 @@ leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_di
     stop("region_id values must be unique")
   }
 
+  assembly_samples <- data.frame(
+    sample_name = as.character(sample_names),
+    fire_dir = file.path(ft_result_dir, sample_names),
+    stringsAsFactors = FALSE
+  )
   region_results <- setNames(vector("list", nrow(regions)), regions$region_id)
 
   for (i in seq_len(nrow(regions))) {
@@ -190,22 +205,18 @@ leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_di
       cat("Region:", region_chr, region_start, region_end, "\n")
     }
 
-    dat <- assemble_region_m6a(
-      sample_names = sample_names,
-      region_chr = region_chr,
-      region_start = region_start,
-      region_end = region_end,
-      ft_result_dir = ft_result_dir,
-      verbose = verbose
+    assembly_region <- data.frame(
+      region_id = region_id, chr = region_chr,
+      start = region_start - 1L, end = region_end,
+      analysis_start = region_start, analysis_end = region_end,
+      stringsAsFactors = FALSE
     )
-    if (verbose) {
-      cat(region_id, ": ", nrow(dat$rids_df), " reads x ", ncol(dat$met_mat),
-          " m6A sites before filtering\n", sep = "")
-    }
-
-    met_mat <- filter_met_mat(dat$met_mat, verbose = verbose)
-    rids_df <- dat$rids_df[match(rownames(met_mat), as.character(dat$rids_df$RID)), ,
-                           drop = FALSE]
+    dat <- assemble_region_m6a(
+      full_span = TRUE, sample_table = assembly_samples, region = assembly_region,
+      matrix_dir = NULL, reuse = FALSE, verbose = verbose
+    )
+    met_mat <- dat$met_mat
+    rids_df <- dat$rids_df
     if (verbose) {
       cat(region_id, ": ", nrow(met_mat), " full-span reads x ", ncol(met_mat),
           " m6A sites\n", sep = "")
@@ -214,18 +225,19 @@ leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_di
     res <- leiden_manhattan_cluster(
       met_mat = met_mat,
       rids_df = rids_df,
-      region_start = region_start,
-      region_end = region_end,
+      region_start = assembly_region$analysis_start,
+      region_end = assembly_region$analysis_end,
       window_size = window_size,
       k_neighbors = k_neighbors,
       resolution = resolution,
-      impute_missing = impute_missing,
-      impute_k = impute_k,
       sigma = sigma,
       seed = seed,
       verbose = verbose
     )
 
+    res$assignments$original_RID <- rids_df$original_RID[
+      match(res$assignments$RID, rids_df$RID)
+    ]
     res$assignments$sample_name <- factor(res$assignments$sample_name,
                                           levels = sample_names)
     if (!is.null(sample_table) &&
@@ -294,49 +306,6 @@ bin_read_matrix <- function(met_mat, region_start, region_end, window_size = 0) 
 
   list(mat = mat, window_anno = anno, window_size = window_size)
 }
-
-
-# ---------------------------------------------------------------------------
-# Step 2 (optional): KNN imputation of the bins still missing after binning,
-# donors for a missing feature are the rows that observe it, 
-# ranked by the nan-euclidean distance
-# d(i,j) = sqrt(n_features / n_co-observed * sum_co (x_i - x_j)^2),
-# and the imputed value is the unweighted mean of the k nearest donors
-# ---------------------------------------------------------------------------
-# knn_impute <- function(mat, k = 5, verbose = TRUE) {
-#   na_idx <- which(is.na(mat), arr.ind = TRUE)
-#   if (nrow(na_idx) == 0) {
-#     if (verbose) cat("KNN imputation: no missing values, nothing to impute\n")
-#     return(mat)
-#   }
-#   if (verbose)
-#     cat(sprintf("KNN imputation (k = %d): %d missing values in %d of %d reads\n",
-#                 k, nrow(na_idx), length(unique(na_idx[, "row"])), nrow(mat)))
-# 
-#   obs <- !is.na(mat)
-#   X0  <- mat; X0[!obs] <- 0
-#   n_feat <- ncol(mat)
-# 
-#   # nan-euclidean over co-observed features, by matrix algebra:
-#   # sum_co (x-y)^2 = sum_co x^2 + sum_co y^2 - 2 sum_co xy
-#   n_co  <- obs %*% t(obs)
-#   D2    <- (X0^2) %*% t(obs) + obs %*% t(X0^2) - 2 * (X0 %*% t(X0))
-#   D     <- sqrt(pmax(D2, 0) * n_feat / pmax(n_co, 1))
-#   D[n_co == 0] <- Inf
-#   diag(D) <- Inf
-# 
-#   for (col in unique(na_idx[, "col"])) {
-#     donors <- which(obs[, col])
-#     if (length(donors) == 0) next          # no read observes this feature
-#     rows <- na_idx[na_idx[, "col"] == col, "row"]
-#     for (r in rows) {
-#       d <- D[r, donors]
-#       use <- donors[order(d)][seq_len(min(k, sum(is.finite(d))))]
-#       if (length(use) > 0) mat[r, col] <- mean(mat[use, col])
-#     }
-#   }
-#   mat
-# }
 
 
 # ---------------------------------------------------------------------------
@@ -424,15 +393,33 @@ leiden_partition <- function(graph, resolution = 1, n_iterations = -1, seed = 1)
 }
 
 
+# Keep the existing size ordering (including table()'s order for ties).
+relabel_clusters_by_size <- function(membership) {
+  ord <- names(sort(table(membership), decreasing = TRUE))
+  factor(paste0("cluster", match(as.character(membership), ord)),
+         levels = paste0("cluster", seq_along(ord)))
+}
+
+
+# Feature rows and cluster labels must already be in the same read order.
+cluster_feature_profiles <- function(feat_mat, cluster, na.rm = TRUE) {
+  profiles <- t(sapply(levels(cluster), function(cl)
+    colMeans(feat_mat[cluster == cl, , drop = FALSE], na.rm = na.rm)))
+  colnames(profiles) <- colnames(feat_mat)
+  profiles
+}
+
+
 # ---------------------------------------------------------------------------
 # Steps 1-8 orchestrator.
 #
-# met_mat:  reads x m6A-site matrix, already reduced to the full-span read set
-#           (filter_met_mat()) by the caller.
+# met_mat:  reads x m6A-site matrix from assemble_region_m6a(full_span = TRUE):
+#           longest alignments physically span the entire analysis window;
+#           reads with zero m6A calls in the window remain in the matrix.
 # rids_df:  read info (RID, chr, start, end, strand, sample_name, ...); extra
 #           columns are carried into the assignment table, so every read keeps
 #           its timepoint next to its cluster.
-# window_size / k_neighbors / resolution / impute_missing / sigma: see above.
+# window_size / k_neighbors / resolution / sigma: see above.
 #
 # Returns the feature matrix, the per-read assignments, the per-cluster mean
 # profiles, the KNN graph and the parameters of the run.
@@ -442,7 +429,6 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
                                      window_size = 0,
                                      k_neighbors = 50,
                                      resolution = 1,
-                                     impute_missing = FALSE, impute_k = 5,
                                      sigma = NULL, seed = 1, verbose = TRUE) {
   rids_df <- rids_df[match(rownames(met_mat), as.character(rids_df$RID)), ]
   stopifnot(!any(is.na(rids_df$RID)))
@@ -460,13 +446,11 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
   }
   if (ncol(feat) < 2) stop("fewer than 2 informative features")
 
-  ## step 2: optional KNN imputation
-  if (impute_missing) feat <- knn_impute(feat, k = impute_k, verbose = verbose)
   n_na <- sum(is.na(feat))
   if (n_na > 0)
     warning(sprintf(paste("%d missing feature value(s) remain; dist() will",
                           "rescale the Manhattan distance over co-observed",
-                          "features. Use full-span reads or impute_missing = TRUE."),
+                          "features. Use full-span reads."),
                     n_na))
 
   ## steps 4-6: Manhattan KNN graph with exponential-kernel affinities
@@ -478,9 +462,7 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
   memb <- part$membership[rownames(feat)]      # order by read, not by vertex id
 
   # renumber largest cluster first, so labels are deterministic
-  ord <- names(sort(table(memb), decreasing = TRUE))
-  cluster <- factor(paste0("cluster", match(as.character(memb), ord)),
-                    levels = paste0("cluster", seq_along(ord)))
+  cluster <- relabel_clusters_by_size(memb)
   if (verbose) {
     cat(sprintf("Leiden (resolution = %g): %d clusters\n", resolution, nlevels(cluster)))
     print(table(cluster))
@@ -497,9 +479,7 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
   rownames(assignments) <- NULL
 
   ## step 8: cluster profiles = mean feature value per cluster
-  profiles <- t(sapply(levels(cluster), function(cl)
-    colMeans(feat[cluster == cl, , drop = FALSE], na.rm = TRUE)))
-  colnames(profiles) <- colnames(feat)
+  profiles <- cluster_feature_profiles(feat, cluster)
 
   list(feat_mat    = feat,
        window_anno = binned$window_anno,
@@ -512,7 +492,6 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
                           resolution = resolution, sigma = knn$sigma,
                           mean_knn_dist = knn$mean_knn_dist,
                           quality = part$quality,
-                          impute_missing = impute_missing, impute_k = impute_k,
                           seed = seed,
                           region_start = region_start, region_end = region_end,
                           n_reads = nrow(feat), n_features = ncol(feat)))
@@ -693,7 +672,7 @@ run_lcl_clustering <- function(regions, sample_table, matrix_dir, output_dir,
     } else {
       result <- leiden_manhattan_cluster(dat$met_mat, dat$rids_df, region$analysis_start,
         region$analysis_end, window_size = window_size, k_neighbors = k_neighbors,
-        resolution = leiden_resolution, sigma = kernel_sigma, seed = leiden_seed, impute_missing = FALSE)
+        resolution = leiden_resolution, sigma = kernel_sigma, seed = leiden_seed)
       meta <- dat$rids_df[match(result$assignments$RID, dat$rids_df$RID), , drop = FALSE]
       for (key in setdiff(names(meta), names(result$assignments))) result$assignments[[key]] <- meta[[key]]
       result$site_met_mat <- dat$met_mat

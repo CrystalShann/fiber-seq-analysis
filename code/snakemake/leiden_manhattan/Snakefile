@@ -1,0 +1,304 @@
+"""Manhattan/Leiden analysis for clustering"""
+import csv
+import itertools
+import math
+import re
+from pathlib import Path
+
+WORKFLOW_DIR = Path(workflow.basedir).resolve()
+SCRIPTS = WORKFLOW_DIR / "scripts"
+configfile: str(WORKFLOW_DIR / "config/config.yaml")
+
+RESULTS = str(Path(config["results_dir"]).expanduser().resolve())
+DATASETS = config["datasets"]
+SLURM = config["slurm"]
+selection = config.get("datasets_to_run", list(DATASETS))
+ACTIVE = selection.split(",") if isinstance(selection, str) else selection
+if not ACTIVE or set(ACTIVE) - set(DATASETS):
+    raise ValueError("datasets_to_run must name configured datasets")
+
+def numeric_grid(key, integer=False, minimum=0):
+    values = config["clustering"][key]
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"clustering.{key} must be a nonempty list")
+    result = []
+    for value in values:
+        number = float(value)
+        if not math.isfinite(number) or number < minimum or (integer and int(number) != number):
+            raise ValueError(f"Invalid clustering.{key}: {value}")
+        result.append(str(int(number)) if integer or number.is_integer() else repr(number))
+    if len(set(result)) != len(result):
+        raise ValueError(f"Duplicate clustering.{key} values")
+    return result
+
+WINDOWS = numeric_grid("window_size", integer=True)
+NEIGHBORS = numeric_grid("k_neighbors", integer=True, minimum=1)
+RESOLUTIONS = numeric_grid("resolution", minimum=0)
+SEEDS = numeric_grid("seed", integer=True)
+GRID = list(itertools.product(WINDOWS, NEIGHBORS, RESOLUTIONS, SEEDS))
+RUN = RESULTS + "/{dataset}/{region_id}/bin{window_size}/k{k}/res{resolution}/seed{seed}"
+
+def sheet(dataset):
+    path = Path(DATASETS[dataset]["sample_sheet"])
+    return str(path if path.is_absolute() else WORKFLOW_DIR / path)
+
+def sample_rows(dataset):
+    with open(sheet(dataset), newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    required = {"sample_name", "sample_label", "fire_dir"}
+    if not rows or not required.issubset(rows[0]):
+        raise ValueError(f"Invalid sample sheet: {sheet(dataset)}")
+    for key in ("sample_name", "sample_label"):
+        if any(not row[key] for row in rows) or len({row[key] for row in rows}) != len(rows):
+            raise ValueError(f"Nonunique or empty {key}: {sheet(dataset)}")
+    return rows
+
+for name, ds in DATASETS.items():
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise ValueError(f"Unsafe dataset name: {name}")
+    filters = ds["read_filter"]
+    if "window_span" not in filters or set(filters) - {"window_span", "phased_heterozygous"}:
+        raise ValueError(f"{name}: read_filter must contain window_span, optionally phased_heterozygous")
+    if set(ds.get("annotate_by", [])) - {"timepoint", "sample", "allele"}:
+        raise ValueError(f"{name}: unknown annotate_by value")
+    for footprint in ds.get("footprints", {}).values():
+        if footprint["format"] not in {"bed12_fibertools", "bed13_fiberhmm", "bed6_per_sample", "bed4_pooled"}:
+            raise ValueError(f"{name}: unknown footprint format {footprint['format']}")
+
+def regions_path(wc):
+    return checkpoints.select_regions.get(dataset=wc.dataset).output.regions
+
+def region_rows(dataset):
+    path = checkpoints.select_regions.get(dataset=dataset).output.regions
+    with open(path, newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+def region_row(wc):
+    rows = [row for row in region_rows(wc.dataset) if row["region_id"] == wc.region_id]
+    if len(rows) != 1:
+        raise ValueError(f"Unknown region {wc.dataset}/{wc.region_id}")
+    return rows[0]
+
+def selected_samples(wc):
+    region = region_row(wc)
+    samples = sample_rows(wc.dataset)
+    if region.get("samples_mode", "all") == "contributing":
+        names = region["contributing_samples"].split(",")
+        lookup = {row["sample_name"]: row for row in samples}
+        if set(names) - set(lookup):
+            raise ValueError("Contributing samples absent from sample sheet")
+        return [lookup[name] for name in names]
+    return samples
+
+def m6a_inputs(wc):
+    region = region_row(wc)
+    paths = [DATASETS[wc.dataset]["m6a"].format(**dict(row, chr=region["chr"])) for row in selected_samples(wc)]
+    return paths + [path + ".tbi" for path in paths]
+
+def footprint_inputs(wc):
+    region = region_row(wc)
+    paths = []
+    for kind, spec in DATASETS[wc.dataset].get("footprints", {}).items():
+        sizes = spec["sizes"] if kind == "tf" else [None]
+        samples = [{}] if spec["format"] == "bed4_pooled" else selected_samples(wc)
+        for sample in samples:
+            for size in sizes:
+                paths.append(spec["source"].format(**dict(sample, chr=region["chr"], size=size)))
+    paths = list(dict.fromkeys(paths))
+    return paths + [path + ".tbi" for path in paths if Path(path + ".tbi").exists()]
+
+def raw_inputs(wc):
+    return [f"{RESULTS}/{wc.dataset}/cache/raw/{row['region_id']}.rds" for row in region_rows(wc.dataset)]
+
+def phase_input(wc):
+    if "phased_heterozygous" in DATASETS[wc.dataset]["read_filter"]:
+        return [f"{RESULTS}/{wc.dataset}/cache/phase_cache.rds"]
+    return []
+
+def phasing_sources(wc):
+    # Missing phasing sources intentionally retain the helper's exclusion policy.
+    paths = []
+    for sample in sample_rows(wc.dataset):
+        directory = Path(sample["phasing_dir"])
+        paths.extend([directory / "blocks.tsv", directory / "read-level-phasing.tsv",
+            directory / (sample["sample_name"] + ".5mC.6mA.aligned.phased.vcf.gz"),
+            directory / (sample["sample_name"] + ".5mC.6mA.aligned.phased.vcf.gz.tbi")])
+    return [str(path) for path in paths if path.exists()]
+
+def run_paths(wc, tail):
+    return [RUN.format(dataset=wc.dataset, region_id=row["region_id"], window_size=b, k=k,
+        resolution=r, seed=s) + tail.format(region_id=row["region_id"])
+        for row in region_rows(wc.dataset) for b, k, r, s in GRID]
+
+def region_sources(wc):
+    paths = []
+    for kind, spec in DATASETS[wc.dataset]["regions"].items():
+        if kind == "tss": paths.append(spec["tss_bed"])
+        elif kind == "asfire_top": paths.append(spec["asfire_file"])
+        elif kind == "bed": paths.append(spec["bed"])
+        elif kind != "custom": raise ValueError(f"Unknown region type: {kind}")
+    return paths
+
+def validation_sources(wc):
+    settings = DATASETS[wc.dataset].get("validation", {})
+    paths = []
+    for key in ("baseline_dir", "legacy_dir"):
+        root = settings.get(key)
+        if root and Path(root).is_dir():
+            for pattern in ("run_parameters_*.tsv", "read_cluster_assignments_*.tsv", "clustering.rds"):
+                paths.extend(str(path) for path in Path(root).rglob(pattern))
+    return sorted(set(paths))
+
+def phase_cache_dir(wc):
+    path = Path(DATASETS[wc.dataset].get("phasing", {}).get("cache_dir", "phase_summary"))
+    path = (path if path.is_absolute() else Path(RESULTS) / wc.dataset / path).resolve()
+    if not path.is_relative_to(Path(RESULTS)):
+        raise ValueError(f"Phasing cache must be inside results_dir: {path}")
+    return str(path)
+
+CORE = [str(Path(config["code_dir"]) / path) for path in (
+    "topic_model/topic_modelling_functions.r", "haplotype_phasing/LCL_phasing.r",
+    "clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")]
+COMMON = str(SCRIPTS / "common.R")
+MEM = int(SLURM["default_mem_mb"])
+
+wildcard_constraints:
+    dataset="(?:" + "|".join(re.escape(name) for name in DATASETS) + ")",
+    region_id=r"[A-Za-z0-9_.-]+",
+    window_size=r"\d+", k=r"\d+", resolution=r"[0-9.eE+-]+", seed=r"\d+"
+
+rule all:
+    input:
+        expand(RESULTS + "/{dataset}/summary/run_summary.tsv", dataset=ACTIVE),
+        expand(RESULTS + "/{dataset}/summary/cluster_summary.tsv", dataset=ACTIVE)
+
+checkpoint select_regions:
+    input:
+        samples=lambda wc: sheet(wc.dataset), sources=region_sources,
+        code=CORE + [COMMON] + [str(SCRIPTS / f"regions_{kind}.R") for kind in ("tss", "custom", "bed", "asfire_top")]
+    output: regions=RESULTS + "/{dataset}/regions.tsv"
+    params: scripts_dir=str(SCRIPTS), settings=lambda wc: DATASETS[wc.dataset]["regions"]
+    resources:
+        mem_mb=MEM, runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "select_regions.R")
+
+rule assemble_raw_reads:
+    input:
+        regions=regions_path, samples=lambda wc: sheet(wc.dataset), m6a=m6a_inputs, code=CORE + [COMMON]
+    output: raw=RESULTS + "/{dataset}/cache/raw/{region_id}.rds"
+    params: scripts_dir=str(SCRIPTS), m6a_template=lambda wc: DATASETS[wc.dataset]["m6a"]
+    resources:
+        mem_mb=int(SLURM.get("assemble_reads_mem_mb", 2 * MEM)), runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "assemble_raw_reads.R")
+
+rule prepare_phasing:
+    input:
+        raw=raw_inputs, samples=lambda wc: sheet(wc.dataset), sources=phasing_sources, code=CORE + [COMMON]
+    output: phase=RESULTS + "/{dataset}/cache/phase_cache.rds"
+    params: scripts_dir=str(SCRIPTS), cache_dir=phase_cache_dir
+    resources:
+        mem_mb=MEM, runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "prepare_phasing.R")
+
+rule assemble_reads:
+    input:
+        raw=RESULTS + "/{dataset}/cache/raw/{region_id}.rds", phase=phase_input,
+        footprints=footprint_inputs, code=CORE + [COMMON, str(SCRIPTS / "footprint_io.R"),
+            str(Path(config["code_dir"]) / "clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r")]
+    output: assembled=RESULTS + "/{dataset}/cache/assembled/{region_id}.rds"
+    params:
+        scripts_dir=str(SCRIPTS), settings=lambda wc: {key: DATASETS[wc.dataset][key]
+            for key in ("read_filter", "footprints")},
+        size_defaults=config["nucleosome_size_defaults"]
+    resources:
+        mem_mb=int(SLURM.get("assemble_reads_mem_mb", 2 * MEM)), runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "assemble_reads.R")
+
+rule cluster:
+    input: assembled=RESULTS + "/{dataset}/cache/assembled/{region_id}.rds", code=CORE + [COMMON]
+    output:
+        clustering=RUN + "/tables/clustering.rds",
+        assignments=RUN + "/tables/read_cluster_assignments_{region_id}.tsv",
+        edges=RUN + "/tables/knn_edges_{region_id}.tsv",
+        profiles=RUN + "/tables/cluster_profiles_{region_id}.tsv",
+        features=RUN + "/tables/feature_matrix_{region_id}.tsv",
+        windows=RUN + "/tables/window_annotation_{region_id}.tsv",
+        parameters=RUN + "/tables/run_parameters_{region_id}.tsv"
+    params: scripts_dir=str(SCRIPTS), kernel_sigma=config["clustering"].get("kernel_sigma")
+    resources:
+        mem_mb=int(SLURM.get("cluster_mem_mb", 4 * MEM)), runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "cluster.R")
+
+rule plot:
+    input:
+        clustering=RUN + "/tables/clustering.rds", assembled=RESULTS + "/{dataset}/cache/assembled/{region_id}.rds",
+        code=CORE + [COMMON, str(SCRIPTS / "plot_registry.R"), str(SCRIPTS / "plot_helpers.R"),
+            str(Path(config["code_dir"]) / "clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r"),
+            str(Path(config["code_dir"]) / "clustering_methods/Leiden_Manhattan/diff_avg_m6a.R")]
+    output: plots=directory(RUN + "/plots")
+    params:
+        scripts_dir=str(SCRIPTS), plot_dir=RUN + "/plots", sample_sheet=lambda wc: sheet(wc.dataset),
+        settings=lambda wc: {key: DATASETS[wc.dataset].get(key) for key in ("plots", "plot_options", "annotate_by")},
+        umap=config["umap"]
+    resources:
+        mem_mb=MEM, runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "plot.R")
+
+rule summarize:
+    input:
+        results=lambda wc: run_paths(wc, "/tables/clustering.rds"),
+        plots=lambda wc: run_paths(wc, "/plots"),
+        timepoints=lambda wc: run_paths(wc, "/tables/cluster_timepoint_counts_{region_id}.tsv")
+            if "timepoint" in DATASETS[wc.dataset].get("annotate_by", []) else [],
+        code=CORE + [COMMON]
+    output:
+        run_summary=RESULTS + "/{dataset}/summary/run_summary.tsv",
+        cluster_summary=RESULTS + "/{dataset}/summary/cluster_summary.tsv"
+    params: scripts_dir=str(SCRIPTS), grid=GRID
+    resources:
+        mem_mb=MEM, runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "summarize.R")
+
+rule cluster_timepoint_counts:
+    input: assignments=RUN + "/tables/read_cluster_assignments_{region_id}.tsv", code=CORE + [COMMON]
+    output: counts=RUN + "/tables/cluster_timepoint_counts_{region_id}.tsv"
+    params: scripts_dir=str(SCRIPTS)
+    resources:
+        mem_mb=MEM, runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "cluster_timepoint_counts.R")
+
+
+rule validate_against_existing:
+    input:
+        expand(RESULTS + "/{dataset}/summary/validation_against_existing.tsv", dataset=ACTIVE)
+
+
+rule validate_dataset:
+    input:
+        results=lambda wc: run_paths(wc, "/tables/clustering.rds"),
+        baselines=validation_sources,
+        code=[COMMON, str(SCRIPTS / "validation_helpers.R")]
+    output: report=RESULTS + "/{dataset}/summary/validation_against_existing.tsv"
+    params:
+        scripts_dir=str(SCRIPTS), settings=lambda wc: DATASETS[wc.dataset].get("validation", {})
+    resources:
+        mem_mb=MEM, runtime=SLURM["default_runtime_min"],
+        slurm_account=SLURM["account"], slurm_partition=SLURM["partition"]
+    envmodules: SLURM["r_module"]
+    script: str(SCRIPTS / "validate_against_existing.R")

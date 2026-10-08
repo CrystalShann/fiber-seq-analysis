@@ -1,5 +1,11 @@
 #!/usr/bin/env Rscript
-# Reuse the original analysis verbatim, redirecting only its OUT_DIR assignment.
+
+###############################################
+# build expression bins 
+###############################################
+
+# assigns every protein coding gene an expression bin from RNA-seq, using the mean TPM over the four LPS timepoints
+
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) != 2L || args[1] != "--out-dir")
   stop("Usage: 00_prepare_expression_bins.R --out-dir OUTPUT/inputs")
@@ -38,7 +44,6 @@ for (expr in expressions) {
   } else eval(expr, envir = env)
 }
 stopifnot(n_redirected == 1L, file.exists(target))
-if (!identical(signature$md5, tools::md5sum(inputs))) stop("Expression sources changed during generation")
 temporary <- paste0(manifest, ".tmp")
 saveRDS(list(signature = signature, output_md5 = tools::md5sum(target)), temporary)
 stopifnot(file.rename(temporary, manifest))

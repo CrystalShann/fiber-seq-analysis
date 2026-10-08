@@ -1186,18 +1186,6 @@ fourier_lcl_helpers <- new.env(parent = environment())
 sys.source(file.path(leiden_code_dir, "leiden_manhattan_functions.r"), envir = fourier_lcl_helpers)
 sys.source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", envir = fourier_lcl_helpers)
 sys.source(file.path(leiden_code_dir, "leiden_manhattan_plots.r"), envir = fourier_lcl_helpers)
-local({
-  notebook <- file.path(leiden_code_dir, "leiden_LCL.Rmd")
-  lines <- readLines(notebook, warn = FALSE)
-  start <- which(trimws(lines) == "```{r lcl-output-loader}")
-  stopifnot(length(start) == 1L)
-  end <- which(seq_along(lines) > start & trimws(lines) == "```")[1L]
-  stopifnot(!is.na(end), end > start + 1L)
-  eval(parse(text = lines[seq.int(start + 1L, end - 1L)]), envir = fourier_lcl_helpers)
-  fourier_lcl_helpers$source_lcl_output_config(notebook, envir = fourier_lcl_helpers)
-})
-fourier_lcl_helpers$LCL_OUTPUT_ROOT <- normalizePath(output_dir, mustWork = TRUE)
-fourier_lcl_helpers$LCL_TOP10_ROOT <- fourier_lcl_helpers$LCL_OUTPUT_ROOT
 
 k_neighbors <- 10L
 resolution <- 1
@@ -1268,9 +1256,7 @@ for (region_id in names(fourier_complex_results)) {
   partition <- leiden_partition(knn$graph, resolution = resolution, seed = clustering_seed)
   membership <- partition$membership[rownames(features)]
   stopifnot(!anyNA(membership))
-  labels_by_size <- names(sort(table(membership), decreasing = TRUE))
-  assignments$cluster <- factor(paste0("cluster", match(as.character(membership), labels_by_size)),
-                                levels = paste0("cluster", seq_along(labels_by_size)))
+  assignments$cluster <- relabel_clusters_by_size(membership)
   assignments$sample_label <- sub("_.*$", "", assignments$sample_name)
   stopifnot(identical(assignments$RID, rownames(features)))
 

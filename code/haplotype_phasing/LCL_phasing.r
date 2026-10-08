@@ -56,8 +56,16 @@ lcl_filter_focal_heterozygotes <- function(dat, region, sample_table, phase_cach
 # locate VCF file for each sample
 # ---------------------------------------------------------------------------------
 
-lcl_phasing_paths <- function(sample_name, phasing_root) {
-  directory <- file.path(phasing_root, sample_name)
+lcl_phasing_paths <- function(sample_name, phasing_root, phasing_dir = NULL) {
+  if (is.null(phasing_dir)) {
+    if (length(phasing_root) != 1L || is.na(phasing_root) || !nzchar(phasing_root))
+      stop("Provide phasing_root or the sample's phasing_dir")
+    directory <- file.path(phasing_root, sample_name)
+  } else {
+    if (length(phasing_dir) != 1L || is.na(phasing_dir) || !nzchar(phasing_dir))
+      stop("phasing_dir must be a nonempty directory for sample ", sample_name)
+    directory <- phasing_dir
+  }
   c(vcf = file.path(directory, paste0(sample_name, ".5mC.6mA.aligned.phased.vcf.gz")),
     tags = file.path(directory, "read-level-phasing.tsv"),
     blocks = file.path(directory, "blocks.tsv"))
@@ -93,13 +101,12 @@ lcl_vcf_sample_column <- function(path, cell_line) {
 
 cache_lcl_haplotags <- function(sample_table, region_data, phasing_root, cache_dir,
                                 reuse = TRUE) {
-  cache_dir <- lcl_output_path(cache_dir)
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
   read_info <- dplyr::bind_rows(lapply(region_data, function(dataset) dataset$rids_df))
   results <- setNames(vector("list", nrow(sample_table)), sample_table$sample_name)
   for (sample_index in seq_len(nrow(sample_table))) {
     sample <- sample_table[sample_index, , drop = FALSE]
-    paths <- lcl_phasing_paths(sample$sample_name, phasing_root)
+    paths <- lcl_phasing_paths(sample$sample_name, phasing_root, sample$phasing_dir)
     required <- c(unname(paths), paste0(paths[["vcf"]], ".tbi"))
     original_ids <- sort(unique(read_info$original_RID[read_info$sample_name == sample$sample_name]))
     signature <- list(version = 1L, cell_line = sample$cell_line, reads = original_ids,

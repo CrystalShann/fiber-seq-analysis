@@ -10,7 +10,10 @@
 # The GTF's transcript tags (Ensembl_canonical, MANE_Select, basic, ...) are
 # comma-joined inside column 4, so the example's
 #   grep Ensembl_canonical all_tss.bed > canonical_TSS.bed
-# works unchanged. Both the all-TSS bed and that canonical subset are written.
+# works unchanged. Three files are written: the all-TSS 20 bp bed, its
+# Ensembl_canonical subset (TSS_interval_gencodev46_Ensembl_canonical.bed), and a
+# 1 bp bed of the canonical TSS itself (gencodev46_Ensembl_canonical_TSS.bed,
+# 0-based start = TSS, end = start + 1).
 #
 # Usage:  bash make_gencode_v46_all_tss.sh
 
@@ -40,7 +43,8 @@ GTF="${OUT_DIR}/gencode.v46.annotation.gtf.gz"
 URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.annotation.gtf.gz"
 
 all_tss="${OUT_DIR}/gencode.v46.annotation_all_tss.bed"
-canonical="${OUT_DIR}/gencodev46_Ensembl_canonical_TSS.bed"
+canonical="${OUT_DIR}/TSS_interval_gencodev46_Ensembl_canonical.bed"
+canonical_tss="${OUT_DIR}/gencodev46_Ensembl_canonical_TSS.bed"
 
 # donwload the gtf file if it does not exist
 if [ ! -s "$GTF" ]; then
@@ -126,18 +130,33 @@ zcat "$GTF" \
 # extract canonical transcripts from bed6
 ##############################
 
-# output: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
+# output: /project/spott/cshan/annotations/TSS_interval_gencodev46_Ensembl_canonical.bed
 
 echo "Filtering to Ensembl_canonical -> ${canonical}..."
 grep Ensembl_canonical "$all_tss" > "$canonical"
 
+##############################
+# collapse the 20 bp canonical intervals to the 1 bp TSS
+##############################
+# The interval is [TSS - 10, TSS + 10) in 0-based coordinates, so the TSS base
+# is start + 10; the output row is [TSS, TSS + 1) with columns 4-6 unchanged.
+
+# output: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
+
+echo "Collapsing to 1 bp TSS -> ${canonical_tss}..."
+awk -F'\t' -v OFS='\t' '{ tss = $2 + 10; print $1, tss, tss + 1, $4, $5, $6 }' "$canonical" > "$canonical_tss"
+
 ## Sanity checks
 n_all=$(wc -l < "$all_tss")
 n_can=$(wc -l < "$canonical")
+n_tss=$(wc -l < "$canonical_tss")
 n_bad=$(awk -F'\t' '$3 - $2 != 20' "$all_tss" | wc -l)
+n_bad_tss=$(awk -F'\t' '$3 - $2 != 1' "$canonical_tss" | wc -l)
 echo "transcript TSSs : ${n_all}"
 echo "canonical TSSs  : ${n_can}"
 [ "$n_bad" -eq 0 ] || { echo "ERROR: ${n_bad} rows are not 20 bp wide" >&2; exit 1; }
+[ "$n_bad_tss" -eq 0 ] || { echo "ERROR: ${n_bad_tss} TSS rows are not 1 bp wide" >&2; exit 1; }
+[ "$n_tss" -eq "$n_can" ] || { echo "ERROR: ${n_tss} TSS rows vs ${n_can} canonical rows" >&2; exit 1; }
 # every canonical row should be a distinct gene
 n_can_genes=$(cut -d';' -f1 "$canonical" | cut -f4 | sort -u | wc -l)
 echo "canonical genes : ${n_can_genes}"

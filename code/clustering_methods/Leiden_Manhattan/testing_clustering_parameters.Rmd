@@ -42,7 +42,7 @@ stopifnot(nrow(region) == 1L)
 result_paths <- readRDS(file.path(input_dir, "summary tables/fiberseq_result_paths.rds"))
 baseline <- fiberseq_display_result(readRDS(result_paths[[region$region_id]]))
 stopifnot(identical(baseline$region$region_id, region$region_id),
-  baseline$params$window_size == 0L, !baseline$params$impute_missing,
+  baseline$params$window_size == 0L,
   baseline$params$k_neighbors == 10L, baseline$params$resolution == 1,
   baseline$params$seed == 1L,
   identical(rownames(baseline$feat_mat), baseline$assignments$RID),
@@ -78,16 +78,11 @@ results <- lapply(seq_len(nrow(parameter_pairs)), function(i) {
     n_iterations = -1L, seed = baseline$params$seed)
   membership <- part$membership[baseline$assignments$RID]
   stopifnot(!anyNA(membership))
-  cluster_order <- names(sort(table(membership), decreasing = TRUE))
   result <- baseline
-  result$assignments$cluster <- factor(
-    paste0("cluster", match(as.character(membership), cluster_order)),
-    levels = paste0("cluster", seq_along(cluster_order)))
-  result$n_clusters <- length(cluster_order)
-  result$profiles <- do.call(rbind, lapply(levels(result$assignments$cluster), function(cl) {
-    colMeans(result$feat_mat[result$assignments$cluster == cl, , drop = FALSE])
-  }))
-  rownames(result$profiles) <- levels(result$assignments$cluster)
+  result$assignments$cluster <- relabel_clusters_by_size(membership)
+  result$n_clusters <- nlevels(result$assignments$cluster)
+  result$profiles <- cluster_feature_profiles(result$feat_mat,
+    result$assignments$cluster, na.rm = FALSE)
   result$graph <- knn$graph
   result$params$k_neighbors <- pair$k
   result$params$k_eff <- knn$k_eff
@@ -157,23 +152,8 @@ fiberseq_haplotype_example <- function(result, title) {
   allele_colors <- fiberseq_category_palette(result$allele_display_levels)
   profiles <- plot_fiberseq_profiles(tables, result$region, result$markers,
     cluster_colors, sample_colors, allele_colors, title)
-  counts <- tables$counts
-  counts$cluster <- factor(counts$cluster, levels = tables$groups)
-  counts$label <- sprintf("%s\nn=%d (%.1f%%)", counts$cluster, counts$n_reads, 100 * counts$proportion)
-  rgb <- grDevices::col2rgb(cluster_colors) / 255
-  text_colors <- setNames(ifelse(colSums(rgb * c(.299, .587, .114)) < .5,
-    "white", "black"), names(cluster_colors))
-  pie <- ggplot2::ggplot(counts, ggplot2::aes(x = "", y = proportion, fill = cluster)) +
-    ggplot2::geom_col(width = 1, color = "white", position = ggplot2::position_stack(reverse = TRUE)) +
-    ggplot2::geom_text(ggplot2::aes(label = ifelse(proportion >= .03,
-      sprintf("%.1f%%", 100 * proportion), ""), color = cluster),
-      position = ggplot2::position_stack(vjust = .5, reverse = TRUE), size = 3) +
-    ggplot2::scale_color_manual(values = text_colors, guide = "none") +
-    ggplot2::coord_polar(theta = "y") +
-    ggplot2::scale_fill_manual(values = cluster_colors, labels = counts$label) +
-    ggplot2::labs(title = paste0("Cluster proportions: ", nrow(result$assignments), " reads"), fill = NULL) +
-    ggplot2::theme_void() + ggplot2::theme(legend.position = "right",
-      legend.text = ggplot2::element_text(size = 8))
+  pie <- plot_cluster_pie(result, counts = tables$counts,
+    cluster_colors = cluster_colors)
   heading <- cowplot::ggdraw() + cowplot::draw_label(
     paste(result$region$annotation, title, sep = "\n"), size = 12)
   overview <- cowplot::plot_grid(heading, pie, ncol = 1, rel_heights = c(.65, 4))

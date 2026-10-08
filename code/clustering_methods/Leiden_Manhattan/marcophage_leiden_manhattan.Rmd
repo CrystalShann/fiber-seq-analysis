@@ -24,8 +24,12 @@ library(cowplot)
 
 # Functions
 
-`extract_ft_region_reads()`, `extract_ft_read_info()`, `get_sparse_met_mat()`
-and `filter_met_mat()` come from the topic model
+`read_ft_bed12()`, `convert_ft_bed12_to_bed6()`, and `get_sparse_met_mat()`
+come from the topic model. The shared `assemble_region_m6a(full_span = TRUE)`
+keeps reads whose longest alignment physically spans the complete analysis
+window, including reads with zero m6A calls in the window. Read IDs are
+`<sample_name>::<read>`, with `original_RID` preserved in the read metadata and
+assignment tables.
 
 ```{r functions}
 source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
@@ -53,13 +57,13 @@ ft_result_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/ext
 early_response_genes <- c(IL1B = "IL1B", TNF = "TNF", IL1A = "IL1A", PTGS2 = "PTGS2",
                           IL8 = "CXCL8", CXCL2 = "CXCL2", IL6 = "IL6", RELB = "RELB")
 
-# GENCODE v46 Ensembl-canonical TSS: promoter windows are canonical TSS +/- tss_flank
+# GENCODE v46 Ensembl-canonical TSS: [TSS - 1000, TSS + 999], 1-based inclusive.
 gencode_tss_bed <- "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
 tss_flank <- 1000L
 
 output_dir <- file.path(
   "/project/spott/cshan/fiber-seq/macrophage_project/clustering_TSS_methods/Leiden_Manhattan",
-  paste0("TSS_", tss_flank)
+  "TSS_2000bp_window_span"
 )
 summary_dir <- file.path(output_dir, "summary")
 if (!dir.exists(summary_dir)) {
@@ -85,10 +89,6 @@ leiden_seed       <- 1
 # reproduce scikit-learn's laplacian_kernel default (gamma = 1 / n_features).
 kernel_sigma <- NULL
 
-# Paper step 2, off for now: with full-span reads there is nothing to impute.
-impute_missing <- FALSE
-impute_k       <- 5
-
 # Rolling-mean width for the m6A fraction line plot only (1 = raw profiles).
 # At window size 0 the per-site cluster means are spiky; e.g. 25 makes the
 # nucleosome-scale structure readable without changing any clustering input.
@@ -100,21 +100,23 @@ set.seed(123)
 # Regions
 
 All eight early-response promoters listed in `early_response_genes`, using
-GENCODE v46 canonical TSS +/- `tss_flank` bp, plus the two custom coordinate
-regions. Coordinates are 1-based inclusive and are exported to
-`summary/regions_bin0.tsv`. Results are written under `TSS_1000/` for this run.
+GENCODE v46 canonical TSS windows of exactly 2000 bp, from TSS - 1000 through
+TSS + 999, plus the two custom coordinate regions. TSS is `canonical BED start + 1`.
+Coordinates are 1-based inclusive and are exported to
+`summary/promoter_regions.tsv` and `summary/regions_bin0.tsv`. Results are
+written under `TSS_2000bp_window_span/` for this run.
 
 ```{r regions}
 # Read gene names and ENSG directly from the canonical TSS annotation; the old
-# GENCODE v49 promoter-table path is no longer present. The BED holds a 20-bp
+# GENCODE v49 promoter-table path is no longer present. The BED holds a 1-bp
 # interval per gene,
-# [TSS - 10, TSS + 10) in 0-based coordinates, so the 1-based TSS is start + 11.
+# [TSS, TSS + 1) in 0-based coordinates, so the 1-based TSS is start + 1.
 gencode_tss <- read.delim(gencode_tss_bed, header = FALSE,
                           col.names = c("chr", "start", "end", "annotation", "score", "strand"))
 gencode_tss$ensg <- sub("\\..*$", "", sub(";.*$", "", gencode_tss$annotation))
 gencode_tss$gene <- vapply(strsplit(gencode_tss$annotation, ";", fixed = TRUE),
                           function(x) x[[3]], character(1))
-gencode_tss$tss  <- gencode_tss$start + 11L
+gencode_tss$tss  <- gencode_tss$start + 1L
 gencode_tss <- gencode_tss[gencode_tss$chr %in% paste0("chr", c(1:22, "X", "Y")) &
                             gencode_tss$gene %in% early_response_genes, ]
 stopifnot(!anyDuplicated(gencode_tss$gene))
@@ -126,7 +128,7 @@ promoters <- data.frame(
   gene_strand = gencode_tss$strand[idx], canonical_tss = gencode_tss$tss[idx]
 )
 promoters$start <- promoters$canonical_tss - tss_flank
-promoters$end   <- promoters$canonical_tss + tss_flank
+promoters$end   <- promoters$canonical_tss + tss_flank - 1L
 promoters[, c("gene", "gencode_name", "ensg", "chr", "gene_strand", "canonical_tss",
               "start", "end")]
 
@@ -167,27 +169,32 @@ cat(
   "Region:", region_chr, region_start, region_end, "\n"
 )
 
+assembly_samples <- data.frame(
+  sample_name = sample_names,
+  fire_dir = file.path(ft_result_dir, sample_names)
+)
+assembly_region <- data.frame(
+  region_id = region_id, chr = region_chr,
+  start = region_start - 1L, end = region_end,
+  analysis_start = region_start, analysis_end = region_end
+)
 dat <- assemble_region_m6a(
-  sample_names = sample_names,
-  region_chr   = region_chr,
-  region_start = region_start,
-  region_end   = region_end,
-  ft_result_dir = ft_result_dir,
-  verbose = TRUE
+  full_span = TRUE, sample_table = assembly_samples, region = assembly_region,
+  matrix_dir = NULL, reuse = FALSE, verbose = TRUE
 )
 
-head(dat$reads)
-dim(dat$reads)
-colnames(dat$reads)
+head(dat$rids_df)
+dim(dat$met_mat)
+dat$qc
 ```
 
 ### 2. bin_read_matrix
 
 ```{r bin_read_matrix}
 binned50 <- bin_read_matrix(
-  met_mat      = filter_met_mat(dat$met_mat, verbose = TRUE),
-  region_start = region_start,
-  region_end   = region_end,
+  met_mat      = dat$met_mat,
+  region_start = assembly_region$analysis_start,
+  region_end   = assembly_region$analysis_end,
   window_size  = window_size
 )
 
@@ -264,8 +271,6 @@ res <- leiden_manhattan_cluster_regions(
   window_size = window_size,
   k_neighbors = k_neighbors,
   resolution = leiden_resolution,
-  impute_missing = impute_missing,
-  impute_k = impute_k,
   sigma = kernel_sigma,
   seed = leiden_seed,
   sample_table = sample_table
