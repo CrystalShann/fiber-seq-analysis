@@ -1,4 +1,4 @@
-# Shared plotting palettes 
+# Shared plotting palettes
 LEIDEN_CLUSTER_COLORS <- c(
   "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00", "black", "gold1",
   "skyblue2", "#FB9A99", "palegreen2", "#CAB2D6", "#FDBF6F", "gray70", "khaki2",
@@ -10,6 +10,16 @@ LEIDEN_CLUSTER_COLORS <- c(
 LEIDEN_TIMEPOINT_COLORS <- c("LPS_0" = "#bdbdbd", "LPS_5" = "#6baed6",
                              "LPS_10" = "#2171b5", "LPS_15" = "#08306b")
 
+# ---------------------------------------------------------------------------
+# Colour each cluster level by its position: the first level gets the first
+# LEIDEN_CLUSTER_COLORS colour, and so on. More than 25 levels are
+# interpolated along the palette with colorRampPalette.
+#
+# Inputs:
+#   levels - cluster labels, in display order
+# Output:
+#   named character vector of colours, names = levels
+# ---------------------------------------------------------------------------
 cluster_palette <- function(levels) {
   n <- length(levels)
   cols <- if (n <= length(LEIDEN_CLUSTER_COLORS)) {
@@ -20,6 +30,16 @@ cluster_palette <- function(levels) {
   setNames(cols, levels)
 }
 
+# ---------------------------------------------------------------------------
+# Colour clusters by the number in their label, so "cluster3" always gets the
+# third colour even when other clusters are absent. Falls back to position
+# (as cluster_palette()) unless every label is "cluster<N>" with N >= 1.
+#
+# Inputs:
+#   levels - cluster labels, e.g. c("cluster1", "cluster2")
+# Output:
+#   named character vector of colours, names = levels
+# ---------------------------------------------------------------------------
 cluster_id_palette <- function(levels) {
   idx <- suppressWarnings(as.integer(sub("^cluster", "", levels)))
   if (anyNA(idx) || any(!grepl("^cluster[0-9]+$", levels))) idx <- seq_along(levels)
@@ -29,7 +49,16 @@ cluster_id_palette <- function(levels) {
 }
 
 
-
+# ---------------------------------------------------------------------------
+# Look up LEIDEN_TIMEPOINT_COLORS for timepoint labels written as "LPS_5",
+# "5 min" or "5": the minutes are extracted and matched to "LPS_<minutes>".
+#
+# Inputs:
+#   x - timepoint labels (character or factor; repeats allowed)
+# Output:
+#   named character vector of colours, one per unique label in order of
+#   appearance, names = the labels as given; stops for a label with no colour
+# ---------------------------------------------------------------------------
 timepoint_palette <- function(x) {
   labels <- unique(as.character(x))
   minutes <- trimws(sub("min$", "", sub("^LPS_", "", labels)))
@@ -43,6 +72,19 @@ timepoint_palette <- function(x) {
 }
 
 
+# ---------------------------------------------------------------------------
+# Shared ggplot theme: a base theme plus optional element overrides.
+#
+# Inputs:
+#   base        - "classic" (theme_classic), "bw" (theme_bw) or "cowplot"
+#                 (cowplot::theme_cowplot)
+#   base_size   - base font size
+#   base_family - font family
+#   overrides   - named list of ggplot2::theme() arguments added on top,
+#                 e.g. list(legend.position = "bottom")
+# Output:
+#   ggplot2 theme object
+# ---------------------------------------------------------------------------
 theme_fiberseq <- function(base = c("classic", "bw", "cowplot"),
                            base_size = 9, base_family = "", overrides = list()) {
   base <- match.arg(base)
@@ -55,12 +97,40 @@ theme_fiberseq <- function(base = c("classic", "bw", "cowplot"),
 }
 
 
+# ---------------------------------------------------------------------------
+# Save a figure to `path`, creating its folder if needed.
+#   draw = NULL : `plot` is a ggplot / patchwork / cowplot object written with
+#                 ggplot2::ggsave
+#   draw = fn   : for grid graphics (e.g. ComplexHeatmap) that ggsave cannot
+#                 write. A PDF device is opened at `path` (must end in .pdf),
+#                 draw(plot) and then after_draw(plot) are called, and the
+#                 device is closed even if drawing fails
+#
+# Inputs:
+#   plot          - the object to save (passed to draw() in callback mode)
+#   path          - output file
+#   width, height - figure size in `units` ("in", "cm", "mm" or "px")
+#   device        - ggsave device, or in callback mode a PDF device function
+#                   (default grDevices::pdf)
+#   dpi, bg, limitsize - passed to ggsave (dpi / bg also used for previews)
+#   draw          - optional drawing callback, see above
+#   after_draw    - optional callback run after draw(), on the same device
+#                   (e.g. to decorate a heatmap)
+#   preview       - optional list(path, dpi, bg, embed): also render a PNG to
+#                   preview$path (a temporary file when NULL) and pass its path
+#                   to preview$embed()
+#   on_saved      - optional callback called with `path` after saving
+#   ...           - extra arguments for ggsave or the PDF device
+# Output:
+#   `path`, invisibly
+# ---------------------------------------------------------------------------
 save_figure <- function(plot, path, width, height,
                         device = NULL, units = "in", dpi = 300,
                         bg = NULL, limitsize = TRUE,
                         draw = NULL, after_draw = NULL,
                         preview = NULL, on_saved = NULL, ...) {
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  # writes one file: the main output, or the PNG preview when preview_image
   render <- function(filename, preview_image = FALSE, image_dpi = dpi, image_bg = bg) {
     if (is.null(draw)) {
       ggplot2::ggsave(filename, plot = plot, width = width, height = height,
@@ -68,6 +138,7 @@ save_figure <- function(plot, path, width, height,
         dpi = image_dpi, bg = image_bg, limitsize = limitsize, ...)
     } else {
       stopifnot(is.function(draw))
+      # base graphics devices take inches
       inches <- switch(units, "in" = 1, "cm" = 1 / 2.54, "mm" = 1 / 25.4,
                        "px" = 1 / image_dpi, stop("Unsupported units: ", units))
       background <- if (is.null(image_bg)) "white" else image_bg
@@ -107,6 +178,35 @@ save_figure <- function(plot, path, width, height,
 }
 
 
+# ---------------------------------------------------------------------------
+# Stacked / filled / dodged bar chart of `fill` categories within each `x`
+# group. Without `y`, geom_bar counts rows (optionally weighted); with `y`,
+# geom_col uses the values in that column.
+#
+# Inputs:
+#   df       - data.frame to plot
+#   x, fill  - column names for the bar groups and the stacked categories
+#   colors   - fill colours, named by `fill` level
+#   y        - optional column of bar heights (e.g. a proportion)
+#   weight   - optional count weight column (only used when y is NULL)
+#   position - "fill" (scale each bar to 1), "stack" or "dodge"
+#   reverse  - reverse the stacking order
+#   horizontal - flip to horizontal bars
+#   width    - bar width
+#   border   - optional list of extra bar arguments, e.g.
+#              list(colour = "white", linewidth = 0.2)
+#   labels   - list passed to ggplot2::labs(); an optional element
+#              `inside = list(min_fraction, accuracy, vjust, color, size)`
+#              writes percentage labels (of `y`) inside segments >= min_fraction
+#   totals   - optional list(data, x, y, label, style): text drawn at height
+#              `y` above each bar from the `label` column of `data`; `style`
+#              is a list of extra geom_text arguments
+#   scales   - list of ggplot components to add (scales, coords, ...)
+#   legend   - extra scale_fill_manual() arguments (name, labels, ...)
+#   theme    - optional theme added last
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
 plot_stacked_proportion <- function(df, x, fill, colors,
                                     y = NULL, weight = NULL,
                                     position = c("fill", "stack", "dodge"),
@@ -115,6 +215,7 @@ plot_stacked_proportion <- function(df, x, fill, colors,
                                     labels = list(), totals = NULL,
                                     scales = list(), legend = list(), theme = NULL) {
   position <- match.arg(position)
+  # build aes() from column names; y / weight only when given
   mapping <- ggplot2::aes(x = .data[[x]], fill = .data[[fill]])
   if (!is.null(y)) mapping$y <- ggplot2::aes(y = .data[[y]])$y
   if (!is.null(weight)) mapping$weight <- ggplot2::aes(weight = .data[[weight]])$weight
@@ -125,6 +226,7 @@ plot_stacked_proportion <- function(df, x, fill, colors,
   args <- c(list(width = width, position = placement), border)
   p <- ggplot2::ggplot(df, mapping) +
     do.call(if (is.null(y)) ggplot2::geom_bar else ggplot2::geom_col, args)
+  # labels$inside is not a labs() argument; take it out before labs()
   inside <- labels$inside
   labels$inside <- NULL
   if (!is.null(inside)) {
@@ -152,6 +254,34 @@ plot_stacked_proportion <- function(df, x, fill, colors,
 }
 
 
+# ---------------------------------------------------------------------------
+# Genomic interval track (e.g. cCREs, peaks, tested regions): each interval is
+# a rectangle or a horizontal segment on its own row.
+#
+# Inputs:
+#   df             - one row per interval
+#   window         - c(start, end) of the x axis
+#   fill_col       - optional column coloured by (fill for rect, colour for
+#                    segment)
+#   highlight      - optional list(start, end, fill, alpha, position): a
+#                    background band; position = "under" draws it beneath the
+#                    intervals, otherwise on top
+#   start_col, end_col - interval coordinate columns
+#   row_col        - optional column giving each interval's y row (default 1)
+#   geometry       - "rect" or "segment"
+#   colors         - optional manual colours for fill_col
+#   color_scale    - optional complete ggplot scale (used instead of colors)
+#   height         - rectangle height in row units
+#   linewidth, lineend - segment style
+#   labels         - list passed to ggplot2::labs()
+#   scales         - list of ggplot components to add; an element named
+#                    `coord` replaces the default coord_cartesian(xlim = window)
+#   theme          - optional theme added last
+#   clip_intervals - TRUE trims intervals to the window
+#   color          - optional fixed outline (rect) / line (segment) colour
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
 plot_interval_track <- function(df, window, fill_col = NULL, highlight = NULL,
                                 start_col = "start", end_col = "end", row_col = NULL,
                                 geometry = c("rect", "segment"),
@@ -160,6 +290,7 @@ plot_interval_track <- function(df, window, fill_col = NULL, highlight = NULL,
                                 labels = list(), scales = list(), theme = NULL,
                                 clip_intervals = FALSE, color = NULL, lineend = "butt") {
   geometry <- match.arg(geometry)
+  # copy the configured columns to fixed internal names
   d <- as.data.frame(df)
   d$.interval_start <- d[[start_col]]
   d$.interval_end <- d[[end_col]]
@@ -192,6 +323,7 @@ plot_interval_track <- function(df, window, fill_col = NULL, highlight = NULL,
     h <- highlight
     band <- ggplot2::annotate("rect", xmin = h$start, xmax = h$end,
       ymin = -Inf, ymax = Inf, fill = h$fill, alpha = h$alpha)
+    # "under": put the band first so the intervals are drawn over it
     if (identical(h$position, "under")) p$layers <- c(list(band), p$layers) else p <- p + band
   }
   coordinates <- scales$coord
@@ -203,6 +335,43 @@ plot_interval_track <- function(df, window, fill_col = NULL, highlight = NULL,
 }
 
 
+# ---------------------------------------------------------------------------
+# Profile of a value along the genome per group, e.g. the m6A fraction at
+# each position for every timepoint or cluster, drawn as lines, areas,
+# columns or ribbons.
+#
+# Inputs:
+#   profile     - long table, one row per group x position
+#   window      - optional c(start, end) x limits (coord_cartesian)
+#   group_col   - optional column mapped to colour (and fill unless
+#                 style = "line")
+#   style       - default layers: "line", "area" (area + line), "column" or
+#                 "ribbon" (ribbon from 0 + line)
+#   x_col, y_col - position and value columns
+#   facet_col   - optional column to facet by (one column of panels)
+#   series_col  - column defining each separate line (default group_col)
+#   colors, fill_colors - optional manual colour / fill values
+#   smooth_k    - > 1 replaces y by a centred rolling mean of smooth_k points
+#                 within each facet/series; rows left NA at the edges are dropped
+#   layers      - optional list of layer specs replacing the style defaults,
+#                 each list(geom = "line"|"area"|"col"|"ribbon"|"vline", ...)
+#                 where ... are arguments for that geom_*()
+#   highlight   - optional list of annotate("rect") arguments (xmin, xmax,
+#                 fill, alpha, ...) plus position = "under" to draw the band
+#                 beneath the layers instead of on top
+#   markers     - optional list of geom_vline() arguments
+#   region      - region row, required when coordinates = "relative"
+#   coordinates - "genomic", or "relative" to convert x to positions relative
+#                 to the region anchor (TSS for promoters) with plot_positions()
+#                 from leiden_manhattan_plots.r
+#   labels      - list passed to ggplot2::labs()
+#   scales      - list of ggplot components to add
+#   legend      - extra arguments for the manual colour / fill scales
+#   theme       - optional theme added last
+#   mapping     - optional aes() replacing the default mapping
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
 plot_group_profile <- function(profile, window = NULL, group_col = NULL,
                                style = c("line", "area", "column", "ribbon"),
                                x_col = "pos", y_col = "fraction",
@@ -250,6 +419,7 @@ plot_group_profile <- function(profile, window = NULL, group_col = NULL,
       highlight[setdiff(names(highlight), "position")]))
     if (identical(highlight$position, "under")) p <- p + band
   }
+  # each spec becomes geom_<geom>(...) with the remaining entries as arguments
   for (spec in layers) {
     geom <- match.arg(spec$geom, c("line", "area", "col", "ribbon", "vline"))
     spec$geom <- NULL
@@ -270,10 +440,73 @@ plot_group_profile <- function(profile, window = NULL, group_col = NULL,
   p
 }
 
+# ---------------------------------------------------------------------------
 # Shared read-by-position heatmap. Layouts preserve the original matrix encoding,
 # row ordering, annotation styles and ComplexHeatmap defaults. Callers supply
 # FIRE window labels/ticks so this definition has no notebook-specific globals.
 # By default return the Heatmap object; draw=TRUE also applies FIRE boundaries.
+#
+# Rows are reads split into cluster slices; columns are positions; black = m6A.
+#   layout = "genomic"  (default) every bp of region$analysis_start..end from
+#                       res$site_met_mat; rows ordered by cluster, read start
+#                       (or allele first with split_alleles). Annotations:
+#                       cluster, sample, optional haplotype / allele; bottom
+#                       coordinate ticks, TSS and SNP marks; minus-strand
+#                       promoters are flipped so upstream is on the left
+#   layout = "features" the clustering feature matrix res$feat_mat (NA = grey);
+#                       rows ordered by cluster, read start; flipped like
+#                       "genomic" for minus-strand promoters. Annotations:
+#                       cluster, timepoint (sample_name)
+#   layout = "fire"     every bp of window$window_start..window_end from
+#                       res$site_met_mat, rows given by `rows` in their order.
+#                       Annotations: cluster, time; a bottom bar marking the
+#                       tested FIRE region and tick labels at `ticks`; with
+#                       draw = TRUE, dashed lines at the tested region edges
+# Needs plot_anchor(), plot_positions(), as_timepoint_factor(), window_snps(),
+# fiberseq_category_palette() and LCL_HAPLOTYPE_COLORS from
+# leiden_manhattan_plots.r.
+#
+# Inputs:
+#   res                   - clustering result: assignments (RID, cluster,
+#                           start, sample_name, ...), site_met_mat (reads x
+#                           positions, rownames = assignments$RID) and, for
+#                           "features", feat_mat
+#   region                - region row ("genomic" / "features"): chr,
+#                           analysis_start, analysis_end, width, and optionally
+#                           region_type, strand, tss, annotation, focal_snp,
+#                           focal_pos, ref, alt
+#   sample_colors         - "genomic": colours named by sample label
+#   include_haplotype     - "genomic": add a haplotype annotation, or the
+#                           focal allele (assignments$allele_display) for
+#                           region_type "top_asfire_het"
+#   variants              - "genomic": SNP table (chr, pos, ref, alt,
+#                           variant_id) marked below the heatmap when the
+#                           region has no focal SNP
+#   show_cluster_profiles - "genomic": add per-cluster m6A fraction lines on top
+#   split_alleles         - "genomic": split rows by allele, then cluster
+#   cluster_label         - "genomic": title text used with include_haplotype
+#   sample_label_column   - "genomic": assignments column for sample labels
+#                           (default: sample_name up to its first "_")
+#   layout                - "genomic", "features" or "fire" (see above)
+#   main                  - title ("features", "fire")
+#   timepoint_cols        - timepoint colours ("features", "fire")
+#   palette               - "features": function giving cluster colours
+#   rows                  - "fire": one row per read in display order, with
+#                           RID (= rownames of site_met_mat), cluster, time
+#   window                - "fire": one-row table with chrom, window_start,
+#                           window_end and the tested region start, end
+#   cluster_colors        - "fire": cluster colours named by level
+#   ticks                 - "fire": genomic positions to label on the x axis
+#   use_raster            - optional override of ComplexHeatmap rasterising
+#   heatmap_options       - named list overriding any ComplexHeatmap::Heatmap()
+#                           argument
+#   draw                  - FALSE returns the Heatmap; TRUE draws it on the
+#                           current device
+#   draw_options          - extra ComplexHeatmap::draw() arguments
+# Output:
+#   draw = FALSE: ComplexHeatmap Heatmap object; draw = TRUE: invisible NULL
+#   (the heatmap is drawn as a side effect)
+# ---------------------------------------------------------------------------
 plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
                               include_haplotype = FALSE, variants = NULL,
                               show_cluster_profiles = FALSE, split_alleles = FALSE,
@@ -330,6 +563,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
     ex <- window
     cl_cols <- cluster_colors
     time_cols <- timepoint_cols
+    # one column per bp of the window; positions without a site stay 0
     pos  <- seq.int(ex$window_start, ex$window_end)
     site <- as.matrix(lr$site_met_mat[rows$RID, , drop = FALSE])
     m <- matrix(0L, nrow(rows), length(pos), dimnames = list(rows$RID, pos))
@@ -366,6 +600,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
                             ex$chrom, ", ", nrow(rows), " molecules)"),
       column_title_gp = grid::gpar(fontsize = 9))
   
+    # tested region edges as fractions of the heatmap width, drawn after draw()
     boundary_positions <- match(c(ex$start, ex$end), pos) / length(pos)
     boundary_slices <- seq_along(n_cl)
   } else {
@@ -393,6 +628,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
         col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors,
           haplotype = LCL_HAPLOTYPE_COLORS))
     }
+    # one column per bp of the analysis window; positions without a site stay 0
     met <- matrix(0L, nrow(assignments), region$width,
                     dimnames = list(assignments$RID, seq.int(region$analysis_start, region$analysis_end)))
     met[, match(colnames(res$site_met_mat), colnames(met))] <- as.matrix(res$site_met_mat[assignments$RID, , drop = FALSE])
@@ -417,6 +653,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
       top <- do.call(ComplexHeatmap::HeatmapAnnotation, c(profile_annotations,
         list(annotation_name_gp = grid::gpar(fontsize = 8), gap = grid::unit(1.5, "mm"))))
     }
+    # bottom annotations: 5 coordinate ticks, then TSS and SNP marks if present
     ticks <- unique(round(seq(1, ncol(display), length.out = 5L)))
     coordinates <- as.integer(colnames(display))
     tick_positions <- if (anchor$promoter) plot_positions(coordinates[ticks], region) else coordinates[ticks]
@@ -461,6 +698,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
         paste0(region$chr, ":", region$analysis_start, "-", region$analysis_end)), collapse = "\n"),
       column_title_gp = grid::gpar(fontsize = 11))
   }
+  # caller overrides, then build (and optionally draw) the heatmap
   if (!is.null(use_raster)) heatmap_args$use_raster <- use_raster
   for (name in names(heatmap_options)) heatmap_args[name] <- heatmap_options[name]
   heatmap <- do.call(ComplexHeatmap::Heatmap, heatmap_args)

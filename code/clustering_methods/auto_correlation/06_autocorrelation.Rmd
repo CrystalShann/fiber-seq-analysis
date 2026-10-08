@@ -32,7 +32,7 @@ The first and last blocks and are removed
 
 **Step 2: Expand blocks and keep calls inside the analysis window**
 
-`extract_ft_region_reads()` retains the longest alignment per RID, expands BED12 blocks, removes the first and last blocks, and keeps calls within selected window
+`assemble_region_m6a(full_span = TRUE)` retains the longest alignment per RID, expands BED12 blocks, removes the first and last blocks, and keeps calls within selected window
 
 `m6a position = BED start + blockStarts + blockSizes`
 
@@ -58,7 +58,7 @@ For example, read A's call at 119291048 is `119282125 + 8922 + 1`.
 
 **Step 3: Extract one metadata row per read**
 
-`extract_ft_read_info(reads)` 
+One row per read, taken from its BED12 alignment
 
 | Read | Chromosome | Start (1-based) | End (inclusive) | Strand | In-window m6A calls |
 | --- | --- | --- | --- | --- | --- |
@@ -70,11 +70,10 @@ For example, read A's call at 119291048 is `119282125 + 8922 + 1`.
 **Step 4: Construct the read-by-position matrix**
 
 
-1. Initialize entries to `NA`.
-2. Set positions covered by a read to `0`.
-3. Set observed m6A-call positions to `1`.
+Only reads whose alignment spans the whole window are kept (read D is removed
+here), and reads with no m6A call in the window are dropped.
 
-`0` means covered without a reported m6A call; `NA` means uncovered.
+`1` is an observed m6A call; `0` means covered without a reported m6A call.
 Every genomic base is a column, including bases with no calls in any read.
 
 | Read | 119291048 | 119291049 | 119291050 | 119291051 | 119291052 | 119291053 | 119291054 | 119291055 | 119291056 | 119291057 | 119291058 | 119291059 |

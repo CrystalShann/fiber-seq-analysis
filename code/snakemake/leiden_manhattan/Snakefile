@@ -61,7 +61,8 @@ for name, ds in DATASETS.items():
         raise ValueError(f"{name}: read_filter must contain window_span, optionally phased_heterozygous")
     if set(ds.get("annotate_by", [])) - {"timepoint", "sample", "allele"}:
         raise ValueError(f"{name}: unknown annotate_by value")
-    for footprint in ds.get("footprints", {}).values():
+    ds.setdefault("footprints", {})
+    for footprint in ds["footprints"].values():
         if footprint["format"] not in {"bed12_fibertools", "bed13_fiberhmm", "bed6_per_sample", "bed4_pooled"}:
             raise ValueError(f"{name}: unknown footprint format {footprint['format']}")
 

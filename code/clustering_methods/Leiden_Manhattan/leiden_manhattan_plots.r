@@ -2,18 +2,24 @@ source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions
 
 # leiden_manhattan_plots.r
 #
-# Shared plots and report export for Leiden + Manhattan single-molecule
-# clustering, including the Fourier-feature notebook. Plot-specific inputs
-# are explicit; Fourier spectrum and phase plots stay in the FFT notebook.
-# LCL-only report orchestration and figure exports live in hidden chunks of
-# leiden_LCL.Rmd; helpers used by multiple notebooks stay here.
-# plot_read_heatmap() displays timepoint-annotated clustering features;
-# plot_read_heatmap() displays genomic m6A with sample/allele tracks.
+# Plot helpers for Leiden + Manhattan single-molecule clustering, shared by
+# leiden_LCL.Rmd, marcophage_leiden_manhattan.Rmd, the Snakemake plot rule and
+# the fire_frequency / autocorrelation notebooks. Generic builders (palettes,
+# save_figure(), plot_stacked_proportion(), plot_group_profile(),
+# plot_read_heatmap(), ...) live in code/parsing_functions/plotting_functions.r,
+# sourced above. LCL-only report orchestration stays in leiden_LCL.Rmd.
 #
-#   cluster_composition_inputs() prepares the two composition tables
-#   plot_read_heatmap()       read x feature methylation heatmap, rows split
-#                                by cluster, with cluster and timepoint
-#                                annotations
+#   report helpers          embed_report_png(), as_timepoint_factor()
+#   plot inputs             cluster_composition_inputs(), met_fraction_inputs(),
+#                           signal_profile_inputs(), category_composition_inputs()
+#   LCL Fiber-seq figures   plot_smf_reads(), plot_fiberseq_profiles(), plot_umap(),
+#                           plot_knn_graph(), plot_cluster_pie(),
+#                           methylation_by_cluster(), save_fiberseq_plots() and
+#                           their palettes, legends and tables
+#   plot coordinates        plot_anchor(), plot_positions(), prepare_read_tracks()
+#   footprints              extract_nucleosomes(), read_footprint_region(),
+#                           cache_footprint_tracks(), region_footprints(),
+#                           footprint_profiles(), signal_profiles()
 #
 # The bar panels are drawn on a fixed 0-1 axis so clusters and genes stay
 # comparable; the line plot uses the data range, since that is the plot for
@@ -23,9 +29,21 @@ suppressMessages({
   requireNamespace("ComplexHeatmap")
 })
 
-# Shared report export: retain PNG previews until Pandoc embeds them in HTML.
-# A writer owns its output directory and manifest, so notebooks do not need
-# global plotting state. Supply draw for objects such as ComplexHeatmap heatmaps.
+# ---------------------------------------------------------------------------
+# Embed a saved PNG in a knitted HTML report. The PNG is copied into
+# image_dir, which retains the preview until Pandoc embeds it in the HTML, and
+# an HTML <figure> with the image and caption is printed. Call it from a
+# results = "asis" chunk, e.g. wrapped as the save_figure() preview$embed
+# callback.
+#
+# Inputs:
+#   path      - existing, non-empty PNG file
+#   label     - caption text, also the image alt text (HTML-escaped)
+#   image_dir - folder that keeps the copied PNG; created if needed
+# Output:
+#   invisible NULL; copies the PNG to <image_dir>/plot-<random>.png and prints
+#   the <figure> HTML to stdout
+# ---------------------------------------------------------------------------
 embed_report_png <- function(path, label, image_dir) {
   stopifnot(file.exists(path), file.info(path)$size > 0)
   dir.create(image_dir, recursive = TRUE, showWarnings = FALSE)
@@ -41,7 +59,18 @@ embed_report_png <- function(path, label, image_dir) {
 }
 
 
-# sample_name as an ordered factor, whatever the caller passed in
+# ---------------------------------------------------------------------------
+# Turn sample_name / timepoint labels into a factor whose levels follow the
+# palette order (LPS_0, LPS_5, ...), whatever the caller passed in, so plots
+# and legends list timepoints in time order. Labels missing from the palette
+# come after, in order of appearance; a factor is returned unchanged.
+#
+# Inputs:
+#   x              - timepoint labels (character or factor)
+#   timepoint_cols - named colour vector; its names give the level order
+# Output:
+#   factor the same length as x
+# ---------------------------------------------------------------------------
 as_timepoint_factor <- function(x, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
   if (is.factor(x)) return(x)
   lv <- intersect(names(timepoint_cols), unique(as.character(x)))
@@ -50,16 +79,21 @@ as_timepoint_factor <- function(x, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
 
 
 # ---------------------------------------------------------------------------
-# 1. Per-cluster m6A methylation proportion at each m6A site 
-
-# One panel per cluster; promoters use strand-oriented positions from the TSS.
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
-# 2a. Cluster composition by timepoint: cluster proportions within each
-# timepoint (stacked), and each timepoint's reads spread over the clusters.
+# Tables for the cluster-composition-by-timepoint plots: cluster proportions
+# within each timepoint (stacked bars drawn from the per-read table), and each
+# timepoint's reads spread over the clusters (the proportions table). Needs
+# dplyr's %>%.
+#
+# Inputs:
+#   res            - clustering result; res$assignments needs cluster and
+#                    sample_name (the timepoint)
+#   timepoint_cols - named timepoint colours giving the timepoint order
+#                    (as_timepoint_factor())
+# Output:
+#   list(assignments = res$assignments with sample_name as a factor in
+#        timepoint order,
+#        proportions = one row per cluster x timepoint: cluster, sample_name,
+#        n (reads) and proportion (n / reads of that timepoint))
 # ---------------------------------------------------------------------------
 cluster_composition_inputs <- function(res, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
   df <- res$assignments
@@ -73,39 +107,63 @@ cluster_composition_inputs <- function(res, timepoint_cols = LEIDEN_TIMEPOINT_CO
 }
 
 
-# ---------------------------------------------------------------------------
-# 3. Read x feature methylation heatmap: 
-
-# rows = reads split by cluster (each and ordered by read start within cluster,
-# columns = features in plot order, left annotation = cluster + timepoint.
-# No colour gradient: a feature with any m6A call is black, none is white,
-
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
-# 4. m6A fraction per feature, one panel per cluster 
-# ---------------------------------------------------------------------------
-
-
-
 # ---- Fiber-seq read, allele and composition plots ----
 
+# read haplotype colours (HP1 / HP2, unphased, and reads pooled without phasing)
 LCL_HAPLOTYPE_COLORS <- c(HP1 = "#ADD8E6", HP2 = "#FFF2AE", unphased = "#999999", pooled = "#BBBBBB")
 
 
+# colour of each read-level track: m6A, nucleosome and FiberHMM TF footprints
 LCL_TRACK_COLORS <- c(m6A = "#800080", "ft_nuc_130-160bp" = "#4d4d4d",
   "FiberHMM_10-30bp" = "#fdae6b", "FiberHMM_40-60bp" = "#f16913",
   "FiberHMM_60-80bp" = "#a63603")
+# legend label of each track
 LCL_TRACK_LABELS <- c(m6A = "m6A", "ft_nuc_130-160bp" = "nucleosome footprint (130-160 bp)",
   "FiberHMM_10-30bp" = "TF footprint 10-30 bp", "FiberHMM_40-60bp" = "TF footprint 40-60 bp",
   "FiberHMM_60-80bp" = "TF footprint 60-80 bp")
+# ---------------------------------------------------------------------------
+# Look up the plot colour of each track, stopping if a track has none.
+#
+# Inputs:
+#   tracks - track names, e.g. c("m6A", "ft_nuc_130-160bp")
+#   colors - named colour vector (default LCL_TRACK_COLORS)
+# Output:
+#   named character vector of colours in the order of tracks, names = tracks
+# ---------------------------------------------------------------------------
 feature_colors <- function(tracks, colors = LCL_TRACK_COLORS) {
   stopifnot(all(tracks %in% names(colors)))
   colors[tracks]
 }
 
+# ---------------------------------------------------------------------------
+# Single-molecule footprint plot (as TNF Fig 1): one row per read, faceted by
+# cluster, with the read span as a grey line and its footprints (and m6A
+# calls, if "m6A" is in tracks) as coloured rectangles. Colour bars left of
+# the reads mark each read's cluster, sample and, with include_haplotype, its
+# focal SNP allele ("top_asfire_het" regions) or haplotype. x is relative to
+# the region anchor (plot_anchor(): TSS, focal SNP or region centre); read
+# rows and coordinates come from prepare_read_tracks().
+#
+# Inputs:
+#   result              - clustering result: assignments (RID, cluster factor,
+#                         start, end, sample_name, optional haplotype /
+#                         allele_display), region (incl. annotation,
+#                         region_type), optional group_id (added to the
+#                         title), and allele_display_levels for
+#                         "top_asfire_het" regions
+#   records             - per-read intervals with RID, start (0-based BED),
+#                         end and track, e.g. signal_profiles()$records;
+#                         tracks not in `tracks` are dropped
+#   sample_colors       - colours named by sample label (sample_name up to its
+#                         first "_", or the sample_label_column values)
+#   tracks              - tracks to draw, bottom to top (default
+#                         LCL_FOOTPRINT_TRACKS: footprints only, no m6A)
+#   include_haplotype   - add the allele / haplotype bar and its legend
+#   track_colors, track_labels - colour and legend label per track
+#   sample_label_column - optional assignments column holding sample labels
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
 plot_smf_reads <- function(result, records, sample_colors, tracks = LCL_FOOTPRINT_TRACKS,
                           include_haplotype = FALSE, track_colors = LCL_TRACK_COLORS,
                           track_labels = LCL_TRACK_LABELS, sample_label_column = NULL) {
@@ -122,6 +180,7 @@ plot_smf_reads <- function(result, records, sample_colors, tracks = LCL_FOOTPRIN
   features$ymax <- features$row + 0.45
   features$fill <- unname(feature_colors[features$track])
   cluster_colors <- cluster_id_palette(levels(reads$cluster))
+  # colour bars left of the window: cluster, sample, then (optional) allele
   make_bar <- function(offset, colors) data.frame(cluster = reads$cluster, row = reads$row,
     left = anchor$left - offset * width, right = anchor$left - (offset - 0.025) * width,
     fill = unname(colors))
@@ -164,9 +223,22 @@ plot_smf_reads <- function(result, records, sample_colors, tracks = LCL_FOOTPRIN
       legend.text = ggplot2::element_text(size = 8), legend.key.size = grid::unit(3, "mm"))
 }
 
-# all features overlaid in one panel for every cluster.
-
-
+# ---------------------------------------------------------------------------
+# Long table of the per-cluster mean m6A of every clustering feature, for the
+# line plot with all features of every cluster overlaid in one panel.
+# Promoter positions become strand-oriented positions from the TSS
+# (plot_positions()); an optional centred rolling mean smooths each cluster.
+#
+# Inputs:
+#   res      - clustering result: profiles (clusters x features matrix,
+#              rownames = clusters, colnames = genomic feature positions) and
+#              assignments$cluster (for the read counts)
+#   smooth_k - rolling-mean width in features; <= 1 means no smoothing
+#   region   - region row used by plot_anchor() (default res$region)
+# Output:
+#   data.frame with cluster (factor, levels relabelled "<cluster> (n=<reads>)"),
+#   pos and value; rows with NA value (e.g. smoothing edges) dropped
+# ---------------------------------------------------------------------------
 met_fraction_inputs <- function(res, smooth_k = 1, region = res$region) {
   P <- res$profiles
   pos <- as.numeric(colnames(P))
@@ -185,6 +257,21 @@ met_fraction_inputs <- function(res, smooth_k = 1, region = res$region) {
   df[!is.na(df$value), , drop = FALSE]
 }
 
+# ---------------------------------------------------------------------------
+# Prepare signal_profiles()$profiles for the per-cluster occupancy plot: keep
+# the tracks that have a colour, add anchor-relative positions and set the
+# cluster and track factor orders.
+#
+# Inputs:
+#   profiles     - long table with cluster, pos, track, fraction, n_reads
+#   region       - region row for plot_positions()
+#   clusters     - cluster levels in display order
+#   track_colors - named track colours; tracks not named are dropped and the
+#                  order of the names sets the track levels
+# Output:
+#   profiles with relative_pos added, cluster and track as factors, sorted by
+#   cluster, track and relative_pos
+# ---------------------------------------------------------------------------
 signal_profile_inputs <- function(profiles, region, clusters, track_colors = LCL_TRACK_COLORS) {
   profiles <- profiles[profiles$track %in% names(track_colors), , drop = FALSE]
   profiles$relative_pos <- plot_positions(profiles$pos, region)
@@ -194,6 +281,18 @@ signal_profile_inputs <- function(profiles, region, clusters, track_colors = LCL
   profiles
 }
 
+# ---------------------------------------------------------------------------
+# One "Dynamic" HCL colour per LCL sample label, ordered by the number in the
+# label (AL2 before AL10). Labels without an "AL<N>" / "AL-<N>" number go last
+# (with an as.integer() NA warning).
+#
+# Inputs:
+#   sample_names  - sample names, e.g. "AL10_..." (repeats allowed); only used
+#                   for the default sample_labels
+#   sample_labels - labels to colour (default: sample_names up to the first "_")
+# Output:
+#   named character vector of colours, names = unique sample labels
+# ---------------------------------------------------------------------------
 sample_palette <- function(sample_names, sample_labels = sub("_.*$", "", sample_names)) {
   labels <- sample_labels
   labels <- unique(labels[order(as.integer(sub("^AL-?([0-9]+).*$", "\\1", labels)))])
@@ -202,6 +301,21 @@ sample_palette <- function(sample_names, sample_labels = sub("_.*$", "", sample_
 
 
 
+# ---------------------------------------------------------------------------
+# Per-read table for a "category composition within cluster" stacked bar,
+# e.g. plot_stacked_proportion(x = "cluster", fill = "category"): adds each
+# read's category, optionally relabelled, as a factor in palette order.
+#
+# Inputs:
+#   res       - clustering result; res$assignments must contain `column`
+#   column    - assignments column holding the category (e.g. "sample_name")
+#   colors    - colours named by category; every (relabelled) category needs
+#               one, and their order sets the factor levels
+#   label_fun - function applied to the category values first (default
+#               identity), e.g. to shorten sample names
+# Output:
+#   res$assignments with an added `category` factor column (one row per read)
+# ---------------------------------------------------------------------------
 category_composition_inputs <- function(res, column, colors, label_fun = identity) {
   assignments <- res$assignments
   stopifnot(column %in% names(assignments))
@@ -214,7 +328,17 @@ category_composition_inputs <- function(res, column, colors, label_fun = identit
 
 
 
-# Fiber-seq panels: every composition denominator is the cluster read count.
+# ---------------------------------------------------------------------------
+# Colours for the sample / allele categories of the Fiber-seq panels.
+# Categories are sorted, with "unphased" and "Unknown allele" moved last and
+# coloured dark grey; focal SNP alleles ("rs123: A") get fixed colour-blind-
+# safe colours (up to four); all others get "Dynamic" HCL colours.
+#
+# Inputs:
+#   categories - category labels (repeats allowed)
+# Output:
+#   named character vector of colours, names = sorted unique categories
+# ---------------------------------------------------------------------------
 fiberseq_category_palette <- function(categories) {
   categories <- sort(unique(as.character(categories)))
   categories <- c(setdiff(categories, c("unphased", "Unknown allele")),
@@ -227,6 +351,18 @@ fiberseq_category_palette <- function(categories) {
   colors
 }
 
+# ---------------------------------------------------------------------------
+# Standalone legend (coloured points) to stack under cowplot figures, taken
+# from a throwaway ggplot with cowplot::get_legend().
+#
+# Inputs:
+#   colors  - named colours, one legend key per name in that order
+#   title   - legend title
+#   columns - number of legend columns (filled by row)
+#   labels  - key labels (default names(colors))
+# Output:
+#   legend grob (gtable) for cowplot::plot_grid()
+# ---------------------------------------------------------------------------
 fiberseq_legend <- function(colors, title, columns = 4L, labels = names(colors)) {
   d <- data.frame(category = factor(names(colors), levels = names(colors)), x = 1, y = 1)
   p <- ggplot2::ggplot(d, ggplot2::aes(x, y, color = category)) +
@@ -237,10 +373,49 @@ fiberseq_legend <- function(colors, title, columns = 4L, labels = names(colors))
   cowplot::get_legend(p)
 }
 
+# ---------------------------------------------------------------------------
+# Height of a fiberseq_legend() grob plus 0.2 in of padding, used as its row
+# height when stacking figure rows.
+#
+# Inputs:
+#   legend - legend grob from fiberseq_legend()
+# Output:
+#   numeric height in inches
+# ---------------------------------------------------------------------------
 fiberseq_legend_height <- function(legend) {
   grid::convertHeight(sum(legend$heights), "in", valueOnly = TRUE) + .2
 }
 
+# ---------------------------------------------------------------------------
+# Per-cluster profile + composition figure: one row per cluster with, on the
+# left, the m6A call fraction (cluster colour) over the nucleosome occupancy
+# (grey line and fill) and, on the right, horizontal bars of the sample and
+# allele composition within the cluster. A header gives the title, colour key
+# and focal markers; sample and allele legends go underneath. Promoters are
+# drawn relative to the TSS (dashed line at 0), other regions in genomic
+# coordinates; markers are dotted lines. Uses plot_group_profile() and
+# plot_stacked_proportion() from plotting_functions.r.
+#
+# Inputs:
+#   tables           - fiberseq_tables() output (groups, counts, profiles,
+#                      sample, allele)
+#   region           - region row (chr, analysis_start, analysis_end,
+#                      region_type; strand and tss for promoters)
+#   markers          - data.frame with pos (1-based genomic) and label, e.g.
+#                      focal_markers(); zero rows draws none
+#   cluster_colors   - colours named by cluster
+#   sample_colors    - colours named by the sample categories of tables$sample
+#   allele_colors    - colours named by the allele categories of tables$allele
+#   title            - header title (default region$annotation)
+#   nucleosome_track - profile track(s) drawn as nucleosome occupancy
+#   nucleosome_label - its name in the header text
+#   nucleosome_color, nucleosome_fill - line and ribbon colour of that track
+#   sample_labels    - sample legend labels (default: names(sample_colors) up
+#                      to the first "_")
+# Output:
+#   list(plot = cowplot figure, height = suggested height in inches: 0.85
+#        header + 1.35 per cluster + the legend heights)
+# ---------------------------------------------------------------------------
 plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, sample_colors, allele_colors,
                                   title = region$annotation, nucleosome_track = "ft_nuc_130-160bp",
                                   nucleosome_label = "130-160 bp nucleosome occupancy",
@@ -258,6 +433,7 @@ plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, samp
     n <- tables$counts$n_reads[match(cluster, tables$counts$cluster)]
     nuc <- d[d$track %in% nucleosome_track, , drop = FALSE]
     met <- d[d$track == "m6A", , drop = FALSE]
+    # left panel: nucleosome ribbon + line, then the m6A line on top
     p <- plot_group_profile(d, style = "ribbon", mapping = ggplot2::aes(pos, fraction),
       layers = list(list(geom = "ribbon", data = nuc,
         mapping = ggplot2::aes(ymin = 0, ymax = fraction),
@@ -277,6 +453,7 @@ plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, samp
         ggplot2::geom_vline(data = markers, ggplot2::aes(xintercept = pos),
           inherit.aes = FALSE, color = "#666666", linetype = "dotted", linewidth = .35)
     }
+    # right panels: sample and allele composition of this cluster
     composition_plots <- lapply(c("sample", "allele"), function(kind) {
       tab <- tables[[kind]]
       tab <- tab[tab$cluster == cluster, ]
@@ -310,6 +487,20 @@ plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, samp
   list(plot = plot, height = sum(heights))
 }
 
+# ---------------------------------------------------------------------------
+# UMAP scatter of the reads coloured by one column (cluster, sample, allele).
+#
+# Inputs:
+#   embedding   - one row per read with UMAP1, UMAP2 and `column`
+#   column      - column mapped to colour
+#   colors      - colours named by the levels of `column`; also the legend
+#                 order (unused levels kept)
+#   title       - plot title
+#   labels      - legend labels (default names(colors))
+#   show_legend - TRUE shows the legend on the right
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
 plot_umap <- function(embedding, column, colors, title, labels = names(colors),
                            show_legend = FALSE) {
   ggplot2::ggplot(embedding, ggplot2::aes(UMAP1, UMAP2, color = .data[[column]])) +
@@ -320,6 +511,26 @@ plot_umap <- function(embedding, column, colors, title, labels = names(colors),
     ggplot2::theme(legend.position = if (show_legend) "right" else "none")
 }
 
+# ---------------------------------------------------------------------------
+# Draw the saved Manhattan KNN graph behind the Leiden clustering with a
+# Fruchterman-Reingold layout: reads are points coloured by Leiden cluster or
+# by focal SNP allele (knn_allele_summary()), edges are grey segments. The
+# layout is seeded and the caller's random seed is restored afterwards.
+#
+# Inputs:
+#   result      - clustering result: graph (undirected igraph, vertex names
+#                 = the assignments RIDs, optional positive edge weights),
+#                 assignments (RID, cluster; allele_label for "allele"),
+#                 region$annotation, and params (seed; k_eff or k_neighbors
+#                 and resolution, shown in the subtitle when present)
+#   main        - title (default: region annotation + what the colour shows)
+#   seed        - layout seed (default result$params$seed, else 1)
+#   vertex_size - point size
+#   edge_width, edge_alpha - edge line width and transparency
+#   color_by    - "cluster" or "allele" (focal-SNP regions only)
+# Output:
+#   ggplot object; legend labels give the read count of each colour group
+# ---------------------------------------------------------------------------
 plot_knn_graph <- function(result, main = NULL, seed = NULL, vertex_size = 1.5,
                            edge_width = 0.3, edge_alpha = 0.2, color_by = c("cluster", "allele")) {
   color_by <- match.arg(color_by)
@@ -340,6 +551,7 @@ plot_knn_graph <- function(result, main = NULL, seed = NULL, vertex_size = 1.5,
   if (length(weights)) stopifnot(all(is.finite(weights)), all(weights > 0))
   if (is.null(seed)) seed <- if (is.null(result$params$seed)) 1L else result$params$seed
   stopifnot(length(seed) == 1L, is.finite(seed))
+  # save the global RNG state and restore it on exit
   had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
   if (had_seed) previous_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
   on.exit({
@@ -391,6 +603,33 @@ plot_knn_graph <- function(result, main = NULL, seed = NULL, vertex_size = 1.5,
       plot.margin = ggplot2::margin(12, 12, 12, 12))
 }
 
+# ---------------------------------------------------------------------------
+# Focal-SNP allele mixing in the saved KNN graph: the allele composition of
+# all reads and of each cluster, and for every read how many of its graph
+# neighbours carry the same or the opposite allele. Every read must have a
+# resolved phased focal allele. Used by plot_knn_graph(color_by = "allele")
+# and plot_knn_allele_connectivity().
+#
+# Inputs:
+#   result - clustering result: graph (undirected, simple igraph with vertex
+#            names = assignments RIDs), focal (one row: variant_id (rsID),
+#            ref, alt) and assignments (RID, cluster, allele_label =
+#            "<variant_id>: <base>", allele_status all
+#            "phased_focal_genotype")
+# Output:
+#   list of
+#     allele_levels - the two allele labels, sorted
+#     composition   - group ("All reads", then clusters), allele, n_reads,
+#                     total_reads (of the group) and fraction
+#     reads         - per read: RID, cluster, allele, degree,
+#                     same_allele_neighbors, opposite_allele_neighbors,
+#                     same_fraction, opposite_fraction (NA without neighbours)
+#     connectivity  - per allele: n_reads, n_reads_with_neighbors,
+#                     n_isolated_reads, mean same_fraction and
+#                     opposite_fraction over connected reads, and
+#                     expected_same_fraction ((n_allele - 1) / (n - 1), the
+#                     random-mixing baseline)
+# ---------------------------------------------------------------------------
 knn_allele_summary <- function(result) {
   graph <- result$graph
   assignments <- result$assignments
@@ -421,6 +660,7 @@ knn_allele_summary <- function(result) {
   composition$total_reads <- ave(composition$n_reads, composition$group, FUN = sum)
   composition$fraction <- composition$n_reads / composition$total_reads
   endpoints <- igraph::as_edgelist(graph, names = FALSE)
+  # count every undirected edge from both of its ends
   source_nodes <- c(endpoints[, 1], endpoints[, 2])
   target_nodes <- c(endpoints[, 2], endpoints[, 1])
   degree <- tabulate(source_nodes, nbins = length(read_ids))
@@ -443,8 +683,22 @@ knn_allele_summary <- function(result) {
 }
 
 
-# Read counts, slice order, contrast-aware labels and legend match the original
-# save_fiberseq_plots() pie. Callers with an existing summary can reuse it.
+# ---------------------------------------------------------------------------
+# Pie chart of the share of reads in each cluster, with percentages on slices
+# of at least 3% (white or black text by slice brightness) and legend labels
+# "<cluster>\nn=<reads> (<pct>%)"; matches the original save_fiberseq_plots()
+# pie. Callers with an existing count summary (e.g. fiberseq_tables()$counts)
+# can pass it in.
+#
+# Inputs:
+#   result         - clustering result; assignments$cluster (factor) gives the
+#                    counts when counts is NULL, and the total in the title
+#   counts         - optional data.frame with cluster, n_reads and proportion;
+#                    its row order sets the slice order
+#   cluster_colors - colours named by cluster (default cluster_id_palette())
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
 plot_cluster_pie <- function(result, counts = NULL, cluster_colors = NULL) {
   groups <- if (is.null(counts)) levels(result$assignments$cluster) else as.character(counts$cluster)
   if (is.null(counts)) {
@@ -455,6 +709,7 @@ plot_cluster_pie <- function(result, counts = NULL, cluster_colors = NULL) {
   counts$cluster <- factor(counts$cluster, levels = groups)
   counts$label <- sprintf("%s\nn=%d (%.1f%%)", counts$cluster, counts$n_reads, 100 * counts$proportion)
   if (is.null(cluster_colors)) cluster_colors <- cluster_id_palette(groups)
+  # white text on dark slices (luma < 0.5), black otherwise
   rgb <- grDevices::col2rgb(cluster_colors) / 255
   text_colors <- setNames(ifelse(colSums(rgb * c(.299, .587, .114)) < .5, "white", "black"), names(cluster_colors))
   ggplot2::ggplot(counts, ggplot2::aes(x = "", y = proportion, fill = cluster)) +
@@ -467,6 +722,89 @@ plot_cluster_pie <- function(result, counts = NULL, cluster_colors = NULL) {
     ggplot2::theme_void() + ggplot2::theme(legend.position = "right", legend.text = ggplot2::element_text(size = 8))
 }
 
+# ---------------------------------------------------------------------------
+# Mean m6A call proportion of each cluster: m6A calls / (reads x observed m6A
+# sites) over the cluster's reads in result$site_met_mat.
+#
+# Inputs:
+#   result - clustering result: assignments (RID, cluster factor) and
+#            site_met_mat (reads x observed m6A sites)
+# Output:
+#   data.frame, one row per cluster: cluster, n_reads, n_sites, n_m6a_calls,
+#   denominator (n_reads x n_sites) and methylation_proportion (NA when the
+#   denominator is 0)
+# ---------------------------------------------------------------------------
+methylation_by_cluster <- function(result) {
+  dplyr::bind_rows(lapply(levels(result$assignments$cluster), function(cluster) {
+    ids <- result$assignments$RID[result$assignments$cluster == cluster]
+    m <- result$site_met_mat[ids, , drop = FALSE]
+    n_calls <- sum(m > 0)
+    denominator <- nrow(m) * ncol(m)
+    data.frame(cluster = cluster, n_reads = nrow(m), n_sites = ncol(m),
+      n_m6a_calls = n_calls, denominator = denominator,
+      methylation_proportion = if (denominator) n_calls / denominator else NA_real_)
+  }))
+}
+
+# ---------------------------------------------------------------------------
+# Bar chart of the methylation_by_cluster() proportions: one bar per cluster
+# on a fixed 0-1 axis, coloured with cluster_id_palette().
+#
+# Inputs:
+#   summary - table from methylation_by_cluster()
+#   region  - region row; region$annotation is used as the title
+# Output:
+#   ggplot object
+# ---------------------------------------------------------------------------
+plot_methylation_by_cluster <- function(summary, region) {
+  summary$cluster <- factor(summary$cluster, levels = summary$cluster)
+  ggplot2::ggplot(summary, ggplot2::aes(cluster, methylation_proportion, fill = cluster)) +
+    ggplot2::geom_col(width = 0.7) +
+    ggplot2::scale_fill_manual(values = cluster_id_palette(levels(summary$cluster)), guide = "none") +
+    ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.03))) +
+    ggplot2::labs(x = "m6A-defined cluster", y = "Mean m6A call proportion", title = region$annotation,
+      subtitle = "Mean across observed m6A sites; all cluster reads included") +
+    cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border()
+}
+
+# ---------------------------------------------------------------------------
+# Build and save the Fiber-seq report figures for one region's clustering:
+#   fiberseq_profiles_composition - plot_fiberseq_profiles()
+#   fiberseq_cluster_proportions  - plot_cluster_pie()
+#   fiberseq_umap_overview        - UMAPs by cluster, sample and allele, the
+#                                   pie and legends
+#   fiberseq_haplotype_example    - the overview above the profiles, one page
+# The result first goes through fiberseq_display_result() and the tables come
+# from fiberseq_tables(). include_read_panels also writes the LCL detail
+# panels, using methylation_by_cluster() / plot_methylation_by_cluster()
+# (above) and plot_read_heatmap() (plotting_functions.r).
+#
+# Inputs:
+#   result              - clustering result: assignments, region, focal /
+#                         variants, site_met_mat, feat_mat; for the detail
+#                         panels also graph, params and n_clusters
+#   footprints          - footprint intervals (RID, start, end, track), e.g.
+#                         dplyr::bind_rows() of extract_nucleosomes() and
+#                         region_footprints()$records
+#   output_dir          - figures go to <output_dir>/plots/ (always created)
+#   sample_colors       - colours named by full sample_name (every
+#                         assignments$sample_name needs one)
+#   embedding           - optional precomputed UMAP (RID in the same order as
+#                         result$assignments, UMAP1, UMAP2); NULL runs
+#                         fiberseq_umap()
+#   example_only        - TRUE saves only fiberseq_haplotype_example
+#   plot_writer         - optional function(plot, name, width, height) called
+#                         instead of writing the four figures as PDFs
+#   include_read_panels - TRUE also writes the detail panels listed below
+# Output:
+#   invisible list(tables = fiberseq_tables() output, embedding = assignments
+#   + UMAP1, UMAP2, display_cluster). Writes <output_dir>/plots/<name>.pdf for
+#   each figure above (unless plot_writer is given); include_read_panels adds
+#   knn_graph.pdf, methylation_proportion_by_cluster.pdf,
+#   heatmap_m6a_footprints.pdf, fig1_read_footprints.pdf,
+#   fig2_occupancy_by_cluster.pdf and cluster_sample_composition.pdf in the
+#   same folder (always with save_figure(), even with plot_writer)
+# ---------------------------------------------------------------------------
 save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
                                embedding = NULL, example_only = FALSE,
                                plot_writer = NULL, include_read_panels = FALSE) {
@@ -520,7 +858,7 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
   }
   if (include_read_panels) {
     # Optional LCL detail panels previously dispatched by the notebook.
-    include_haplotype <- TRUE
+    # detail panels name samples by their short label (sample_name before "_")
     detail_colors <- setNames(unname(sample_colors), sub("_.*$", "", names(sample_colors)))
     save_figure(plot_knn_graph(result), file.path(plot_dir, "knn_graph.pdf"),
       width = 12, height = 9, bg = "white")
@@ -533,15 +871,15 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
     summary <- methylation_by_cluster(result)
     save_figure(plot_methylation_by_cluster(summary, result$region), file.path(plot_dir, "methylation_proportion_by_cluster.pdf"),
       width = 8, height = 4.5)
-    heatmap_file <- if (include_haplotype) "heatmap_m6a_footprints.pdf" else "heatmap_m6a.pdf"
-    heatmap_height <- if (include_haplotype) 11 + 0.55 * result$n_clusters else 11
     heatmap <- plot_read_heatmap(result, result$region, detail_colors,
-      include_haplotype = include_haplotype, variants = result$variants,
-      show_cluster_profiles = include_haplotype)
-    save_figure(heatmap, file.path(plot_dir, heatmap_file), width = 14, height = heatmap_height,
+      include_haplotype = TRUE, variants = result$variants,
+      show_cluster_profiles = TRUE)
+    save_figure(heatmap, file.path(plot_dir, "heatmap_m6a_footprints.pdf"), width = 14,
+      height = 11 + 0.55 * result$n_clusters,
       draw = function(x) ComplexHeatmap::draw(x, newpage = FALSE))
-    save_figure(plot_smf_reads(result, records, detail_colors, include_haplotype = include_haplotype), file.path(plot_dir, "fig1_read_footprints.pdf"),
+    save_figure(plot_smf_reads(result, records, detail_colors, include_haplotype = TRUE), file.path(plot_dir, "fig1_read_footprints.pdf"),
       width = 12, height = max(7, 0.03 * nrow(result$assignments) + 3.5 + 0.3 * result$n_clusters), limitsize = FALSE)
+    # fig2: m6A and footprint occupancy profiles, one facet per cluster
     save_figure(local({
       .profile_args <- list(profiles = profiles,
       region = result$region,
@@ -580,6 +918,7 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
           plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
     }), file.path(plot_dir, "fig2_occupancy_by_cluster.pdf"),
       width = 10, height = 1.4 * result$n_clusters + 2.5, limitsize = FALSE)
+    # sample composition within each cluster (filled bars)
     composition <- category_composition_inputs(result, "sample_name", detail_colors,
       label_fun = function(x) sub("_.*$", "", x))
     save_figure(plot_stacked_proportion(composition, "cluster", "category", detail_colors,
@@ -600,6 +939,16 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
 # Per-cluster mean m6A call at every bp of the region. Columns of met_mat are
 # the positions with at least one call; every other bp is 0 because all reads
 # are full-span and have no call there.
+#
+# Inputs:
+#   res     - clustering result: assignments (RID, cluster factor) and the
+#             region bounds, region$analysis_start / analysis_end (else
+#             params$region_start / region_end)
+#   met_mat - reads x positions m6A call matrix (rownames = RIDs, colnames =
+#             1-based positions inside the region), e.g. res$site_met_mat
+# Output:
+#   data.frame, one row per cluster x bp: cluster, pos, met (mean call over
+#   the cluster's reads, 0-1) and n_reads (cluster reads found in met_mat)
 # ---------------------------------------------------------------------------
 cluster_site_profiles <- function(res, met_mat) {
   M  <- as.matrix(met_mat)
@@ -621,12 +970,38 @@ cluster_site_profiles <- function(res, met_mat) {
   }))
 }
 
+# ---------------------------------------------------------------------------
+# Path of each sample's fibertools `ft extract` BED file for one feature and
+# chromosome.
+#
+# Inputs:
+#   sample_table - samples with fire_dir and sample_name columns
+#   chromosome   - chromosome name, e.g. "chr5"
+#   feature      - extracted feature, e.g. "nuc"
+# Output:
+#   character vector, one path per sample:
+#   <fire_dir>/extracted_results/<feature>_by_chr/
+#     <sample_name>.ft_extracted_<feature>.<chromosome>.bed.gz
+# ---------------------------------------------------------------------------
 extracted_path <- function(sample_table, chromosome, feature) {
   file.path(sample_table$fire_dir, "extracted_results", paste0(feature, "_by_chr"),
             paste0(sample_table$sample_name, ".ft_extracted_", feature, ".", chromosome, ".bed.gz"))
 }
 
-# Collapse sample-level variants to exact in-window SNP positions and REF/ALT bases.
+# ---------------------------------------------------------------------------
+# Collapse sample-level variants to exact in-window SNP positions and REF/ALT
+# bases, for the SNP marks under plot_read_heatmap(). Only a single-base REF
+# with single-base ALT allele(s) counts; labels of several variants at one
+# position are joined with "; ".
+#
+# Inputs:
+#   variants - variant table with chr, pos, ref, alt and variant_id ("." or NA
+#              is shown as "SNP"); NULL or empty gives no SNPs
+#   region   - region row with chr, analysis_start and analysis_end
+# Output:
+#   data.frame with pos (integer) and label ("<id> <pos> <ref>><alt>"), one
+#   row per SNP position; zero rows when there is none
+# ---------------------------------------------------------------------------
 window_snps <- function(variants, region) {
   empty <- data.frame(pos = integer(), label = character())
   if (is.null(variants) || !nrow(variants)) return(empty)
@@ -641,7 +1016,17 @@ window_snps <- function(variants, region) {
 }
 
 
-# Plot only the observed focal SNP / or an annotated TSS
+# ---------------------------------------------------------------------------
+# Position to mark on profile plots: only the observed focal SNP, else the
+# region's focal SNP, else its annotated TSS.
+#
+# Inputs:
+#   result - clustering result: optional focal (pos, variant_id, ref, alt) and
+#            region (optional focal_pos, focal_snp, tss, gene)
+# Output:
+#   data.frame with pos, end (= pos) and label ("<variant_id> <ref>><alt>",
+#   the focal_snp, or "<gene> TSS"); zero rows when nothing is annotated
+# ---------------------------------------------------------------------------
 focal_markers <- function(result) {
   focal <- result$focal
   if (!is.null(focal) && nrow(focal))
@@ -655,7 +1040,26 @@ focal_markers <- function(result) {
   data.frame(pos = integer(), end = integer(), label = character())
 }
 
-# Keep detailed phasing provenance, but combine unknown focal alleles for display.
+# ---------------------------------------------------------------------------
+# Add the display fields used by the Fiber-seq plots. Detailed phasing
+# provenance is kept, but unknown focal alleles are combined for display: in a
+# focal-SNP region (region$focal_pos set) every read without a resolved
+# phased focal genotype becomes "Unknown allele", and the levels are the focal
+# SNP alleles ("rs123: A", observed or REF/ALT in result$variants) plus
+# "Unknown allele". "top_asfire_het" regions are strict: every read must be a
+# resolved heterozygote (0|1 / 1|0) and the levels are exactly the region's
+# REF and ALT alleles. Other regions show allele_label as is.
+#
+# Inputs:
+#   result - clustering result: assignments (allele_label; in focal-SNP
+#            regions also allele_status, and focal_genotype for
+#            "top_asfire_het"), region, and optional focal, variants and
+#            allele_levels
+# Output:
+#   result with markers (focal_markers()), allele_display_levels and
+#   assignments$allele_display (factor) added; stops if a read's display
+#   allele is not among the levels
+# ---------------------------------------------------------------------------
 fiberseq_display_result <- function(result) {
   result$markers <- focal_markers(result)
   a <- result$assignments
@@ -690,6 +1094,29 @@ fiberseq_display_result <- function(result) {
   result
 }
 
+# ---------------------------------------------------------------------------
+# Summary tables behind the Fiber-seq figures: read counts per cluster, the
+# sample and allele composition within each cluster (every composition
+# denominator is the cluster read count), and per-bp profiles of the m6A call
+# fraction (cluster_site_profiles()) and nucleosome occupancy
+# (footprint_profiles()). Applies fiberseq_display_result() first.
+#
+# Inputs:
+#   result           - clustering result: assignments (RID, cluster,
+#                      sample_column, allele fields), site_met_mat and region
+#                      (chr, start, end, analysis_start, analysis_end, width)
+#   footprints       - footprint intervals with RID, start, end, track
+#   nucleosome_track - footprint track(s) profiled as nucleosome occupancy
+#   sample_column    - assignments column used for the sample composition
+# Output:
+#   list of
+#     counts         - cluster, n_reads, total_reads, proportion
+#     sample, allele - cluster, category, n_reads, cluster_reads, fraction
+#                      (fractions sum to 1 within each cluster)
+#     profiles       - cluster, pos (1-based), track ("m6A" or the nucleosome
+#                      track), fraction, n_reads, chr, coordinate_system
+#     groups         - cluster labels in display order (unused levels dropped)
+# ---------------------------------------------------------------------------
 fiberseq_tables <- function(result, footprints, nucleosome_track = "ft_nuc_130-160bp",
                             sample_column = "sample_name") {
   result <- fiberseq_display_result(result)
@@ -721,6 +1148,20 @@ fiberseq_tables <- function(result, footprints, nucleosome_track = "ft_nuc_130-1
        profiles = profiles, groups = groups)
 }
 
+# ---------------------------------------------------------------------------
+# 2-D UMAP of the reads from their clustering features with the Manhattan
+# metric (as the Leiden KNN graph), random init and single threads so the
+# seed reproduces it. Needs the uwot package; sets the global random seed.
+#
+# Inputs:
+#   result      - clustering result: assignments$RID and feat_mat (reads x
+#                 features, no NA, at least 3 reads)
+#   seed        - set.seed() value
+#   n_neighbors - UMAP neighbours (capped at the number of reads - 1)
+#   min_dist    - UMAP min_dist
+# Output:
+#   result$assignments with UMAP1 and UMAP2 columns added
+# ---------------------------------------------------------------------------
 fiberseq_umap <- function(result, seed = 1L, n_neighbors = 15L, min_dist = 0.1) {
   stopifnot(requireNamespace("uwot", quietly = TRUE))
   a <- result$assignments
@@ -740,6 +1181,18 @@ fiberseq_umap <- function(result, seed = 1L, n_neighbors = 15L, min_dist = 0.1) 
 LCL_FOOTPRINT_TRACKS <- c("ft_nuc_130-160bp", "FiberHMM_10-30bp",
                           "FiberHMM_40-60bp", "FiberHMM_60-80bp")
 
+# ---------------------------------------------------------------------------
+# Turn every m6A call in site_met_mat into a 1-bp BED-style interval, in the
+# same layout as the footprint records so both can be drawn together
+# (signal_profiles(), plot_smf_reads()).
+#
+# Inputs:
+#   result - clustering result: site_met_mat (reads x 1-based positions,
+#            rownames = RIDs), assignments (RID, original_RID), region$chr
+# Output:
+#   data.frame, one row per call: RID, original_RID, chr, start (0-based),
+#   end, size (1), track ("m6A")
+# ---------------------------------------------------------------------------
 m6a_intervals <- function(result) {
   sites <- Matrix::summary(as(result$site_met_mat, "dgCMatrix"))
   sites <- sites[sites$x > 0, , drop = FALSE]
@@ -751,8 +1204,21 @@ m6a_intervals <- function(result) {
     end = positions, size = rep(1L, length(identifiers)), track = rep("m6A", length(identifiers)))
 }
 
-# Focal SNPs always retain genome order, even when promoter metadata is present.
-# Only a promoter with a known +/- strand and TSS is TSS-anchored.
+# ---------------------------------------------------------------------------
+# Choose the x-axis origin and orientation for a region. A focal-SNP region is
+# centred on the SNP and always retains genome order, even when promoter
+# metadata is present. Only a promoter with a known +/- strand and TSS is
+# TSS-anchored, flipped on the minus strand so upstream is negative. Any other
+# region is centred on the middle of its window.
+#
+# Inputs:
+#   region - region row: analysis_start / analysis_end (else start / end),
+#            and optionally focal_pos, focal_snp, region_type, tss, strand
+# Output:
+#   list(anchor = origin position, direction = 1, or -1 for a minus-strand
+#   promoter, left / right = window ends relative to the anchor, promoter =
+#   TRUE if TSS-anchored, x_label = matching axis title)
+# ---------------------------------------------------------------------------
 plot_anchor <- function(region) {
   focal <- !is.null(region$focal_pos) && !is.na(region$focal_pos)
   promoter <- !focal && isTRUE(region$region_type == "promoter") &&
@@ -767,13 +1233,43 @@ plot_anchor <- function(region) {
     x_label = if (focal) paste0("Position relative to ", region$focal_snp, " (bp)") else if (promoter) "Position relative to canonical TSS (bp); upstream < 0" else "Position relative to region centre (bp)")
 }
 
-# Positions are 1-based inclusive. Convert BED starts with +1 before calling;
-# BED exclusive ends already equal the last included 1-based position.
+# ---------------------------------------------------------------------------
+# Convert genomic positions to plot positions relative to the region anchor
+# (plot_anchor()), strand-oriented for promoters. Positions are 1-based
+# inclusive: convert BED starts with +1 before calling; BED exclusive ends
+# already equal the last included 1-based position.
+#
+# Inputs:
+#   pos    - 1-based genomic positions
+#   region - region row (see plot_anchor())
+# Output:
+#   numeric vector of bp from the anchor (upstream < 0 for promoters)
+# ---------------------------------------------------------------------------
 plot_positions <- function(pos, region) {
   anchor <- plot_anchor(region)
   anchor$direction * (pos - anchor$anchor)
 }
 
+# ---------------------------------------------------------------------------
+# Lay out reads and their intervals for plot_smf_reads(): reads are ordered by
+# cluster, start and RID and numbered within their cluster, and reads and
+# intervals get anchor-relative left / right ends clipped to the window
+# (intervals widened by 0.5 bp on each side so 1-bp calls stay visible).
+#
+# Inputs:
+#   result              - clustering result: assignments (RID, cluster, start,
+#                         end, sample_name, optional haplotype) and region
+#   records             - per-read intervals with RID, start (0-based BED),
+#                         end; intervals of reads not in assignments dropped
+#   sample_colors       - colours named by sample label; every read's label
+#                         must be present
+#   sample_label_column - optional assignments column with sample labels
+#                         (default: sample_name up to its first "_")
+# Output:
+#   list(reads = assignments plus row, sample_label, haplotype ("pooled" if
+#   absent), left, right; features = records plus row, cluster, left, right;
+#   anchor = plot_anchor() of the region; region)
+# ---------------------------------------------------------------------------
 prepare_read_tracks <- function(result, records, sample_colors, sample_label_column = NULL) {
   anchor <- plot_anchor(result$region)
   reads <- result$assignments
@@ -801,8 +1297,22 @@ prepare_read_tracks <- function(result, records, sample_colors, sample_label_col
 }
 
 
-# For unindexed files, gzip/awk scans with bounded memory and emits only relevant
-# records. Every scanned record is checked against the explicitly configured dialect.
+# ---------------------------------------------------------------------------
+# Read the records of selected reads overlapping a region from an unindexed
+# footprint BED. gzip/awk scans with bounded memory and emits only relevant
+# records; every scanned record is checked against the column count of the
+# explicitly configured format. Used by read_footprint_region().
+#
+# Inputs:
+#   path         - footprint BED file (.gz files are decompressed with gzip)
+#   format       - configured format name (footprint_format_columns())
+#   region       - region row with chr, start (0-based) and end
+#   original_ids - raw read names (BED column 4) to keep
+# Output:
+#   data.frame of the matching records with all-character columns V1, V2, ...;
+#   an empty data.frame() when none match. Stops on a column-count mismatch
+#   or read failure
+# ---------------------------------------------------------------------------
 stream_footprint_region <- function(path, format, region, original_ids) {
   expected <- footprint_format_columns(format)
   id_file <- tempfile("footprint_reads_", fileext = ".txt")
@@ -810,6 +1320,7 @@ stream_footprint_region <- function(path, format, region, original_ids) {
   err_file <- tempfile("footprint_stderr_", fileext = ".txt")
   on.exit(unlink(c(id_file, out_file, err_file)), add = TRUE)
   writeLines(unique(as.character(original_ids)), id_file)
+  # awk: first file = wanted read names, then filter the BED arriving on stdin
   awk <- paste(
     'FILENAME == ARGV[1] { wanted[$0] = 1; next }',
     'NF != expected { printf "Footprint file %s (configured format %s): expected %d columns, found %d\\n", source_path, format_name, expected, NF > "/dev/stderr"; exit 23 }',
@@ -830,6 +1341,24 @@ stream_footprint_region <- function(path, format, region, original_ids) {
              stringsAsFactors = FALSE, check.names = FALSE)
 }
 
+# ---------------------------------------------------------------------------
+# Read one sample's footprint records for a region: a tabix query when
+# <path>.tbi exists (read_tabix_region()), otherwise a streamed scan
+# (stream_footprint_region()). Checks the column count and BED coordinates,
+# then keeps the records on region$chr that overlap the region and belong to
+# the requested reads.
+#
+# Inputs:
+#   path         - footprint BED (.bed.gz with optional .tbi index)
+#   format       - configured format name (footprint_format_columns())
+#   region       - region row with chr, start (0-based), end, analysis_start
+#                  and analysis_end
+#   original_ids - raw read names (BED column 4) to keep; empty returns none
+# Output:
+#   data.frame of raw BED columns (columns 2-3 integer, column 4 character);
+#   an empty data.frame() when nothing matches. Stops on a missing file, a
+#   wrong column count or invalid coordinates
+# ---------------------------------------------------------------------------
 read_footprint_region <- function(path, format, region, original_ids) {
   expected <- footprint_format_columns(format)
   if (!file.exists(path)) stop("Missing footprint file ", path, " (configured format '", format, "')")
@@ -857,10 +1386,37 @@ read_footprint_region <- function(path, format, region, original_ids) {
   records[selected, , drop = FALSE]
 }
 
-# input_path may be function(sample, chromosome), where sample is one row of
-# sample_table, or a template with {sample_name}, {chr}, {chromosome} and other
-# sample-table columns. NULL retains the original LCL fibertools path/reader.
-# Custom sources match their raw read names through original_RID when supplied.
+# ---------------------------------------------------------------------------
+# Nucleosome footprints of the clustered reads in a region, one row per
+# nucleosome block, filtered by size. input_path = NULL retains the original
+# LCL fibertools path/reader: each sample's nuc BED12 (extracted_path(), tabix
+# query, longest alignment per read), with reads matched as
+# "<sample_name>::<read name>" RIDs. Otherwise input_path may be
+# function(sample, chromosome), where sample is one row of sample_table, or a
+# template with {sample_name}, {chr}, {chromosome}, {sample} and other
+# sample-table columns; those files are read with read_footprint_region().
+# Custom sources match their raw read names through original_RID when
+# supplied. BED12 parsing comes from parsing_footprints_functions.r.
+#
+# Inputs:
+#   sample_table       - one row per sample (sample_name; fire_dir for the
+#                        default path)
+#   region             - region row: chr, start (0-based), end,
+#                        analysis_start, analysis_end
+#   assignments        - clustered reads: RID, original_RID, optional
+#                        sample_name
+#   min_size, max_size - nucleosome size range in bp (inclusive); NULL drops
+#                        that bound
+#   input_path         - NULL, a function or a path template (see above)
+#   format             - "bed12_fibertools" or "bed13_fiberhmm" (the latter
+#                        needs input_path)
+#   strict_blocks      - TRUE validates the blocks of bed13_fiberhmm files
+# Output:
+#   data.frame with RID, original_RID, start, end (0-based BED), size, chr and
+#   track: "ft_nuc_<min>-<max>bp" (fibertools) or "nuc_<min>-<max>bp"
+#   (FiberHMM) when both bounds are set, else "nuc_all", "nuc_gt<min-1>bp" or
+#   "nuc_le<max>bp"
+# ---------------------------------------------------------------------------
 extract_nucleosomes <- function(sample_table, region, assignments, min_size = 130L, max_size = 160L,
                                 input_path = NULL, format = "bed12_fibertools", strict_blocks = FALSE) {
   if (length(format) != 1L || !format %in% c("bed12_fibertools", "bed13_fiberhmm"))
@@ -928,6 +1484,26 @@ extract_nucleosomes <- function(sample_table, region, assignments, min_size = 13
   result
 }
 
+# ---------------------------------------------------------------------------
+# Pre-extract the pooled FiberHMM TF footprints (10-30, 40-60 and 60-80 bp
+# BED4 files) that overlap any of the regions into one RDS cache per file, so
+# per-region lookups (region_footprints()) avoid rescanning the large files.
+# Files are scanned with gzip | awk in parallel; an existing cache is reused
+# when it was built for the same regions and file.
+#
+# Inputs:
+#   regions    - regions with chr, start (0-based) and end
+#   tracks_dir - folder with one subfolder per chromosome holding
+#                combined_<chr>_<size>bp_fps.bed.gz files
+#   cache_dir  - output folder for the caches (created if needed)
+#   workers    - parallel::mclapply cores
+#   reuse      - FALSE always re-extracts
+# Output:
+#   character vector of cache paths, one per footprint file:
+#   <cache_dir>/<footprint file name>.rds, each holding list(records =
+#   data.frame(chr, start, end, original_RID, size, track =
+#   "FiberHMM_<size>bp"), signature = list(version, regions, path))
+# ---------------------------------------------------------------------------
 cache_footprint_tracks <- function(regions, tracks_dir, cache_dir, workers = 2L, reuse = TRUE) {
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
   paths <- unlist(lapply(unique(regions$chr), function(chromosome) {
@@ -974,6 +1550,20 @@ cache_footprint_tracks <- function(regions, tracks_dir, cache_dir, workers = 2L,
   unlist(caches, use.names = FALSE)
 }
 
+# ---------------------------------------------------------------------------
+# One region's TF footprints from the cache_footprint_tracks() caches, mapped
+# to the clustered reads. The pooled BED4 files carry no sample ID, so the
+# raw read names must be unique across samples.
+#
+# Inputs:
+#   caches      - cache paths from cache_footprint_tracks()
+#   region      - region row with region_id, chr, start (0-based) and end
+#   assignments - clustered reads with RID and original_RID (unique)
+# Output:
+#   list(records = footprints of the clustered reads overlapping the region:
+#   chr, start, end, original_RID, size, track, RID; tracks = track name of
+#   each cache of this chromosome, named by cache path)
+# ---------------------------------------------------------------------------
 region_footprints <- function(caches, region, assignments) {
   if (anyDuplicated(assignments$original_RID)) {
     stop("Combined BED4 lacks sample IDs: ambiguous original read names in ", region$region_id)
@@ -993,6 +1583,20 @@ region_footprints <- function(caches, region, assignments) {
        }, character(1)))
 }
 
+# ---------------------------------------------------------------------------
+# Per-read, per-bp footprint occupancy: 1 where one of the read's intervals
+# covers the bp, else 0. Intervals are clipped to the region.
+#
+# Inputs:
+#   records     - intervals with RID, start (0-based BED) and end; reads not
+#                 in assignments are skipped
+#   assignments - reads (RID) giving the row order
+#   region      - region row: start (0-based, = analysis_start - 1), end,
+#                 analysis_start, analysis_end, width
+# Output:
+#   integer matrix, reads x bp (rownames = RIDs, colnames = 1-based positions
+#   analysis_start..analysis_end)
+# ---------------------------------------------------------------------------
 occupancy_matrix <- function(records, assignments, region) {
   occupancy <- matrix(0L, nrow(assignments), region$width,
                        dimnames = list(assignments$RID, seq.int(region$analysis_start, region$analysis_end)))
@@ -1000,6 +1604,7 @@ occupancy_matrix <- function(records, assignments, region) {
   for (record_index in seq_len(nrow(records))) {
     read_index <- match(records$RID[record_index], assignments$RID)
     if (is.na(read_index)) next
+    # BED [start, end) -> window columns start + 1 .. end
     left <- max(records$start[record_index], region$start) - region$start + 1L
     right <- min(records$end[record_index], region$end) - region$start
     if (left <= right) occupancy[read_index, seq.int(left, right)] <- 1L
@@ -1007,6 +1612,20 @@ occupancy_matrix <- function(records, assignments, region) {
   occupancy
 }
 
+# ---------------------------------------------------------------------------
+# Per-cluster footprint occupancy profiles: for each track and cluster, the
+# fraction of the cluster's reads covered at each bp (occupancy_matrix()).
+#
+# Inputs:
+#   records     - footprint intervals with RID, start, end and track
+#   tracks      - tracks to profile
+#   assignments - reads with RID and cluster (factor; its levels are the
+#                 clusters)
+#   region      - region row (see occupancy_matrix())
+# Output:
+#   data.frame, one row per track x cluster x bp: cluster, pos (1-based),
+#   track, fraction, n_reads
+# ---------------------------------------------------------------------------
 footprint_profiles <- function(records, tracks, assignments, region) {
   dplyr::bind_rows(lapply(tracks, function(track) {
     occupancy <- occupancy_matrix(records[records$track == track, ], assignments, region)
@@ -1019,7 +1638,22 @@ footprint_profiles <- function(records, tracks, assignments, region) {
 }
 
 
-# Footprints use per-base occupancy; m6A profiles are per-bp cluster means (0 where no read has a call)
+# ---------------------------------------------------------------------------
+# Read-level records and per-cluster profiles of the m6A and footprint tracks
+# of one region. Footprints use per-base occupancy (footprint_profiles()); m6A
+# profiles are per-bp cluster means, 0 where no read has a call
+# (cluster_site_profiles()).
+#
+# Inputs:
+#   result     - clustering result: assignments (RID, original_RID, cluster),
+#                site_met_mat and region
+#   footprints - footprint intervals with RID, start, end, track
+#   tracks     - footprint tracks to keep (default LCL_FOOTPRINT_TRACKS)
+# Output:
+#   list(records = m6a_intervals() plus the kept footprints, for
+#   plot_smf_reads(); tracks = c("m6A", tracks); profiles = cluster, pos,
+#   track, fraction, n_reads)
+# ---------------------------------------------------------------------------
 signal_profiles <- function(result, footprints, tracks = LCL_FOOTPRINT_TRACKS) {
   footprints <- footprints[footprints$track %in% tracks, , drop = FALSE]
   records <- dplyr::bind_rows(m6a_intervals(result), footprints)

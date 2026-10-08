@@ -269,29 +269,8 @@ plot methylation by cluster
 ```{r methylation-figures, include=TRUE}
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 
-plot_methylation_by_cluster <- function(summary, region) {
-  summary$cluster <- factor(summary$cluster, levels = summary$cluster)
-  ggplot2::ggplot(summary, ggplot2::aes(cluster, methylation_proportion, fill = cluster)) +
-    ggplot2::geom_col(width = 0.7) +
-    ggplot2::scale_fill_manual(values = cluster_id_palette(levels(summary$cluster)), guide = "none") +
-    ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.03))) +
-    ggplot2::labs(x = "m6A-defined cluster", y = "Mean m6A call proportion", title = region$annotation,
-      subtitle = "Mean across observed m6A sites; all cluster reads included") +
-    cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border()
-}
-
-methylation_by_cluster <- function(result) {
-  dplyr::bind_rows(lapply(levels(result$assignments$cluster), function(cluster) {
-    ids <- result$assignments$RID[result$assignments$cluster == cluster]
-    m <- result$site_met_mat[ids, , drop = FALSE]
-    n_calls <- sum(m > 0)
-    denominator <- nrow(m) * ncol(m)
-    data.frame(cluster = cluster, n_reads = nrow(m), n_sites = ncol(m),
-      n_m6a_calls = n_calls, denominator = denominator,
-      methylation_proportion = if (denominator) n_calls / denominator else NA_real_)
-  }))
-}
-
+# methylation_by_cluster() and plot_methylation_by_cluster() are defined in
+# leiden_manhattan_plots.r, next to save_fiberseq_plots() which uses them.
 ```
 
 # Main results and haplotype examples

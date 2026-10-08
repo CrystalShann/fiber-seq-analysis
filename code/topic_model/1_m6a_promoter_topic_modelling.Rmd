@@ -366,9 +366,9 @@ ex_metA_rds <- read_rds(file.path(output_dir, "CXCL2", "fit_binom_metA_CXCL2.rds
 ex_region_rds <- read_rds(file.path(output_dir, "CXCL2", "region_met_data_CXCL2.rds"))
 ```
 
-region: all extracted methylation data for the region, pooled across 4 LPS timepoints before any modelling - read each sample's extracted results for the region, tags every read with its sample with its sample name, and binds them into one pooled dataset
+region: one row per read overlapping the region, pooled across 4 LPS timepoints before any modelling - read each sample's extracted results for the region, tags every read with its sample name, and binds them into one pooled dataset
 ```{r region-rds}
-ex_region_rds[["reads"]]
+ex_region_rds[["rids_df"]]
 ```
 
 

@@ -5,6 +5,8 @@ date: "`r Sys.Date()`"
 output:
   html_document:
     self_contained: true
+params:
+  regenerate_regions: false
 ---
 
 ```{r setup, include=FALSE}
@@ -523,7 +525,7 @@ top10 %>%
 for (i in seq_len(nrow(top10))) {
   for (s in sample_names) {
     parsed <- file.path(extract_root, top10$outname[i], s, "parsed")
-    if (file.exists(file.path(parsed, "fire.bed"))) next
+    if (!isTRUE(params$regenerate_regions) && file.exists(file.path(parsed, "fire.bed"))) next
     region_str <- paste0(top10$chrom[i], ":", top10$window_start[i], "-",
                          top10$window_end[i])
     cat("extracting", top10$outname[i], s, "\n")
@@ -859,6 +861,11 @@ for (i in seq_len(nrow(top10_examples_regions))) {
 
   # the clustered (full-span) reads, with timepoint as metadata
   a <- lr$assignments
+  # Clustering namespaces pooled full-span IDs as sample::RID.  The plot
+  # extraction retains original IDs and verifies they are unique across samples.
+  # lr$site_met_mat keeps the namespaced rows, so the heatmap uses leiden_RID.
+  a$leiden_RID <- a$RID
+  a$RID <- a$original_RID
   a$time <- factor(time_labels[as.character(a$sample_name)], levels = time_levels)
   stopifnot(all(a$RID %in% levels(res_ex$rids_df$RID)))
   cl_cols <- cluster_palette(levels(a$cluster))
@@ -930,9 +937,10 @@ for (i in seq_len(nrow(top10_examples_regions))) {
 
   ## C1: Leiden m6A heatmap ---------------------------------------------------------
   rows_C <- a[order(a$cluster, a$time, a$start, a$RID), ]
+  rows_C1 <- transform(rows_C, RID = leiden_RID)
   h_C1 <- min(14, 3 + 0.02 * nrow(rows_C))
   save_figure(lr, f("panel_C_leiden_heatmap"), width = 9, height = h_C1,
-    draw = function(x) plot_read_heatmap(x, layout = "fire", rows = rows_C, window = ex,
+    draw = function(x) plot_read_heatmap(x, layout = "fire", rows = rows_C1, window = ex,
       cluster_colors = cl_cols, timepoint_cols = time_cols, ticks = window_breaks(ex),
       main = example_title(ex), draw = TRUE))
 
@@ -980,7 +988,7 @@ for (i in seq_len(nrow(top10_examples_regions))) {
 
   ## C: heatmap and cluster footprints side by side --------------------------------------
   h_C <- max(h_C1, h_C2)
-  g_C1 <- grid::grid.grabExpr(plot_read_heatmap(lr, layout = "fire", rows = rows_C, window = ex,
+  g_C1 <- grid::grid.grabExpr(plot_read_heatmap(lr, layout = "fire", rows = rows_C1, window = ex,
       cluster_colors = cl_cols, timepoint_cols = time_cols, ticks = window_breaks(ex),
       main = example_title(ex), draw = TRUE),
                               width = 9, height = h_C)

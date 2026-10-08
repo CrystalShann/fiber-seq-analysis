@@ -17,8 +17,20 @@ source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions
 #   run_m6a_delta()     one saved clustering.rds -> TSV + PDF
 #   run_all_m6a_delta() several saved clustering.rds files
 
+# minus sign (U+2212) used in the pair labels
 M6A_DELTA_MINUS <- "−"
 
+# ---------------------------------------------------------------------------
+# Cluster pairs to compare: every unique (A, B) pair of clusters that have
+# reads, or `baseline` against each other cluster.
+#
+# Inputs:
+#   res      - clustering result with assignments$cluster (and region)
+#   baseline - optional cluster label; NULL = all pairs
+# Output:
+#   data.frame(cluster_A, cluster_B, n_A, n_B) with the read count of each
+#   cluster, or NULL (with a message) when fewer than 2 clusters have reads
+# ---------------------------------------------------------------------------
 m6a_delta_pairs <- function(res, baseline = NULL) {
   cluster <- res$assignments$cluster
   clusters <- if (is.factor(cluster)) levels(cluster) else unique(as.character(cluster))
@@ -39,6 +51,21 @@ m6a_delta_pairs <- function(res, baseline = NULL) {
              stringsAsFactors = FALSE)
 }
 
+# ---------------------------------------------------------------------------
+# Per-bp difference in mean m6A between each cluster pair,
+# delta = met(A) - met(B), using cluster_site_profiles() over
+# res$site_met_mat (every bp of the analysis window), plus a centred rolling
+# mean over smooth_bp positions.
+#
+# Inputs:
+#   res       - clustering result with assignments, site_met_mat and region
+#   baseline  - see m6a_delta_pairs()
+#   smooth_bp - rolling-mean width in bp (1 = no smoothing)
+# Output:
+#   long data.frame(pair, cluster_A, cluster_B, n_A, n_B, pos, delta,
+#   delta_smooth), pair a factor labelled "A − B"; NULL when fewer than 2
+#   clusters have reads
+# ---------------------------------------------------------------------------
 m6a_delta_table <- function(res, baseline = NULL, smooth_bp = 25) {
   stopifnot(length(smooth_bp) == 1L, smooth_bp >= 1, smooth_bp == round(smooth_bp))
   pairs <- m6a_delta_pairs(res, baseline)
@@ -64,8 +91,16 @@ m6a_delta_table <- function(res, baseline = NULL, smooth_bp = 25) {
   out
 }
 
+# ---------------------------------------------------------------------------
 # Insert y = 0 rows where the smoothed line crosses zero so the above/below
-# ribbons meet exactly at the crossing instead of leaving a gap.
+# ribbons meet exactly at the crossing instead of leaving a gap. The crossing
+# x is interpolated linearly between the two neighbouring points.
+#
+# Inputs:
+#   x, y - positions and values of one line, ordered by x (y may contain NA)
+# Output:
+#   data.frame(x, y) with the crossing points added, ordered by x
+# ---------------------------------------------------------------------------
 m6a_delta_zero_crossings <- function(x, y) {
   ok <- !is.na(y[-length(y)]) & !is.na(y[-1])
   cross <- which(ok & y[-length(y)] * y[-1] < 0)
@@ -75,6 +110,24 @@ m6a_delta_zero_crossings <- function(x, y) {
   d[order(d$x), ]
 }
 
+# ---------------------------------------------------------------------------
+# One panel per cluster pair: the per-bp delta in grey, the smoothed delta in
+# black, and optional shading where the smoothed delta is above (red) or
+# below (blue) 0. With a region, x is relative to the region anchor
+# (plot_anchor() / plot_positions() from leiden_manhattan_plots.r) with a
+# dashed line at 0; without one, x is the genomic position.
+#
+# Inputs:
+#   delta       - table from m6a_delta_table()
+#   region      - optional region row (chr, analysis_start, analysis_end,
+#                 annotation, ...)
+#   ylim        - y limits; must span 0
+#   shade       - draw the above / below ribbons
+#   smooth_bp   - rolling-mean width, shown in the subtitle
+#   above_color, below_color - ribbon colours
+# Output:
+#   list(plot = ggplot, height = suggested figure height in inches)
+# ---------------------------------------------------------------------------
 plot_m6a_delta <- function(delta, region = NULL, ylim = c(-1, 1), shade = TRUE, smooth_bp = 25,
                            above_color = "#C0392B", below_color = "#2874A6") {
   stopifnot(length(ylim) == 2L, ylim[1] < 0, ylim[2] > 0)
@@ -126,6 +179,24 @@ plot_m6a_delta <- function(delta, region = NULL, ylim = c(-1, 1), shade = TRUE, 
   list(plot = p, height = 1.6 * nrow(pairs) + 1.5)
 }
 
+# ---------------------------------------------------------------------------
+# Pairwise m6A differences for one saved clustering result: read the RDS,
+# build the delta table, and write the table and its plot.
+#
+# Inputs:
+#   result_path - saved clustering result (e.g. clustering.rds from
+#                 run_lcl_clustering())
+#   output_root - output folder
+#   baseline, smooth_bp - see m6a_delta_table()
+#   ylim, shade - see plot_m6a_delta()
+#   width       - PDF width in inches (the height grows with the pairs)
+# Output:
+#   invisible list(table = TSV path, plot = PDF path, delta); writes
+#     <output_root>/<region_id>/tables/pairwise_m6a_delta.tsv
+#     <output_root>/<region_id>/plots/pairwise_m6a_delta.pdf
+#   region_id is res$region$region_id, else the name of the folder two levels
+#   above result_path. Invisible NULL when fewer than 2 clusters have reads
+# ---------------------------------------------------------------------------
 run_m6a_delta <- function(result_path, output_root, baseline = NULL, smooth_bp = 25,
                           ylim = c(-1, 1), shade = TRUE, width = 10) {
   res <- readRDS(result_path)
@@ -145,6 +216,16 @@ run_m6a_delta <- function(result_path, output_root, baseline = NULL, smooth_bp =
   invisible(list(table = tsv, plot = pdf, delta = delta))
 }
 
+# ---------------------------------------------------------------------------
+# run_m6a_delta() for several saved clustering results.
+#
+# Inputs:
+#   result_paths - saved clustering result paths; all must exist
+#   output_root  - output folder
+#   ...          - passed to run_m6a_delta()
+# Output:
+#   invisible list of run_m6a_delta() results, named by result path
+# ---------------------------------------------------------------------------
 run_all_m6a_delta <- function(result_paths, output_root, ...) {
   stopifnot(all(file.exists(result_paths)))
   out <- lapply(result_paths, run_m6a_delta, output_root = output_root, ...)

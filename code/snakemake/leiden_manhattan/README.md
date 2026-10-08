@@ -17,9 +17,12 @@ Rscript --vanilla config/make_lcl_sample_sheet.R \
 All samples require unique `sample_name`, `sample_label`, and `fire_dir`
   - phasing also needs `phasing_dir` and `cell_line`
 
-Dry-run one dataset, or submit it to SLURM:
+Dry-run one dataset, or submit it to SLURM. `module load R/4.4.1` first -
+jobs submit with `--export=ALL` and inherit it; the profile does not load
+R itself (see `profiles/slurm/config.yaml` for why):
 
 ```bash
+module load R/4.4.1
 snakemake -n --config datasets_to_run=macrophage
 snakemake --profile profiles/slurm --config datasets_to_run=macrophage
 ```
@@ -29,10 +32,10 @@ All settings are in `config/config.yaml`
 `parsing_functions` names the shared
 `code/parsing_functions/parsing_footprints_functions.r`, relative to `project_root`.
 The R scripts source this configured file through `scripts/common.R`. It contains
-the BED12/tabix readers, read metadata and methylation matrix helpers, and
-`read_sample_region_reads()` for per-sample m6A/CpG loading. The topic-model
-assembly and the default Leiden assembly share that loader; the full-span Leiden
-branch keeps its existing read selection.
+the BED12/tabix readers, read metadata helpers, and `assemble_region_m6a()`, which
+loads each sample's m6A (or CpG, `modality = "cpg"`) reads and builds the
+read-by-position matrix for the Leiden workflow, the LCL autocorrelation input
+and the topic model.
 
 All BED12 block expansion goes through `convert_ft_bed12_to_bed6()`. The shared
 `footprint_format_columns()` table in `parsing_footprints_functions.r` maps explicit

@@ -43,44 +43,48 @@ assemble_region_met_data <- function(sample_names, region_chr, region_start, reg
                                      filter_NAs = FALSE,
                                      verbose = TRUE) {
 
-  region_gr <- GRanges(seqnames = region_chr, ranges = IRanges(start = region_start, end = region_end))
-  if (length(region_gr) != 1)
-    stop("region_gr should be a single region!")
-
   if (verbose)
     cat("Assembling region data for", length(sample_names), "samples in",
         paste0(region_chr, ":", region_start, "-", region_end), "...\n")
 
-  # assemble data for metA
+  # every read overlapping the region, NA where a read does not cover a position
+  sample_table <- data.frame(sample_name = sample_names, fire_dir = file.path(ft_result_dir, sample_names))
+  region <- data.frame(region_id = paste(region_chr, region_start, region_end, sep = "_"),
+                       chr = region_chr, start = region_start - 1, end = region_end,
+                       analysis_start = region_start, analysis_end = region_end)
   if (verbose) cat("Assembling data for m6A...\n")
-  reads_list <- read_sample_region_reads(sample_names, region_gr, ft_result_dir,
-    modality = "m6a", keep_pos_in_region_only = FALSE, verbose = verbose)
-  reads_list <- Filter(Negate(is.null), reads_list)
-  combined_reads_metA <- do.call(rbind, reads_list)
-  combined_reads_metA <- combined_reads_metA %>% dplyr::mutate(base = "A")
-
-  combined_rids_metA_df <- extract_ft_read_info(combined_reads_metA, keep_columns = c("sample_name", "score"))
-  cat("Number of RIDs in metA data:", nrow(combined_rids_metA_df), "\n")
-
-  # assemble data for metCG
+  metA <- assemble_region_m6a(sample_table, region, modality = "m6a")
+  cat("Number of RIDs in metA data:", nrow(metA$rids_df), "\n")
   if (verbose) cat("Assembling data for metCG...\n")
-  reads_list <- read_sample_region_reads(sample_names, region_gr, ft_result_dir,
-    modality = "cpg", keep_pos_in_region_only = FALSE, verbose = verbose)
-  reads_list <- Filter(Negate(is.null), reads_list)
-  combined_reads_metCG <- do.call(rbind, reads_list)
-  combined_reads_metCG <- combined_reads_metCG %>% dplyr::mutate(base = "CG")
+  metCG <- assemble_region_m6a(sample_table, region, modality = "cpg")
+  cat("Number of RIDs in metCG data:", nrow(metCG$rids_df), "\n")
 
-  combined_rids_metCG_df <- extract_ft_read_info(combined_reads_metCG, keep_columns = c("sample_name", "score"))
-  cat("Number of RIDs in metCG data:", nrow(combined_rids_metCG_df), "\n")
-
-  combined_rids_df <- unique(rbind(combined_rids_metA_df, combined_rids_metCG_df))
+  # one row per read in either file, keyed by the raw read ID: m6A reads sorted
+  # by ID, then the reads found only in the CpG file
+  info_cols <- c("original_RID", "chr", "start", "end", "strand", "sample_name", "score")
+  metA_info <- metA$rids_df[order(metA$rids_df$original_RID, method = "radix"), info_cols]
+  metCG_info <- metCG$rids_df[order(metCG$rids_df$original_RID, method = "radix"), info_cols]
+  combined_rids_df <- rbind(metA_info, metCG_info[!metCG_info$original_RID %in% metA_info$original_RID, ])
+  names(combined_rids_df)[1] <- "RID"
   rownames(combined_rids_df) <- NULL
   cat("Number of RIDs in combined data:", nrow(combined_rids_df), "\n")
 
-  combined_reads <- rbind(dplyr::mutate(combined_reads_metA, base = "A"),
-                          dplyr::mutate(combined_reads_metCG, base = "CG"))
+  # a read missing from one file has no calls of that type: 0 where it covers
+  # a position, NA elsewhere
+  union_rows <- function(dat) {
+    idx <- match(combined_rids_df$RID, dat$rids_df$original_RID)
+    met_mat <- as.matrix(dat$met_mat)[idx, , drop = FALSE]
+    absent <- is.na(idx)
+    if (any(absent)) {
+      pos <- as.numeric(colnames(met_mat))
+      met_mat[absent, ] <- ifelse(outer(combined_rids_df$start[absent], pos, "<=") &
+                                    outer(combined_rids_df$end[absent], pos, ">="), 0, NA)
+    }
+    rownames(met_mat) <- combined_rids_df$RID
+    as(met_mat, "dgCMatrix")
+  }
 
-  metA_mat <- get_sparse_met_mat(combined_reads, combined_rids_df, window_start = region_start, window_end = region_end, base = "A")
+  metA_mat <- union_rows(metA)
   if (nrow(metA_mat) == 0 | ncol(metA_mat) == 0) {
     if (verbose) cat("metA matrix is empty. \n")
   } else {
@@ -88,7 +92,7 @@ assemble_region_met_data <- function(sample_names, region_chr, region_start, reg
     if (verbose) cat("Dimensions of the metA matrix:", nrow(metA_mat), "x", ncol(metA_mat), "\n")
   }
 
-  metCG_mat <- get_sparse_met_mat(combined_reads, combined_rids_df, window_start = region_start, window_end = region_end, base = "CG")
+  metCG_mat <- union_rows(metCG)
   if (nrow(metCG_mat) == 0 | ncol(metCG_mat) == 0) {
     if (verbose) cat("metCG matrix is empty. \n")
   } else {
@@ -122,7 +126,6 @@ assemble_region_met_data <- function(sample_names, region_chr, region_start, reg
               end = region_end,
               sample_names = sample_names,
               rids_df = combined_rids_df,
-              reads = combined_reads,
               metA_mat = metA_mat,
               metCG_mat = metCG_mat,
               combined_met_mat = combined_met_mat))

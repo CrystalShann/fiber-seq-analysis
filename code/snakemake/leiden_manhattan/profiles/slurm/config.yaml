@@ -1,7 +1,12 @@
-# Resource values and R module are read from the workflow config's slurm block.
+# Resource values are read from the workflow config's slurm block.
+# R is NOT loaded via --use-envmodules: "module purge && module load R/4.4.1"
+# (what --use-envmodules generates) hits a bug in /software/modulefiles/R/4.4.1 -
+# module purge drops the SOFTPATH env var the modulefile needs, so the load fails
+# with a Tcl "wrong # args" error and Rscript is never put on PATH. Jobs submit
+# with --export=ALL, so `module load R/4.4.1` in the shell that runs snakemake is
+# enough: every job inherits it, with no module command run inside the job itself.
 executor: slurm
 jobs: 20
-use-envmodules: true
 latency-wait: 60
 rerun-incomplete: true
 printshellcmds: true

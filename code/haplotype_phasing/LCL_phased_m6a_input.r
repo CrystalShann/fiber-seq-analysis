@@ -5,7 +5,7 @@
 
 lcl_build_phased_m6a_input <- function(region, sample_table, ft_result_dir,
     phasing_root, existing_phase_dir = NULL) {
-  required <- c("region_id", "chr", "analysis_start", "analysis_end",
+  required <- c("region_id", "chr", "start", "end", "analysis_start", "analysis_end",
     "focal_pos", "focal_snp", "ref", "alt")
   stopifnot(nrow(region) == 1L, all(required %in% names(region)),
     !anyNA(region[, required]), region$analysis_start >= 1L,
@@ -15,36 +15,21 @@ lcl_build_phased_m6a_input <- function(region, sample_table, ft_result_dir,
   samples <- lcl_region_samples(region, sample_table)
   stopifnot(nrow(samples) > 0L, !anyNA(samples$sample_name))
   positions <- seq.int(region$analysis_start, region$analysis_end)
-  query <- GenomicRanges::GRanges(region$chr,
-    IRanges::IRanges(region$analysis_start, region$analysis_end))
-  matrices <- metadata <- list()
-  for (sample_name in samples$sample_name) {
-    path <- file.path(ft_result_dir, sample_name, "extracted_results/m6a_by_chr",
-      paste0(sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
-    if (!all(file.exists(c(path, paste0(path, ".tbi"))))) stop("Missing indexed m6A BED: ", path)
-    reads <- extract_ft_region_reads(path, query)
-    if (is.null(reads) || !nrow(reads)) next
-    info <- extract_ft_read_info(reads)
-    if (is.null(info) || !nrow(info)) next
-    mat <- get_sparse_met_mat(reads = reads, rids_df = info,
-      window_start = region$analysis_start, window_end = region$analysis_end,
-      all_met_pos = positions, base = "A")
-    if (is.null(mat) || !nrow(mat)) next
-    mat <- mat[rowSums(is.na(mat)) == 0L, , drop = FALSE]
-    if (!nrow(mat)) next
-    info <- info[match(rownames(mat), info$RID), , drop = FALSE]
-    info$original_RID <- info$RID
-    info$sample_name <- sample_name
-    info$RID <- paste(sample_name, info$original_RID, sep = "__")
-    rownames(mat) <- info$RID
-    stopifnot(!anyNA(info$RID), all(info$start <= region$analysis_start),
-      all(info$end >= region$analysis_end))
-    matrices[[sample_name]] <- mat
-    metadata[[sample_name]] <- info
-  }
-  if (!length(matrices)) stop("No fully spanning reads: ", region$region_id)
-  mat <- do.call(rbind, matrices)
-  reads <- dplyr::bind_rows(metadata)
+  paths <- file.path(ft_result_dir, samples$sample_name, "extracted_results/m6a_by_chr",
+    paste0(samples$sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
+  dat <- assemble_region_m6a(sample_table = samples, region = region, full_span = TRUE,
+    positions = positions, matrix_dir = NULL, m6a_paths = paths)
+  # Keep full-span reads with at least one m6A call in the window, ordered by
+  # sample and then read ID, with sample__RID row names.
+  info <- dat$rids_df
+  keep <- which(Matrix::rowSums(dat$met_mat) > 0)
+  keep <- keep[order(match(info$sample_name[keep], samples$sample_name),
+    info$original_RID[keep], method = "radix")]
+  mat <- dat$met_mat[keep, , drop = FALSE]
+  reads <- info[keep, c("chr", "start", "end", "strand", "original_RID", "sample_name")]
+  reads <- data.frame(RID = paste(reads$sample_name, reads$original_RID, sep = "__"), reads)
+  rownames(reads) <- NULL
+  rownames(mat) <- reads$RID
   stopifnot(!anyNA(mat), all(mat@x %in% c(0, 1)), !anyDuplicated(reads$RID),
     identical(rownames(mat), reads$RID), identical(as.integer(colnames(mat)), positions))
 

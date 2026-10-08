@@ -1,5 +1,16 @@
 # PDF previews shared by the Leiden and autocorrelation reports. Keep the LCL
 # font mappings so embedding an existing figure renders the same PNG.
+
+# ---------------------------------------------------------------------------
+# Write a temporary xpdf config that maps the standard PDF fonts (Helvetica,
+# Times, Courier, Symbol, ZapfDingbats) to the Liberation Sans / DejaVu font
+# files on the cluster, so pdftopng renders previews with consistent fonts.
+#
+# Inputs:
+#   none
+# Output:
+#   path of the temporary xpdfrc file; the caller deletes it
+# ---------------------------------------------------------------------------
 report_xpdf_config <- function() {
   xpdfrc <- tempfile("xpdfrc-")
   sans <- "/usr/share/fonts/liberation-sans/LiberationSans-"
@@ -22,6 +33,20 @@ report_xpdf_config <- function() {
   xpdfrc
 }
 
+# ---------------------------------------------------------------------------
+# Embed the first page of a PDF figure in a knitted HTML report: render it to
+# PNG with xpdf's pdftopng (fonts from report_xpdf_config()) and print an HTML
+# <figure> with the PNG as a base64 data URI and `label` as its caption. Use
+# in a chunk with results = "asis".
+#
+# Inputs:
+#   path     - existing, non-empty PDF
+#   label    - caption and alt text
+#   dpi      - rendering resolution
+#   pdftopng - path of the pdftopng executable
+# Output:
+#   invisible NULL; the HTML is printed with cat()
+# ---------------------------------------------------------------------------
 inline_png <- function(path, label, dpi = 120,
                        pdftopng = "/software/xpdf-4.05-el8-x86_64/bin/pdftopng") {
   stopifnot(file.exists(path), file.info(path)$size > 0)

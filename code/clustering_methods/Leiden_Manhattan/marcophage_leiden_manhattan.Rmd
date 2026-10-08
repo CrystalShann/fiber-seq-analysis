@@ -24,8 +24,7 @@ library(cowplot)
 
 # Functions
 
-`read_ft_bed12()`, `convert_ft_bed12_to_bed6()`, and `get_sparse_met_mat()`
-come from the topic model. The shared `assemble_region_m6a(full_span = TRUE)`
+`read_ft_bed12()` and `convert_ft_bed12_to_bed6()` come from the topic model. The shared `assemble_region_m6a(full_span = TRUE)`
 keeps reads whose longest alignment physically spans the complete analysis
 window, including reads with zero m6A calls in the window. Read IDs are
 `<sample_name>::<read>`, with `original_RID` preserved in the read metadata and
@@ -181,7 +180,7 @@ assembly_region <- data.frame(
 )
 dat <- assemble_region_m6a(
   full_span = TRUE, sample_table = assembly_samples, region = assembly_region,
-  matrix_dir = NULL, reuse = FALSE, verbose = TRUE
+  matrix_dir = NULL, reuse = FALSE
 )
 
 head(dat$rids_df)

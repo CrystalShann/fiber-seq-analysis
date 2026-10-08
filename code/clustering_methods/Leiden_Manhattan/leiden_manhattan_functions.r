@@ -27,106 +27,28 @@ suppressMessages({
 
 
 # ---------------------------------------------------------------------------
-# Pooled m6A read x position matrix for one region, tagging each read with its
-# sample of origin
-# ---------------------------------------------------------------------------
-assemble_region_m6a <- function(sample_names = NULL, region_chr = NULL, region_start = NULL, region_end = NULL,
-                                ft_result_dir = NULL, verbose = TRUE, full_span = FALSE,
-                                sample_table = NULL, region = NULL, matrix_dir = NULL, reuse = TRUE,
-                                m6a_paths = NULL) {
-  if (!full_span && !is.null(m6a_paths)) stop("m6a_paths requires full_span = TRUE")
-  if (full_span) {
-    stopifnot(!is.null(sample_table), !is.null(region), nrow(region) == 1L,
-      all(c("sample_name", "fire_dir") %in% names(sample_table)),
-      !anyDuplicated(sample_table$sample_name),
-      region$analysis_start == region$start + 1L, region$analysis_end == region$end,
-      region$analysis_start <= region$analysis_end)
-    if (is.null(m6a_paths)) {
-      paths <- file.path(sample_table$fire_dir, "extracted_results", "m6a_by_chr",
-        paste0(sample_table$sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
-    } else {
-      if (!is.character(m6a_paths) || length(m6a_paths) != nrow(sample_table) ||
-          anyNA(m6a_paths) || any(!nzchar(m6a_paths)))
-        stop("m6a_paths must contain one nonempty path per sample, in sample_table order")
-      paths <- unname(m6a_paths)
-    }
-    required <- c(paths, paste0(paths, ".tbi"))
-    if (!all(file.exists(required))) stop("Missing input: ", paste(required[!file.exists(required)], collapse = ", "))
-    signature <- list(version = 1L, region = region, samples = sample_table)
-    if (!is.null(m6a_paths)) signature$m6a_paths <- paths
-    cache <- NULL
-    if (!is.null(matrix_dir)) {
-      region_matrix_dir <- file.path(matrix_dir, region$region_id)
-      dir.create(region_matrix_dir, recursive = TRUE, showWarnings = FALSE)
-      cache <- file.path(region_matrix_dir, paste0(region$region_id, "_m6a_matrix.rds"))
-      if (reuse && file.exists(cache)) {
-        previous <- readRDS(cache)
-        if (identical(previous$signature[names(signature)], signature)) {
-          stopifnot(!anyDuplicated(previous$rids_df$RID),
-            all(previous$rids_df$start <= region$analysis_start),
-            all(previous$rids_df$end >= region$analysis_end),
-            identical(rownames(previous$met_mat), as.character(previous$rids_df$RID)))
-          return(previous)
-        }
-      }
-    }
-    region_gr <- GenomicRanges::GRanges(region$chr,
-      IRanges::IRanges(region$analysis_start, region$analysis_end))
-    reads_list <- metadata_list <- qc_list <- vector("list", nrow(sample_table))
-    for (sample_index in seq_len(nrow(sample_table))) {
-      sample_name <- sample_table$sample_name[sample_index]
-      bed <- read_ft_bed12(paths[sample_index], region_gr, longest_alignment = TRUE)
-      overlapping <- nrow(bed)
-      if (overlapping) bed <- bed[bed$start <= region$start & bed$end >= region$end, , drop = FALSE]
-      qc_list[[sample_index]] <- data.frame(sample_name = sample_name,
-        overlapping_reads = overlapping, full_span_reads = nrow(bed))
-      if (!nrow(bed)) next
-      original_ids <- as.character(bed$RID)
-      bed$RID <- paste(sample_name, original_ids, sep = "::")
-      metadata_list[[sample_index]] <- data.frame(
-        RID = bed$RID, original_RID = original_ids, chr = bed$chr,
-        start = bed$start + 1L, end = bed$end, strand = bed$strand,
-        sample_name = sample_name, score = bed$score)
-      blocks <- convert_ft_bed12_to_bed6(bed,
-        format = "bed12_fibertools", source = paths[sample_index])
-      if (any(blocks$end - blocks$start != 1L)) stop("Non-single-base m6A block in ", paths[sample_index])
-      blocks <- blocks[blocks$end >= region$analysis_start & blocks$end <= region$analysis_end, , drop = FALSE]
-      reads_list[[sample_index]] <- data.frame(RID = as.character(blocks$RID), pos = blocks$end)
-    }
-    rids_df <- dplyr::bind_rows(metadata_list)
-    reads <- dplyr::bind_rows(reads_list)
-    if (nrow(rids_df) < 3L || !nrow(reads)) stop("Insufficient full-span reads/m6A sites: ", region$region_id)
-    met_mat <- get_sparse_met_mat(reads, rids_df, region$analysis_start, region$analysis_end,
-      base = "A", require_full_span = TRUE)
-    stopifnot(!anyNA(met_mat), !anyDuplicated(rownames(met_mat)))
-    result <- list(met_mat = met_mat, rids_df = rids_df, qc = dplyr::bind_rows(qc_list),
-      signature = signature)
-    if (!is.null(cache)) {
-      saveRDS(result, cache)
-      data.table::fwrite(result$qc, file.path(region_matrix_dir, paste0(region$region_id, "_read_qc.tsv")), sep = "\t")
-    }
-    return(result)
-  }
-  
-  region_gr <- GRanges(region_chr, IRanges(region_start, region_end))
-  reads_list <- read_sample_region_reads(sample_names, region_gr, ft_result_dir,
-    modality = "m6a", keep_pos_in_region_only = TRUE, verbose = verbose)
-  reads_list <- Filter(Negate(is.null), reads_list)
-  
-  reads <- dplyr::bind_rows(reads_list)
-  if (nrow(reads) == 0) stop("no reads in region")
-  rids_df <- extract_ft_read_info(reads, keep_columns = c("sample_name", "score"))
-  met_mat <- get_sparse_met_mat(reads, rids_df,
-                                window_start = region_start,
-                                window_end = region_end, base = "A")
-  list(reads = reads, rids_df = rids_df, met_mat = met_mat)
-}
-
-
-# ---------------------------------------------------------------------------
-# run the full Leiden + Manhattan workflow across a table
-# of explicit regions. Regions must contain 1-based inclusive chr/start/end,
-# and may carry a region_id column; otherwise coordinate-based IDs are created.
+# Run the full Leiden + Manhattan workflow on a table of regions: for each
+# region, assemble the full-span m6A matrix of all samples with
+# assemble_region_m6a() (parsing_footprints_functions.r) and cluster it with
+# leiden_manhattan_cluster(). Each sample's files are read from
+# <ft_result_dir>/<sample>/extracted_results/m6a_by_chr/.
+#
+# Inputs:
+#   sample_names  - sample folder names under ft_result_dir; also the factor
+#                   levels of assignments$sample_name
+#   regions       - data.frame with 1-based inclusive chr, start, end and an
+#                   optional unique region_id (default "<chr>_<start>_<end>")
+#   ft_result_dir - root of the per-sample fibertools results
+#   window_size, k_neighbors, resolution, sigma, seed - passed to
+#                   leiden_manhattan_cluster()
+#   sample_table  - optional table with sample_name and timepoint; adds a
+#                   timepoint column to the assignments
+#   verbose       - print progress
+# Output:
+#   list named by region_id of leiden_manhattan_cluster() results, each also
+#   holding region, met_mat and site_met_mat (the full-span read x m6A-site
+#   matrix), params$region_chr / region_id, and assignments with
+#   original_RID (and timepoint)
 # ---------------------------------------------------------------------------
 leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_dir,
                                              window_size = 0,
@@ -199,7 +121,7 @@ leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_di
     )
     dat <- assemble_region_m6a(
       full_span = TRUE, sample_table = assembly_samples, region = assembly_region,
-      matrix_dir = NULL, reuse = FALSE, verbose = verbose
+      matrix_dir = NULL, reuse = FALSE
     )
     met_mat <- dat$met_mat
     rids_df <- dat$rids_df
@@ -248,17 +170,22 @@ leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_di
 # ---------------------------------------------------------------------------
 # Step 1: read x feature matrix.
 #
-# window_size > 0: consecutive windows tiling [region_start, region_end]
-# a read's feature value is the mean of its
-# m6A site calls in the window. Windows containing no m6A site carry no
-# information for any read and are dropped, and are recorded in the returned
-# window annotation with n_sites = 0
-
+# window_size > 0: consecutive windows tiling [region_start, region_end]; a
+# read's feature value is the mean of its m6A site calls in the window.
+# Windows containing no m6A site carry no information for any read and are
+# dropped; they stay in the returned window annotation with n_sites = 0.
 # window_size = 0: no windowing - each m6A site is its own feature and the
 # matrix is the 0/1 site matrix itself.
+# Feature column names are the genomic midpoint of the window (the site
+# position when window_size = 0).
 #
-# Feature matrix column names are the genomic midpoint of the window (the site
-# position when window_size = 0)
+# Inputs:
+#   met_mat                  - reads x m6A sites matrix (colnames = positions)
+#   region_start, region_end - 1-based window tiled when window_size > 0
+#   window_size              - window width in bp; 0 = one feature per site
+# Output:
+#   list(mat = reads x features matrix, window_anno = data.frame(feature,
+#   win_start, win_end, mid, n_sites) with one row per window, window_size)
 # ---------------------------------------------------------------------------
 bin_read_matrix <- function(met_mat, region_start, region_end, window_size = 0) {
   M   <- as.matrix(met_mat)
@@ -296,12 +223,23 @@ bin_read_matrix <- function(met_mat, region_start, region_end, window_size = 0) 
 
 # ---------------------------------------------------------------------------
 # Steps 4-6: Manhattan distances between reads, KNN graph, exponential-kernel
-# affinities as edge weights. Each edge also retains its original Manhattan
-# distance (before the exponential kernel) as the manhattan_distance attribute.
+# affinities exp(-distance / sigma) as edge weights. The graph joins two reads
+# if either is among the other's k nearest neighbours. Each edge also keeps
+# its original Manhattan distance (before the kernel) as the
+# manhattan_distance attribute. k_neighbors is capped at nrow(mat) - 1.
 #
-# k_neighbours is capped at nrow(mat) - 1. sigma = NULL uses the mean of the
-# retained KNN distances; pass sigma = ncol(mat) for scikit-learn's
-# laplacian_kernel default (gamma = 1 / n_features).
+# Inputs:
+#   mat         - reads x features matrix (rownames = read IDs)
+#   k_neighbors - neighbours per read
+#   sigma       - kernel width; NULL = mean of the retained KNN distances.
+#                 sigma = ncol(mat) gives scikit-learn's laplacian_kernel
+#                 default (gamma = 1 / n_features). Falls back to 1 when all
+#                 KNN distances are 0
+#   verbose     - print the graph size and sigma
+# Output:
+#   list(graph = undirected igraph, vertex names = read IDs, edge attributes
+#   weight and manhattan_distance; sigma; k_eff = k used; mean_knn_dist;
+#   dist = full reads x reads distance matrix with an Inf diagonal)
 # ---------------------------------------------------------------------------
 manhattan_knn_graph <- function(mat, k_neighbors = 50, sigma = NULL, verbose = TRUE) {
   n <- nrow(mat)
@@ -366,7 +304,16 @@ manhattan_knn_graph <- function(mat, k_neighbors = 50, sigma = NULL, verbose = T
 # ---------------------------------------------------------------------------
 # Step 7: Leiden community detection with the RBConfigurationVertexPartition
 # quality function (= igraph's modularity objective with a resolution
-# parameter). Returns the membership vector named by read
+# parameter), weighted by the edge affinities.
+#
+# Inputs:
+#   graph        - igraph from manhattan_knn_graph() (edge attribute weight)
+#   resolution   - higher gives more, smaller clusters
+#   n_iterations - Leiden iterations; negative = until the partition is stable
+#   seed         - random seed set before clustering
+# Output:
+#   list(membership = cluster number per read, named by read ID;
+#   quality = quality of the partition)
 # ---------------------------------------------------------------------------
 leiden_partition <- function(graph, resolution = 1, n_iterations = -1, seed = 1) {
   set.seed(seed)
@@ -379,7 +326,18 @@ leiden_partition <- function(graph, resolution = 1, n_iterations = -1, seed = 1)
 }
 
 
-# Keep the existing size ordering (including table()'s order for ties).
+# ---------------------------------------------------------------------------
+# Rename clusters by size: the largest becomes "cluster1", the next
+# "cluster2", and so on, so labels do not depend on Leiden's arbitrary
+# numbering. Keep the existing size ordering (including table()'s order for
+# ties).
+#
+# Inputs:
+#   membership - cluster number per read
+# Output:
+#   factor of "cluster<N>" labels in the order of membership, levels
+#   cluster1 ... clusterK
+# ---------------------------------------------------------------------------
 relabel_clusters_by_size <- function(membership) {
   ord <- names(sort(table(membership), decreasing = TRUE))
   factor(paste0("cluster", match(as.character(membership), ord)),
@@ -387,7 +345,18 @@ relabel_clusters_by_size <- function(membership) {
 }
 
 
+# ---------------------------------------------------------------------------
+# Step 8: mean feature value (m6A fraction) of each cluster at every feature.
 # Feature rows and cluster labels must already be in the same read order.
+#
+# Inputs:
+#   feat_mat - reads x features matrix
+#   cluster  - factor of cluster labels, one per row of feat_mat
+#   na.rm    - ignore NA values in the means
+# Output:
+#   clusters x features matrix (rownames = cluster levels, colnames =
+#   colnames(feat_mat))
+# ---------------------------------------------------------------------------
 cluster_feature_profiles <- function(feat_mat, cluster, na.rm = TRUE) {
   profiles <- t(sapply(levels(cluster), function(cl)
     colMeans(feat_mat[cluster == cl, , drop = FALSE], na.rm = na.rm)))
@@ -397,18 +366,32 @@ cluster_feature_profiles <- function(feat_mat, cluster, na.rm = TRUE) {
 
 
 # ---------------------------------------------------------------------------
-# Steps 1-8 orchestrator.
+# Steps 1-8 orchestrator for one region: bin the read x site matrix into
+# features (bin_read_matrix), build the Manhattan KNN graph
+# (manhattan_knn_graph), run Leiden (leiden_partition), name clusters by size
+# (relabel_clusters_by_size) and average each cluster's features
+# (cluster_feature_profiles). Warns when NA features remain.
 #
-# met_mat:  reads x m6A-site matrix from assemble_region_m6a(full_span = TRUE):
-#           longest alignments physically span the entire analysis window;
-#           reads with zero m6A calls in the window remain in the matrix.
-# rids_df:  read info (RID, chr, start, end, strand, sample_name, ...); extra
-#           columns are carried into the assignment table, so every read keeps
-#           its timepoint next to its cluster.
-# window_size / k_neighbors / resolution / sigma: see above.
-#
-# Returns the feature matrix, the per-read assignments, the per-cluster mean
-# profiles, the KNN graph and the parameters of the run.
+# Inputs:
+#   met_mat     - reads x m6A-site matrix from assemble_region_m6a(full_span =
+#                 TRUE): longest alignments physically span the entire
+#                 analysis window; reads with zero m6A calls in the window
+#                 remain in the matrix
+#   rids_df     - read info with RID (= rownames of met_mat), and optionally
+#                 sample_name, chr, start, end, strand, which are copied into
+#                 the assignment table
+#   region_start, region_end - 1-based analysis window (used when
+#                 window_size > 0)
+#   window_size - feature window in bp; 0 = one feature per m6A site
+#   k_neighbors, sigma - see manhattan_knn_graph()
+#   resolution, seed   - see leiden_partition()
+#   verbose     - print feature, graph and cluster summaries
+# Output:
+#   list(feat_mat, window_anno (from bin_read_matrix), assignments =
+#   data.frame(RID, cluster, sample_name, chr, start, end, strand), profiles =
+#   clusters x features means, graph, n_clusters, params = the settings plus
+#   k_eff, sigma, mean_knn_dist, Leiden quality, region_start / region_end,
+#   n_reads, n_features)
 # ---------------------------------------------------------------------------
 leiden_manhattan_cluster <- function(met_mat, rids_df,
                                      region_start, region_end,
@@ -492,12 +475,36 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
 # ---------------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------------
-# select siginficant AS-FIRE regions using combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds
-# ---------------------------------------------------------------------------------
-
-# /project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds
-
+# ---------------------------------------------------------------------------
+# Select the top LCL allele-specific FIRE (AS-FIRE) regions: filter peak x SNP
+# tests on coverage and FIRE frequency, compute Fisher q-values when missing
+# (qvalue package), keep q < q_cutoff with a valid rsID and SNV, take one lead
+# SNP per FIRE peak (smallest p-value), rank peaks by p-value and keep the
+# first top_n. Each region is a width_bp window centred on its lead SNP.
+#
+# The LCL workflow reads
+#   /project/spott/kevinluo/Fiber_seq/results/QTL/fireQTL/AS_fire_freq_results/combined_results/combined_AS_fire_freq_merged_peaks_window2000_firefreq0.1_het_only.rds
+#
+# Inputs:
+#   asfire_results - table of AS-FIRE tests with chr (or seqnames), start,
+#                    end, peak_name, rsID, snp_pos, ref, alt, fisher_pvalue,
+#                    coverage, coverage_ref, coverage_alt, sample_name
+#                    (comma-separated samples carrying the SNP), and
+#                    fire_freq or fire_coverage; fisher_qvalue is optional
+#   top_n          - number of regions to keep
+#   width_bp       - window width; must be 2000
+#   q_cutoff       - keep fisher_qvalue < q_cutoff
+#   min_coverage   - keep coverage > min_coverage (both alleles must be > 0)
+#   min_fire_freq  - keep fire_freq > min_fire_freq
+# Output:
+#   data.frame, one row per region in rank order: the input columns plus
+#   rank, region_id ("rank01_<rsID>_<peak>"), analysis_start / analysis_end
+#   (1-based), start / end (BED), width, focal_snp, focal_pos,
+#   contributing_samples, n_listed_samples, annotation, region_type =
+#   "top_asfire_het", qvalue_source, peak_start / peak_end, and diagnostics
+#   (overlapping windows / peaks, nearest selected SNP distance,
+#   same_focal_snp_as_another_peak)
+# ---------------------------------------------------------------------------
 select_lcl_top_asfire_regions <- function(asfire_results, top_n = 10L, width_bp = 2000L,
                                           q_cutoff = 0.1, min_coverage = 20,
                                           min_fire_freq = 0.1) {
@@ -598,19 +605,26 @@ select_lcl_top_asfire_regions <- function(asfire_results, top_n = 10L, width_bp 
     min(abs(x$focal_pos[other] - x$focal_pos[i]))
   }, numeric(1))
   
-  # if two different FIRE peak select the same lead SNP, if so, drop both calls
+  # flag regions whose lead SNP is also the lead SNP of another selected peak
+  # (flagged only, not dropped)
   x$same_focal_snp_as_another_peak <- duplicated(paste(x$chr, x$focal_pos)) |
     duplicated(paste(x$chr, x$focal_pos), fromLast = TRUE)
   rownames(x) <- NULL
   x
 }
 
-# ---------------------------------------------------------------------------------
-# filter for LCL samples containing AS-FIRE SNP
-# ---------------------------------------------------------------------------------
-
-# creates a sample table for each AS-FIRE region centered on the SNP
-
+# ---------------------------------------------------------------------------
+# Sample table for one AS-FIRE region: the rows of sample_table listed in the
+# region's comma-separated contributing_samples (the LCLs carrying the SNP),
+# in that order. Without a contributing_samples column the whole table is
+# returned.
+#
+# Inputs:
+#   region       - one region row, optionally with contributing_samples
+#   sample_table - all samples (sample_name, fire_dir, ...)
+# Output:
+#   data.frame subset of sample_table; stops if a listed sample is missing
+# ---------------------------------------------------------------------------
 lcl_region_samples <- function(region, sample_table) {
   if (is.null(region$contributing_samples)) return(sample_table)
   ids <- strsplit(region$contributing_samples, ",", fixed = TRUE)[[1]]
@@ -619,14 +633,33 @@ lcl_region_samples <- function(region, sample_table) {
   sample_table[match(ids, sample_table$sample_name), , drop = FALSE]
 }
 
-# ---------------------------------------------------------------------------------
-# Build m6a binary matrix, run leiden clustering using Manhattan distance
-# ---------------------------------------------------------------------------------
-
-# build m6a matrix for reads covering each complete region, then retains reads with lead SNP
-# from heterozygous samples. Cluster both alleles together with Manhattan distance (bin = 0,
-# k =10, resolution = 1)
-
+# ---------------------------------------------------------------------------
+# LCL AS-FIRE clustering: for each region, build the m6A matrix of reads
+# covering the complete region (assemble_region_m6a, cached under
+# matrix_dir), keep reads phased at the heterozygous lead SNP
+# (lcl_filter_focal_heterozygotes() from LCL_phasing.r) and cluster both
+# alleles together with leiden_manhattan_cluster() (defaults: bin = 0,
+# k = 10, resolution = 1). A saved clustering.rds is reused only when its
+# inputs and parameters are identical; otherwise the function stops. Needs
+# lcl_output_path() from leiden_LCL.Rmd.
+#
+# Inputs:
+#   regions      - rows from select_lcl_top_asfire_regions() (region_type
+#                  "top_asfire_het")
+#   sample_table - LCL samples (sample_name, fire_dir, phasing columns)
+#   matrix_dir   - cache folder for assemble_region_m6a()
+#   output_dir   - results folder
+#   window_size, k_neighbors, leiden_resolution, leiden_seed, kernel_sigma -
+#                  clustering parameters (see leiden_manhattan_cluster())
+#   reuse_cache  - reuse matching m6A matrix caches
+#   phase_cache  - per-sample haplotags from cache_lcl_haplotags()
+# Output:
+#   character vector of clustering.rds paths named by region_id. Writes
+#     <output_dir>/<region_id>/bin<W>/k<K>/resolution<R>/tables/clustering.rds
+#     <output_dir>/summary tables/run_summary.tsv
+#     <output_dir>/summary tables/result_paths.rds
+#     <matrix_dir>/<region_id>/<region_id>_m6a_matrix.rds and _read_qc.tsv
+# ---------------------------------------------------------------------------
 run_lcl_clustering <- function(regions, sample_table, matrix_dir, output_dir,
                                 window_size = 0L, k_neighbors = 10L,
                                 leiden_resolution = 1, leiden_seed = 1L,

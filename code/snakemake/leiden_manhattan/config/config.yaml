@@ -144,6 +144,29 @@ datasets:
       - occupancy_by_cluster
       - heatmap_m6a_footprints
 
+  test_repeats:                                     # smoke test: RepeatMasker regions (LCL), see test/
+    sample_sheet: config/samples_lcl.tsv
+    m6a: "{fire_dir}/extracted_results/m6a_by_chr/{sample_name}.ft_extracted_m6a.{chr}.bed.gz"
+    read_filter: [window_span]
+    annotate_by: [sample]
+    regions:
+      bed: test/repeats_regions.bed                 # built by test/make_repeats_bed.R
+    footprints:
+      nucleosome:
+        source: "{fire_dir}/extracted_results/nuc_by_chr/{sample_name}.ft_extracted_nuc.{chr}.bed.gz"
+        format: bed12_fibertools
+        min_size: 130
+        max_size: 160
+      tf:
+        source: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks/{chr}/combined_{chr}_{size}bp_fps.bed.gz"
+        format: bed4_pooled
+        sizes: ["10-30", "40-60", "60-80"]
+    plots:
+      - umap_overview
+      - read_footprints
+      - occupancy_by_cluster
+      - heatmap_m6a_footprints
+
 slurm:
   account: pi-spott
   partition: caslake
