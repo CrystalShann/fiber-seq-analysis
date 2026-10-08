@@ -201,16 +201,9 @@ p_hex
  
 ### Footprints per FIRE per kb vs FIRE frequency, combined across all timepoints
 
-```{r define_groups}
-open_min <- 0.5
-```
-
-#### Absolute footprint rate among open regions
-
-Distribution of `fp_per_fire_read_per_kb` among open regions (`fire_freq >= open_min`),
-in absolute units.
-
 ```{r fp_rate_summary}
+open_min <- 0.5
+
 fp_rate_summary <- function(df) {
   rate <- df$fp_per_fire_read_per_kb
   probs <- c(0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
@@ -284,8 +277,8 @@ Read the distribution and threshold table above, then fill these in -- no
 default is chosen from the data.
 
 ```{r cutoff_params}
-low_cut  <- NA_real_
-high_cut <- NA_real_
+low_cut  <- 2
+high_cut <- 6
 ```
 
 ```{r define_fp_groups}
