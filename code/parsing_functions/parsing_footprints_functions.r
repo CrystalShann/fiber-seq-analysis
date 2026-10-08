@@ -23,6 +23,27 @@ read_tabix_region <- function(ft_extracted_file, region_gr) {
   )
 }
 
+footprint_format_columns <- function(format) {
+  columns <- c(bed12_fibertools = 12L, bed13_fiberhmm = 13L,
+               bed15_fiberhmm_tf = 15L, bed6_per_sample = 6L, bed4_pooled = 4L)
+  if (length(format) != 1L || is.na(format) || !format %in% names(columns))
+    stop("Unsupported footprint format: ", paste(format, collapse = ", "))
+  unname(columns[[format]])
+}
+
+footprint_column_error <- function(path, format, actual) {
+  stop("Footprint file ", path, " (configured format '", format, "'): expected ",
+       footprint_format_columns(format), " columns, found ", actual, call. = FALSE)
+}
+
+
+keep_longest_alignment <- function(df) {
+  df <- as.data.frame(df)
+  if (!nrow(df)) return(df)
+  df <- df[order(df$RID, -(df$end - df$start)), , drop = FALSE]
+  df[!duplicated(df$RID), , drop = FALSE]
+}
+
 read_ft_bed12 <- function(bed_file, region = NULL, longest_alignment = FALSE) {
   if (is.null(region)) {
     df <- data.table::fread(bed_file, header = FALSE)
@@ -34,9 +55,7 @@ read_ft_bed12 <- function(bed_file, region = NULL, longest_alignment = FALSE) {
   if (ncol(df) != 12L) stop("Expected fibertools BED12 in ", bed_file)
   names(df) <- c('chr','start','end','RID','score','strand','x1','x2','rgb','blockCount','blockSizes','blockStarts')
   if (longest_alignment) {
-    df <- as.data.frame(df)
-    df <- df[order(df$RID, -(df$end - df$start)), , drop = FALSE]
-    df <- df[!duplicated(df$RID), , drop = FALSE]
+    df <- keep_longest_alignment(df)
   }
   return(df)
 }
@@ -54,18 +73,41 @@ read_ft_bed12 <- function(bed_file, region = NULL, longest_alignment = FALSE) {
 ################################################
 
 convert_ft_bed12_to_bed6 <- function(bed12_df, include_read_start_end = FALSE,
-                                   drop_sentinels = TRUE, keep_block_scores = FALSE) {
+                                   drop_sentinels = TRUE, keep_block_scores = FALSE,
+                                   format = NULL, source = NULL,
+                                   longest_alignment = FALSE, validate_blocks = FALSE) {
+  if (!is.null(format)) {
+    expected <- footprint_format_columns(format)
+    if (!format %in% c("bed12_fibertools", "bed13_fiberhmm", "bed15_fiberhmm_tf"))
+      stop("Not a BED12 block format: ", format)
+    configured_sentinels <- format == "bed12_fibertools"
+    if (!missing(drop_sentinels) && !identical(drop_sentinels, configured_sentinels))
+      stop("drop_sentinels conflicts with configured format '", format, "'")
+    drop_sentinels <- configured_sentinels
+    if (ncol(bed12_df) != expected)
+      footprint_column_error(if (is.null(source)) "<unknown>" else source,
+                             format, ncol(bed12_df))
+  }
   if (nrow(bed12_df) == 0) {
     return(data.frame())
   }
   # Existing calls retain the BED12-only contract. FiberHMM callers opt in by
   # keeping all blocks or requesting its per-block scores.
-  legacy <- isTRUE(drop_sentinels) && !isTRUE(keep_block_scores)
-  if (legacy && ncol(bed12_df) != 12L) stop("Expected 12 BED columns")
-  if (!ncol(bed12_df) %in% c(12L, 13L)) stop("Expected 12 or 13 BED columns")
-  has_block_scores <- ncol(bed12_df) == 13L
+  if (is.null(format)) {
+    legacy <- isTRUE(drop_sentinels) && !isTRUE(keep_block_scores)
+    if (legacy && ncol(bed12_df) != 12L) stop("Expected 12 BED columns")
+    if (!ncol(bed12_df) %in% c(12L, 13L)) stop("Expected 12 or 13 BED columns")
+  }
+  has_block_scores <- if (is.null(format)) ncol(bed12_df) == 13L else format != "bed12_fibertools"
   colnames(bed12_df) <- c('chr','start','end','RID','score','strand','read_start','read_end','rgb','blockCount','blockSizes','blockStarts',
-                         if (has_block_scores) 'blockScores')
+                         if (has_block_scores) 'blockScores',
+                         if (identical(format, "bed15_fiberhmm_tf")) c('blockEdgeLeft', 'blockEdgeRight'))
+  if (identical(format, "bed12_fibertools")) {
+    bed12_df$blockCount <- as.integer(bed12_df$blockCount)
+    bed12_df$blockSizes <- as.character(bed12_df$blockSizes)
+    bed12_df$blockStarts <- as.character(bed12_df$blockStarts)
+  }
+  if (longest_alignment) bed12_df <- keep_longest_alignment(bed12_df)
 
   # expand BED12 into one row per block
   block_sizes_list  <- strsplit(sub(",$", "", bed12_df$blockSizes),  ",", fixed = TRUE)
@@ -86,6 +128,11 @@ convert_ft_bed12_to_bed6 <- function(bed12_df, include_read_start_end = FALSE,
     strand = rep(bed12_df$strand, n_blocks),
     stringsAsFactors = FALSE
   )
+
+  if (validate_blocks && (any(bed6_df$end <= bed6_df$start) ||
+      any(bed6_df$start < rep(bed12_df$start, n_blocks))))
+    stop("Invalid blocks in ", if (is.null(source)) "<unknown>" else source,
+         " (configured format '", if (is.null(format)) "<unspecified>" else format, "')")
 
   if (keep_block_scores && has_block_scores) {
     block_scores_list <- strsplit(sub(",$", "", bed12_df$blockScores), ",", fixed = TRUE)
@@ -151,13 +198,13 @@ extract_ft_region_reads <- function(ft_extracted_file, region, keep_pos_in_regio
 
   # if duplicated RIDs are found, keep the longest alignment per RID
   if (any(duplicated(extracted_data_bed12$RID))) {
-    extracted_data_bed12 <- extracted_data_bed12 %>%
-      dplyr::group_by(RID) %>%
-      dplyr::slice_max(end - start, n = 1, with_ties = FALSE) %>%
-      dplyr::ungroup()
+    extracted_data_bed12 <- keep_longest_alignment(extracted_data_bed12)
+    extracted_data_bed12 <- extracted_data_bed12[
+      order(extracted_data_bed12$RID, method = "radix"), , drop = FALSE]
   }
 
-  reads <- convert_ft_bed12_to_bed6(extracted_data_bed12, include_read_start_end = TRUE)
+  reads <- convert_ft_bed12_to_bed6(extracted_data_bed12, include_read_start_end = TRUE,
+    format = "bed12_fibertools", source = ft_extracted_file)
   reads <- reads %>% dplyr::rename(chrom = chr)
   # use 1-based positions
   reads <- reads %>% dplyr::mutate(pos = end, read_start = read_start + 1)

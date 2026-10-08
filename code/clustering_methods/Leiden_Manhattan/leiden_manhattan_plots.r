@@ -966,7 +966,7 @@ fiberseq_umap <- function(result, seed = 1L, n_neighbors = 15L, min_dist = 0.1) 
 
 # ---- Single-molecule footprint processing ----
 # Process LCL nucleosome/TF footprints on fixed m6A-defined read clusters.
-# BED12 and shared data utilities are defined above in this file.
+# BED12 parsing is provided by parsing_footprints_functions.r; display helpers follow.
 # Footprint display tracks only; the clustering input remains the m6A matrix.
 LCL_FOOTPRINT_TRACKS <- c("ft_nuc_130-160bp", "FiberHMM_10-30bp",
                           "FiberHMM_40-60bp", "FiberHMM_60-80bp")
@@ -1031,19 +1031,6 @@ prepare_read_tracks <- function(result, records, sample_colors, sample_label_col
   list(reads = reads, features = records, anchor = anchor, region = result$region)
 }
 
-
-footprint_format_columns <- function(format) {
-  columns <- c(bed12_fibertools = 12L, bed13_fiberhmm = 13L,
-               bed6_per_sample = 6L, bed4_pooled = 4L)
-  if (length(format) != 1L || is.na(format) || !format %in% names(columns))
-    stop("Unsupported footprint format: ", paste(format, collapse = ", "))
-  unname(columns[[format]])
-}
-
-footprint_column_error <- function(path, format, actual) {
-  stop("Footprint file ", path, " (configured format '", format, "'): expected ",
-       footprint_format_columns(format), " columns, found ", actual, call. = FALSE)
-}
 
 # For unindexed files, gzip/awk scans with bounded memory and emits only relevant
 # records. Every scanned record is checked against the explicitly configured dialect.
@@ -1120,7 +1107,8 @@ extract_nucleosomes <- function(sample_table, region, assignments, min_size = 13
       bed$RID <- paste(sample_table$sample_name[sample_index], bed$RID, sep = "::")
       bed <- bed[bed$RID %in% assignments$RID, , drop = FALSE]
       if (!nrow(bed)) return(NULL)
-      blocks <- convert_ft_bed12_to_bed6(bed)
+      blocks <- convert_ft_bed12_to_bed6(bed,
+        format = "bed12_fibertools", source = paths[sample_index])
       blocks$original_RID <- assignments$original_RID[match(blocks$RID, assignments$RID)]
     } else {
       sample <- as.data.frame(sample_table)[sample_index, , drop = FALSE]
@@ -1143,21 +1131,10 @@ extract_nucleosomes <- function(sample_table, region, assignments, min_size = 13
       if (length(path) != 1L || is.na(path)) stop("input_path must resolve to one file per sample and chromosome")
       bed <- read_footprint_region(path, format, region, original_ids)
       if (!nrow(bed)) return(NULL)
-      if (format == "bed12_fibertools") {
-        bed[[10]] <- as.integer(bed[[10]])
-        bed[[11]] <- as.character(bed[[11]])
-        bed[[12]] <- as.character(bed[[12]])
-        bed <- bed[order(bed[[4]], -(bed[[3]] - bed[[2]])), , drop = FALSE]
-        bed <- bed[!duplicated(bed[[4]]), , drop = FALSE]
-      }
-      blocks <- convert_ft_bed12_to_bed6(bed, drop_sentinels = format == "bed12_fibertools")
+      blocks <- convert_ft_bed12_to_bed6(bed, format = format,
+        longest_alignment = (format == "bed12_fibertools"),
+        validate_blocks = strict_blocks && format == "bed13_fiberhmm", source = path)
       if (!nrow(blocks)) return(NULL)
-      # The workflow already rejected nonpositive FiberHMM sizes/negative
-      # offsets; legacy nucleosome-positioning callers retained zero sizes.
-      if (strict_blocks && format == "bed13_fiberhmm" &&
-          (any(blocks$end <= blocks$start) ||
-           any(blocks$start < rep(bed[[2]], as.integer(bed[[10]])))))
-        stop("Invalid blocks in ", path, " (configured format '", format, "')")
       matched <- match(as.character(blocks$RID), original_ids)
       stopifnot(!anyNA(matched))
       blocks$original_RID <- as.character(blocks$RID)

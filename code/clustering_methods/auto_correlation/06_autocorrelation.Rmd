@@ -236,56 +236,6 @@ head(processed_bed12, 20)
   
 ```
 
-#### build nucleosome footprint track
-
-builds the nucleosome footprint track for each clustered read in the autocorrelation
-
-  - Keeps footprints that are 130–160 bp
-
-```{r prepare-nucleosomes-function, include=TRUE}
-prepare_nucleosomes <- function(region, assignments, ft_root) {
-  output <- list()
-  query <- GenomicRanges::GRanges(region$chr,
-    IRanges::IRanges(region$analysis_start, region$analysis_end))
-  for (sample in unique(assignments$sample_name)) {
-    path <- file.path(ft_root, sample, "extracted_results", "nuc_by_chr",
-      paste0(sample, ".ft_extracted_nuc.", region$chr, ".bed.gz"))
-    if (!file.exists(path) || !file.exists(paste0(path, ".tbi")))
-      stop("Missing indexed nucleosome BED: ", path)
-    lines <- unlist(Rsamtools::scanTabix(Rsamtools::TabixFile(path), param = query),
-      use.names = FALSE)
-    if (!length(lines)) next
-    bed <- utils::read.table(text = lines, sep = "\t", header = FALSE,
-      quote = "", comment.char = "", stringsAsFactors = FALSE)
-    stopifnot(ncol(bed) == 12L)
-    names(bed) <- c("chr", "start", "end", "RID", "score", "strand",
-      "read_start", "read_end", "rgb", "blockCount", "blockSizes", "blockStarts")
-    bed <- bed[order(bed$RID, -(bed$end - bed$start)), , drop = FALSE]
-    bed <- bed[!duplicated(bed$RID), , drop = FALSE]
-    bed <- bed[bed$RID %in% assignments$original_RID[assignments$sample_name == sample], , drop = FALSE]
-    for (i in seq_len(nrow(bed))) {
-      sizes <- as.integer(strsplit(sub(",$", "", bed$blockSizes[i]), ",", fixed = TRUE)[[1]])
-      offsets <- as.integer(strsplit(sub(",$", "", bed$blockStarts[i]), ",", fixed = TRUE)[[1]])
-      stopifnot(length(sizes) == bed$blockCount[i], length(offsets) == length(sizes),
-        !anyNA(sizes), !anyNA(offsets))
-      keep <- if (length(sizes) > 2L) seq.int(2L, length(sizes) - 1L) else integer()
-      starts <- bed$start[i] + offsets[keep]
-      ends <- starts + sizes[keep]
-      valid <- sizes[keep] >= 130L & sizes[keep] <= 160L &
-        starts < region$end & ends > region$start
-      if (!any(valid)) next
-      output[[length(output) + 1L]] <- data.frame(
-        RID = paste(sample, bed$RID[i], sep = "::"), original_RID = bed$RID[i],
-        chr = region$chr, start = starts[valid], end = ends[valid],
-        
-        size = sizes[keep][valid], track = "ft_nuc_130-160bp")
-    }
-  }
-  if (length(output)) do.call(rbind, output) else empty_footprints()
-}
-```
-
-
 #### build footprint tracks from FiberHMM
 
 10–30, 40–60, and 60–80 bp size footprints
@@ -335,6 +285,9 @@ run autocorrelation, and get nucleeosomes and footprints
 prepare_report_data <- function(region_data, project, destination,
     ft_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
     tracks_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks") {
+  # Python extracts function chunks only, so load these dependencies here too.
+  source(file.path(project, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
+  source(file.path(project, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r"), local = TRUE)
   stopifnot(region_data$schema_version == 1L, is.data.frame(region_data$region),
     nrow(region_data$region) == 1L, is.data.frame(region_data$records),
     identical(region_data$row_ids, region_data$records$row_id), !anyDuplicated(region_data$row_ids))
@@ -349,7 +302,14 @@ prepare_report_data <- function(region_data, project, destination,
   region_data$footprint_tracks <- character()
   region_data$footprint_sources <- data.frame(track = character(), source = character(), n_records = integer())
   if (nrow(a)) {
-    nucleosomes <- prepare_nucleosomes(region_data$region, a, ft_root)
+    samples <- unique(a$sample_name)
+    nuc_samples <- data.frame(sample_name = samples, fire_dir = file.path(ft_root, samples))
+    nuc_paths <- extracted_path(nuc_samples, region_data$region$chr, "nuc")
+    for (path in nuc_paths) {
+      if (!file.exists(path) || !file.exists(paste0(path, ".tbi")))
+        stop("Missing indexed nucleosome BED: ", path)
+    }
+    nucleosomes <- extract_nucleosomes(nuc_samples, region_data$region, a)
     tracks <- lapply(c("10-30", "40-60", "60-80"), function(size)
       prepare_fiberhmm_track(region_data$region, a, size, project, tracks_root))
     region_data$footprints <- do.call(rbind, c(list(nucleosomes), lapply(tracks, `[[`, "records")))

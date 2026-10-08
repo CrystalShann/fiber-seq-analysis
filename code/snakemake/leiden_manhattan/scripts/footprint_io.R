@@ -93,19 +93,9 @@ collect_footprints <- function(ds, cfg, sample_table, region, assignments) {
       bed <- read_footprint_region(path, spec$format, region, reads$original_RID)
       if (!nrow(bed)) next
       if (spec$format %in% c("bed12_fibertools", "bed13_fiberhmm")) {
-        if (spec$format == "bed12_fibertools") {
-          bed[[10]] <- as.integer(bed[[10]])
-          bed[[11]] <- as.character(bed[[11]])
-          bed[[12]] <- as.character(bed[[12]])
-          bed <- bed[order(bed[[4]], -(bed[[3]] - bed[[2]])), , drop = FALSE]
-          bed <- bed[!duplicated(bed[[4]]), , drop = FALSE]
-        }
-        blocks <- convert_ft_bed12_to_bed6(bed,
-          drop_sentinels = spec$format == "bed12_fibertools")
-        if (spec$format == "bed13_fiberhmm" && nrow(blocks) &&
-            (any(blocks$end <= blocks$start) ||
-             any(blocks$start < rep(bed[[2]], as.integer(bed[[10]])))))
-          stop("Invalid blocks in ", path, " (configured format '", spec$format, "')")
+        blocks <- convert_ft_bed12_to_bed6(bed, format = spec$format,
+          longest_alignment = (spec$format == "bed12_fibertools"),
+          validate_blocks = (spec$format == "bed13_fiberhmm"), source = path)
       } else {
         blocks <- as.data.frame(bed[, 1:4, drop = FALSE], stringsAsFactors = FALSE)
         names(blocks) <- c("chr", "start", "end", "RID")

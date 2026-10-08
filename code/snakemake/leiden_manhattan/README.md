@@ -34,6 +34,14 @@ the BED12/tabix readers, read metadata and methylation matrix helpers, and
 assembly and the default Leiden assembly share that loader; the full-span Leiden
 branch keeps its existing read selection.
 
+All BED12 block expansion goes through `convert_ft_bed12_to_bed6()`. The shared
+`footprint_format_columns()` table in `parsing_footprints_functions.r` maps explicit
+format names to column counts; column counts never select the format. The
+converter handles sentinel policy, longest-alignment selection, and optional block
+validation. Existing strict checks apply only to `bed13_fiberhmm`; fibertools
+paths retain their previous acceptance behavior. BED6/BED4 readers keep their
+column checks and region filtering. Configured format values are unchanged.
+
 The parsing file is included in `CORE`, an input of every rule/checkpoint that
 loads it, so changes to the file make those rules eligible to rerun.
 

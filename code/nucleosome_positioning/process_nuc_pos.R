@@ -10,8 +10,8 @@
 #'
 #' Inputs
 #'   * FiberHMM footprint BED12, one tabix-indexed file per sample x chromosome.
-#'     The files carry 13 columns (the last is an all-zero block field); only
-#'     the standard BED12 columns are read. FiberHMM writes NO sentinel
+#'     The files carry 13 columns: BED12 plus all-zero blockScores. The shared
+#'     converter accepts that column but does not retain scores here. FiberHMM writes NO sentinel
 #'     first/last blocks, so every block is a real nucleosome footprint and all
 #'     of them are used (no size filter).
 #'   * FiberHMM TF footprints split by size class: BED6 with the footprint size

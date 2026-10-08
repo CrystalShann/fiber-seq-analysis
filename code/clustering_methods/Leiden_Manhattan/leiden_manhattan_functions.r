@@ -94,7 +94,8 @@ assemble_region_m6a <- function(sample_names = NULL, region_chr = NULL, region_s
         RID = bed$RID, original_RID = original_ids, chr = bed$chr,
         start = bed$start + 1L, end = bed$end, strand = bed$strand,
         sample_name = sample_name, score = bed$score)
-      blocks <- convert_ft_bed12_to_bed6(bed)
+      blocks <- convert_ft_bed12_to_bed6(bed,
+        format = "bed12_fibertools", source = paths[sample_index])
       if (any(blocks$end - blocks$start != 1L)) stop("Non-single-base m6A block in ", paths[sample_index])
       blocks <- blocks[blocks$end >= region$analysis_start & blocks$end <= region$analysis_end, , drop = FALSE]
       reads_list[[sample_index]] <- data.frame(RID = as.character(blocks$RID), pos = blocks$end)

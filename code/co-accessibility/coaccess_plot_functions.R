@@ -175,7 +175,8 @@ load_ft_tracks <- function(res, keys = NULL, ft_root = FT_RESULT_DIR,
         d[, key := character(0)]
         return(d)
       }
-      d <- as.data.table(convert_ft_bed12_to_bed6(rows, drop_sentinels = !fiberhmm))
+      d <- as.data.table(convert_ft_bed12_to_bed6(rows,
+        format = if (fiberhmm) "bed13_fiberhmm" else "bed12_fibertools", source = p))
       # LCL sentinel removal groups by RID; retain this track's original read
       # order, and its rule excluding any remaining zero-width blocks.
       d <- d[order(match(RID, rows[[4]]))]

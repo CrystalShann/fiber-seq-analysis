@@ -69,6 +69,13 @@ load_region_results <- function(region,
                  start = as.numeric(region$start),
                  end = as.numeric(region$end))
 
+  fiberhmm_formats <- c(tf = "bed15_fiberhmm_tf", footprint = "bed13_fiberhmm",
+                        msp = "bed13_fiberhmm")
+  for (feature in list(fiberHMM_feature, nucleosome_feature)) {
+    if (length(feature) != 1L || is.na(feature) || !feature %in% names(fiberhmm_formats))
+      stop("Unsupported FiberHMM feature: ", paste(feature, collapse = ", "))
+  }
+
   reads_l <- list(); fire_l <- list(); peaks_l <- list(); fps_l <- list(); nuc_l <- list()
 
   for (i in seq_along(sample_names)) {
@@ -97,6 +104,7 @@ load_region_results <- function(region,
 
     fp <- read_fiberhmm_region(
       file.path(d, paste0("region.fiberhmm_", fiberHMM_feature, ".bed")),
+      format = unname(fiberhmm_formats[[fiberHMM_feature]]),
       min_score = min_fiberHMM_fp_score,
       size_breaks = fiberHMM_size_breaks)
     if (nrow(fp) > 0) fp$sample_name <- s
@@ -106,6 +114,7 @@ load_region_results <- function(region,
     # score filter here.
     nuc <- read_fiberhmm_region(
       file.path(d, paste0("region.fiberhmm_", nucleosome_feature, ".bed")),
+      format = unname(fiberhmm_formats[[nucleosome_feature]]),
       min_score = 0,
       size_breaks = nucleosome_size_breaks)
     if (nrow(nuc) > 0) {

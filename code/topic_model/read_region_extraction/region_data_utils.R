@@ -49,15 +49,12 @@ read_ft_mod_region <- function(file, region_start, region_end) {
 
   # one alignment per read: keep the longest if a read is split
   if (any(duplicated(df$RID))) {
-    df <- df %>%
-      dplyr::group_by(RID) %>%
-      dplyr::slice_max(end - start, n = 1, with_ties = FALSE) %>%
-      dplyr::ungroup() %>%
-      as.data.frame()
+    df <- keep_longest_alignment(df)
+    df <- df[order(df$RID, method = "radix"), , drop = FALSE]
   }
 
   blocks <- convert_ft_bed12_to_bed6(df, include_read_start_end = TRUE,
-                                    drop_sentinels = TRUE)
+                                    format = "bed12_fibertools", source = file)
   if (nrow(blocks) == 0) return(data.frame())
   blocks <- blocks[order(match(blocks$RID, df$RID)), , drop = FALSE]
 
@@ -127,26 +124,21 @@ assign_size_class <- function(size, breaks) {
 
 #' Read FiberHMM footprint calls for the region and expand them into footprints.
 #'
-#' @param feature_cols column names for the file: 15 for `tf`
-#'   (blockScores/blockEdgeLeft/blockEdgeRight), 13 for `footprint`/`msp` (blockScores).
-read_fiberhmm_region <- function(file,
+#' @param format Explicit `bed15_fiberhmm_tf` for `tf`, or `bed13_fiberhmm`
+#'   for `footprint`/`msp`. TF edge columns are ignored.
+read_fiberhmm_region <- function(file, format,
                                  min_score = 0,
                                  size_breaks = c(10, 30, 60, 80)) {
+  if (length(format) != 1L || is.na(format) ||
+      !format %in% c("bed13_fiberhmm", "bed15_fiberhmm_tf"))
+    stop("FiberHMM requires bed13_fiberhmm or bed15_fiberhmm_tf format")
   df <- read_bed(file)
   if (nrow(df) == 0) return(data.frame())
 
-  cols <- switch(as.character(ncol(df)),
-    "12" = FT_BED12_COLS,
-    "13" = c(FT_BED12_COLS, "blockScores"),
-    "15" = c(FT_BED12_COLS, "blockScores", "blockEdgeLeft", "blockEdgeRight"),
-    stop(file, " has ", ncol(df), " columns; expected 12, 13 or 15"))
-  colnames(df) <- cols
-
-  # FiberHMM beds have no sentinel blocks, unlike `ft extract` output
-  # The two TF edge columns are not block scores and were never used here.
-  blocks <- convert_ft_bed12_to_bed6(df[, seq_len(min(ncol(df), 13L)), drop = FALSE],
+  # FiberHMM has no sentinels; the configured TF edge columns are ignored.
+  blocks <- convert_ft_bed12_to_bed6(df, format = format, source = file,
                                     include_read_start_end = TRUE,
-                                    drop_sentinels = FALSE, keep_block_scores = TRUE)
+                                    keep_block_scores = TRUE)
   if (nrow(blocks) == 0) return(data.frame())
 
   if ("block_score" %in% colnames(blocks) && min_score > 0)
