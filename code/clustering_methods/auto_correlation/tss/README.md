@@ -401,10 +401,11 @@ Per-expression-bin NRL plots and tables use every sampled molecule.
 
 Final plotting uses base R; Python produces matrices and tables only.
 The individual worker scripts retain their working-file behavior when invoked
-directly. For example, `02_plot_tss_autocorrelation.R --out-dir PATH --png` can
-generate PNGs while the working directory still contains the footprint binary
-and shape TSV, but also writes validation and manifest files there. Published
-tables alone are insufficient to rerun the full plotting step after cleanup.
+directly. For example, `02_plot_tss_autocorrelation.R --out-dir PATH` writes
+seventeen PDFs while the working directory still contains the footprint binary
+and shape TSV, plus validation and manifest files there. The wrapper publishes
+only the PDFs from `plots/`. Published tables alone are insufficient to rerun
+the full plotting step after cleanup.
 
 ## Runtime
 

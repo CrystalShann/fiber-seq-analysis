@@ -1,9 +1,10 @@
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
+
 #!/usr/bin/env Rscript
 
 # Base R only. Rasterization changes rendering, never the per-base ACF matrix.
 args <- commandArgs(trailingOnly = TRUE)
 out_dir <- "/project/spott/cshan/fiber-seq/macrophage_project/auto_correlation/tss"
-write_png <- FALSE
 force <- FALSE
 i <- 1L
 while (i <= length(args)) {
@@ -11,12 +12,10 @@ while (i <= length(args)) {
     i <- i + 1L
     if (i > length(args)) stop("--out-dir requires a path")
     out_dir <- args[i]
-  } else if (args[i] == "--png") {
-    write_png <- TRUE
   } else if (args[i] == "--force") {
     force <- TRUE
   } else if (args[i] %in% c("--help", "-h")) {
-    cat("Usage: Rscript 02_plot_tss_autocorrelation.R [--out-dir PATH] [--png] [--force]\n")
+    cat("Usage: Rscript 02_plot_tss_autocorrelation.R [--out-dir PATH] [--force]\n")
     quit(save = "no", status = 0L)
   } else {
     stop("Unknown argument: ", args[i])
@@ -41,7 +40,7 @@ input_paths <- c(input_paths, footprint_path, footprint_shape_path)
 if (!all(file.exists(input_paths))) stop("Missing inputs: ",
   paste(input_paths[!file.exists(input_paths)], collapse = ", "))
 signature <- list(input_md5 = tools::md5sum(c(input_paths, script_path)),
-  png = write_png, R_version = R.version.string)
+  R_version = R.version.string)
 manifest_path <- file.path(plot_dir, "plot_manifest.rds")
 validation_path <- file.path(validation_dir, "plot_validation.tsv")
 old_manifest <- if (file.exists(manifest_path)) {
@@ -242,8 +241,7 @@ plot_counts <- count_matrix[plot_levels, , drop = FALSE]
 within_bin <- sweep(plot_counts, 2, colSums(plot_counts), "/")
 within_cluster <- within_cluster[plot_levels, , drop = FALSE]
 bin_colors <- setNames(c("#4477AA", "#66CCEE", "#EEAA33", "#CC6677"), bins)
-timepoint_colors <- c(LPS_0 = "#bdbdbd", LPS_5 = "#6baed6",
-                      LPS_10 = "#2171b5", LPS_15 = "#08306b")
+timepoint_colors <- timepoint_palette(names(LEIDEN_TIMEPOINT_COLORS))
 footprint_colors <- c("No call" = "white", "Nucleosome >90 bp" = "#4d4d4d",
                       "TF <60 bp" = "#f16913", "m6A" = "#800080")
 check("footprint_timepoints", all(metadata$timepoint %in% names(timepoint_colors)),
@@ -253,20 +251,13 @@ acf_limit <- max(0.01, unname(quantile(abs(acf[valid, -1, drop = FALSE]),
   probs = 0.99, na.rm = TRUE)))
 output_paths <- character()
 save_plot <- function(name, draw, width = 11, height = 8) {
-  for (format in c("pdf", if (write_png) "png")) {
-    path <- file.path(plot_dir, paste0(name, ".", format))
-    tmp <- paste0(path, ".tmp")
-    if (format == "pdf") {
-      grDevices::pdf(tmp, width = width, height = height, onefile = TRUE,
-        useDingbats = FALSE, compress = TRUE)
-    } else {
-      grDevices::png(tmp, width = width, height = height, units = "in", res = 180,
-        type = if (capabilities("cairo")) "cairo" else getOption("bitmapType"))
-    }
-    tryCatch(draw(), finally = grDevices::dev.off())
-    if (!file.rename(tmp, path)) stop("Could not finalize plot: ", path)
-    output_paths <<- c(output_paths, path)
-  }
+  path <- file.path(plot_dir, paste0(name, ".pdf"))
+  tmp <- paste0(path, ".tmp")
+  grDevices::pdf(tmp, width = width, height = height, onefile = TRUE,
+    useDingbats = FALSE, compress = TRUE)
+  tryCatch(draw(), finally = grDevices::dev.off())
+  if (!file.rename(tmp, path)) stop("Could not finalize plot: ", path)
+  output_paths <<- c(output_paths, path)
   message("[", format(Sys.time(), "%F %T"), "] Wrote ", name)
 }
 heatmap_panel <- function(rows, title) {
@@ -574,7 +565,7 @@ save_plot("11_null_prominence_distribution", function() {
     length(v), calibration$shuffle_mode, if ("quantile" %in% names(calibration)) calibration$quantile else "fixed",
     100 * mean(v > threshold)), side = 3, line = 0.3, cex = 0.7)
 }, width = 9, height = 6)
-check("plot_completion", length(output_paths) == 17L * (if (write_png) 2L else 1L) &&
+check("plot_completion", length(output_paths) == 17L &&
   all(file.exists(output_paths)) && all(file.info(output_paths)$size > 0L),
   paste(length(output_paths), "plots exported successfully"))
 write.table(checks, paste0(validation_path, ".tmp"), sep = "\t", row.names = FALSE, quote = FALSE)

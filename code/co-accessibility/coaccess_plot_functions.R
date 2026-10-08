@@ -39,6 +39,7 @@ suppressPackageStartupMessages({
 })
 
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 
 TABIX_BIN <- "/project/spott/cshan/envs/dimelo/bin/tabix"
 
@@ -57,9 +58,6 @@ FT_RESULT_DIR <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/ext
 FIREHMM_DIR <- "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract"
 FP_SIZE_BINS <- c("size10-30", "size40-60", "size60-80")
 
-# per-timepoint line colours for the aggregate panels, recycled over `samples`
-# (the topic model's tp_colors in 1_m6a_promoter_topic_modelling.Rmd)
-TP_COLS       <- c("#0072B2", "#E69F00", "#009E73", "#D55E00")
 
 M6A_COL       <- "blue"
 BACKBONE_COL  <- "grey70"
@@ -317,28 +315,15 @@ plot_pair_panels <- function(res, cre1, cre2, labels, cres = NULL,
     ct[, tested := (start == cre1$start & end == cre1$end) |
                    (start == cre2$start & end == cre2$end)]
     ct[, y := 1]
-    gg$cres <- band(
-      ggplot(ct, aes(x = start, xend = end, y = y, yend = y, colour = tested)) +
-        geom_segment(linewidth = 3) +
-        scale_colour_manual(values = c("FALSE" = "grey55", "TRUE" = "#B2182B"),
-                            labels = c("FALSE" = "other cCRE", "TRUE" = "tested pair"),
-                            name = NULL) +
-        scale_y_continuous(breaks = 1, labels = "cCREs") +
-        theme_bw(11) +
-        theme(axis.text.y = element_text(size = 10), legend.position = "right") +
-        labs(x = NULL, y = NULL)) +
-      coord_cartesian(xlim = xlims)
+    gg$cres <- band(plot_interval_track(ct, xlims, fill_col = "tested", row_col = "y",
+      geometry = "segment", linewidth = 3,
+      color_scale = scale_colour_manual(values = c("FALSE" = "grey55", "TRUE" = "#B2182B"),
+        labels = c("FALSE" = "other cCRE", "TRUE" = "tested pair"), name = NULL),
+      scales = list(y = scale_y_continuous(breaks = 1, labels = "cCREs")),
+      labels = list(x = NULL, y = NULL),
+      theme = theme_bw(11) + theme(axis.text.y = element_text(size = 10), legend.position = "right")))
   }
 
-  raster_theme <- function(p, ylab) {
-    band(p +
-      facet_grid(sample_name ~ ., scales = "free_y", space = "free_y") +
-      theme_bw(11) +
-      theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
-            panel.grid.major.y = element_blank()) +
-      labs(x = NULL, y = ylab)) +
-      coord_cartesian(xlim = xlims)
-  }
 
   ## 3. m6A fraction + raster -------------------------------------------------
   ## methylation fraction the way the topic model plots it (the empirical profile
@@ -363,11 +348,12 @@ plot_pair_panels <- function(res, cre1, cre2, labels, cres = NULL,
       if (nrow(prop) > 0) {
         prop[, sample_name := factor(sample_name, levels = samples)]
         gg$m6a_prop <- band(
-          ggplot(prop, aes(pos, frac, colour = sample_name)) +
-            geom_line(linewidth = 0.4) +
+          plot_group_profile(prop, group_col = "sample_name", style = "line", y_col = "frac",
+            mapping = aes(pos, frac, colour = sample_name),
+            layers = list(list(geom = "line", linewidth = 0.4))) +
             facet_grid(sample_name ~ .) +
             scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
-            scale_colour_manual(values = rep(TP_COLS, length.out = length(samples))) +
+            scale_colour_manual(values = timepoint_palette(samples)) +
             theme_bw(11) +
             theme(strip.text.y = element_text(angle = 0), legend.position = "none") +
             labs(x = NULL, y = "m6A fraction",
@@ -376,13 +362,18 @@ plot_pair_panels <- function(res, cre1, cre2, labels, cres = NULL,
       }
 
       ## the raw single-molecule signal: one mark per methylated adenine
-      gg$m6a <- raster_theme(
+      gg$m6a <- band(
         ggplot() +
           geom_segment(data = sp, aes(x = start, xend = end, y = key, yend = key),
                        colour = BACKBONE_COL, linewidth = linewidth) +
           geom_tile(data = m, aes(x = start, y = key), width = 8, height = 0.85,
-                    fill = M6A_COL),
-        "m6A")
+                    fill = M6A_COL) +
+          facet_grid(sample_name ~ ., scales = "free_y", space = "free_y") +
+          theme_fiberseq("bw", base_size = 11, overrides = list(
+            axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+            panel.grid.major.y = element_blank())) +
+          labs(x = NULL, y = "m6A")) +
+        coord_cartesian(xlim = xlims)
     }
   }
 
@@ -410,13 +401,18 @@ plot_pair_panels <- function(res, cre1, cre2, labels, cres = NULL,
   seg[, sample_name := factor(sample_name, levels = samples)]
   setorder(seg, class)
 
-  gg$reads <- raster_theme(
+  gg$reads <- band(
     ggplot(seg) +
       geom_segment(aes(x = start, xend = end, y = key, yend = key, colour = class),
                    linewidth = linewidth) +
       scale_colour_manual(values = SEG_COLS, name = NULL, drop = FALSE) +
-      guides(colour = guide_legend(override.aes = list(linewidth = 3))),
-    "FiberHMM footprints") +
+      guides(colour = guide_legend(override.aes = list(linewidth = 3))) +
+      facet_grid(sample_name ~ ., scales = "free_y", space = "free_y") +
+      theme_fiberseq("bw", base_size = 11, overrides = list(
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank())) +
+      labs(x = NULL, y = "FiberHMM footprints")) +
+    coord_cartesian(xlim = xlims) +
     labs(x = region$chrom)
 
   order_ <- c("m6a_prop", "cres", "m6a", "reads")
@@ -429,19 +425,9 @@ plot_pair_panels <- function(res, cre1, cre2, labels, cres = NULL,
 
 
 #' Configuration proportions per timepoint - the 2x2 read off the fibers.
-plot_config_bars <- function(labels, samples, title = NULL) {
-  d <- labels[!is.na(config)]
+configuration_proportion_inputs <- function(labels, samples) {
+  d <- data.table::copy(labels[!is.na(config)])
   d[, sample_name := factor(sample_name, levels = samples)]
   n_lab <- d[, .(n = .N), by = sample_name][, lab := paste0("n=", n)]
-
-  ggplot(d, aes(x = sample_name, fill = config)) +
-    geom_bar(position = "fill", width = 0.7) +
-    geom_text(data = n_lab, aes(x = sample_name, y = 1.04, label = lab),
-              inherit.aes = FALSE, size = 3) +
-    scale_fill_manual(values = CONFIG_COLS, drop = FALSE) +
-    scale_y_continuous(labels = scales::percent, limits = c(0, 1.08),
-                       breaks = c(0, .25, .5, .75, 1)) +
-    theme_bw(11) +
-    labs(x = NULL, y = "fibers spanning both cCREs", fill = "configuration",
-         title = title)
+  list(rows = d, totals = n_lab)
 }

@@ -42,8 +42,29 @@ validation. Existing strict checks apply only to `bed13_fiberhmm`; fibertools
 paths retain their previous acceptance behavior. BED6/BED4 readers keep their
 column checks and region filtering. Configured format values are unchanged.
 
-The parsing file is included in `CORE`, an input of every rule/checkpoint that
-loads it, so changes to the file make those rules eligible to rerun.
+`plotting_functions` names the single shared file
+`code/parsing_functions/plotting_functions.r`, relative to `project_root`.
+`common.R` sources it after the parsing file and before the Leiden plot library.
+It defines palettes, `timepoint_palette()`, `theme_fiberseq()`, `save_figure()`,
+`plot_stacked_proportion()`, `plot_interval_track()`, `plot_group_profile()` and
+`plot_read_heatmap()`
+without loading packages or drawing anything when sourced. Timepoint colors are
+LPS_0 `#bdbdbd`, LPS_5 `#6baed6`, LPS_10 `#2171b5`, and LPS_15 `#08306b`;
+LCL sample and footprint-class palettes remain separate.
+
+Both files are included in `CORE`, including the plot and summarize rule inputs,
+so changes make dependent rules eligible to rerun. Plot filenames, dimensions,
+PDF devices, `panels.tsv` statuses and manifests retain their existing behavior.
+Raw-read proportions use count normalization; precomputed fractions retain their
+original denominators. Profile drawing uses the shared renderer while preparation
+keeps each existing denominator, smoothing window and promoter orientation. Ordered
+layer specifications preserve ribbons, outlines, columns and annotation placement.
+Read heatmaps share one renderer with genomic, clustering-feature and FIRE-window
+layouts. Each layout retains its row ordering, annotations and raster settings;
+PDF filenames, dimensions and manifest panel identifiers are unchanged.
+The macrophage composition figure keeps its stacked first
+panel and dodged second panel. Direct heatmap PDF exports inherit `pdf.options()`
+for the background; ggplot exports retain their configured background.
 
 Dry-run all configured datasets without executing analysis jobs:
 

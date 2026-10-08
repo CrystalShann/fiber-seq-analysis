@@ -1,0 +1,14 @@
+---
+title: "footprints at FIRE regions"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Footprint occupancy at FIRE regions 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+

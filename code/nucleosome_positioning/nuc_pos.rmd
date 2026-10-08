@@ -187,12 +187,35 @@ panel per cluster, timepoints pooled. Distinct profiles = the accessibility
 states are also distinct nucleosome-positioning states.
 
 ```{r occupancy-cluster, fig.width=7.5, fig.height=9}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 occ_cluster <- occupancy_profile(footprints, reads, anchors, by = c("region_id", "cluster"))
 fwrite(occ_cluster, file.path(table_dir, "occupancy_by_cluster.tsv"), sep = "\t")
 
 for (rid in names(p_reads)) {
   reads_r <- reads[region_id == rid]
-  p <- plot_occupancy_by_cluster(occ_cluster[region_id == rid], reads_r, anchors[region_id == rid])
+  p <- local({
+    .profile_args <- list(occ_cl = occ_cluster[region_id == rid],
+      reads_r = reads_r,
+      meta = anchors[region_id == rid])
+    occ_cl <- .profile_args$occ_cl
+    reads_r <- .profile_args$reads_r
+    meta <- .profile_args$meta
+    d <- copy(occ_cl)[, cluster := droplevels(cluster)]
+    plot_group_profile(d, group_col = "cluster", style = "line",
+      mapping = aes(pos, fraction, colour = cluster),
+      layers = list(list(geom = "vline", xintercept = 0, linetype = "dashed",
+        colour = "grey30", linewidth = 0.4), list(geom = "line", linewidth = 0.6))) +
+      scale_colour_manual(values = cluster_id_palette(levels(d$cluster)), guide = "none") +
+      position_scale(meta) +
+      scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
+                         expand = expansion(mult = c(0, 0.02))) +
+      facet_wrap(~ cluster, ncol = 1, labeller = as_labeller(cluster_labels(reads_r))) +
+      labs(x = position_label(meta), y = "Fraction of reads with a nucleosome",
+           title = "Nucleosome occupancy per Leiden cluster",
+           subtitle = paste0(region_title(meta), ", timepoints pooled")) +
+      profile_theme() +
+      panel_border()
+  })
   print(p)
   ggsave(file.path(plot_dir, sprintf("%s_fig2_occupancy_by_cluster.pdf", rid)), p,
          width = 7.5, height = 1.4 * uniqueN(reads_r$cluster) + 1.4)

@@ -1,7 +1,7 @@
 # Custom regions supplied as a BED file. BED is 0-based, half-open; the
 # workflow stores analysis coordinates as 1-based, inclusive.
 select_bed_regions <- function(spec) {
-  path <- spec$bed
+  path <- spec
   if (is.null(path) || length(path) != 1L || !nzchar(path) || !file.exists(path))
     stop("regions.bed requires an existing BED file")
   bed <- read.delim(path, header = FALSE, stringsAsFactors = FALSE,

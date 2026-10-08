@@ -5,8 +5,6 @@
 #' the window in relative coordinates), and returns a ggplot:
 #'   plot_read_footprints()       Fig 1  read-level footprint tracks, rows grouped
 #'                                       by Leiden cluster, then timepoint
-#'   plot_occupancy_by_cluster()  Fig 2  nucleosome occupancy per cluster, one
-#'                                       panel per cluster, timepoints pooled
 #'   plot_position_summary()      supporting: -1 / +1 nucleosome position and
 #'                                NFR width per read, by cluster and timepoint
 #'
@@ -21,12 +19,12 @@ suppressPackageStartupMessages({
   library(cowplot)
 })
 
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
        local = TRUE)
 
 # timepoint colours keyed by LPS minutes (sequential, as in the Leiden notebook)
-TP_COLORS <- setNames(LEIDEN_TIMEPOINT_COLORS,
-                     sub("^LPS_", "", names(LEIDEN_TIMEPOINT_COLORS)))
+TP_COLORS <- timepoint_palette(c("0", "5", "10", "15"))
 TP_LABELS <- setNames(paste0("LPS ", names(TP_COLORS), " min"), names(TP_COLORS))
 
 # footprint classes drawn in the read tracks (NUC_ prefix: the topic-model
@@ -143,22 +141,7 @@ plot_read_footprints <- function(fp_r, reads_r, pos_r, meta) {
 # ---------------------------------------------------------------------------
 # Fig 2. Nucleosome occupancy per cluster, one panel per cluster
 # ---------------------------------------------------------------------------
-plot_occupancy_by_cluster <- function(occ_cl, reads_r, meta) {
-  d <- copy(occ_cl)[, cluster := droplevels(cluster)]
-  ggplot(d, aes(pos, fraction, colour = cluster)) +
-    anchor_line() +
-    geom_line(linewidth = 0.6) +
-    scale_colour_manual(values = cluster_id_palette(levels(d$cluster)), guide = "none") +
-    position_scale(meta) +
-    scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
-                       expand = expansion(mult = c(0, 0.02))) +
-    facet_wrap(~ cluster, ncol = 1, labeller = as_labeller(cluster_labels(reads_r))) +
-    labs(x = position_label(meta), y = "Fraction of reads with a nucleosome",
-         title = "Nucleosome occupancy per Leiden cluster",
-         subtitle = paste0(region_title(meta), ", timepoints pooled")) +
-    profile_theme() +
-    panel_border()
-}
+
 
 # ---------------------------------------------------------------------------
 # Supporting: -1 / +1 nucleosome position and NFR width per read

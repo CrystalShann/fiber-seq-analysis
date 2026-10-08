@@ -386,6 +386,7 @@ def main(argv=None):
     if args.region:
         regions = regions[regions.region_id.isin(args.region)]
     sources = [FUNCTIONS, PHASED_INPUT, R_BUILDER, args.selection_signature, args.sample_table, R_REPORT,
+               PROJECT / "code/parsing_functions/plotting_functions.r",
                PROJECT / "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r",
                PROJECT / "code/haplotype_phasing/LCL_phasing.r",
                *sorted(Path(__file__).parent.glob("*.py"))]

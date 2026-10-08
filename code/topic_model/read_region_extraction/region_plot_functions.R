@@ -15,6 +15,7 @@
 #   <out_root>/<outname>/<sample>/parsed/
 
 # Source region_data_utils.R before this file.
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -370,10 +371,10 @@ plot_region_panels <- function(res,
 
   ## 1. Methylation proportion -------------------------------------------------
   pil <- res$pileup
-  gg$pileup <- ggplot(dplyr::filter(pil, base == "A"),
-                      aes(x = pos, y = smooth_frac, colour = base)) +
-    geom_col(data = dplyr::filter(pil, base == "CG"), aes(y = smooth_frac)) +
-    geom_line() +
+  gg$pileup <- plot_group_profile(dplyr::filter(pil, base == "A"), group_col = "base",
+    style = "line", y_col = "smooth_frac", mapping = aes(x = pos, y = smooth_frac, colour = base),
+    layers = list(list(geom = "col", data = dplyr::filter(pil, base == "CG"),
+      mapping = aes(y = smooth_frac)), list(geom = "line"))) +
     theme_bw() +
     scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
     scale_colour_manual(values = bp) +
@@ -393,15 +394,13 @@ plot_region_panels <- function(res,
       pk$group <- factor(pk$group, levels = unique(pk$group))
       pk <- pk[order(pk$group, pk$start), , drop = FALSE]
       pk$y <- rev(seq_len(nrow(pk)))
-      gg$peaks <- ggplot(pk, aes(x = start, xend = end, y = y, yend = y)) +
-        geom_segment(linewidth = 1.5, colour = "black") +
-        theme_bw() +
-        labs(x = NULL, y = NULL) +
-        scale_y_continuous(breaks = pk$y, labels = as.character(pk$group),
-                           expand = expansion(mult = c(.15, .15))) +
-        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
-              axis.text.y = element_text(size = 7), panel.grid.minor = element_blank()) +
-        coord_cartesian(xlim = xlims, expand = TRUE)
+      gg$peaks <- plot_interval_track(pk, xlims, row_col = "y", geometry = "segment",
+        linewidth = 1.5, color = "black", labels = list(x = NULL, y = NULL),
+        scales = list(y = scale_y_continuous(breaks = pk$y, labels = as.character(pk$group),
+          expand = expansion(mult = c(.15, .15))),
+          coord = coord_cartesian(xlim = xlims, expand = TRUE)),
+        theme = theme_bw() + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          axis.text.y = element_text(size = 7), panel.grid.minor = element_blank()))
     }
   }
 
@@ -411,19 +410,14 @@ plot_region_panels <- function(res,
   if (!is.null(res$fire_peaks) && nrow(res$fire_peaks) > 0) {
     fp <- res$fire_peaks
     fp$y <- 1
-    gg$fire_peaks <- ggplot(fp, aes(x = start, xend = end, y = y, yend = y,
-                                    colour = logFDR)) +
-      geom_segment(linewidth = 1) +
-      theme_bw() +
-      labs(x = NULL, y = NULL, colour = "-log10(FDR)") +
-      scale_colour_gradient2(low = "black", mid = "gray", high = "red",
-                             midpoint = 1.3, limits = c(0, 5.2),
-                             oob = scales::squish) +
-      scale_y_continuous(breaks = 1, labels = "FIRE peaks", expand = expansion(add = 1)) +
-      theme(legend.key.size = unit(0.4, "cm"),
-            legend.text = element_text(size = 7),
-            legend.title = element_text(size = 8)) +
-      coord_cartesian(xlim = xlims, expand = TRUE)
+    gg$fire_peaks <- plot_interval_track(fp, xlims, fill_col = "logFDR", row_col = "y",
+      geometry = "segment", linewidth = 1, labels = list(x = NULL, y = NULL, colour = "-log10(FDR)"),
+      color_scale = scale_colour_gradient2(low = "black", mid = "gray", high = "red",
+        midpoint = 1.3, limits = c(0, 5.2), oob = scales::squish),
+      scales = list(y = scale_y_continuous(breaks = 1, labels = "FIRE peaks", expand = expansion(add = 1)),
+        coord = coord_cartesian(xlim = xlims, expand = TRUE)),
+      theme = theme_bw() + theme(legend.key.size = unit(.4, "cm"),
+        legend.text = element_text(size = 7), legend.title = element_text(size = 8)))
   }
 
   ## 4. SMF reads --------------------------------------------------------------

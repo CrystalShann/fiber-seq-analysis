@@ -17,6 +17,7 @@ input_dir <- file.path(project_dir, "LCL_project/Leiden_manhattan")
 suppressPackageStartupMessages(library(dplyr))
 source(file.path(project_dir, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
 source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
   cache = FALSE, dev = "png", dpi = 120, out.width = "100%",
@@ -144,6 +145,7 @@ sample_colors <- sample_colors[names(sample_colors) %in% baseline$assignments$sa
 ```
 
 ```{r figure-helpers}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 # Assemble the original haplotype-example layout without its file-saving wrapper
 # and without the UMAP panels. Returns the plot with the figure height it needs.
 fiberseq_haplotype_example <- function(result, title) {
@@ -163,18 +165,13 @@ fiberseq_haplotype_example <- function(result, title) {
     height = min(1.35 * sum(heights), 40))
 }
 
-heatmap_m6a_footprints <- function(result, title) {
-  heatmap <- plot_genomic_cluster_heatmap(result, result$region, short_colors,
-    include_haplotype = TRUE, variants = result$variants,
-    show_cluster_profiles = TRUE, cluster_label = title)
-  ComplexHeatmap::draw(heatmap)
-  invisible(NULL)
-}
+
 
 detail_index <- sort(union(which(!duplicated(parameter_pairs$n_clusters)), baseline_index))
 ```
 
 ```{r per-pair-figures, results="asis"}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 knitting <- isTRUE(getOption("knitr.in.progress"))
 for (i in detail_index) {
   result <- results[[i]]
@@ -183,7 +180,7 @@ for (i in detail_index) {
   if (!knitting) {
     # Interactive run: show the figures directly instead of generating sections.
     print(hap$plot)
-    heatmap_m6a_footprints(result, label)
+    plot_read_heatmap(result, result$region, short_colors, include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = label, draw = TRUE)
     next
   }
   slug <- sprintf("k%d-res%s", parameter_pairs$k[i],
@@ -203,7 +200,8 @@ for (i in detail_index) {
     "",
     sprintf("```{r heatmap-%s, fig.width=14, fig.height=%.2f, echo=FALSE}",
       slug, min(11 + .55 * result$n_clusters, 40)),
-    "heatmap_m6a_footprints(result, label)",
+    'source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)',
+    "plot_read_heatmap(result, result$region, short_colors, include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = label, draw = TRUE)",
     "```", ""),
     envir = environment(), quiet = TRUE), sep = "\n")
 }

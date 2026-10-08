@@ -5,26 +5,19 @@
 # Skok (2026), "Cohesin collisions maintain ordered nucleosome architecture at
 # boundaries and promoters" (bioRxiv 2026.05.22.727261)
 
-# Paper's clustering method:
+
 
 #   1. bin the per-read accessibility signal into indows across the 2-kb
 #      region; a read's bin value is the mean methylation call in the bin;
-#   2. optionally fill bins still missing after binning by KNN;
-#   3. balance conditions - sample an equal number of reads per condition -
+#   2. balance conditions - sample an equal number of reads per condition -
 #      and pool the sampled reads before clustering 
-#   4. read-read similarity = Manhattan distance over the bins
-#   5. KNN graph over reads (k = 50 nearest neighbours, scikit-learn)
-#   6. edge weights = affinities from an exponential kernel on those distances
-#   7. Leiden community detection (leidenalg, RBConfigurationVertexPartition)
+#   3. read-read similarity = Manhattan distance over the bins
+#   4. KNN graph over reads (k = 10 nearest neighbours)
+#   5. edge weights = affinities from an exponential kernel on those distances
+#   6. Leiden community detection (leidenalg, RBConfigurationVertexPartition)
 #      at a given resolution;
-#   8. cluster profiles = mean accessibility over the reads of each cluster
-#
-# Method:
-#   * Reads: longest alignments physically spanning the complete analysis
-#     window, including reads with zero m6A calls in that window. Read IDs are
-#     sample-prefixed, with original_RID retained. All LPS timepoints are pooled.
-#   * No KNN imputation (step 2)
-#   * No condition balancing (step 3)
+#   7. cluster profiles = mean accessibility over the reads of each cluster
+
 
 
 suppressMessages({

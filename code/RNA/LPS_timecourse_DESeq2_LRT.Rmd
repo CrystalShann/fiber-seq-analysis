@@ -35,7 +35,7 @@ dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 
 # save plots
 save_fig <- function(p, name, w, h) {         
-  ggsave(file.path(fig_dir, paste0(name, ".png")), p,
+  ggsave(file.path(fig_dir, paste0(name, ".pdf")), p,
          width = w, height = h, dpi = 300)
 }
 ```
@@ -675,8 +675,8 @@ ph <- pheatmap(z, cluster_rows = FALSE, cluster_cols = FALSE,
                gaps_row = cumsum(table(clust[row_ord]))[-k],
                color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
                main = paste(nrow(z), "response genes (VST z-score per gene)"))
-png(file.path(fig_dir, "response_gene_heatmap.png"),
-    width = 7, height = 7, units = "in", res = 300)
+pdf(file.path(fig_dir, "response_gene_heatmap.pdf"),
+    width = 7, height = 7)
 grid::grid.newpage(); grid::grid.draw(ph$gtable); dev.off()
 ```
 

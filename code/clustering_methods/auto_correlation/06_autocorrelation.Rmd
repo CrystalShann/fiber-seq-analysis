@@ -142,6 +142,8 @@ Constant molecules have undefined ACF and are excluded from clustering
 
 <!-- set knitr options and find the region folders. Parameters: figures 12 x 8 in, 300 dpi, SVG; run folder = params$output_dir; regions = every rank* folder under outputs/, or only those in params$regions -->
 ```{r setup, include=FALSE, purl=FALSE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE,
   out.width = "100%", fig.width = 12, fig.height = 8, dpi = 300,
   fig.retina = 1, dev = "svglite")
@@ -161,6 +163,7 @@ if (!length(region_dirs)) stop("No region results found under ", output)
 <!-- load the shared Leiden_Manhattan plotting functions (read plot, m6A heatmap, signal profiles, UMAP, kNN graph, colors) so the figures use the same code, layout and fonts as the Leiden_Manhattan report -->
 ```{r source-leiden-plots, include=FALSE}
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r", local = TRUE)
 ```
 
@@ -287,6 +290,7 @@ prepare_report_data <- function(region_data, project, destination,
     tracks_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks") {
   # Python extracts function chunks only, so load these dependencies here too.
   source(file.path(project, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
+  source(file.path(project, "code/parsing_functions/plotting_functions.r"), local = TRUE)
   source(file.path(project, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r"), local = TRUE)
   stopifnot(region_data$schema_version == 1L, is.data.frame(region_data$region),
     nrow(region_data$region) == 1L, is.data.frame(region_data$records),
@@ -408,6 +412,7 @@ report_figure_frame <- function(plot, region_data, caption = NULL) {
 <!-- plot the mean ACF of each cluster as curves and as a heatmap. Parameters: lag 0 omitted, no smoothing; lower/upper set the lag range (default all nonzero lags) -->
 ```{r report-cluster-acf-function, include=FALSE}
 plot_report_cluster_acf <- function(region_data, lower = 1, upper = Inf, title = "Cluster averages; no smoothing") {
+  source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
   d <- region_data$tables$cluster_acf_summary
   if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", region_data$region$region_id))
   d <- d[d$lag_bp >= lower & d$lag_bp <= upper, , drop = FALSE]
@@ -436,17 +441,12 @@ plot_report_cluster_acf <- function(region_data, lower = 1, upper = Inf, title =
 
 <!-- stacked bars: fraction of each sample's clustered reads in each cluster -->
 ```{r report-sample-composition-function, include=FALSE}
-plot_report_sample_composition <- function(region_data) {
+report_sample_composition_inputs <- function(region_data) {
   d <- region_data$tables$sample_composition
-  if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", region_data$region$region_id))
+  if (!is.data.frame(d) || !nrow(d)) return(NULL)
   groups <- as.character(sort(unique(as.integer(as.character(d$cluster)))))
   d$cluster <- factor(d$cluster, levels = groups)
-  ggplot2::ggplot(d, ggplot2::aes(sample_name, fraction_within_sample, fill = cluster)) +
-    ggplot2::geom_col(position = ggplot2::position_stack(reverse = TRUE)) +
-    ggplot2::scale_fill_manual(values = cluster_id_palette(groups)) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, .01))) +
-    ggplot2::labs(title = region_data$region$region_id, x = "Sample", y = "Fraction of clustered molecules", fill = "Cluster") +
-    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = .5))
+  d
 }
 ```
 
@@ -583,9 +583,24 @@ plot_report_allele_peaks <- function(region_data) {
 <!-- pick a summary figure by name: cluster_acf, sample_composition, allele_coverage, allele_acf, allele_proportions, allele_peaks -->
 ```{r report-table-plot-function, include=FALSE}
 plot_report_table <- function(region_data, kind) {
+  source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
   switch(kind,
     cluster_acf = plot_report_cluster_acf(region_data),
-    sample_composition = plot_report_sample_composition(region_data),
+    sample_composition = {
+      d <- report_sample_composition_inputs(region_data)
+      if (is.null(d)) {
+        report_empty_plot("No clustered reads", region_data$region$region_id)
+      } else {
+        plot_stacked_proportion(d, "sample_name", "cluster", cluster_id_palette(levels(d$cluster)),
+          y = "fraction_within_sample", position = "stack", reverse = TRUE, width = .9,
+          scales = list(ggplot2::scale_y_continuous(limits = c(0, 1),
+            expand = ggplot2::expansion(mult = c(0, .01)))),
+          labels = list(title = region_data$region$region_id, x = "Sample",
+            y = "Fraction of clustered molecules", fill = "Cluster"),
+          theme = ggplot2::theme_bw(base_size = 10) +
+            ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = .5)))
+      }
+    },
     allele_coverage = plot_report_allele_coverage(region_data),
     allele_acf = plot_report_allele_acf(region_data),
     allele_proportions = plot_report_allele_proportions(region_data),
@@ -721,6 +736,7 @@ autocor_acf_heatmap <- function(result) {
 <!-- combine UMAPs colored by cluster, LCL sample and focal SNP allele with the cluster pie chart -->
 ```{r function-autocor-umap-overview, include=FALSE}
 autocor_umap_overview <- function(result) {
+  source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
   embedding <- result$assignments
   embedding$UMAP1 <- embedding$umap1
   embedding$UMAP2 <- embedding$umap2
@@ -750,6 +766,7 @@ autocor_umap_overview <- function(result) {
 <!-- per-cluster m6A and nucleosome profiles with sample and allele composition bars -->
 ```{r function-autocor-profile-composition, include=FALSE}
 autocor_profile_composition <- function(result) {
+  source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
   short_colors <- sample_palette(result$assignments$sample_name)
   samples <- unique(result$assignments$sample_name)
   sample_colors <- setNames(unname(short_colors[sub("_.*$", "", samples)]), samples)
@@ -1303,9 +1320,10 @@ for (entry in region_results) {
 ## ACF and genomic m6A heatmaps
 
 ```{r figure-acf-m6a-heatmap, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
+  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_read_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
   report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "ACF and genomic m6A heatmaps", sep = " — "), file.path(entry$folder, "autocorrelation", "acf_and_m6a_heatmaps.pdf"))
 }
 ```
@@ -1345,9 +1363,10 @@ for (entry in region_results) {
 ## Genomic m6A heatmap
 
 ```{r figure-m6a-heatmap, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
+  figure <- report_fiberseq_figure(entry, function(result) plot_read_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "Autocorrelation-defined Leiden clusters"))
   report_pdf_figure(figure, fiberseq_figure_size(entry, "heatmap")[1], fiberseq_figure_size(entry, "heatmap")[2], paste(entry$region_id, "m6A and footprint heatmaps", sep = " — "), file.path(entry$folder, "autocorrelation", "heatmap_m6a_footprints.pdf"))
 }
 ```
@@ -1355,9 +1374,46 @@ for (entry in region_results) {
 ## Footprint occupancy by cluster
 
 ```{r figure-occupancy, echo=FALSE, results='asis', fig.height=10, purl=TRUE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 for (entry in region_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) plot_signal_profile(signal_profiles(result, result$footprints)$profiles, result$region, levels(result$assignments$cluster)))
+  figure <- report_fiberseq_figure(entry, function(result) local({
+    .profile_args <- list(profiles = signal_profiles(result, result$footprints)$profiles,
+      region = result$region,
+      clusters = levels(result$assignments$cluster))
+    profiles <- .profile_args$profiles
+    region <- .profile_args$region
+    clusters <- .profile_args$clusters
+    title <- region$annotation
+    track_colors <- LCL_TRACK_COLORS
+    track_labels <- LCL_TRACK_LABELS
+    nucleosome_track <- "ft_nuc_130-160bp"
+    profiles <- signal_profile_inputs(profiles, region, clusters, track_colors)
+    anchor <- plot_anchor(region)
+    colors <- feature_colors(levels(profiles$track), track_colors)
+    counts <- unique(profiles[, c("cluster", "n_reads")])
+    labels <- setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
+    plot <- plot_group_profile(profiles, group_col = "track", style = "ribbon",
+      x_col = "relative_pos",
+      mapping = ggplot2::aes(relative_pos, fraction, fill = track, color = track, group = track),
+      layers = list(list(geom = "ribbon",
+        data = profiles[profiles$track %in% nucleosome_track, , drop = FALSE],
+        mapping = ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", color = NA, alpha = .18),
+        list(geom = "line", linewidth = 0.5)))
+    plot + ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
+      ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.4) +
+      ggplot2::scale_fill_manual(values = colors, labels = track_labels) +
+      ggplot2::scale_color_manual(values = colors, labels = track_labels) +
+      ggplot2::scale_x_continuous(limits = c(anchor$left - 0.5, anchor$right + 0.5), expand = c(0, 0)) +
+      ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))) +
+      ggplot2::labs(x = anchor$x_label, y = "Fraction of cluster reads", title = title,
+        subtitle = "m6A calls and footprint occupancy; retained heterozygous reads", fill = "Plot track", color = "Plot track") +
+      cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
+      ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4), color = ggplot2::guide_legend(ncol = 4)) +
+      ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8),
+        plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
+  }))
   report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "Occupancy profiles by cluster", sep = " — "), file.path(entry$folder, "autocorrelation", "fig2_occupancy_by_cluster.pdf"))
 }
 ```
@@ -1574,9 +1630,10 @@ for (entry in m6a_results) {
 ## ACF and genomic m6A heatmaps
 
 ```{r figure-m6a-leiden-acf-m6a-heatmap, echo=FALSE, results='asis', fig.height=12, purl=TRUE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_genomic_cluster_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "m6A-defined Leiden clusters"))
+  figure <- report_fiberseq_figure(entry, function(result) autocor_acf_heatmap(result) + plot_read_heatmap(result, result$region, sample_palette(result$assignments$sample_name), include_haplotype = TRUE, variants = result$variants, show_cluster_profiles = TRUE, cluster_label = "m6A-defined Leiden clusters"))
   report_pdf_figure(figure, fiberseq_figure_size(entry, "acf_heatmap")[1], fiberseq_figure_size(entry, "acf_heatmap")[2], paste(entry$region_id, "m6A Leiden clusters: ACF and genomic m6A heatmaps", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_acf_and_m6a_heatmaps.pdf"))
 }
 ```
@@ -1594,9 +1651,46 @@ for (entry in m6a_results) {
 ## Footprint occupancy by cluster
 
 ```{r figure-m6a-leiden-occupancy, echo=FALSE, results='asis', fig.height=10, purl=TRUE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 for (entry in m6a_results) {
   cat("\n\n### ", entry$region_id, "\n\n", sep = "")
-  figure <- report_fiberseq_figure(entry, function(result) plot_signal_profile(signal_profiles(result, result$footprints)$profiles, result$region, levels(result$assignments$cluster)))
+  figure <- report_fiberseq_figure(entry, function(result) local({
+    .profile_args <- list(profiles = signal_profiles(result, result$footprints)$profiles,
+      region = result$region,
+      clusters = levels(result$assignments$cluster))
+    profiles <- .profile_args$profiles
+    region <- .profile_args$region
+    clusters <- .profile_args$clusters
+    title <- region$annotation
+    track_colors <- LCL_TRACK_COLORS
+    track_labels <- LCL_TRACK_LABELS
+    nucleosome_track <- "ft_nuc_130-160bp"
+    profiles <- signal_profile_inputs(profiles, region, clusters, track_colors)
+    anchor <- plot_anchor(region)
+    colors <- feature_colors(levels(profiles$track), track_colors)
+    counts <- unique(profiles[, c("cluster", "n_reads")])
+    labels <- setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
+    plot <- plot_group_profile(profiles, group_col = "track", style = "ribbon",
+      x_col = "relative_pos",
+      mapping = ggplot2::aes(relative_pos, fraction, fill = track, color = track, group = track),
+      layers = list(list(geom = "ribbon",
+        data = profiles[profiles$track %in% nucleosome_track, , drop = FALSE],
+        mapping = ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", color = NA, alpha = .18),
+        list(geom = "line", linewidth = 0.5)))
+    plot + ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
+      ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.4) +
+      ggplot2::scale_fill_manual(values = colors, labels = track_labels) +
+      ggplot2::scale_color_manual(values = colors, labels = track_labels) +
+      ggplot2::scale_x_continuous(limits = c(anchor$left - 0.5, anchor$right + 0.5), expand = c(0, 0)) +
+      ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))) +
+      ggplot2::labs(x = anchor$x_label, y = "Fraction of cluster reads", title = title,
+        subtitle = "m6A calls and footprint occupancy; retained heterozygous reads", fill = "Plot track", color = "Plot track") +
+      cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
+      ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4), color = ggplot2::guide_legend(ncol = 4)) +
+      ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8),
+        plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
+  }))
   report_pdf_figure(figure, fiberseq_figure_size(entry, "occupancy")[1], fiberseq_figure_size(entry, "occupancy")[2], paste(entry$region_id, "m6A Leiden clusters: occupancy profiles by cluster", sep = " — "), file.path(entry$folder, "leiden", "m6a_leiden_occupancy_by_cluster.pdf"))
 }
 ```

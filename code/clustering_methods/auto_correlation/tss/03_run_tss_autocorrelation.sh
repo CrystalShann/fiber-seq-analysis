@@ -165,7 +165,7 @@ echo "[$(date -Is)] 02: final R plots"
 echo "[$(date -Is)] Publishing final tables and plots"
 shopt -s nullglob
 TABLE_FILES=("$TSS_WORK_DIR"/tables/*.tsv "$TSS_WORK_DIR"/tables/*.tsv.gz)
-PLOT_FILES=("$TSS_WORK_DIR"/plots/*.pdf "$TSS_WORK_DIR"/plots/*.png)
+PLOT_FILES=("$TSS_WORK_DIR"/plots/*.pdf)
 if ((${#TABLE_FILES[@]} < 21 || ${#PLOT_FILES[@]} < 17)); then
   echo "Expected at least 21 final tables and 17 plots; publishing aborted" >&2
   exit 1

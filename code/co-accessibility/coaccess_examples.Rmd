@@ -17,8 +17,7 @@ co-accessibility is **low at baseline (LPS_0) and rises as the LPS timecourse
 progresses** — a weighted upward trend of the fiber-level odds ratio over the
 four timepoints — and draws them at single-fiber resolution across all four.
 
-The tables come from `03_coaccess_cres.py`, which reimplements
-`coaccess_fire_CREs_combined_samples_around_genes.R`: cCREs overlapping a FIRE
+The tables come from `03_coaccess_cres.py`: cCREs overlapping a FIRE
 peak, paired within TSS ± 10 kb gene windows at 500 < gap < 20,000 bp, scored on
 the fibers that overlap both, with accessibility called by FIRE-element overlap
 and tested by `fisher.test(table + 1)`. The one structural difference from Kevin
@@ -33,6 +32,7 @@ Nothing here sources his code.
 ```{r functions}
 code_dir <- "/project/spott/cshan/fiber-seq/code/co-accessibility"
 source(file.path(code_dir, "coaccess_plot_functions.R"))
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 
 suppressPackageStartupMessages({
   library(data.table); library(dplyr); library(ggplot2); library(patchwork)
@@ -227,6 +227,7 @@ size40-60 / size60-80) on top, smallest last. m6A comes from the existing
 which are what the 2×2 is actually built from, come from `lizarraga_FIRE`.
 
 ```{r plot-fn}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 plot_one <- function(r, width = 11, height = 16) {
   region <- list(chrom = r$chrom,
                  start = max(0, r$cre1_start - flank),
@@ -249,12 +250,19 @@ plot_one <- function(r, width = 11, height = 16) {
   p <- plot_pair_panels(res, cre1, cre2, labs, cres = cres_here,
                         plot_name = paste0(r$gene_names, "  (", r$CRE_pair_labels, ")"),
                         subtitle = sub)
-  bars <- plot_config_bars(labs, samples,
-                           title = paste0(r$gene_names, ": configuration by timepoint"))
+  config_inputs <- configuration_proportion_inputs(labs, samples)
+  bars <- plot_stacked_proportion(config_inputs$rows, "sample_name", "config", CONFIG_COLS,
+    position = "fill", width = .7, legend = list(drop = FALSE),
+    totals = list(data = config_inputs$totals, x = "sample_name", y = 1.04, label = "lab",
+      style = list(size = 3)),
+    scales = list(scale_y_continuous(labels = scales::percent, limits = c(0, 1.08),
+      breaks = c(0, .25, .5, .75, 1))),
+    labels = list(x = NULL, y = "fibers spanning both cCREs", fill = "configuration",
+      title = paste0(r$gene_names, ": configuration by timepoint")), theme = theme_bw(11))
 
-  ggsave(file.path(plot_dir, paste0(r$pair_id, "_reads.pdf")), p$combined,
+  save_figure(p$combined, file.path(plot_dir, paste0(r$pair_id, "_reads.pdf")),
          width = width, height = height, limitsize = FALSE)
-  ggsave(file.path(plot_dir, paste0(r$pair_id, "_config_bars.pdf")), bars,
+  save_figure(bars, file.path(plot_dir, paste0(r$pair_id, "_config_bars.pdf")),
          width = 6, height = 4)
 
   list(res = res, labels = labs, panels = p, bars = bars)

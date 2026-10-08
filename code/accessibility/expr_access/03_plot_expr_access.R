@@ -1,3 +1,5 @@
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
+
 #' Metaplots of SAM-seq accessibility (m6A) around protein-coding TSS by
 #' expression bin, from the profile table written by 02_tss_m6a_profiles.py.
 #'
@@ -52,13 +54,13 @@ p1 <- ggplot(prof, aes(mid, m6a, color = expr_bin)) +
 p2 <- ggplot(prof, aes(mid, m6a, color = timepoint)) +
   base +
   facet_wrap(~expr_bin, nrow = 1) +
-  scale_color_brewer(palette = "RdYlBu", direction = -1, name = NULL) +
+  scale_color_manual(values = setNames(
+    unname(timepoint_palette(sub("^LPS ", "", levels(prof$timepoint)))),
+    levels(prof$timepoint)), name = NULL) +
   ggtitle("accessibility around protein-coding TSS by LPS timepoint")
 
 for (nm in c("tss_m6a_metaprofile_by_expression", "tss_m6a_metaprofile_by_timepoint")) {
   p <- if (nm == "tss_m6a_metaprofile_by_expression") p1 else p2
   ggsave(file.path(PLOT_DIR, paste0(nm, ".pdf")), p, width = 12, height = 4.2)
-  ggsave(file.path(PLOT_DIR, paste0(nm, ".png")), p, width = 12, height = 4.2,
-         dpi = 200)
 }
 message("Wrote plots to ", PLOT_DIR)

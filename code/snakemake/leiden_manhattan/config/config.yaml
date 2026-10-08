@@ -1,6 +1,7 @@
 project_root: /project/spott/cshan/fiber-seq
 code_dir: /project/spott/cshan/fiber-seq/code
 parsing_functions: code/parsing_functions/parsing_footprints_functions.r
+plotting_functions: code/parsing_functions/plotting_functions.r
 results_dir: /project/spott/cshan/fiber-seq/snakemake_results/leiden_man_clustering
 
 # Clustering: every combination of the lists below is run (keep one value each
@@ -57,16 +58,15 @@ datasets:
         source: "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/firehmm_tf/ft_by_size/size{size}/{fiberhmm_label}/{fiberhmm_label}_tf_size{size}_{chr}.bed.gz"
         format: bed6_per_sample
         sizes: ["10-30", "40-60", "60-80"]
-    plots:                            # current macrophage notebook outputs
+    plots:
       - cluster_met_profiles
       - cluster_composition
       - heatmap
       - met_fraction_lines
-      # available once footprints are wired in:
-      # - read_footprints
-      # - occupancy_by_cluster
-      # - knn_graph
-      # - umap_overview
+      - read_footprints
+      - occupancy_by_cluster
+      - knn_graph
+      - umap_overview
     plot_options:
       line_smooth_k: 1
 

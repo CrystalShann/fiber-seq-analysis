@@ -34,6 +34,7 @@ All functions adapted from Kevin Luo's `process_fiberseq_data.R` and
 
 ```{r functions}
 source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 ```
 
 # Settings
@@ -452,7 +453,8 @@ qc_reads <- bind_rows(qc_reads, .id = "region")
 
 ```
 ```{r plot-QC}
-color <- c("LPS_0" = "#0072B2", "LPS_5" = "#E69F00", "LPS_10" = "#009E73", "LPS_15" = "#D55E00")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
+color <- timepoint_palette(c("LPS_0", "LPS_5", "LPS_10", "LPS_15"))
 
 qcplot <- ggplot(qc_reads,
        aes(x = gene,y = n_reads,fill = sample_name)) +
@@ -724,6 +726,7 @@ binning); the x-axis is genomic position, matching the topic-profile panels so t
 empirical profile lines up position-for-position with the fitted topics.
 
 ```{r il1a-empirical-m6a-by-timepoint, fig.width=9, fig.height=8, message=FALSE, warning=FALSE}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 gene   <- "IL1A"
 region <- promoters %>% dplyr::filter(gene == !!gene)
 # original:
@@ -751,7 +754,7 @@ dfp$pos       <- as.numeric(sub("^A_", "", dfp$col))
 dfp$timepoint <- factor(dfp$timepoint, levels = levels(timepoint))
 
 # four contrasting, colourblind-friendly colours, one per timepoint panel
-tp_colors <- c("0" = "#0072B2", "5" = "#E69F00", "10" = "#009E73", "15" = "#D55E00")
+tp_colors <- timepoint_palette(c("0", "5", "10", "15"))
 
 gg_prof <- ggplot(dfp, aes(pos, mean_m6a, color = timepoint)) +
   geom_line(linewidth = 0.5) +

@@ -206,7 +206,7 @@ function.
 | `label_reads()` | per-fiber configuration at the pair, under the same rules as the table |
 | `order_reads()` | sort fibers by timepoint, then configuration, then position |
 | `plot_pair_panels()` | the four stacked panels, pair shaded on each |
-| `plot_config_bars()` | configuration proportions per timepoint |
+| `plot_stacked_proportion()` | configuration proportions per timepoint |
 
 ## Running it
 

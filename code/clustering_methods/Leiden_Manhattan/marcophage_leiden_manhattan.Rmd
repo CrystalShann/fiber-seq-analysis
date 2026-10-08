@@ -34,6 +34,7 @@ assignment tables.
 ```{r functions}
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r")
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r")
 ```
 
@@ -264,6 +265,7 @@ are saved once; zero-distance edges are retained. At bin 0 the feature columns
 are genomic site positions and values are the original 0/1 m6A calls.
 
 ```{r cluster-regions, fig.width=9, fig.height=9}
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 res <- leiden_manhattan_cluster_regions(
   sample_names = sample_names,
   regions = regions,
@@ -342,21 +344,114 @@ for (region_id in names(res)) {
     plot_region$annotation <- paste(region_id, "canonical promoter")
   }
 
-  gg <- plot_cluster_met_profiles(region_res, region_res$site_met_mat, main = region_id,
-                                  region = plot_region)
+  gg <- local({
+    .profile_args <- list(main = region_id,
+      region = plot_region,
+      res = region_res,
+      met_mat = region_res$site_met_mat)
+    res <- .profile_args$res
+    met_mat <- .profile_args$met_mat
+    tss <- NULL
+    main <- .profile_args$main
+    region <- .profile_args$region
+    palette <- cluster_palette
+    x_label <- NULL
+    # cluster_site_profiles() takes cluster labels and computes mean m6a value at every 
+    # position for each cluster
+    prof <- cluster_site_profiles(res, met_mat)
+    anchor <- plot_anchor(region)
+    if (anchor$promoter) {
+      prof$pos <- plot_positions(prof$pos, region)
+      tss <- 0
+    }
+    lv   <- levels(res$assignments$cluster)
+    pal  <- palette(lv)
+  
+    p_list <- lapply(lv, function(cl) {
+      d <- prof[prof$cluster == cl, ]
+      gg <- plot_group_profile(d, style = "column", y_col = "met",
+        mapping = aes(x = pos, y = met),
+        layers = list(list(geom = "col", fill = pal[cl]))) +
+        ylim(0, 1) +
+        ylab("met prop.") + xlab(if (!is.null(x_label)) x_label else if (anchor$promoter) anchor$x_label else "pos") +
+        ggtitle(sprintf("%s (n=%d)", cl, d$n_reads[1])) +
+        theme_cowplot(font_size = 10) +
+        theme(plot.title = element_text(hjust = 0.5))
+      if (!is.null(tss))
+        gg <- gg + geom_vline(xintercept = tss, linetype = "dashed", color = "grey40")
+      gg
+    })
+    if (!is.null(main))
+      p_list <- c(list(cowplot::ggdraw() +
+                         cowplot::draw_label(main, fontface = "bold", size = 12)),
+                  p_list)
+    cowplot::plot_grid(plotlist = p_list, ncol = 1,
+                       rel_heights = if (is.null(main)) 1
+                                     else c(0.4, rep(1, length(p_list) - 1)))
+  })
   ggsave(file.path(plots_dir, paste0("cluster_met_profiles_", region_id, ".pdf")), gg,
          width = 6, height = 1.4 * region_res$n_clusters + 1.4, limitsize = FALSE)
 
-  gg <- plot_cluster_composition(region_res, main = region_id)
+  inputs <- cluster_composition_inputs(region_res, timepoint_palette(names(LEIDEN_TIMEPOINT_COLORS)))
+    p1 <- plot_stacked_proportion(inputs$assignments, "sample_name", "cluster",
+      cluster_palette(levels(inputs$assignments$cluster)), position = "fill", width = .9,
+      labels = list(x = NULL, y = "fraction of reads",
+        title = paste0("Cluster composition per timepoint, ", region_id)),
+      theme = cowplot::theme_cowplot(font_size = 10))
+    p2 <- plot_stacked_proportion(inputs$proportions, "cluster", "sample_name", timepoint_palette(names(LEIDEN_TIMEPOINT_COLORS)),
+      y = "proportion", position = "dodge", width = .7, legend = list(name = "timepoint"),
+      labels = list(x = "cluster", y = "proportion of that timepoint's reads",
+        title = paste0("Timepoints per cluster, ", region_id)),
+      theme = cowplot::theme_cowplot(font_size = 10) +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)))
+  gg <- cowplot::plot_grid(p1, p2, ncol = 1)
   ggsave(file.path(plots_dir, paste0("cluster_composition_", region_id, ".pdf")), gg,
          width = 7, height = 8)
 
   pdf(file.path(plots_dir, paste0("heatmap_", region_id, ".pdf")), width = 8, height = 9)
-  ComplexHeatmap::draw(plot_cluster_heatmap(region_res, main = region_id, region = plot_region))
+  ComplexHeatmap::draw(plot_read_heatmap(region_res, main = region_id, region = plot_region, layout = "features"))
   dev.off()
 
-  gg <- plot_met_fraction_lines(region_res, main = region_id, smooth_k = line_smooth_k,
-                                region = plot_region)
+  gg <- local({
+    .profile_args <- list(main = region_id,
+      smooth_k = line_smooth_k,
+      region = plot_region,
+      res = region_res)
+    res <- .profile_args$res
+    tss <- NULL
+    main <- .profile_args$main
+    smooth_k <- .profile_args$smooth_k
+    region <- .profile_args$region
+    palette <- cluster_palette
+    x_label <- NULL
+    P   <- res$profiles
+    pos <- as.numeric(colnames(P))
+    anchor <- plot_anchor(region)
+    if (anchor$promoter) {
+      # Column names are genomic window midpoints; keep the original bins.
+      pos <- plot_positions(pos, region)
+      tss <- 0
+    }
+  
+    df <- met_fraction_inputs(res, smooth_k, region)
+  
+    ylab <- if (res$params$window_size == 0) "m6A fraction per site"
+            else sprintf("mean m6A per %d-bp window", res$params$window_size)
+    sub  <- if (smooth_k > 1) sprintf("rolling mean over %d features", smooth_k) else NULL
+  
+    gg <- plot_group_profile(df, group_col = "cluster", style = "line", y_col = "value",
+      mapping = aes(x = pos, y = value, color = cluster),
+      layers = list(list(geom = "line", linewidth = 0.5))) +
+      scale_color_manual(values = setNames(palette(rownames(P)), levels(df$cluster)),
+                         guide = "none") +
+      facet_wrap(~ cluster, ncol = 1, strip.position = "right") +
+      labs(x = if (!is.null(x_label)) x_label else if (anchor$promoter) anchor$x_label else "genomic position",
+           y = ylab, title = main, subtitle = sub) +
+      theme_cowplot(font_size = 10)
+    if (!is.null(tss))
+      gg <- gg + geom_vline(xintercept = tss, linetype = "dashed", color = "grey40")
+    gg
+  })
   ggsave(file.path(plots_dir, paste0("met_fraction_lines_", region_id, ".pdf")), gg,
          width = 8, height = 1.4 * region_res$n_clusters + 1, limitsize = FALSE)
 }

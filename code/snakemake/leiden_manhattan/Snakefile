@@ -135,7 +135,7 @@ def region_sources(wc):
     for kind, spec in DATASETS[wc.dataset]["regions"].items():
         if kind == "tss": paths.append(spec["tss_bed"])
         elif kind == "asfire_top": paths.append(spec["asfire_file"])
-        elif kind == "bed": paths.append(spec["bed"])
+        elif kind == "bed": paths.append(spec)
         elif kind != "custom": raise ValueError(f"Unknown region type: {kind}")
     return paths
 
@@ -157,7 +157,8 @@ def phase_cache_dir(wc):
     return str(path)
 
 PARSING_FUNCTIONS = str(Path(config["project_root"]) / config["parsing_functions"])
-CORE = [PARSING_FUNCTIONS] + [str(Path(config["code_dir"]) / path) for path in (
+PLOTTING_FUNCTIONS = str(Path(config["project_root"]) / config["plotting_functions"])
+CORE = [PARSING_FUNCTIONS, PLOTTING_FUNCTIONS] + [str(Path(config["code_dir"]) / path) for path in (
     "haplotype_phasing/LCL_phasing.r",
     "clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")]
 COMMON = str(SCRIPTS / "common.R")

@@ -1,3 +1,5 @@
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
+
 # leiden_manhattan_plots.r
 #
 # Shared plots and report export for Leiden + Manhattan single-molecule
@@ -5,19 +7,13 @@
 # are explicit; Fourier spectrum and phase plots stay in the FFT notebook.
 # LCL-only report orchestration and figure exports live in hidden chunks of
 # leiden_LCL.Rmd; helpers used by multiple notebooks stay here.
-# plot_cluster_heatmap() displays timepoint-annotated clustering features;
-# plot_genomic_cluster_heatmap() displays genomic m6A with sample/allele tracks.
+# plot_read_heatmap() displays timepoint-annotated clustering features;
+# plot_read_heatmap() displays genomic m6A with sample/allele tracks.
 #
-#   plot_cluster_met_profiles()  per-cluster m6A methylation proportion at each
-#                                bp, one panel per cluster - the topic
-#                                model's cluster_met_profiles plot, so the
-#                                clusterings can be compared panel for panel
-#   plot_cluster_composition()   cluster proportions per timepoint and
-#                                timepoint proportions per cluster
-#   plot_cluster_heatmap()       read x feature methylation heatmap, rows split
+#   cluster_composition_inputs() prepares the two composition tables
+#   plot_read_heatmap()       read x feature methylation heatmap, rows split
 #                                by cluster, with cluster and timepoint
 #                                annotations
-#   plot_met_fraction_lines()    m6A fraction per feature, one panel per cluster
 #
 # The bar panels are drawn on a fixed 0-1 axis so clusters and genes stay
 # comparable; the line plot uses the data range, since that is the plot for
@@ -44,61 +40,6 @@ embed_report_png <- function(path, label, image_dir) {
   invisible(NULL)
 }
 
-create_report_plot_writer <- function(image_dir, dpi = 160, bg = "white") {
-  dir.create(image_dir, recursive = TRUE, showWarnings = FALSE)
-  image_dir <- normalizePath(image_dir)
-  plot_files <- character()
-  save_plot <- function(filename, plot, width, height, ..., dpi = dpi_default,
-                        bg = bg_default, draw = NULL, label = NULL) {
-    preview <- tempfile(fileext = ".png")
-    on.exit(unlink(preview), add = TRUE)
-    dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
-    if (is.null(draw)) {
-      ggplot2::ggsave(filename, plot = plot, width = width, height = height,
-                      ..., dpi = dpi, bg = bg)
-      ggplot2::ggsave(preview, plot = plot, width = width, height = height,
-                      ..., dpi = dpi, bg = bg)
-    } else {
-      stopifnot(is.function(draw), tolower(tools::file_ext(filename)) == "pdf")
-      grDevices::pdf(filename, width = width, height = height, bg = bg)
-      tryCatch(draw(plot), finally = grDevices::dev.off())
-      grDevices::png(preview, width = width, height = height, units = "in",
-                     res = dpi, type = "cairo", bg = bg)
-      tryCatch(draw(plot), finally = grDevices::dev.off())
-    }
-    if (is.null(label)) label <- tools::file_path_sans_ext(basename(filename))
-    embed_report_png(preview, label, image_dir)
-    plot_files <<- c(plot_files, filename)
-    invisible(filename)
-  }
-  dpi_default <- dpi
-  bg_default <- bg
-  list(save = save_plot, files = function() plot_files)
-}
-
-# 25-colour cluster palette (the topic model's colors_25 / the hamming
-# notebook's PHASE_CLUSTER_COLORS), extended by interpolation if Leiden ever
-# returns more clusters than that
-LEIDEN_CLUSTER_COLORS <- c(
-  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00", "black", "gold1",
-  "skyblue2", "#FB9A99", "palegreen2", "#CAB2D6", "#FDBF6F", "gray70", "khaki2",
-  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4", "darkturquoise",
-  "green1", "yellow4", "yellow3", "darkorange4", "brown"
-)
-
-# timepoint colours (sequential, as in the spearman notebook)
-LEIDEN_TIMEPOINT_COLORS <- c("LPS_0" = "#bdbdbd", "LPS_5" = "#6baed6",
-                             "LPS_10" = "#2171b5", "LPS_15" = "#08306b")
-
-cluster_palette <- function(levels) {
-  n <- length(levels)
-  cols <- if (n <= length(LEIDEN_CLUSTER_COLORS)) {
-    LEIDEN_CLUSTER_COLORS[seq_len(n)]
-  } else {
-    grDevices::colorRampPalette(LEIDEN_CLUSTER_COLORS)(n)
-  }
-  setNames(cols, levels)
-}
 
 # sample_name as an ordered factor, whatever the caller passed in
 as_timepoint_factor <- function(x, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
@@ -113,74 +54,22 @@ as_timepoint_factor <- function(x, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
 
 # One panel per cluster; promoters use strand-oriented positions from the TSS.
 # ---------------------------------------------------------------------------
-plot_cluster_met_profiles <- function(res, met_mat, tss = NULL, main = NULL, region = res$region,
-                                      palette = cluster_palette, x_label = NULL) {
-  # cluster_site_profiles() takes cluster labels and computes mean m6a value at every 
-  # position for each cluster
-  prof <- cluster_site_profiles(res, met_mat)
-  anchor <- plot_anchor(region)
-  if (anchor$promoter) {
-    prof$pos <- plot_positions(prof$pos, region)
-    tss <- 0
-  }
-  lv   <- levels(res$assignments$cluster)
-  pal  <- palette(lv)
 
-  p_list <- lapply(lv, function(cl) {
-    d <- prof[prof$cluster == cl, ]
-    gg <- ggplot(d, aes(x = pos, y = met)) +
-      geom_col(fill = pal[cl]) +
-      ylim(0, 1) +
-      ylab("met prop.") + xlab(if (!is.null(x_label)) x_label else if (anchor$promoter) anchor$x_label else "pos") +
-      ggtitle(sprintf("%s (n=%d)", cl, d$n_reads[1])) +
-      theme_cowplot(font_size = 10) +
-      theme(plot.title = element_text(hjust = 0.5))
-    if (!is.null(tss))
-      gg <- gg + geom_vline(xintercept = tss, linetype = "dashed", color = "grey40")
-    gg
-  })
-  if (!is.null(main))
-    p_list <- c(list(cowplot::ggdraw() +
-                       cowplot::draw_label(main, fontface = "bold", size = 12)),
-                p_list)
-  cowplot::plot_grid(plotlist = p_list, ncol = 1,
-                     rel_heights = if (is.null(main)) 1
-                                   else c(0.4, rep(1, length(p_list) - 1)))
-}
 
 
 # ---------------------------------------------------------------------------
 # 2a. Cluster composition by timepoint: cluster proportions within each
 # timepoint (stacked), and each timepoint's reads spread over the clusters.
 # ---------------------------------------------------------------------------
-plot_cluster_composition <- function(res, main = NULL,
-                                     timepoint_cols = LEIDEN_TIMEPOINT_COLORS,
-                                     palette = cluster_palette) {
+cluster_composition_inputs <- function(res, timepoint_cols = LEIDEN_TIMEPOINT_COLORS) {
   df <- res$assignments
   df$sample_name <- as_timepoint_factor(df$sample_name, timepoint_cols)
-  pal <- palette(levels(df$cluster))
-
-  p1 <- ggplot(df, aes(x = sample_name, fill = cluster)) +
-    geom_bar(position = "fill") +
-    scale_fill_manual(values = pal) +
-    labs(x = NULL, y = "fraction of reads",
-         title = if (is.null(main)) NULL else paste0("Cluster composition per timepoint, ", main)) +
-    theme_cowplot(font_size = 10)
-
   prop <- df %>%
     dplyr::count(cluster, sample_name) %>%
     dplyr::group_by(sample_name) %>%
     dplyr::mutate(proportion = n / sum(n)) %>%
     dplyr::ungroup()
-  p2 <- ggplot(prop, aes(x = cluster, y = proportion, fill = sample_name)) +
-    geom_col(position = "dodge", width = 0.7) +
-    scale_fill_manual(values = timepoint_cols, name = "timepoint") +
-    labs(x = "cluster", y = "proportion of that timepoint's reads",
-         title = if (is.null(main)) NULL else paste0("Timepoints per cluster, ", main)) +
-    theme_cowplot(font_size = 10) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-  cowplot::plot_grid(p1, p2, ncol = 1)
+  list(assignments = df, proportions = prop)
 }
 
 
@@ -192,100 +81,16 @@ plot_cluster_composition <- function(res, main = NULL,
 # No colour gradient: a feature with any m6A call is black, none is white,
 
 # ---------------------------------------------------------------------------
-plot_cluster_heatmap <- function(res, main = NULL,
-                                 timepoint_cols = LEIDEN_TIMEPOINT_COLORS, region = res$region,
-                                 palette = cluster_palette) {
-  # takes per read assignment from the clustering result
-  df <- res$assignments
-  df$sample_name <- as_timepoint_factor(df$sample_name, timepoint_cols)
-  # sort by cluster
-  # within each cluster, sort by read start position
-  o  <- order(df$cluster, df$start)
-  df <- df[o, ]
-  # Takes the feature matrix used for  clustering
-  # and puts its rows in exactly the same order as df
-  mat <- res$feat_mat[df$RID, , drop = FALSE]
-  if (plot_anchor(region)$direction == -1L)
-    mat <- mat[, rev(seq_len(ncol(mat))), drop = FALSE]
-  mat <- matrix(ifelse(is.na(mat), NA, ifelse(mat > 0, "m6A", "no m6A")),
-                nrow(mat), ncol(mat), dimnames = dimnames(mat))
 
-  # create row annotations
-  ha <- ComplexHeatmap::rowAnnotation(
-    cluster   = df$cluster,
-    timepoint = df$sample_name,
-    col = list(cluster   = palette(levels(df$cluster)),
-               timepoint = timepoint_cols[levels(df$sample_name)]))
-
-  # rows are reads, columns are m6a sites
-  ComplexHeatmap::Heatmap(
-    mat,
-    name = "m6A call",
-    col  = c("m6A" = "black", "no m6A" = "white"),
-    na_col = "grey85",
-    show_row_names = FALSE, show_column_names = FALSE,
-    cluster_rows = FALSE, cluster_columns = FALSE,
-    row_split = df$cluster, row_gap = unit(0.6, "mm"),
-    row_title_rot = 0, row_title_gp = grid::gpar(fontsize = 8),
-    width = unit(11, "cm"), height = unit(14, "cm"),
-    use_raster = TRUE,
-    column_title = main,
-    column_title_gp = grid::gpar(fontsize = 13, fontface = "bold"),
-    left_annotation = ha)
-}
 
 
 # ---------------------------------------------------------------------------
 # 4. m6A fraction per feature, one panel per cluster 
 # ---------------------------------------------------------------------------
-plot_met_fraction_lines <- function(res, tss = NULL, main = NULL, smooth_k = 1, region = res$region,
-                                   palette = cluster_palette, x_label = NULL) {
-  P   <- res$profiles
-  pos <- as.numeric(colnames(P))
-  anchor <- plot_anchor(region)
-  if (anchor$promoter) {
-    # Column names are genomic window midpoints; keep the original bins.
-    pos <- plot_positions(pos, region)
-    tss <- 0
-  }
 
-  smooth_row <- function(v) {
-    if (smooth_k <= 1) return(v)
-    as.numeric(stats::filter(v, rep(1 / smooth_k, smooth_k), sides = 2))
-  }
-
-  df <- do.call(rbind, lapply(rownames(P), function(cl)
-    data.frame(cluster = cl, pos = pos, value = smooth_row(P[cl, ]))))
-  df$cluster <- factor(df$cluster, levels = rownames(P))
-  n <- table(res$assignments$cluster)
-  levels(df$cluster) <- sprintf("%s (n=%d)", rownames(P), as.integer(n[rownames(P)]))
-
-  ylab <- if (res$params$window_size == 0) "m6A fraction per site"
-          else sprintf("mean m6A per %d-bp window", res$params$window_size)
-  sub  <- if (smooth_k > 1) sprintf("rolling mean over %d features", smooth_k) else NULL
-
-  gg <- ggplot(df[!is.na(df$value), ], aes(x = pos, y = value, color = cluster)) +
-    geom_line(linewidth = 0.5) +
-    scale_color_manual(values = setNames(palette(rownames(P)), levels(df$cluster)),
-                       guide = "none") +
-    facet_wrap(~ cluster, ncol = 1, strip.position = "right") +
-    labs(x = if (!is.null(x_label)) x_label else if (anchor$promoter) anchor$x_label else "genomic position",
-         y = ylab, title = main, subtitle = sub) +
-    theme_cowplot(font_size = 10)
-  if (!is.null(tss))
-    gg <- gg + geom_vline(xintercept = tss, linetype = "dashed", color = "grey40")
-  gg
-}
 
 
 # ---- Fiber-seq read, allele and composition plots ----
-cluster_id_palette <- function(levels) {
-  idx <- suppressWarnings(as.integer(sub("^cluster", "", levels)))
-  if (anyNA(idx) || any(!grepl("^cluster[0-9]+$", levels))) idx <- seq_along(levels)
-  cols <- if (max(idx) <= length(LEIDEN_CLUSTER_COLORS)) LEIDEN_CLUSTER_COLORS[idx] else
-    grDevices::colorRampPalette(LEIDEN_CLUSTER_COLORS)(max(idx))[idx]
-  setNames(cols, levels)
-}
 
 LCL_HAPLOTYPE_COLORS <- c(HP1 = "#ADD8E6", HP2 = "#FFF2AE", unphased = "#999999", pooled = "#BBBBBB")
 
@@ -360,38 +165,33 @@ plot_smf_reads <- function(result, records, sample_colors, tracks = LCL_FOOTPRIN
 }
 
 # all features overlaid in one panel for every cluster.
-plot_signal_profile <- function(profiles, region, clusters,
-                                title = region$annotation, track_colors = LCL_TRACK_COLORS,
-                                track_labels = LCL_TRACK_LABELS,
-                                nucleosome_track = "ft_nuc_130-160bp") {
+
+
+met_fraction_inputs <- function(res, smooth_k = 1, region = res$region) {
+  P <- res$profiles
+  pos <- as.numeric(colnames(P))
+  if (plot_anchor(region)$promoter) pos <- plot_positions(pos, region)
+  smooth_row <- function(v) {
+    if (smooth_k <= 1) return(v)
+    as.numeric(stats::filter(v, rep(1 / smooth_k, smooth_k), sides = 2))
+  }
+
+  df <- do.call(rbind, lapply(rownames(P), function(cl)
+    data.frame(cluster = cl, pos = pos, value = smooth_row(P[cl, ]))))
+  df$cluster <- factor(df$cluster, levels = rownames(P))
+  n <- table(res$assignments$cluster)
+  levels(df$cluster) <- sprintf("%s (n=%d)", rownames(P), as.integer(n[rownames(P)]))
+
+  df[!is.na(df$value), , drop = FALSE]
+}
+
+signal_profile_inputs <- function(profiles, region, clusters, track_colors = LCL_TRACK_COLORS) {
   profiles <- profiles[profiles$track %in% names(track_colors), , drop = FALSE]
-  anchor <- plot_anchor(region)
   profiles$relative_pos <- plot_positions(profiles$pos, region)
   profiles$cluster <- factor(profiles$cluster, levels = clusters)
   profiles$track <- factor(profiles$track, levels = names(track_colors)[names(track_colors) %in% profiles$track])
   profiles <- profiles[order(profiles$cluster, profiles$track, profiles$relative_pos), ]
-  colors <- feature_colors(levels(profiles$track), track_colors)
-  counts <- unique(profiles[, c("cluster", "n_reads")])
-  labels <- setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
-  plot <- ggplot2::ggplot(profiles,
-    ggplot2::aes(relative_pos, fraction, fill = track, color = track, group = track))
-  plot <- plot + ggplot2::geom_ribbon(
-    data = profiles[profiles$track %in% nucleosome_track, , drop = FALSE],
-    ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", color = NA, alpha = .18) +
-    ggplot2::geom_line(linewidth = 0.5)
-  plot + ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
-    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.4) +
-    ggplot2::scale_fill_manual(values = colors, labels = track_labels) +
-    ggplot2::scale_color_manual(values = colors, labels = track_labels) +
-    ggplot2::scale_x_continuous(limits = c(anchor$left - 0.5, anchor$right + 0.5), expand = c(0, 0)) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
-      expand = ggplot2::expansion(mult = c(0, 0.02))) +
-    ggplot2::labs(x = anchor$x_label, y = "Fraction of cluster reads", title = title,
-      subtitle = "m6A calls and footprint occupancy; retained heterozygous reads", fill = "Plot track", color = "Plot track") +
-    cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
-    ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4), color = ggplot2::guide_legend(ncol = 4)) +
-    ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8),
-      plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
+  profiles
 }
 
 sample_palette <- function(sample_names, sample_labels = sub("_.*$", "", sample_names)) {
@@ -400,132 +200,18 @@ sample_palette <- function(sample_names, sample_labels = sub("_.*$", "", sample_
   setNames(grDevices::hcl.colors(length(labels), "Dynamic"), labels)
 }
 
-plot_genomic_cluster_heatmap <- function(res, region = res$region, sample_colors,
-                                     include_haplotype = FALSE, variants = NULL,
-                                     show_cluster_profiles = FALSE, split_alleles = FALSE,
-                                     cluster_label = "Saved m6A-defined clusters",
-                                     sample_label_column = NULL) {
-  assignments <- res$assignments
-  if (split_alleles) stopifnot(include_haplotype, !is.null(assignments$allele_display))
-  ordering <- if (split_alleles) order(assignments$allele_display, assignments$cluster, assignments$start, assignments$RID) else
-    order(assignments$cluster, assignments$start, assignments$RID)
-  assignments <- assignments[ordering, , drop = FALSE]
-  sample_labels <- if (is.null(sample_label_column)) sub("_.*$", "", assignments$sample_name) else
-    assignments[[sample_label_column]]
-  if (!is.null(sample_label_column))
-    stopifnot(length(sample_labels) == nrow(assignments), all(sample_labels %in% names(sample_colors)))
-  sample <- factor(sample_labels, levels = names(sample_colors))
-  annotation <- ComplexHeatmap::rowAnnotation(
-    cluster = assignments$cluster, sample = sample,
-    col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors))
-  if (include_haplotype && identical(region$region_type, "top_asfire_het")) {
-    annotation <- ComplexHeatmap::rowAnnotation(
-      cluster = assignments$cluster, sample = sample, allele = assignments$allele_display,
-      col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors,
-        allele = fiberseq_category_palette(res$allele_display_levels)))
-  } else if (include_haplotype) {
-    annotation <- ComplexHeatmap::rowAnnotation(
-      cluster = assignments$cluster, sample = sample, haplotype = assignments$haplotype,
-      col = list(cluster = cluster_id_palette(levels(assignments$cluster)), sample = sample_colors,
-        haplotype = LCL_HAPLOTYPE_COLORS))
-  }
-  met <- matrix(0L, nrow(assignments), region$width,
-                  dimnames = list(assignments$RID, seq.int(region$analysis_start, region$analysis_end)))
-  met[, match(colnames(res$site_met_mat), colnames(met))] <- as.matrix(res$site_met_mat[assignments$RID, , drop = FALSE])
-  anchor <- plot_anchor(region)
-  if (anchor$direction == -1L) met <- met[, rev(seq_len(ncol(met))), drop = FALSE]
-  display <- met
-  colors <- c("0" = "white", "1" = "black")
-  legend <- list(at = c(0, 1), labels = c("no m6A call", "m6A"))
-  legend_name <- "m6A"
-  top <- NULL
-  if (show_cluster_profiles) {
-    cluster_colors <- cluster_id_palette(levels(assignments$cluster))
-    profile_annotations <- lapply(levels(assignments$cluster), function(cluster) {
-      selected <- assignments$cluster == cluster
-      ComplexHeatmap::anno_lines(
-        colMeans(met[selected, , drop = FALSE]),
-        ylim = c(0, 1), gp = grid::gpar(col = cluster_colors[[cluster]], lwd = 0.7),
-        axis_param = list(at = c(0, 0.5, 1), labels = c("0", ".5", "1")),
-        height = grid::unit(12, "mm"))
-    })
-    names(profile_annotations) <- paste0(levels(assignments$cluster), " m6A")
-    top <- do.call(ComplexHeatmap::HeatmapAnnotation, c(profile_annotations,
-      list(annotation_name_gp = grid::gpar(fontsize = 8), gap = grid::unit(1.5, "mm"))))
-  }
-  ticks <- unique(round(seq(1, ncol(display), length.out = 5L)))
-  coordinates <- as.integer(colnames(display))
-  tick_positions <- if (anchor$promoter) plot_positions(coordinates[ticks], region) else coordinates[ticks]
-  bottom_parts <- list(coordinate = ComplexHeatmap::anno_mark(at = ticks,
-    labels = format(tick_positions, scientific = FALSE, trim = TRUE),
-    which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 8)))
-  if (identical(region$region_type, "promoter") && !is.null(region$tss) &&
-      !is.na(region$tss) && region$tss >= region$analysis_start && region$tss <= region$analysis_end) {
-    bottom_parts$TSS <- ComplexHeatmap::anno_mark(
-      at = match(region$tss, coordinates),
-      labels = if (anchor$promoter) "TSS: 0" else paste0("TSS: ", region$chr, ":", region$tss),
-      which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 8, col = "#D55E00"))
-  }
-  snps <- if (!is.null(region$focal_snp)) data.frame(pos = region$focal_pos,
-    label = paste0(region$focal_snp, " ", region$ref, ">", region$alt)) else window_snps(variants, region)
-  if (nrow(snps)) {
-    bottom_parts$SNP <- ComplexHeatmap::anno_mark(
-      at = match(snps$pos, coordinates),
-      labels = if (anchor$promoter) paste0(snps$label, " (", plot_positions(snps$pos, region), " bp from TSS)") else snps$label,
-      which = "column", side = "bottom", labels_gp = grid::gpar(fontsize = 7),
-      link_gp = grid::gpar(col = "#984EA3"))
-  }
-  bottom <- do.call(ComplexHeatmap::HeatmapAnnotation, c(bottom_parts,
-    list(annotation_name_gp = grid::gpar(fontsize = 8))))
-  ComplexHeatmap::Heatmap(
-    display, name = legend_name, col = colors, heatmap_legend_param = legend,
-    cluster_rows = FALSE, cluster_columns = FALSE, cluster_row_slices = FALSE,
-    row_split = if (split_alleles) data.frame(allele = assignments$allele_display,
-      cluster = assignments$cluster) else assignments$cluster,
-    row_gap = grid::unit(if (split_alleles) 3 else 0.6, "mm"),
-    row_title_rot = 0, row_title_gp = grid::gpar(fontsize = 8),
-    show_row_names = FALSE, show_column_names = FALSE,
-    use_raster = TRUE, raster_quality = 2, raster_resize_mat = FALSE,
-    left_annotation = annotation,
-    top_annotation = top, bottom_annotation = bottom,
-    column_title = paste(c(region$annotation,
-      if (include_haplotype) paste0(cluster_label, "; focal allele annotated per sample"),
-      if (split_alleles) "Rows split by focal allele, then cluster",
-      if (show_cluster_profiles) "Top: m6A call fraction per cluster (all full-span reads)",
-      if (anchor$promoter) anchor$x_label,
-      if (include_haplotype && !nrow(snps)) "No phased heterozygous SNP in this window",
-      paste0(region$chr, ":", region$analysis_start, "-", region$analysis_end)), collapse = "\n"),
-    column_title_gp = grid::gpar(fontsize = 11))
-}
 
-plot_category_composition <- function(res, column, colors, main = NULL,
-                                      legend_title = column,
-                                      y_label = "Fraction of cluster reads",
-                                      label_fun = identity) {
+
+category_composition_inputs <- function(res, column, colors, label_fun = identity) {
   assignments <- res$assignments
   stopifnot(column %in% names(assignments))
   categories <- label_fun(as.character(assignments[[column]]))
   stopifnot(length(categories) == nrow(assignments),
             !anyNA(categories), all(categories %in% names(colors)))
   assignments$category <- factor(categories, levels = names(colors))
-  counts <- table(assignments$cluster)
-  ggplot2::ggplot(assignments, ggplot2::aes(cluster, fill = category)) +
-    ggplot2::geom_bar(position = "fill", width = .75) +
-    ggplot2::scale_fill_manual(values = colors, drop = FALSE) +
-    ggplot2::scale_x_discrete(labels = function(x) paste0(x, "\n(n=", counts[x], ")")) +
-    ggplot2::scale_y_continuous(labels = scales::percent, breaks = seq(0, 1, .25),
-      expand = ggplot2::expansion(mult = c(0, .02))) +
-    ggplot2::labs(x = "Cluster", y = y_label, fill = legend_title, title = main,
-      subtitle = "Each bar sums to 100% of retained reads in that cluster") +
-    ggplot2::theme_bw(base_size = 10) + ggplot2::theme(legend.position = "right")
+  assignments
 }
 
-plot_sample_composition <- function(res, sample_colors, main = NULL, sample_column = "sample_name",
-                                    label_fun = function(x) sub("_.*$", "", x)) {
-  plot_category_composition(res, sample_column, sample_colors, main,
-    legend_title = "LCL sample", y_label = "Sample composition within cluster",
-    label_fun = label_fun)
-}
 
 
 # Fiber-seq panels: every composition denominator is the cluster read count.
@@ -572,11 +258,12 @@ plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, samp
     n <- tables$counts$n_reads[match(cluster, tables$counts$cluster)]
     nuc <- d[d$track %in% nucleosome_track, , drop = FALSE]
     met <- d[d$track == "m6A", , drop = FALSE]
-    p <- ggplot2::ggplot(d, ggplot2::aes(pos, fraction)) +
-      ggplot2::geom_ribbon(data = nuc, ggplot2::aes(ymin = 0, ymax = fraction),
-        fill = nucleosome_fill, alpha = .18, color = NA) +
-      ggplot2::geom_line(data = nuc, color = nucleosome_color, linewidth = .55) +
-      ggplot2::geom_line(data = met, color = cluster_colors[[cluster]], linewidth = .45) +
+    p <- plot_group_profile(d, style = "ribbon", mapping = ggplot2::aes(pos, fraction),
+      layers = list(list(geom = "ribbon", data = nuc,
+        mapping = ggplot2::aes(ymin = 0, ymax = fraction),
+        fill = nucleosome_fill, alpha = .18, color = NA),
+        list(geom = "line", data = nuc, color = nucleosome_color, linewidth = .55),
+        list(geom = "line", data = met, color = cluster_colors[[cluster]], linewidth = .45))) +
       ggplot2::scale_x_continuous(limits = limits,
         labels = function(x) format(x, scientific = FALSE, trim = TRUE), expand = ggplot2::expansion(mult = 0)) +
       ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1)) +
@@ -590,21 +277,24 @@ plot_fiberseq_profiles <- function(tables, region, markers, cluster_colors, samp
         ggplot2::geom_vline(data = markers, ggplot2::aes(xintercept = pos),
           inherit.aes = FALSE, color = "#666666", linetype = "dotted", linewidth = .35)
     }
-    bar <- function(tab, colors, heading) {
+    composition_plots <- lapply(c("sample", "allele"), function(kind) {
+      tab <- tables[[kind]]
       tab <- tab[tab$cluster == cluster, ]
+      colors <- if (kind == "sample") sample_colors else allele_colors
+      heading <- if (kind == "sample") "LCL sample" else allele_heading
       tab$category <- factor(tab$category, levels = names(colors))
-      ggplot2::ggplot(tab, ggplot2::aes(x = 1, y = fraction, fill = category)) +
-        ggplot2::geom_col(width = .6, position = ggplot2::position_stack(reverse = TRUE)) +
-        ggplot2::coord_flip() + ggplot2::scale_fill_manual(values = colors, drop = FALSE) +
-        ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1), labels = scales::percent,
-          expand = ggplot2::expansion(mult = 0)) +
-        ggplot2::scale_x_continuous(breaks = NULL) +
-        ggplot2::labs(title = heading, subtitle = paste0("n = ", n), x = NULL, y = "Within cluster") +
-        ggplot2::theme_bw(base_size = 9) + ggplot2::theme(legend.position = "none", panel.grid = ggplot2::element_blank(),
-          plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
-    }
-    cowplot::plot_grid(p, bar(tables$sample, sample_colors, "LCL sample"),
-      bar(tables$allele, allele_colors, allele_heading), nrow = 1,
+      tab$bar <- 1
+      plot_stacked_proportion(tab, "bar", "category", colors, y = "fraction",
+        position = "stack", reverse = TRUE, horizontal = TRUE, width = .6,
+        legend = list(drop = FALSE),
+        scales = list(ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1),
+          labels = scales::percent, expand = ggplot2::expansion(mult = 0)),
+          ggplot2::scale_x_continuous(breaks = NULL)),
+        labels = list(title = heading, subtitle = paste0("n = ", n), x = NULL, y = "Within cluster"),
+        theme = ggplot2::theme_bw(base_size = 9) + ggplot2::theme(legend.position = "none",
+          panel.grid = ggplot2::element_blank(), plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5)))
+    })
+    cowplot::plot_grid(p, composition_plots[[1]], composition_plots[[2]], nrow = 1,
       rel_widths = c(2.7, 1, 1.5), align = "h", axis = "tb")
   })
   marker_text <- if (nrow(markers)) paste(paste0(markers$label, ": ", markers$pos),
@@ -779,7 +469,7 @@ plot_cluster_pie <- function(result, counts = NULL, cluster_colors = NULL) {
 
 save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
                                embedding = NULL, example_only = FALSE,
-                               plot_writer = NULL) {
+                               plot_writer = NULL, include_read_panels = FALSE) {
   result <- fiberseq_display_result(result)
   allele_heading <- if (identical(result$region$region_type, "top_asfire_het"))
     "Focal SNP allele" else "Allele / sample-local haplotype"
@@ -789,16 +479,10 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
   cluster_colors <- cluster_id_palette(tables$groups)
   allele_colors <- fiberseq_category_palette(result$allele_display_levels)
   stopifnot(all(result$assignments$sample_name %in% names(sample_colors)))
-  save_plot <- function(plot, name, width, height) {
-    if (example_only && name != "fiberseq_haplotype_example") return(invisible(NULL))
-    if (!is.null(plot_writer)) return(invisible(plot_writer(plot, name, width, height)))
-    ggplot2::ggsave(file.path(plot_dir, paste0(name, ".pdf")),
-      plot, width = width, height = height, limitsize = FALSE, bg = "white")
-  }
   profiles <- plot_fiberseq_profiles(tables, result$region, result$markers,
     cluster_colors, sample_colors, allele_colors,
     result$region$annotation)
-  save_plot(profiles$plot, "fiberseq_profiles_composition", 16, profiles$height)
+  figures <- list(fiberseq_profiles_composition = list(plot = profiles$plot, width = 16, height = profiles$height))
   if (is.null(embedding)) embedding <- fiberseq_umap(result)
   stopifnot(identical(embedding$RID, result$assignments$RID))
   embedding <- data.frame(result$assignments, embedding[, c("UMAP1", "UMAP2")])
@@ -808,7 +492,7 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
   ps <- plot_umap(embedding, "sample_name", sample_colors, "UMAP: LCL sample")
   pa <- plot_umap(embedding, "allele_display", allele_colors, paste0("UMAP: ", allele_heading))
   pie <- plot_cluster_pie(result, counts = tables$counts, cluster_colors = cluster_colors)
-  save_plot(pie, "fiberseq_cluster_proportions", 8, 5)
+  figures$fiberseq_cluster_proportions <- list(plot = pie, width = 8, height = 5)
   legends <- list(fiberseq_legend(cluster_colors, "Cluster", 5, cluster_labels),
     fiberseq_legend(sample_colors, "LCL sample", 6, sub("_.*$", "", names(sample_colors))),
     fiberseq_legend(allele_colors, allele_heading, 3))
@@ -817,12 +501,97 @@ save_fiberseq_plots <- function(result, footprints, output_dir, sample_colors,
   overview <- cowplot::plot_grid(plotlist = c(list(heading, cowplot::plot_grid(pc, ps, pa, pie, ncol = 2)), legends),
                                 ncol = 1, rel_heights = c(.45, 8, lh))
   overview_height <- 8.45 + sum(lh)
-  save_plot(overview, "fiberseq_umap_overview", 16, overview_height)
+  figures$fiberseq_umap_overview <- list(plot = overview, width = 16, height = overview_height)
   # One PDF page combines the same UMAP coordinates, cluster pie, aggregate
   # accessibility/nucleosomes, and within-cluster sample/actual-allele bars.
   example <- cowplot::plot_grid(overview, profiles$plot, ncol = 1,
     rel_heights = c(overview_height, profiles$height))
-  save_plot(example, "fiberseq_haplotype_example", 16, overview_height + profiles$height)
+  figures$fiberseq_haplotype_example <- list(plot = example, width = 16,
+    height = overview_height + profiles$height)
+  for (name in names(figures)) {
+    if (example_only && name != "fiberseq_haplotype_example") next
+    figure <- figures[[name]]
+    if (!is.null(plot_writer)) {
+      plot_writer(figure$plot, name, figure$width, figure$height)
+    } else {
+      save_figure(figure$plot, file.path(plot_dir, paste0(name, ".pdf")),
+        width = figure$width, height = figure$height, limitsize = FALSE, bg = "white")
+    }
+  }
+  if (include_read_panels) {
+    # Optional LCL detail panels previously dispatched by the notebook.
+    include_haplotype <- TRUE
+    detail_colors <- setNames(unname(sample_colors), sub("_.*$", "", names(sample_colors)))
+    save_figure(plot_knn_graph(result), file.path(plot_dir, "knn_graph.pdf"),
+      width = 12, height = 9, bg = "white")
+    signals <- signal_profiles(result, footprints)
+    profiles <- signals$profiles
+    records <- signals$records
+    matched <- match(records$RID, result$assignments$RID)
+    for (column in intersect(c("cluster", "sample_name", "haplotype", "phase_set", "group_id"),
+                             names(result$assignments))) records[[column]] <- result$assignments[[column]][matched]
+    summary <- methylation_by_cluster(result)
+    save_figure(plot_methylation_by_cluster(summary, result$region), file.path(plot_dir, "methylation_proportion_by_cluster.pdf"),
+      width = 8, height = 4.5)
+    heatmap_file <- if (include_haplotype) "heatmap_m6a_footprints.pdf" else "heatmap_m6a.pdf"
+    heatmap_height <- if (include_haplotype) 11 + 0.55 * result$n_clusters else 11
+    heatmap <- plot_read_heatmap(result, result$region, detail_colors,
+      include_haplotype = include_haplotype, variants = result$variants,
+      show_cluster_profiles = include_haplotype)
+    save_figure(heatmap, file.path(plot_dir, heatmap_file), width = 14, height = heatmap_height,
+      draw = function(x) ComplexHeatmap::draw(x, newpage = FALSE))
+    save_figure(plot_smf_reads(result, records, detail_colors, include_haplotype = include_haplotype), file.path(plot_dir, "fig1_read_footprints.pdf"),
+      width = 12, height = max(7, 0.03 * nrow(result$assignments) + 3.5 + 0.3 * result$n_clusters), limitsize = FALSE)
+    save_figure(local({
+      .profile_args <- list(profiles = profiles,
+      region = result$region,
+      clusters = levels(result$assignments$cluster))
+      profiles <- .profile_args$profiles
+      region <- .profile_args$region
+      clusters <- .profile_args$clusters
+      title <- region$annotation
+      track_colors <- LCL_TRACK_COLORS
+      track_labels <- LCL_TRACK_LABELS
+      nucleosome_track <- "ft_nuc_130-160bp"
+      profiles <- signal_profile_inputs(profiles, region, clusters, track_colors)
+      anchor <- plot_anchor(region)
+      colors <- feature_colors(levels(profiles$track), track_colors)
+      counts <- unique(profiles[, c("cluster", "n_reads")])
+      labels <- setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
+      plot <- plot_group_profile(profiles, group_col = "track", style = "ribbon",
+        x_col = "relative_pos",
+        mapping = ggplot2::aes(relative_pos, fraction, fill = track, color = track, group = track),
+        layers = list(list(geom = "ribbon",
+          data = profiles[profiles$track %in% nucleosome_track, , drop = FALSE],
+          mapping = ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", color = NA, alpha = .18),
+          list(geom = "line", linewidth = 0.5)))
+      plot + ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
+        ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.4) +
+        ggplot2::scale_fill_manual(values = colors, labels = track_labels) +
+        ggplot2::scale_color_manual(values = colors, labels = track_labels) +
+        ggplot2::scale_x_continuous(limits = c(anchor$left - 0.5, anchor$right + 0.5), expand = c(0, 0)) +
+        ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
+          expand = ggplot2::expansion(mult = c(0, 0.02))) +
+        ggplot2::labs(x = anchor$x_label, y = "Fraction of cluster reads", title = title,
+          subtitle = "m6A calls and footprint occupancy; retained heterozygous reads", fill = "Plot track", color = "Plot track") +
+        cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
+        ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4), color = ggplot2::guide_legend(ncol = 4)) +
+        ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8),
+          plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
+    }), file.path(plot_dir, "fig2_occupancy_by_cluster.pdf"),
+      width = 10, height = 1.4 * result$n_clusters + 2.5, limitsize = FALSE)
+    composition <- category_composition_inputs(result, "sample_name", detail_colors,
+      label_fun = function(x) sub("_.*$", "", x))
+    save_figure(plot_stacked_proportion(composition, "cluster", "category", detail_colors,
+      position = "fill", width = .75, legend = list(drop = FALSE),
+      scales = list(ggplot2::scale_x_discrete(labels = function(x) paste0(x, "\n(n=", table(composition$cluster)[x], ")")),
+        ggplot2::scale_y_continuous(labels = scales::percent, breaks = seq(0, 1, .25),
+          expand = ggplot2::expansion(mult = c(0, .02)))),
+      labels = list(x = "Cluster", y = "Sample composition within cluster", fill = "LCL sample",
+        title = result$region$annotation, subtitle = "Each bar sums to 100% of retained reads in that cluster"),
+      theme = ggplot2::theme_bw(base_size = 10) + ggplot2::theme(legend.position = "right")), file.path(plot_dir, "cluster_sample_composition.pdf"),
+      width = 12, height = 5)
+  }
   invisible(list(tables = tables, embedding = embedding))
 }
 

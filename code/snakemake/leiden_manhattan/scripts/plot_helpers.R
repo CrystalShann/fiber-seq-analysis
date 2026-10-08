@@ -1,22 +1,8 @@
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
+
 # Plot helpers extracted from leiden_LCL.Rmd; no notebook evaluation at runtime.
 # Shared primitives are loaded by common.R::load_shared().
 
-plot_knn_allele_composition <- function(summary, main = NULL) {
-  composition <- summary$composition
-  counts <- tapply(composition$n_reads, composition$group, sum)
-  ggplot2::ggplot(composition, ggplot2::aes(group, fraction, fill = allele)) +
-    ggplot2::geom_col(width = 0.75, position = ggplot2::position_stack(reverse = TRUE)) +
-    ggplot2::geom_text(ggplot2::aes(label = ifelse(fraction >= 0.05, scales::percent(fraction, accuracy = 1), "")),
-      position = ggplot2::position_stack(vjust = 0.5, reverse = TRUE), color = "white", size = 3) +
-    ggplot2::scale_fill_manual(values = fiberseq_category_palette(summary$allele_levels), drop = FALSE) +
-    ggplot2::scale_x_discrete(labels = function(labels) paste0(labels, "\n(n=", counts[labels], ")")) +
-    ggplot2::scale_y_continuous(labels = scales::percent, limits = c(0, 1),
-      expand = ggplot2::expansion(mult = c(0, 0.02))) +
-    ggplot2::labs(title = main, x = "Leiden cluster", y = "Proportion of retained reads", fill = "Focal SNP allele",
-      subtitle = "All reads: region-wide baseline; each bar sums to 100%") +
-    ggplot2::theme_bw(base_size = 11) +
-    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
-}
 
 plot_knn_allele_connectivity <- function(summary, main = NULL) {
   connectivity <- summary$connectivity
@@ -106,8 +92,7 @@ workflow_plot_context <- function(result, assembled, cfg, ds, table_dir) {
   context$include_allele <- "allele" %in% context$annotations
   if ("timepoint" %in% context$annotations) {
     stopifnot("timepoint" %in% names(samples))
-    colors <- unname(LEIDEN_TIMEPOINT_COLORS[paste0("LPS_", samples$timepoint)])
-    if (anyNA(colors)) stop("Timepoint has no LEIDEN_TIMEPOINT_COLORS entry")
+    colors <- unname(timepoint_palette(samples$timepoint)[as.character(samples$timepoint)])
     context$sample_colors <- setNames(colors, samples$sample_label)
     context$timepoint_colors <- setNames(colors, samples$sample_name)
     context$sample_heading <- "Timepoint"
@@ -216,7 +201,7 @@ context_haplotype_panel <- function(context) {
 
 context_genomic_heatmap <- function(context) {
   r <- context$result
-  heatmap <- plot_genomic_cluster_heatmap(r, r$region, context$sample_colors,
+  heatmap <- plot_read_heatmap(r, r$region, context$sample_colors,
     include_haplotype = context$include_allele, variants = r$variants,
     show_cluster_profiles = TRUE, sample_label_column = "sample_label")
   draw <- function(x) {
@@ -254,9 +239,46 @@ context_read_footprints <- function(context) {
 
 context_occupancy <- function(context) {
   r <- context$result
-  p <- plot_signal_profile(context_signals(context)$profiles, r$region,
-    levels(r$assignments$cluster), track_colors = context$track_spec$colors,
-    track_labels = context$track_spec$labels, nucleosome_track = context$track_spec$nucleosome_track) +
+  p <- local({
+    .profile_args <- list(track_colors = context$track_spec$colors,
+      track_labels = context$track_spec$labels,
+      nucleosome_track = context$track_spec$nucleosome_track,
+      profiles = context_signals(context)$profiles,
+      region = r$region,
+      clusters = levels(r$assignments$cluster))
+    profiles <- .profile_args$profiles
+    region <- .profile_args$region
+    clusters <- .profile_args$clusters
+    title <- region$annotation
+    track_colors <- .profile_args$track_colors
+    track_labels <- .profile_args$track_labels
+    nucleosome_track <- .profile_args$nucleosome_track
+    profiles <- signal_profile_inputs(profiles, region, clusters, track_colors)
+    anchor <- plot_anchor(region)
+    colors <- feature_colors(levels(profiles$track), track_colors)
+    counts <- unique(profiles[, c("cluster", "n_reads")])
+    labels <- setNames(paste0(counts$cluster, " (n=", counts$n_reads, ")"), counts$cluster)
+    plot <- plot_group_profile(profiles, group_col = "track", style = "ribbon",
+      x_col = "relative_pos",
+      mapping = ggplot2::aes(relative_pos, fraction, fill = track, color = track, group = track),
+      layers = list(list(geom = "ribbon",
+        data = profiles[profiles$track %in% nucleosome_track, , drop = FALSE],
+        mapping = ggplot2::aes(ymin = 0, ymax = fraction), fill = "grey60", color = NA, alpha = .18),
+        list(geom = "line", linewidth = 0.5)))
+    plot + ggplot2::facet_wrap(~cluster, ncol = 1, labeller = ggplot2::as_labeller(labels)) +
+      ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.4) +
+      ggplot2::scale_fill_manual(values = colors, labels = track_labels) +
+      ggplot2::scale_color_manual(values = colors, labels = track_labels) +
+      ggplot2::scale_x_continuous(limits = c(anchor$left - 0.5, anchor$right + 0.5), expand = c(0, 0)) +
+      ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))) +
+      ggplot2::labs(x = anchor$x_label, y = "Fraction of cluster reads", title = title,
+        subtitle = "m6A calls and footprint occupancy; retained heterozygous reads", fill = "Plot track", color = "Plot track") +
+      cowplot::theme_cowplot(font_size = 10) + cowplot::panel_border() +
+      ggplot2::guides(fill = ggplot2::guide_legend(ncol = 4), color = ggplot2::guide_legend(ncol = 4)) +
+      ggplot2::theme(legend.position = "bottom", legend.text = ggplot2::element_text(size = 8),
+        plot.margin = ggplot2::margin(5.5, 16, 5.5, 5.5))
+  }) +
     ggplot2::labs(subtitle = if (context$include_allele)
       "m6A calls and footprint occupancy; retained heterozygous reads" else
       "m6A calls and footprint occupancy; all full-span reads")
@@ -293,42 +315,3 @@ context_profile_result <- function(context) {
   r
 }
 
-save_plots <- function(context, panels, plot_dir, manifest = file.path(plot_dir, "panels.tsv")) {
-  dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
-  if (anyDuplicated(panels)) stop("Dataset plots contains duplicate panel names")
-  missing <- setdiff(panels, names(panel_registry))
-  if (length(missing)) stop("Unknown plot panels: ", paste(missing, collapse = ", "))
-  records <- list()
-  # Layout helpers may open a device; keep incidental Rplots.pdf out of outputs.
-  grDevices::pdf(NULL)
-  layout_device <- grDevices::dev.cur()
-  on.exit(if (layout_device %in% grDevices::dev.list()) grDevices::dev.off(layout_device), add = TRUE)
-  for (name in panels) {
-    entry <- panel_registry[[name]]
-    filename <- entry$filename(context$result$region$region_id)
-    if (!is.null(entry$enabled) && !entry$enabled(context)) {
-      records[[name]] <- data.frame(panel = name, filename = filename, status = "outside_rank_limit")
-      next
-    }
-    descriptor <- entry$render(context)
-    path <- file.path(plot_dir, filename)
-    if (is.null(descriptor$draw)) {
-      ggplot2::ggsave(path, descriptor$plot, width = descriptor$width, height = descriptor$height,
-        device = grDevices::cairo_pdf, limitsize = FALSE, bg = "white")
-    } else {
-      grDevices::pdf(path, width = descriptor$width, height = descriptor$height)
-      tryCatch(descriptor$draw(descriptor$plot), finally = grDevices::dev.off())
-    }
-    stopifnot(file.exists(path), file.info(path)$size > 0)
-    records[[name]] <- data.frame(panel = name, filename = filename, status = descriptor$status)
-  }
-  tab <- if (length(records)) do.call(rbind, records) else
-    data.frame(panel = character(), filename = character(), status = character())
-  utils::write.table(tab, manifest, sep = "\t", quote = FALSE, row.names = FALSE)
-  invisible(tab)
-}
-
-save_all_plots <- function(context, plot_dir, panels = unlist(context$ds$plots, use.names = FALSE),
-                           manifest = file.path(plot_dir, "panels.tsv")) {
-  save_plots(context, panels, plot_dir, manifest)
-}

@@ -13,7 +13,7 @@ one-to-one on region_id + timepoint. For every union region and timepoint:
                          the same, restricted to the region's FIRE-positive reads
                          (only for features with a gate)
 
-Features (FEATURES registry; a new feature only needs a new entry):
+Features (ex: footprints, FIRE regions):
     fire   FIRE elements (same file as 03), element covers >= 50% of the region
     fp     FiberHMM TF footprints, score >= 50 and 10-80 bp, footprint lies 100%
            inside the region; not required to sit inside a FIRE element; gate = fire
@@ -30,6 +30,17 @@ Outputs in --out-dir:
     feature_count_long.tsv.gz   one row per (region, timepoint)
     feature_count_wide.tsv.gz   one row per region, per-timepoint columns
 """
+
+# Footprints are in: 
+# /project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/firehmm_tf/LPS<t>/LPS<t>_hmm_extracted_tf_<chrom>.bed.gz
+
+# FIRE elements are in: 
+# /project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE/<s>/additional-outputs-v0.1/fire-peaks/<s>-v0.1-fire-elements.bed.gz
+
+# read spans are in: /project/spott/cshan/fiber-seq/macrophage_project/fire_frequency/<s>/<s>.read_spans.bed.gz
+  # chr read_start read_end read_id
+  # read span of every aligined read, which is then filtered for 100% overlap with a FIRE region, 
+  # this is done in /project/spott/cshan/fiber-seq/code/fire_frequency/02_read_spans.sh
 
 import argparse
 import os
@@ -80,6 +91,7 @@ def tabix_awk(path, chrom, out_bed, program, awk_vars=None):
 ###############################
 # loaders: write a BED4 (chrom start end read_name) for one chromosome
 ###############################
+# pulls one chr's lines outof the indexed file
 def load_bed4(path, chrom, out_bed, args):
     """Intervals as-is, first four columns."""
     tabix_awk(path, chrom, out_bed, 'BEGIN { FS = OFS = "\\t" } { print $1, $2, $3, $4 }')
@@ -87,9 +99,15 @@ def load_bed4(path, chrom, out_bed, args):
 
 # FiberHMM BED12+3, one line per read: $2 read start, $4 read name, $10 blockCount,
 # $11 sizes, $12 offsets, $13 scores (comma-separated). Every block is a real call
-# (no sentinel blocks, see split_footprints_by_size.sh). $13 is the per-block tq
+# (see split_footprints_by_size.sh). $13 is the per-block tq
 # (round(LLR*10), 0-255); $14/$15 are edge scores. fiberhmm-extract already drops
-# tq < 50, so --min-score only bites above 50.
+# tq < 50
+
+###############################
+# One line per footprint
+# each FiberHMM line is one read, with footprints stored as BED12 blocks
+###############################
+
 EXPLODE_BLOCKS = r'''
 BEGIN { FS = OFS = "\t" }
 {
@@ -123,6 +141,8 @@ def fiberhmm_label(s):
 # gate: also count this feature on the region's reads positive for the gate feature
 # (the gate must come earlier in the dict).
 ###############################
+
+# load and match the features to its input path
 FEATURES = {
     "fire": {
         "path": lambda s, chrom, args: Path(FIRE_ROOT) / s / "additional-outputs-v0.1" /
@@ -139,6 +159,20 @@ FEATURES = {
         "gate": "fire",
     },
 }
+
+###############################
+# builds the list of output column names 
+###############################
+
+# n_reads: the number of distinct reads whose span covers 100% of the region
+# fire_n_elements: the total number of FIRE elements on spanning reads that cover at least 50% of the region.
+  # If a read had two  elements, count both
+# fire_n_reads: the number of spanning reads with at least one such FIRE element, so the FIRE-positive reads
+# fp_n_elements: the total number of footprints lying fully inside the region on any spanning read, open or not
+# fp_n_reads: the number of spanning reads with at least one such footprint
+
+# gated (fp_n_elements_gated, fp_n_reads_gated): footprints only on reads that are also within a FIRE region
+# ungated (fp_n_elements, fp_n_reads): footprints on all spanning reads, whether or not they're open
 
 
 def count_columns():
@@ -165,12 +199,15 @@ def feature_hits(regions_bed, feature_bed, flag, min_frac):
         hits[f[3]].append(f[7])
     return hits
 
-
+###############################
+# count the number of features once per timepoint annd chr
+###############################
 def counts_for_chrom(chrom, regions, s, spans_path, args, tmpdir):
     """({region_id: {count column: value}}, {feature: dropped hits}) for one chromosome.
 
     Only regions with >= 1 spanning read are returned; missing columns are 0.
     """
+    
     sub = regions[regions["chrom"] == chrom]
     if sub.empty:
         return {}, {k: 0 for k in FEATURES}
@@ -178,7 +215,7 @@ def counts_for_chrom(chrom, regions, s, spans_path, args, tmpdir):
     sub[["chrom", "start", "end", "region_id"]].to_csv(
         reg_chr, sep="\t", header=False, index=False)
 
-    # Denominator: reads whose span covers 100% of the region (identical to 03).
+    # Denominator: reads whose span covers 100% of the region 
     spans_chr = tmpdir / f"spans.{chrom}.bed"
     load_bed4(spans_path, chrom, spans_chr, args)
     cov = {r: set(names) for r, names in
@@ -198,11 +235,13 @@ def counts_for_chrom(chrom, regions, s, spans_path, args, tmpdir):
         positive[k] = {}
         dropped[k] = 0
         for r, names in hits.items():
+          # drop elements on non-spanning reads
             span = cov.get(r, set())
             kept = [n for n in names if n in span]
             dropped[k] += len(names) - len(kept)
             if not kept:
                 continue
+              
             reads = set(kept)
             positive[k][r] = reads
             c = counts[r]
