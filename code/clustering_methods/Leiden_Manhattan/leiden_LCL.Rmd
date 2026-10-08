@@ -88,7 +88,7 @@ The promoter analysis below instead pools all fully spanning reads without phasi
 ```{r setup, include=FALSE}
 code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
 suppressPackageStartupMessages(library(dplyr))
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
 source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r", local = TRUE)
 source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
@@ -658,7 +658,7 @@ profile is dark grey. Supporting tables record read order, profiles and QC.
 example_code_dir <- "/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan"
 suppressPackageStartupMessages(library(dplyr))
 source(file.path(example_code_dir, "leiden_manhattan_functions.r"), local = TRUE)
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
 source(file.path(example_code_dir, "leiden_manhattan_plots.r"), local = TRUE)
 if (!exists("lcl_output_path", mode = "function")) {
   notebook <- readLines(file.path(example_code_dir, "leiden_LCL.Rmd"), warn = FALSE)

@@ -1,5 +1,6 @@
 project_root: /project/spott/cshan/fiber-seq
 code_dir: /project/spott/cshan/fiber-seq/code
+parsing_functions: code/parsing_functions/parsing_footprints_functions.r
 results_dir: /project/spott/cshan/fiber-seq/snakemake_results/leiden_man_clustering
 
 # Clustering: every combination of the lists below is run (keep one value each

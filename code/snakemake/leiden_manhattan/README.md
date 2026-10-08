@@ -26,6 +26,26 @@ snakemake --profile profiles/slurm --config datasets_to_run=macrophage
 
 All settings are in `config/config.yaml`
 
+`parsing_functions` names the shared
+`code/parsing_functions/parsing_footprints_functions.r`, relative to `project_root`.
+The R scripts source this configured file through `scripts/common.R`. It contains
+the BED12/tabix readers, read metadata and methylation matrix helpers, and
+`read_sample_region_reads()` for per-sample m6A/CpG loading. The topic-model
+assembly and the default Leiden assembly share that loader; the full-span Leiden
+branch keeps its existing read selection.
+
+The parsing file is included in `CORE`, an input of every rule/checkpoint that
+loads it, so changes to the file make those rules eligible to rerun.
+
+Dry-run all configured datasets without executing analysis jobs:
+
+```bash
+snakemake -n
+```
+
+Or dry-run each dataset with `--config datasets_to_run=macrophage`,
+`--config datasets_to_run=lcl_asfire`, or `--config datasets_to_run=lcl_promoters`.
+
 ```yaml
 clustering:
   window_size: [0, 10]
@@ -59,4 +79,3 @@ To change nucleosome size, edit the dataset's `footprints.nucleosome`:
 min_size: 101
 max_size: null
 ```
-

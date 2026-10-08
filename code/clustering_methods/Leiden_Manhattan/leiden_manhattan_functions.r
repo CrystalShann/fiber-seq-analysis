@@ -115,17 +115,9 @@ assemble_region_m6a <- function(sample_names = NULL, region_chr = NULL, region_s
   }
   
   region_gr <- GRanges(region_chr, IRanges(region_start, region_end))
-  reads_list <- lapply(sample_names, function(sample_name) {
-    extracted_file <- file.path(
-      ft_result_dir, sample_name, "extracted_results", "m6a_by_chr",
-      paste0(sample_name, ".ft_extracted_m6a.", region_chr, ".bed.gz"))
-    
-    sample_reads <- extract_ft_region_reads(extracted_file, region_gr,
-                                            keep_pos_in_region_only = TRUE,
-                                            verbose = verbose)
-    if (nrow(sample_reads) == 0) return(NULL)
-    dplyr::mutate(sample_reads, sample_name = sample_name, .before = 1)
-  })
+  reads_list <- read_sample_region_reads(sample_names, region_gr, ft_result_dir,
+    modality = "m6a", keep_pos_in_region_only = TRUE, verbose = verbose)
+  reads_list <- Filter(Negate(is.null), reads_list)
   
   reads <- dplyr::bind_rows(reads_list)
   if (nrow(reads) == 0) stop("no reads in region")

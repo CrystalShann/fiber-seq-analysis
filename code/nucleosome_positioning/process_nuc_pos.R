@@ -41,7 +41,7 @@ suppressPackageStartupMessages({
   library(Rsamtools)
 })
 
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
        local = TRUE)
 

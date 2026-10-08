@@ -16,7 +16,7 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE)
 ```
 
 ```{r load-functions}
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r")
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")
 source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phasing.r")
 source("/project/spott/cshan/fiber-seq/code/haplotype_phasing/LCL_phased_m6a_input.r")

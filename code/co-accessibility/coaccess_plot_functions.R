@@ -38,7 +38,7 @@ suppressPackageStartupMessages({
   library(patchwork)
 })
 
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
 
 TABIX_BIN <- "/project/spott/cshan/envs/dimelo/bin/tabix"
 

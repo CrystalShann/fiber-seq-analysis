@@ -1,5 +1,5 @@
 # Shared input for the LCL Fourier and autocorrelation workflows.
-# Source topic_modelling_functions.r, leiden_manhattan_functions.r and
+# Source parsing_footprints_functions.r, leiden_manhattan_functions.r and
 # LCL_phasing.r first. The binary representation is the original Fourier one;
 # the read-selection rule is the existing LCL Leiden focal-heterozygote filter.
 

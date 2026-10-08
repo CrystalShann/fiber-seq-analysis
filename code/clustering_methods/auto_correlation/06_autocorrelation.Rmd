@@ -160,7 +160,7 @@ if (!length(region_dirs)) stop("No region results found under ", output)
 
 <!-- load the shared Leiden_Manhattan plotting functions (read plot, m6A heatmap, signal profiles, UMAP, kNN graph, colors) so the figures use the same code, layout and fonts as the Leiden_Manhattan report -->
 ```{r source-leiden-plots, include=FALSE}
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r", local = TRUE)
 ```
 

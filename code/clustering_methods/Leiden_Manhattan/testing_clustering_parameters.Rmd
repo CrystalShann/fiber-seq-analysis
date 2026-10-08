@@ -15,7 +15,7 @@ project_dir <- "/project/spott/cshan/fiber-seq"
 code_dir <- file.path(project_dir, "code/clustering_methods/Leiden_Manhattan")
 input_dir <- file.path(project_dir, "LCL_project/Leiden_manhattan")
 suppressPackageStartupMessages(library(dplyr))
-source(file.path(project_dir, "code/topic_model/topic_modelling_functions.r"), local = TRUE)
+source(file.path(project_dir, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
 source(file.path(code_dir, "leiden_manhattan_functions.r"), local = TRUE)
 source(file.path(code_dir, "leiden_manhattan_plots.r"), local = TRUE)
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,

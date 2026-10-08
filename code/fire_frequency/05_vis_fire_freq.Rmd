@@ -612,7 +612,7 @@ suppressPackageStartupMessages({
   library(cowplot)
   library(patchwork)
 })
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r")
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")
 source("/project/spott/cshan/fiber-seq/code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r")
 ht_opt$message <- FALSE

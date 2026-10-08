@@ -8,7 +8,7 @@ load_shared <- function(cfg, plots = FALSE, footprints = FALSE) {
     library(Rsamtools)
     library(igraph)
   })
-  source(file.path(cfg$code_dir, "topic_model/topic_modelling_functions.r"), local = .GlobalEnv)
+  source(file.path(cfg$project_root, cfg$parsing_functions), local = .GlobalEnv)
   source(file.path(cfg$code_dir, "clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r"), local = .GlobalEnv)
   source(file.path(cfg$code_dir, "haplotype_phasing/LCL_phasing.r"), local = .GlobalEnv)
   if (plots || footprints) {

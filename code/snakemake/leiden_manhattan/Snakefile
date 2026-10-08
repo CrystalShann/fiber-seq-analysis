@@ -156,8 +156,9 @@ def phase_cache_dir(wc):
         raise ValueError(f"Phasing cache must be inside results_dir: {path}")
     return str(path)
 
-CORE = [str(Path(config["code_dir"]) / path) for path in (
-    "topic_model/topic_modelling_functions.r", "haplotype_phasing/LCL_phasing.r",
+PARSING_FUNCTIONS = str(Path(config["project_root"]) / config["parsing_functions"])
+CORE = [PARSING_FUNCTIONS] + [str(Path(config["code_dir"]) / path) for path in (
+    "haplotype_phasing/LCL_phasing.r",
     "clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r")]
 COMMON = str(SCRIPTS / "common.R")
 MEM = int(SLURM["default_mem_mb"])

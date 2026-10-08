@@ -101,7 +101,7 @@ load_m6a_regions <- function(selection, region_table = NULL, window_size = 2000L
 }
 
 build_m6a_input <- function(region, sample_table, ft_result_dir, project) {
-  source(file.path(project, "code/topic_model/topic_modelling_functions.r"), local = TRUE)
+  source(file.path(project, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
   source(file.path(project, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r"), local = TRUE)
   source(file.path(project, "code/haplotype_phasing/LCL_phasing.r"), local = TRUE)
   source(file.path(project, "code/haplotype_phasing/LCL_phased_m6a_input.r"), local = TRUE)

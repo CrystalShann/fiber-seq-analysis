@@ -9,7 +9,7 @@ suppressPackageStartupMessages({
   library(IRanges)
 })
 
-source("/project/spott/cshan/fiber-seq/code/topic_model/topic_modelling_functions.r", local = TRUE)
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r", local = TRUE)
 
 FT_BED12_COLS <- c("chr", "start", "end", "RID", "score", "strand",
                    "read_start", "read_end", "rgb", "blockCount",
