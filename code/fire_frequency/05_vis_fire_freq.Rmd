@@ -486,9 +486,14 @@ signif_ccre %>%
 The 5 cCRE-supported significant regions with the smallest p-value and are associated with protein coding genes
 
 ```{r region_functions}
-code_dir <- "/project/spott/cshan/fiber-seq/code/topic_model/read_region_extraction"
-source(file.path(code_dir, "region_data_utils.R"))
-source(file.path(code_dir, "region_plot_functions.R"))
+code_dir <- "/project/spott/cshan/fiber-seq/code/parsing_functions"
+# packages the region helpers attached before they moved into parsing_functions
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(GenomicRanges); library(IRanges)
+  library(ggplot2); library(patchwork)
+})
+source(file.path(code_dir, "parsing_footprints_functions.r"))
+source(file.path(code_dir, "plotting_functions.r"), local = TRUE)
 ```
 
 
@@ -521,42 +526,15 @@ top10 %>%
   knitr::kable(caption = "Top 10 cCRE-supported differential regions selected for read-level plots")
 ```
 
-```{r top10_extract, include=FALSE}
-for (i in seq_len(nrow(top10))) {
-  for (s in sample_names) {
-    parsed <- file.path(extract_root, top10$outname[i], s, "parsed")
-    if (!isTRUE(params$regenerate_regions) && file.exists(file.path(parsed, "fire.bed"))) next
-    region_str <- paste0(top10$chrom[i], ":", top10$window_start[i], "-",
-                         top10$window_end[i])
-    cat("extracting", top10$outname[i], s, "\n")
-    rc <- system2("bash", c(extract_script, s, region_str, top10$outname[i],
-                            extract_root))
-    if (rc != 0) stop("extraction failed for ", top10$outname[i], " ", s)
-  }
-}
-```
+Each region and timepoint is extracted into `region_plots/<outname>/<timepoint>/parsed`
+by `plot_region_example()` when `parsed/fire.bed` is missing (or `params$regenerate_regions`
+is `TRUE`), then loaded and plotted in the same call.
 
 ```{r top10_region_plots, fig.width=10, fig.height=16}
 for (i in seq_len(nrow(top10))) {
   row <- top10[i, ]
   cat("=== ", row$region_id, " (", row$ccre_class, ", nearest gene: ",
       row$nearest_gene, ") ===\n", sep = "")
-
-  res <- load_region_results(
-    region       = data.frame(chr = row$chrom, start = row$window_start,
-                              end = row$window_end),
-    sample_names = sample_names,
-    result_dirs  = file.path(extract_root, row$outname, sample_names, "parsed"),
-    fiberHMM_feature      = "tf",
-    min_fiberHMM_fp_score = 50,
-    fiberHMM_size_breaks  = c(10, 30, 60, 80))
-
-  # facet the read-level panels and the pileup by timepoint
-  res <- add_read_groups(res,
-                         labels = setNames(as.character(res$rids_df$sample_name),
-                                           as.character(res$rids_df$RID)),
-                         group_col = "timepoint",
-                         group_levels = sample_names)
 
   # cCREs in the window, one row per cCRE labelled with its class; the tested region
   # itself is the yellow band behind every panel
@@ -565,14 +543,30 @@ for (i in seq_len(nrow(top10))) {
     arrange(ccre_class, start) %>%
     transmute(chr, start, end, group = ccre_class)
 
-  p <- plot_region_panels(res,
-                          plot_name = paste0(row$region_id, "  (", row$ccre_class,
-                                             ", nearest gene: ", row$nearest_gene, ")"),
-                          peaks_df = peaks_df,
-                          highlight = c(row$start, row$end),
-                          fiberHMM_cols = c("purple", "magenta", "#41c4e1"),
-                          heights = c(pileup = 10, peaks = 2, fire_peaks = 1,
-                                      reads = 8, fire_fiberHMM = 8))
+  p <- plot_region_example(
+    region       = data.frame(chr = row$chrom, start = row$window_start,
+                              end = row$window_end),
+    sample_names = sample_names,
+    out_root     = extract_root,
+    outname      = row$outname,
+    script       = extract_script,
+    regenerate   = isTRUE(params$regenerate_regions),
+    load_options = list(fiberHMM_feature      = "tf",
+                        min_fiberHMM_fp_score = 50,
+                        fiberHMM_size_breaks  = c(10, 30, 60, 80)),
+    # facet the read-level panels and the pileup by timepoint
+    group = function(res) add_read_groups(res,
+                         labels = setNames(as.character(res$rids_df$sample_name),
+                                           as.character(res$rids_df$RID)),
+                         group_col = "timepoint",
+                         group_levels = sample_names),
+    panel_options = list(plot_name = paste0(row$region_id, "  (", row$ccre_class,
+                                            ", nearest gene: ", row$nearest_gene, ")"),
+                         peaks_df = peaks_df,
+                         highlight = c(row$start, row$end),
+                         fiberHMM_cols = c("purple", "magenta", "#41c4e1"),
+                         heights = c(pileup = 10, peaks = 2, fire_peaks = 1,
+                                     reads = 8, fire_fiberHMM = 8)))$plot
   print(p$combined)
 }
 ```

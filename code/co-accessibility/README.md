@@ -205,7 +205,9 @@ function.
 | `read_tabix_region()` + `convert_ft_bed12_to_bed6()` | read and expand a BED12 slice using the shared LCL helpers |
 | `label_reads()` | per-fiber configuration at the pair, under the same rules as the table |
 | `order_reads()` | sort fibers by timepoint, then configuration, then position |
-| `plot_pair_panels()` | the four stacked panels, pair shaded on each |
+| `coaccess_region_result()` | adapt the retained, ordered pair reads for the shared region builder |
+| `coaccess_m6a_fraction()` | per-position fraction of covering fibers methylated, by timepoint |
+| `plot_region_panels()` (shared `parsing_functions/plotting_functions.r`) | the four stacked panels, pair shaded on each |
 | `plot_stacked_proportion()` | configuration proportions per timepoint |
 
 ## Running it

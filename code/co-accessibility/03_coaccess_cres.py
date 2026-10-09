@@ -58,7 +58,7 @@ TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
 # Deliberately NOT the numerator: FiberHMM/extract/ft_result_dir. That tree holds raw
 # m6A / CpG / nucleosome calls with no FIRE scoring, and was extracted from the
 # unfiltered BAM, so it covers ~8% more fibers than the -filtered FIRE CRAM. It is
-# used for display only, by coaccess_plot_functions.R.
+# used for display only, by load_ft_tracks() in parsing_functions/parsing_footprints_functions.r.
 FIRE_ROOT = "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE"
 
 

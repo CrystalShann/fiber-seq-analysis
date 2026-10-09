@@ -15,15 +15,24 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 Stacked read-level panels for the nine early-response promoter regions, with the SMF
 reads split by the topic-model read clusters.
 
-Inputs are whatever `run_extract_regions.sh` wrote under `extract_root`; nothing here
-reads a BAM or queries tabix.
+Inputs are the per-region extractions under `extract_root`. `plot_region_example()`
+(`code/parsing_functions/plotting_functions.r`) runs
+`code/parsing_functions/extract_region_result_macrophage.sh` for any timepoint whose
+`parsed/fire.bed` is missing - the same files `run_extract_regions.sh` writes as a SLURM
+array - and then loads and plots the region.
 
 # Functions
 
 ```{r functions}
-code_dir <- "/project/spott/cshan/fiber-seq/code/topic_model/read_region_extraction"
-source(file.path(code_dir, "region_data_utils.R"))
-source(file.path(code_dir, "region_plot_functions.R"))
+code_dir <- "/project/spott/cshan/fiber-seq/code/parsing_functions"
+# packages the region helpers attached before they moved into parsing_functions
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(GenomicRanges); library(IRanges)
+  library(ggplot2); library(patchwork)
+})
+source(file.path(code_dir, "parsing_footprints_functions.r"))
+source(file.path(code_dir, "plotting_functions.r"), local = TRUE)
+extract_script <- file.path(code_dir, "extract_region_result_macrophage.sh")
 ```
 
 # Settings
@@ -95,8 +104,9 @@ promoters
 
 # Plot one region
 
-`plot_promoter_region()` wires the three steps together. Set `use_clusters = FALSE` to
-get the same panels without the topic-model split.
+`plot_promoter_region()` wires the steps together through `plot_region_example()`:
+extract (when missing), load, attach the topic-model clusters, plot. Set
+`use_clusters = FALSE` to get the same panels without the topic-model split.
 
 ```{r plot-region-fn}
 plot_promoter_region <- function(gene, use_clusters = TRUE, peaks_df = NULL,
@@ -105,26 +115,28 @@ plot_promoter_region <- function(gene, use_clusters = TRUE, peaks_df = NULL,
   outname <- region$outname
   cat("=== ", gene, ": ", region$chr, ":", region$start, "-", region$end, " ===\n", sep = "")
 
-  result_dirs <- file.path(extract_root, outname, sample_names, "parsed")
-
-  res <- load_region_results(
-    region      = region[, c("chr", "start", "end")],
-    sample_names = sample_names,
-    result_dirs  = result_dirs,
-    fiberHMM_feature      = fiberHMM_feature,
-    min_fiberHMM_fp_score = min_fiberHMM_fp_score,
-    fiberHMM_size_breaks  = fiberHMM_size_breaks)
-
-  if (use_clusters) {
+  # topic-model read clusters, joined after loading
+  add_clusters <- if (use_clusters) function(res) {
     assignments_file <- file.path(topic_model_dir, outname,
                                   paste0("read_topic_assignments_", outname, ".tsv"))
-    res <- add_topic_clusters(res, assignments_file, assignment_col = "cluster")
+    add_topic_clusters(res, assignments_file, assignment_col = "cluster")
   }
 
-  p <- plot_region_panels(res,
-                          plot_name = gene,
-                          peaks_df = peaks_df,
-                          fiberHMM_cols = fiberHMM_cols)
+  out <- plot_region_example(
+    region       = region[, c("chr", "start", "end")],
+    sample_names = sample_names,
+    out_root     = extract_root,
+    outname      = outname,
+    script       = extract_script,
+    load_options = list(fiberHMM_feature      = fiberHMM_feature,
+                        min_fiberHMM_fp_score = min_fiberHMM_fp_score,
+                        fiberHMM_size_breaks  = fiberHMM_size_breaks),
+    group = add_clusters,
+    panel_options = list(plot_name = gene,
+                         peaks_df = peaks_df,
+                         fiberHMM_cols = fiberHMM_cols))
+  res <- out$res
+  p <- out$plot
 
   suffix <- if (use_clusters) "_by_cluster" else ""
   ggsave(file.path(plot_dir, paste0("region_", outname, suffix, ".pdf")),

@@ -23,20 +23,19 @@ the fibers that overlap both, with accessibility called by FIRE-element overlap
 and tested by `fisher.test(table + 1)`. The one structural difference from Kevin
 is that **each timepoint is tested by itself** where he pools 17 LCL samples.
 
-Plotting is `coaccess_plot_functions.R` in this directory — an independent
-implementation of his panel semantics that reads only the two tabix-indexed BEDs.
-Nothing here sources his code.
+The loaders (`load_region()`, `label_reads()`, `load_ft_tracks()`, ...) live in
+`parsing_functions/parsing_footprints_functions.r` and the figure is drawn by
+`plot_coaccess_pair()` in `parsing_functions/plotting_functions.r`, the same
+functions the LCL figures use. Nothing here sources his code.
 
 # Functions
 
 ```{r functions}
-code_dir <- "/project/spott/cshan/fiber-seq/code/co-accessibility"
-source(file.path(code_dir, "coaccess_plot_functions.R"))
-source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
-
 suppressPackageStartupMessages({
-  library(data.table); library(dplyr); library(ggplot2); library(patchwork)
+  library(data.table); library(ggplot2); library(patchwork); library(dplyr)
 })
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 ```
 
 # Settings
@@ -51,6 +50,17 @@ fire_root  <- "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merge
 plot_dir   <- file.path(coaccess, "plots")
 dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
 
+# track locations for plot_coaccess_pair(): fiber spans (root), FIRE elements
+# (fire_root), `ft extract` m6A (ft_root, extracted from the unfiltered BAM, so
+# display only) and the FiberHMM nucleosome / size-binned footprint calls
+# (hmm_root; file names drop the underscore, LPS_0 -> LPS0)
+paths <- list(
+  root      = root,
+  fire_root = fire_root,
+  ft_root   = "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract/ft_result_dir",
+  hmm_root  = "/project/spott/cshan/fiber-seq/macrophage_project/FiberHMM/extract",
+  tabix_bin = "/project/spott/cshan/envs/dimelo/bin/tabix")
+
 samples <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
 t_sel   <- "LPS_15"      # reference table for pair coords/labels/gene anchors
 
@@ -64,7 +74,8 @@ flank <- 1000            # bp either side of the pair for the plot window
 # so the evidence and fiber floors are relaxed relative to the unrestricted
 # screen; the floors still keep every facet legible.
 mins            <- c(0, 5, 10, 15)  # LPS timepoints in minutes, aligned to samples
-label_filter    <- "CTCF"   # regex on CRE_pair_labels; "" disables the restriction
+cre_types       <- "CA-CTCF"  # cCRE classes for select_cre_pairs(); NULL allows any type
+cre_match       <- "either"   # "either" / "both" members in cre_types (or "pair" + cre_types2)
 max_p_trend     <- 0.05     # one-sided weighted trend p (increase)
 max_or_baseline <- 1.5      # OR cap at LPS_0: coupling absent/weak at baseline
 min_delta_lor   <- log(2)   # logOR(late) - logOR(0): >= 2-fold OR rise
@@ -83,8 +94,9 @@ min_locus_sep <- 1e6     # keep the picks on different loci
 
 Only pairs anchored to at least one **protein-coding** gene are considered, and
 pair labels name the protein-coding genes only. The selection is further
-restricted to pairs with a **CA-CTCF partner** (`label_filter` on
-`CRE_pair_labels`) — only ~2.3K such pairs are testable across all four
+restricted to pairs with a **CA-CTCF partner** (`select_cre_pairs()` with
+`cre_types` / `cre_match`, matching the class in each member's `CRE_ID`
+exactly; `cre_types <- NULL` allows any cCRE type) — only ~2.3K such pairs are testable across all four
 timepoints, which is why the evidence and fiber floors below are looser than an
 unrestricted screen would use. Pairs are selected for a
 **gain of coupling from baseline**: the odds ratio at LPS_0 must be ≤
@@ -155,7 +167,7 @@ cat(nrow(pairs_dt), "pairs anchored to a protein-coding gene\n")
 
 pairs_dt <- merge(pairs_dt, trend, by = "CRE_pair")
 
-sig <- pairs_dt[(label_filter == "" | grepl(label_filter, CRE_pair_labels)) &
+sig <- select_cre_pairs(pairs_dt, cre_types = cre_types, cre_match = cre_match)[
                 p_trend < max_p_trend & or0 <= max_or_baseline & lor_min_at0 &
                 delta_logOR >= min_delta_lor & dist > min_dist_sel &
                 min_shared >= min_shared_all & co_access_late > min_co_acc_late]
@@ -227,45 +239,27 @@ size40-60 / size60-80) on top, smallest last. m6A comes from the existing
 which are what the 2×2 is actually built from, come from `lizarraga_FIRE`.
 
 ```{r plot-fn}
-source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
+# plot_coaccess_pair() with the macrophage settings: read spans, FiberHMM
+# nucleosomes and size-binned footprints, one facet per timepoint. The window is
+# the pair +/- flank and the subtitle starts with its coordinates.
 plot_one <- function(r, width = 11, height = 16) {
-  region <- list(chrom = r$chrom,
-                 start = max(0, r$cre1_start - flank),
-                 end   = r$cre2_end + flank)
-  cre1 <- list(start = r$cre1_start, end = r$cre1_end)
-  cre2 <- list(start = r$cre2_start, end = r$cre2_end)
+  out <- plot_coaccess_pair(r, samples, paths,
+    span_source = "read_spans", nuc_source = "fiberhmm", tf_source = "by_size",
+    facet_by = "sample", colors = timepoint_palette(samples), cres = cre_uni,
+    flank = flank, read_rule = read_rule,
+    plot_name = paste0(r$gene_names, "  (", r$CRE_pair_labels, ")"),
+    subtitle = sprintf("gap %d bp  |  OR(0/5/10/15)=%s  |  trend p=%.2g",
+                       r$dist, r$or_series, r$p_trend),
+    show_2x2 = FALSE,
+    heights = c(pileup = 4, peaks = 1.2, reads = 11, fire_fiberHMM = 13),
+    bar_title = paste0(r$gene_names, ": configuration by timepoint"))
 
-  res <- load_region(region, samples, root, fire_root)
-  labs <- label_reads(res, cre1, cre2, read_rule = read_rule)
-  # m6A and nucleosome tracks, restricted to the fibers actually drawn (the m6A
-  # track runs ~240 blocks per fiber, so expanding all of them is wasteful)
-  res <- load_ft_tracks(res, keys = labs[!is.na(config), key])
-
-  cres_here <- cre_uni[chrom == region$chrom & end > region$start & start < region$end]
-
-  sub <- sprintf("%s:%d-%d  |  gap %d bp  |  OR(0/5/10/15)=%s  |  trend p=%.2g",
-                 region$chrom, region$start, region$end, r$dist,
-                 r$or_series, r$p_trend)
-
-  p <- plot_pair_panels(res, cre1, cre2, labs, cres = cres_here,
-                        plot_name = paste0(r$gene_names, "  (", r$CRE_pair_labels, ")"),
-                        subtitle = sub)
-  config_inputs <- configuration_proportion_inputs(labs, samples)
-  bars <- plot_stacked_proportion(config_inputs$rows, "sample_name", "config", CONFIG_COLS,
-    position = "fill", width = .7, legend = list(drop = FALSE),
-    totals = list(data = config_inputs$totals, x = "sample_name", y = 1.04, label = "lab",
-      style = list(size = 3)),
-    scales = list(scale_y_continuous(labels = scales::percent, limits = c(0, 1.08),
-      breaks = c(0, .25, .5, .75, 1))),
-    labels = list(x = NULL, y = "fibers spanning both cCREs", fill = "configuration",
-      title = paste0(r$gene_names, ": configuration by timepoint")), theme = theme_bw(11))
-
-  save_figure(p$combined, file.path(plot_dir, paste0(r$pair_id, "_reads.pdf")),
+  save_figure(out$panels$combined, file.path(plot_dir, paste0(r$pair_id, "_reads.pdf")),
          width = width, height = height, limitsize = FALSE)
-  save_figure(bars, file.path(plot_dir, paste0(r$pair_id, "_config_bars.pdf")),
+  save_figure(out$bars, file.path(plot_dir, paste0(r$pair_id, "_config_bars.pdf")),
          width = 6, height = 4)
 
-  list(res = res, labels = labs, panels = p, bars = bars)
+  out
 }
 ```
 
