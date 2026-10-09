@@ -4,46 +4,6 @@ Measures whether pairs of ENCODE cCREs inside a gene window are accessible on th
 **same fiber** more often than chance, separately for each LPS timepoint
 (`LPS_0`, `LPS_5`, `LPS_10`, `LPS_15` — minutes of stimulation, merged replicates).
 
-This is an independent reimplementation of
-`/project/spott/kevinluo/Fiber_seq/fiberhub/scripts/coaccess_fire_CREs_combined_samples_around_genes.R`
-and its helper `test_coaccess_fire_elements()`
-([tutorial](https://kevinlkx.github.io/fiber-seq-analysis/coaccess_fire_CREs_combined_samples_around_genes_examples.html)).
-**Nothing of Kevin's is sourced, imported, or modified** — his code is the semantic
-reference only.
-
-## What matches Kevin, and the one intended difference
-
-| | Kevin | here |
-|---|---|---|
-| elements | ENCODE cCREs overlapping FIRE peaks | same |
-| `CRE_ID` | `accession1.accession2.CRE_label` | same |
-| gene window | TSS ± 10 kb | same |
-| pair distance | GenomicRanges gap, `500 < d < 20000` (strict) | same |
-| shared fibers | fibers overlapping **both** cCREs (any ≥1 bp) | same (`--read-rule any`, the default) |
-| accessible | fiber carries a FIRE element overlapping the cCRE (any ≥1 bp) | same |
-| test | `fisher.test(table + 1)`, two-sided | same |
-| **samples** | **17 LCL samples pooled into one test** | **each timepoint tested by itself** |
-
-The last row is the intended difference. Timepoints are never tested against each
-other in the pipeline; the notebook shows a pair across all four side by side.
-
-### Where this had to depart, and why
-
-| # | Kevin | here | reason |
-|---|---|---|---|
-| D1 | fiber set from `ft fire --extract` on a per-gene region BAM | aligned spans from the CRAM, `-F 0x900` | the published `*-fire-elements.bed.gz` holds **FIRE elements only** (already FDR ≤ 0.05), so it does not tile the fiber and cannot give a denominator — absence at a cCRE is "closed" or "does not reach", and only the alignment settles it. No `fire_all.bed.gz` exists in this tree. |
-| D2 | `gene_name` key, `which.max(n_CREs)` collapse | `gene_id` key, no collapse | in the GENCODE v46 canonical TSS bed 488 gene names are duplicated over 2,103 rows — `Y_RNA` alone appears **756 times**. Keying on the name fuses those loci into one pseudo-gene carrying ~1,034 cCREs and manufactures ~534k spurious pairs. |
-| D3 | pair orientation from `expand.grid` + `!duplicated` | `CRE1` = leftmost by coordinate | his orientation is an artifact of that construction, so `CRE1_access`/`CRE2_access` are arbitrary between the two members and the `CRE_pair` string is not reproducible. |
-| D4 | zero-accessibility pairs → `NA` → silently dropped | kept and flagged; `--kevin-compat` drops them | dropping them removes exactly the constitutively-closed-partner signal. |
-| D5 | no multiple-testing correction; a pair repeats once per gene | BH on the **deduplicated** pair table only | correcting on the gene-anchored table over-counts the tests. |
-| D6 | per-region extraction (~100k directories) | 4 genome-wide span files | identical numbers, orders of magnitude less I/O. |
-| D7 | `v0.1.1` paths | `v0.1` | only `additional-outputs-v0.1` exists here. |
-
-Kevin's `max_dist` is **20000** in the combined-samples script and **10000** in his
-single-sample one. Since each timepoint is analysed separately (the single-sample
-case), both are defensible; the default here is 20000, and `--max-dist 10000` is a
-one-flag rerun. The value used is recorded in every output row.
-
 ## Pipeline
 
 ```
@@ -232,22 +192,3 @@ sbatch run_coaccess.sh
 # 4. read-level figures
 module load R/4.4.1 pandoc/2.17.1.1
 Rscript -e 'rmarkdown::render("coaccess_examples.Rmd")'
-```
-
-`pandoc` is a separate module; without it `rmarkdown::render` fails with
-"pandoc version 1.12.3 or higher is required".
-
-## Caveats
-
-- **The `+1` pseudocount is not valid for inference.** It was a device to keep
-  `fisher.test`'s estimate finite. `pval` reproduces Kevin; `pval_raw` is the column
-  to test on.
-- **Kevin applies no multiple-testing correction**, and his "significant" filter
-  (`pval < 0.01` plus cell floors) is a screening threshold, not error control.
-- **The timepoints are merged pools with no replication.** Nothing here supports a
-  claim that co-accessibility *changes* with LPS; per-replicate FIRE runs
-  (`R1_*`, `R2_*`, `R3_*` under the FIRE root) exist and are what that would need.
-- **Power differs across timepoints** — FIRE element counts run 10.5 M (LPS_0) to
-  12.4 M (LPS_10) with read depth to match. The odds ratio is depth-robust; the
-  p-value is not. Compare `n_shared_reads` distributions before reading anything
-  into a difference in significant-pair counts.
