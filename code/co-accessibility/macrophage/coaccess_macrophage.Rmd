@@ -19,7 +19,8 @@ four timepoints — and draws them at single-fiber resolution across all four.
 
 The tables come from `03_coaccess_cres.py`: cCREs overlapping a FIRE
 peak, paired within TSS ± 10 kb gene windows at 500 < gap < 20,000 bp, scored on
-the fibers that overlap both, with accessibility called by FIRE-element overlap
+the fibers that overlap both, with accessibility requiring a single FIRE element
+on the same fiber to cover at least 50% of the cCRE
 and tested by `fisher.test(table + 1)`. The one structural difference from Kevin
 is that **each timepoint is tested by itself** where he pools 17 LCL samples.
 
@@ -86,6 +87,7 @@ min_co_acc_late <- 5        # co_access floor at the last timepoint
 # the read rule the tables were computed under; the figure must match or the
 # fibers drawn and the 2x2 will disagree
 read_rule <- "any"
+fire_overlap_fraction <- 0.5  # fraction of cCRE covered by one same-read FIRE interval
 
 min_locus_sep <- 1e6     # keep the picks on different loci
 ```
@@ -109,13 +111,32 @@ marginal accessibility, this is not fooled by both cCREs independently becoming
 more accessible after LPS — the *coordination* itself has to grow.
 
 ```{r select}
+read_coaccess_table <- function(file, select = NULL) {
+  required <- c("read_rule", "fire_overlap_fraction")
+  header <- names(fread(file, nrows = 0L))
+  if (!all(required %in% header)) {
+    stop("Missing accessibility-rule metadata in ", file,
+         ". Rerun macrophage/run_coaccess.sh with --fire-overlap-fraction 0.5.")
+  }
+  if (!is.null(select)) select <- unique(c(select, required))
+  d <- fread(file, select = select)
+  if (anyNA(d$fire_overlap_fraction) ||
+      any(!is.finite(d$fire_overlap_fraction)) ||
+      any(abs(d$fire_overlap_fraction - fire_overlap_fraction) > 1e-10) ||
+      anyNA(d$read_rule) || any(d$read_rule != read_rule)) {
+    stop("Saved counting rules disagree with plotting settings in ", file,
+         ". Rerun macrophage/run_coaccess.sh with matching read and FIRE rules.")
+  }
+  d
+}
+
 cre_uni <- fread(file.path(uni_dir, "cre_universe.bed"),
                  col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
 
 # per-timepoint 2x2 cells for every pair. Cell identities checked once:
 # co_closed == co_inaccess, and the four cells sum to n_shared_reads.
 tp_cells <- rbindlist(lapply(seq_along(samples), function(i) {
-  d <- fread(file.path(coaccess, paste0(samples[i], "_coaccess_pairs.tsv.gz")),
+  d <- read_coaccess_table(file.path(coaccess, paste0(samples[i], "_coaccess_pairs.tsv.gz")),
              select = c("CRE_pair", "co_access", "CRE1_access", "CRE2_access",
                         "co_inaccess", "n_shared_reads", "or_haldane"))
   d[, `:=`(timepoint = samples[i], min_lps = mins[i])]
@@ -150,14 +171,14 @@ trend <- tp_cells[, {
 trend[, fdr_trend := p.adjust(p_trend, "BH")]
 
 # coords/labels/gene anchors from the reference timepoint's table
-pairs_dt <- fread(file.path(coaccess, paste0(t_sel, "_coaccess_pairs.tsv.gz")))
+pairs_dt <- read_coaccess_table(file.path(coaccess, paste0(t_sel, "_coaccess_pairs.tsv.gz")))
 cat(nrow(pairs_dt), "distinct cCRE pairs;", nrow(trend), "present in all four timepoints\n")
 
 # restrict to pairs anchored to >= 1 protein-coding gene. transcript_type lives
 # only in the gene-anchored stat table (the pair-level dedup drops it), so the
 # protein-coding pairs are read off that table, and gene_names is relabelled to
 # the protein-coding genes only so titles/filenames name the genes that kept it.
-stat_dt <- fread(file.path(coaccess, paste0(t_sel, "_coaccess_stat.tsv.gz")))
+stat_dt <- read_coaccess_table(file.path(coaccess, paste0(t_sel, "_coaccess_stat.tsv.gz")))
 pc_map  <- stat_dt[transcript_type == "protein_coding",
                    .(gene_names = paste(sort(unique(gene_name)), collapse = ";")),
                    by = CRE_pair]
@@ -246,7 +267,7 @@ plot_one <- function(r, width = 11, height = 16) {
   out <- plot_coaccess_pair(r, samples, paths,
     span_source = "read_spans", nuc_source = "fiberhmm", tf_source = "by_size",
     facet_by = "sample", colors = timepoint_palette(samples), cres = cre_uni,
-    flank = flank, read_rule = read_rule,
+    flank = flank, read_rule = read_rule, fire_overlap_fraction = fire_overlap_fraction,
     plot_name = paste0(r$gene_names, "  (", r$CRE_pair_labels, ")"),
     subtitle = sprintf("gap %d bp  |  OR(0/5/10/15)=%s  |  trend p=%.2g",
                        r$dist, r$or_series, r$p_trend),

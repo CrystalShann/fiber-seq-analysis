@@ -13,7 +13,7 @@ FIRE_ROOT="/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hi
 OUT_ROOT="/project/spott/cshan/fiber-seq/macrophage_project/co-accessibility"
 CRE_BED="/project/spott/cshan/annotations/GRCh38-cCREs.bed"
 TSS_BED="/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
-SORT_TMP="/scratch/midway3/cshan"
+SORT_TMP="${SLURM_TMPDIR:-/scratch/midway3/cshan/tmp}"
 
 BEDTOOLS=/project/spott/cshan/envs/bedtools/bin/bedtools
 BGZIP=/project/spott/cshan/envs/dimelo/bin/bgzip
@@ -25,8 +25,10 @@ CHROM_RE='^chr([1-9]|1[0-9]|2[0-2]|X|Y)$'
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 [ -s "$CRE_BED" ] || die "cCRE bed not found: $CRE_BED"
-[ -s "$TSS_BED" ] || die "canonical TSS bed not found (run make_gencode_v46_all_tss.sh): $TSS_BED"
+[ -s "$TSS_BED" ] || die "canonical TSS bed not found (run ../make_gencode_v46_all_tss.sh): $TSS_BED"
 mkdir -p "$SORT_TMP" 2>/dev/null || SORT_TMP="${SLURM_TMPDIR:-/tmp}"
+work_dir=$(mktemp -d "${SORT_TMP}/macrophage-universe.XXXXXX") || die "mktemp failed"
+trap 'rm -rf -- "$work_dir"' EXIT
 
 uni="${OUT_ROOT}/universe"
 mkdir -p "$uni" || die "cannot create $uni"
@@ -54,17 +56,17 @@ echo "Started    : $(date)"
 # against, so none is applied here either.
 
 echo "Pooling FIRE peaks across timepoints..."
-: > "${uni}/.peaks_tmp"
+: > "${work_dir}/peaks_tmp"
 for s in "${SAMPLES[@]}"; do
     pk="${FIRE_ROOT}/${s}/${s}-fire-v0.1-peaks.bed.gz"
     [ -s "$pk" ] || die "FIRE peaks not found: $pk"
     n=$(zcat "$pk" | awk -v re="$CHROM_RE" 'BEGIN{OFS="\t"} $1 ~ /^#/ {next} $1 ~ re {print $1,$2,$3}' \
-        | tee -a "${uni}/.peaks_tmp" | wc -l)
+        | tee -a "${work_dir}/peaks_tmp" | wc -l)
     echo "  ${s}: ${n} peaks"
 done
-LC_ALL=C sort -k1,1 -k2,2n -T "$SORT_TMP" "${uni}/.peaks_tmp" \
+LC_ALL=C sort -k1,1 -k2,2n -T "$SORT_TMP" "${work_dir}/peaks_tmp" \
     | "$BEDTOOLS" merge -i - > "$peaks_union" || die "peak merge failed"
-rm -f "${uni}/.peaks_tmp"
+rm -f "${work_dir}/peaks_tmp"
 echo "  union: $(wc -l < "$peaks_union") merged peak intervals"
 
 
@@ -139,7 +141,8 @@ echo "  ${n_multi} genes carry more than one cCRE (these are the ones that yield
 
 echo "Flagging per-timepoint peak membership..."
 flags="${uni}/cre_in_timepoint_peaks.tsv.gz"
-tmpdir=$(mktemp -d "${SORT_TMP}/creflag.XXXXXX") || die "mktemp failed"
+tmpdir="${work_dir}/flags"
+mkdir -p "$tmpdir" || die "cannot create $tmpdir"
 cut -f4 "$cre_universe" > "${tmpdir}/ids"
 for s in "${SAMPLES[@]}"; do
     zcat "${FIRE_ROOT}/${s}/${s}-fire-v0.1-peaks.bed.gz" \

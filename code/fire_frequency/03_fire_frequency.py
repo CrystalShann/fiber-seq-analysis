@@ -39,7 +39,7 @@ TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
 READ_MIN_REGION_FRACTION = 1.0
 FIRE_MIN_REGION_FRACTION = 0.5
 # Per-read FIRE element calls (FDR <= 0.05) from the FIRE pipeline, same numerator
-# source as 03_coaccess_cres.py; see the note there on why NOT FiberHMM/ft_result_dir.
+# source as ../co-accessibility/macrophage/03_coaccess_cres.py; see the note there on why NOT FiberHMM/ft_result_dir.
 FIRE_ROOT = "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE"
 
 ###############################

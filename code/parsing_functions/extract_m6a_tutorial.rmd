@@ -1,0 +1,269 @@
+---
+title: "Tutorial: extract m6A and footprints at an LCL promoter (ALAS1)"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+This example uses the ALAS1 promoter, one of the two LCL promoters (PRDX1, ALAS1)
+in `code/clustering_methods/Leiden_Manhattan/leiden_LCL.Rmd`, and only functions
+from `code/parsing_functions/`:
+
+1. build the read x position m6A matrix with `assemble_region_m6a()`
+2. plot it as a heatmap without clustering
+3. plot the aggregated accessibility profile (m6A fraction of reads per position)
+4. plot the nucleosome, TF footprint and FIRE element tracks of the same reads
+
+Reads from all 31 LCL samples are pooled. Only reads spanning the whole window are kept. There is no phasing (the HP tag is never read) and no clustering: reads are ordered by sample, then by read start
+
+
+# Setup
+
+```{r functions}
+suppressPackageStartupMessages({
+  library(dplyr); library(GenomicRanges); library(Rsamtools); library(Matrix)
+})
+code_dir <- "/project/spott/cshan/fiber-seq/code/parsing_functions"
+source(file.path(code_dir, "parsing_footprints_functions.r"))
+source(file.path(code_dir, "plotting_functions.r"))
+```
+
+```{r settings}
+gene     <- "ALAS1"
+flank_bp <- 1000L
+
+tss_bed      <- "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
+sample_sheet <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+fire_root    <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+tf_root      <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model"
+tabix_bin    <- "/project/spott/cshan/envs/dimelo/bin/tabix"
+
+nuc_size         <- c(130, 160)  # nucleosome size window (bp), the LCL setting of leiden_LCL.Rmd
+min_tf_score     <- 50           # FiberHMM v2 per-footprint score floor
+pileup_window_bp <- 10           # sliding window of the smoothed m6A fraction
+
+out_dir <- file.path("/project/spott/cshan/fiber-seq/LCL_project/extract_m6a_tutorial", gene)
+```
+
+# 1. Region
+
+The canonical TSS BED stores the TSS as a 1 bp interval `[TSS0, TSS0 + 1)`
+(0-based). As in `leiden_LCL.Rmd`, the window is the 2,000 bp
+`[TSS0 - 1000, TSS0 + 1000)`: BED `start` / `end`, or 1-based
+`analysis_start` / `analysis_end`. The 1-based TSS is `TSS0 + 1`.
+
+ALAS1 is on the + strand, so upstream is on the left. To use PRDX1 instead, set
+`gene <- "PRDX1"`; it is on the - strand, so its upstream side is on the right.
+
+```{r region}
+tss <- data.table::fread(tss_bed, header = FALSE, data.table = FALSE,
+  col.names = c("chr", "start", "end", "annotation", "score", "strand"))
+tss <- tss[vapply(strsplit(tss$annotation, ";", fixed = TRUE), `[`, character(1), 3L) == gene, ]
+stopifnot(nrow(tss) == 1L, tss$end - tss$start == 1L)
+
+region <- data.frame(region_id = gene, chr = tss$chr,
+  start = tss$start - flank_bp, end = tss$start + flank_bp,                # BED, 0-based start
+  analysis_start = tss$start - flank_bp + 1L, analysis_end = tss$start + flank_bp,
+  tss = tss$start + 1L, strand = tss$strand)
+region
+```
+
+# 2. Extract the m6A matrix
+
+`assemble_region_m6a()` queries each sample's `ft extract` m6A BED12 with tabix
+(`<fire_dir>/extracted_results/m6a_by_chr/<sample>.ft_extracted_m6a.<chr>.bed.gz`),
+keeps the longest alignment of each read and drops the sentinel blocks.
+
+- `full_span = TRUE` keeps only reads that cover the whole window, so every entry is
+  1 (m6A call) or 0 (no call).
+- `positions` = every base of the window, so the matrix has one column per bp.
+
+Read IDs are `<sample>::<read name>`.
+
+```{r extract-m6a}
+samples <- read.csv(sample_sheet, stringsAsFactors = FALSE)[, c("sample_name", "fire_dir")]
+
+dat <- assemble_region_m6a(samples, region, full_span = TRUE,
+  positions = seq(region$analysis_start, region$analysis_end))
+dim(dat$met_mat)
+head(dat$rids_df)
+dat$qc   # overlapping and full-span reads per sample
+```
+
+Read order for all figures: sample sheet order, then read start. No clustering.
+
+```{r read-order}
+rids <- dat$rids_df
+rids <- rids[order(match(rids$sample_name, samples$sample_name), rids$start, rids$RID), ]
+read_order <- rids$RID
+```
+
+The same calls as one row per m6A call, the input of `pileup_reads()` and
+`plot_region_panels()`:
+
+```{r m6a-calls}
+calls <- Matrix::summary(dat$met_mat)
+m6a_calls <- data.frame(RID = rownames(dat$met_mat)[calls$i],
+  pos = as.integer(colnames(dat$met_mat))[calls$j], base = "A")
+```
+
+# 3. m6A heatmap (no clustering)
+
+Rows are reads in `read_order`, columns are bases; black = m6A call. The dashed
+line marks the TSS.
+
+```{r heatmap, fig.width=10, fig.height=10}
+m6a_mat <- as.matrix(dat$met_mat[read_order, , drop = FALSE])
+positions <- as.integer(colnames(m6a_mat))
+tss_col <- match(region$tss, positions)
+ticks <- unique(round(seq(1, ncol(m6a_mat), length.out = 5L)))
+
+sample_label <- factor(sub("_.*$", "", rids$sample_name),
+  levels = sub("_.*$", "", samples$sample_name))
+sample_colors <- setNames(grDevices::hcl.colors(nlevels(sample_label), "Dynamic"),
+  levels(sample_label))
+
+heatmap <- ComplexHeatmap::Heatmap(m6a_mat, name = "m6A",
+  col = c("0" = "white", "1" = "black"),
+  heatmap_legend_param = list(at = c(0, 1), labels = c("no m6A call", "m6A")),
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_row_names = FALSE, show_column_names = FALSE,
+  use_raster = TRUE, raster_quality = 2,
+  left_annotation = ComplexHeatmap::rowAnnotation(sample = sample_label,
+    col = list(sample = sample_colors),
+    annotation_legend_param = list(sample = list(ncol = 2))),
+  bottom_annotation = ComplexHeatmap::HeatmapAnnotation(
+    coordinate = ComplexHeatmap::anno_mark(at = ticks,
+      labels = format(positions[ticks], big.mark = ","), which = "column",
+      side = "bottom", labels_gp = grid::gpar(fontsize = 8)),
+    TSS = ComplexHeatmap::anno_mark(at = tss_col, labels = "TSS", which = "column",
+      side = "bottom", labels_gp = grid::gpar(fontsize = 8, col = "#D55E00")),
+    annotation_name_gp = grid::gpar(fontsize = 8)),
+  column_title = sprintf("%s promoter, %s:%d-%d\n%d full-span reads from %d LCL samples, ordered by sample then read start",
+    gene, region$chr, region$analysis_start, region$analysis_end,
+    nrow(m6a_mat), length(unique(rids$sample_name))),
+  column_title_gp = grid::gpar(fontsize = 11))
+
+# the TSS line is drawn on the heatmap body after the heatmap itself
+draw_heatmap <- function(x) {
+  ComplexHeatmap::draw(x, merge_legend = TRUE)
+  ComplexHeatmap::decorate_heatmap_body("m6A", {
+    grid::grid.lines(x = rep((tss_col - 0.5) / ncol(m6a_mat), 2), y = c(0, 1),
+      gp = grid::gpar(col = "#D55E00", lty = "dashed", lwd = 1.2))
+  })
+}
+save_figure(heatmap, file.path(out_dir, "m6a_heatmap.pdf"), width = 10, height = 10,
+  draw = draw_heatmap)
+draw_heatmap(heatmap)
+```
+
+# 4. Aggregated accessibility profile
+
+`pileup_reads()` gives, at every position with at least one m6A call, the fraction
+of reads with a call there (`frac`), and its `pileup_window_bp` sliding-window mean
+(`smooth_frac`). All reads span the window, so the denominator is every read.
+
+```{r profile, fig.width=9, fig.height=3.5}
+pileup <- pileup_reads(m6a_calls, rids, region$analysis_start, region$analysis_end,
+  smooth = TRUE, window_n = pileup_window_bp)
+
+profile_plot <- plot_group_profile(pileup, x_col = "pos", y_col = "smooth_frac",
+  layers = list(
+    list(geom = "line", mapping = ggplot2::aes(y = frac), colour = "grey75", linewidth = 0.3),
+    list(geom = "line", colour = "blue", linewidth = 0.6)),
+  markers = list(xintercept = region$tss, linetype = "dashed", colour = "#D55E00"),
+  window = c(region$analysis_start, region$analysis_end),
+  scales = list(ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1))),
+  labels = list(x = paste(region$chr, "(1-based)"), y = "m6A fraction of reads",
+    title = paste(gene, "promoter: aggregated accessibility"),
+    subtitle = sprintf("%d full-span reads; grey = per position, blue = %d bp sliding mean; dashed = TSS",
+      nrow(rids), pileup_window_bp)),
+  theme = theme_fiberseq("bw", base_size = 10))
+save_figure(profile_plot, file.path(out_dir, "aggregate_m6a_profile.pdf"), width = 9, height = 3.5)
+profile_plot
+```
+
+# 5. Footprint tracks
+
+For the same reads, `load_region()` reads the FIRE elements and
+`load_ft_tracks()` reads:
+
+- nucleosomes: `ft extract` `nuc_by_chr` (kept when `nuc_size[1]` to `nuc_size[2]` bp)
+- TF footprints: FiberHMM v2 `<sample>.recalled_tf.bed.gz`, score >= `min_tf_score`,
+  binned into `FP_SIZE_BINS` (half-open 10-30, 40-60, 60-80 bp; other sizes are
+  not drawn)
+
+These functions key reads as `"<sample> <read name>"`.
+
+`load_ft_tracks()` also returns the m6A calls (`$m6a`); this tutorial uses
+the matrix from step 2 instead.
+
+```{r load-footprints}
+keys <- paste(rids$sample_name, rids$original_RID)
+tracks <- load_region(list(chrom = region$chr, start = region$start, end = region$end),
+  samples$sample_name, root = NULL, fire_root = fire_root, tabix_bin = tabix_bin,
+  span_source = "fire_all")
+tracks <- load_ft_tracks(tracks, keys = keys, ft_root = fire_root, tabix_bin = tabix_bin,
+  nuc_source = "ft", tf_source = "recalled_tf", tf_root = tf_root,
+  min_tf_score = min_tf_score)
+
+# back to the "<sample>::<read name>" IDs of the m6A matrix
+nuc_label <- paste0(nuc_size[1], "-", nuc_size[2], " bp nucleosome")
+fire <- as.data.frame(tracks$elements)
+fire <- fire[fire$key %in% keys, ]
+fire <- data.frame(RID = paste(fire$sample_name, fire$RID, sep = "::"),
+  start = fire$start, end = fire$end, class = "FIRE")
+nucs <- as.data.frame(tracks$nuc)
+nucs <- nucs[!is.na(assign_size_class(nucs$end - nucs$start, nuc_size)), ]
+nucs <- data.frame(RID = paste(nucs$sample_name, nucs$RID, sep = "::"),
+  start = nucs$start, end = nucs$end, class = nuc_label)
+tfs <- as.data.frame(tracks$size_fps)
+tfs <- data.frame(RID = paste(tfs$sample_name, tfs$RID, sep = "::"),
+  start = tfs$start, end = tfs$end, class = factor(tfs$class, levels = FP_SIZE_BINS))
+
+c(FIRE_elements = nrow(fire), nucleosomes = nrow(nucs), TF_footprints = nrow(tfs))
+table(tfs$class)
+```
+
+`plot_region_panels()` stacks the aggregated profile, the m6A reads and the
+footprint reads. It draws whatever is in `res$fps_infire`. Here that is every TF
+footprint, not only the ones inside a FIRE element. ggplot puts the first read
+level at the bottom, so the levels are reversed to keep the heatmap's top-to-bottom
+order.
+
+```{r footprint-tracks, fig.width=10, fig.height=14}
+rid_levels <- rev(read_order)
+as_read_factor <- function(d) { d$RID <- factor(d$RID, levels = rid_levels); d }
+res <- list(
+  region     = list(chr = region$chr, start = region$analysis_start, end = region$analysis_end),
+  reads      = as_read_factor(m6a_calls),
+  rids_df    = as_read_factor(data.frame(RID = rids$RID, start = rids$start, end = rids$end)),
+  fire       = as_read_factor(fire),
+  nucs       = as_read_factor(nucs),
+  fps_infire = as_read_factor(tfs),
+  pileup     = pileup,
+  size_levels = FP_SIZE_BINS,
+  nuc_label  = nuc_label,
+  group_col  = NULL)
+
+panels <- plot_region_panels(res,
+  plot_name = paste(gene, "promoter"),
+  subtitle = sprintf("%s:%d-%d; %d full-span reads, ordered by sample then read start; dashed = TSS",
+    region$chr, region$analysis_start, region$analysis_end, nrow(rids)),
+  heights = c(pileup = 2, reads = 6, fire_fiberHMM = 6),
+  read_options = list(arrows = FALSE),
+  y_labels = c(pileup = "m6A fraction", reads = "m6A calls",
+               fire_fiberHMM = "FIRE / nucleosomes / TF footprints"),
+  x_label = paste(region$chr, "(1-based)"))
+footprint_plot <- panels$combined &
+  ggplot2::geom_vline(xintercept = region$tss, linetype = "dashed", colour = "#D55E00", linewidth = 0.4)
+save_figure(footprint_plot, file.path(out_dir, "footprint_tracks.pdf"), width = 10, height = 14)
+footprint_plot
+```

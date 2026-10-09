@@ -1481,8 +1481,8 @@ add_haplotype_groups <- function(res, group_col = "haplotype",
 # ===========================================================================
 # cCRE-pair co-accessibility: fibers, FIRE elements and display tracks
 #
-# Shared by the macrophage timecourse (code/co-accessibility/coaccess_examples.Rmd)
-# and the LCL samples. Every path is an argument. The
+# Shared by code/co-accessibility/macrophage/coaccess_macrophage.Rmd and
+# code/co-accessibility/LCL/LCL_co-access.Rmd. Every path is an argument. The
 # accessibility call is always the FIRE elements; m6A, nucleosome and TF
 # footprint tracks are display only. Figures: plot_coaccess_pair() in
 # plotting_functions.r.
@@ -1518,6 +1518,9 @@ tabix_region <- function(path, chrom, start, end, col_names, tabix_bin) {
   q <- sprintf("%s:%d-%d", chrom, start + 1L, end)     # tabix is 1-based inclusive
   txt <- suppressWarnings(system2(tabix_bin, c(shQuote(path), shQuote(q)),
                                   stdout = TRUE, stderr = FALSE))
+  status <- attr(txt, "status")
+  if (!is.null(status) && status != 0L)
+    stop("tabix failed (status ", status, ") for ", path, " at ", q)
   if (length(txt) == 0)
     return(data.table::data.table(matrix(character(0), ncol = length(col_names),
                                          dimnames = list(NULL, col_names))))
@@ -1543,8 +1546,8 @@ tabix_region <- function(path, chrom, start, end, col_names, tabix_bin) {
 #                 "fire_all" <s>/extracted_results/<s>.fire_all.bed.gz
 #   fire_ver    - FIRE version in the file names
 #   tabix_bin   - tabix executable
-#   span_source - "read_spans": one primary alignment per row (macrophage,
-#                 02_read_spans.sh); "fire_all": `ft fire --extract --all` rows
+#   span_source - "read_spans": one primary alignment per row (both datasets,
+#                 their respective *_read_spans.sh); "fire_all": `ft fire --extract --all` rows
 #                 collapsed to one span per read (min start, max end of the rows
 #                 overlapping the window) with the read's HP tag (LCL)
 # Output:
@@ -1732,21 +1735,29 @@ load_ft_tracks <- function(res, keys = NULL, ft_root, hmm_root = NULL, tabix_bin
 
 # ---------------------------------------------------------------------------
 # Per-fiber configuration at a cCRE pair. A fiber is accessible at a cCRE
-# when one of its own FIRE elements overlaps that cCRE by >= 1 bp - the rule
-# the statistics use. read_rule must match the rule the table was computed
-# under, or the figure and the 2x2 disagree.
+# when ONE of its own FIRE elements overlaps at least fire_overlap_fraction
+# of the cCRE length. Separate elements are not summed and the overlap is not
+# reciprocal. Both this fraction and read_rule must match the statistics.
 #
 # Inputs:
 #   res        - load_region() result
 #   cre1, cre2 - list(start, end) in BED coordinates
 #   read_rule  - "any" (a fiber counts if it overlaps the cCRE at all, Kevin's
 #                rule) or "contain" (it must span the whole cCRE)
+#   fire_overlap_fraction - fraction of cCRE width covered by one FIRE element;
+#                0 preserves legacy >= 1 bp behavior; current notebooks use 0.5
 # Output:
 #   data.table key, sample_name, shared, acc1, acc2, config (factor with
 #   CONFIG_LEVELS; NA for fibers that do not cover both cCREs)
 # ---------------------------------------------------------------------------
-label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain")) {
+label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain"),
+                        fire_overlap_fraction = 0) {
   read_rule <- match.arg(read_rule)
+  if (length(fire_overlap_fraction) != 1L || !is.finite(fire_overlap_fraction) ||
+      fire_overlap_fraction < 0 || fire_overlap_fraction > 1)
+    stop("fire_overlap_fraction must be one number in [0, 1]")
+  if (cre1$end <= cre1$start || cre2$end <= cre2$start)
+    stop("cCREs must have positive width")
   sp <- res$spans
   el <- res$elements
 
@@ -1758,10 +1769,11 @@ label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain")) {
   cov1 <- covers(cre1$start, cre1$end)
   cov2 <- covers(cre2$start, cre2$end)
 
-  # keys of fibers with a FIRE element overlapping s-e
+  # Apply the threshold to each single element, then take distinct fiber keys.
   hit <- function(s, e) {
     if (nrow(el) == 0) return(character(0))
-    unique(el$key[el$start < e & el$end > s])
+    overlap <- pmin(el$end, e) - pmax(el$start, s)
+    unique(el$key[overlap > 0 & overlap >= fire_overlap_fraction * (e - s)])
   }
   a1 <- sp$key %in% hit(cre1$start, cre1$end)
   a2 <- sp$key %in% hit(cre2$start, cre2$end)

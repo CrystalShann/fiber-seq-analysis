@@ -18,12 +18,16 @@
 #   sbatch 02_read_spans.sh          # all four timepoints
 #   bash   02_read_spans.sh LPS_0    # one timepoint
 
-set -uo pipefail
+set -euo pipefail
 
 SAMPLES=(LPS_0 LPS_5 LPS_10 LPS_15)
 if [ -n "${1:-}" ]; then
     sample_name=$1
 else
+    [ -n "${SLURM_ARRAY_TASK_ID:-}" ] || {
+        echo "Usage: bash $0 LPS_0 (or submit as a SLURM array)" >&2
+        exit 1
+    }
     sample_name=${SAMPLES[$((SLURM_ARRAY_TASK_ID - 1))]}
 fi
 
@@ -57,18 +61,18 @@ echo "Started    : $(date)"
 if [ -s "$spans" ] && [ -s "${spans}.tbi" ]; then
     echo "Reusing existing read spans ($(zcat "$spans" | wc -l) rows)"
 else
-    # one chromosome at a time
+    work_dir=$(mktemp -d "${out_dir}/.spans.XXXXXX") || die "mktemp failed"
+    trap 'rm -rf -- "$work_dir"' EXIT
+    work_spans="${work_dir}/${sample_name}.read_spans.bed.gz"
+    # One chromosome at a time; convert primary alignments to BED.
+    # -F 0x900 removes secondary (0x100) and supplementary (0x800) alignments.
     for chrom in $CHROMS; do
-    # extract primary alignments, convert to BED, and merge all chromosomes together
-    # remove secondary and supplementary alignments (-F 0x900) to avoid duplicate read names
-        # 0 x 100 = secondary alignment
-        # 0 x 800 = supplementary alignment
-    # output BAM
         "$SAMTOOLS" view -T "$REF" -F 0x900 -@ ${ncore} -b "$cram" "$chrom" \
-            # convert BAM to BED
-            | "$BEDTOOLS" bamtobed -i stdin
-    done | "$BGZIP" -@ ${ncore} > "$spans" || die "read span extraction failed"
-    "$TABIX" -f -p bed "$spans" || die "tabix failed: $spans"
+            | "$BEDTOOLS" bamtobed -i stdin || exit 1
+    done | "$BGZIP" -@ ${ncore} > "$work_spans" || die "read span extraction failed"
+    "$TABIX" -f -p bed "$work_spans" || die "tabix failed: $work_spans"
+    mv -- "$work_spans" "$spans"
+    mv -- "${work_spans}.tbi" "${spans}.tbi"
 fi
 
 # count the number of primary alignments and distinct read names

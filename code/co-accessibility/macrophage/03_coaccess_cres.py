@@ -6,14 +6,10 @@
                     CRE_ID = accession1.accession2.CRE_label
     gene window     TSS +/- 10 kb, pairs enumerated within a window
     pair distance   GenomicRanges gap distance, MIN_DIST < d < MAX_DIST (500 / 20000)
-    shared reads    reads overlapping BOTH cCREs (Kevin: two subsetByOverlaps + intersect
-                    on read id, i.e. ANY overlap >= 1 bp) -- see --read-rule
-    accessible      the read carries >= 1 FIRE element overlapping that cCRE (>= 1 bp)
+    shared reads    reads overlapping BOTH cCREs -- see --read-rule
+    accessible      the read carries one FIRE element covering >= 50% of that cCRE
+                    (fraction of cCRE length; not reciprocal or summed across FIREs)
     test            two-sided Fisher exact on the 2x2 + a pseudocount of 1 in every cell
-
-The one structural difference from Kevin is that each timepoint is counted and tested
-BY ITSELF, where he pools 17 LCL samples into a single test. Timepoints are never
-tested against each other here.
 
 2x2 layout (rows = element 1 state, cols = element 2 state, FALSE first), matching
 his table(fire_region1, fire_region2) with levels forced to c(FALSE, TRUE):
@@ -30,13 +26,14 @@ Inputs (from 01_make_fire_universe.sh and 02_read_spans.sh):
     <FIRE>/<s>/additional-outputs-v0.1/fire-peaks/<s>-v0.1-fire-elements.bed.gz
 
 Outputs in --out-dir:
-    <s>_coaccess_stat.tsv.gz    one row per (gene, cCRE pair) - Kevin's coaccess_stat_df
+    <s>_coaccess_stat.tsv.gz    one row per (gene, cCRE pair) 
     <s>_coaccess_pairs.tsv.gz   one row per distinct cCRE pair, with BH FDR
 """
 
 import argparse
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -116,7 +113,8 @@ def run_intersect(args_list, desc):
     return p.stdout
 
 
-def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, read_rule, tmpdir):
+def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, read_rule, tmpdir,
+                        fire_overlap_fraction=0.5):
     """{CRE_ID: set(read_id)} for covered and for accessible, on one chromosome."""
     cre_chr = tmpdir / f"cre.{chrom}.bed"
     with open(cre_chr, "w") as fh:
@@ -150,10 +148,12 @@ def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, read_rule, tmp
         f = line.split("\t")
         cov[f[3]].add(f[8])          # CRE_ID, read name
 
-    # a read is accessible at a cCRE if one of ITS FIRE elements overlaps it
+    # A single FIRE interval on this read must cover the configured fraction of
+    # the cCRE (BED A). This is neither reciprocal nor the sum of disjoint FIREs.
     acc = defaultdict(set)
     for line in run_intersect(
-            [BEDTOOLS, "intersect", "-a", str(cre_chr), "-b", str(fe_chr), "-wa", "-wb"],
+            [BEDTOOLS, "intersect", "-a", str(cre_chr), "-b", str(fe_chr),
+             "-f", str(fire_overlap_fraction), "-wa", "-wb"],
             f"fire element intersect {chrom}").splitlines():
         f = line.split("\t")
         acc[f[3]].add(f[8])          # CRE_ID, read name
@@ -185,19 +185,24 @@ def main():
     ap.add_argument("--pseudocount", type=int, default=1,
                     help="added to every cell before the Fisher test, as Kevin does")
     ap.add_argument("--read-rule", choices=["any", "contain"], default="any",
-                    help="'any' (default) reproduces Kevin's subsetByOverlaps; "
+                    help="'any' requires at least 1 bp of aligned-span overlap; "
                          "'contain' requires the read to span the whole cCRE")
+    ap.add_argument("--fire-overlap-fraction", type=float, default=0.5,
+                    help="minimum fraction of the cCRE overlapped by ONE FIRE "
+                         "element on the same read (default: 0.5)")
     ap.add_argument("--kevin-compat", action="store_true",
                     help="drop pairs where either cCRE is never accessible among the "
                          "shared reads, as Kevin's NA path silently does")
     ap.add_argument("--chrom", default=None, help="restrict to one chromosome (testing)")
     args = ap.parse_args()
+    if not 0 < args.fire_overlap_fraction <= 1:
+        ap.error("--fire-overlap-fraction must be finite and in (0, 1]")
 
     root = Path(args.root)
     out_dir = Path(args.out_dir) if args.out_dir else root / "coaccess"
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmpdir = out_dir / ".tmp"
-    tmpdir.mkdir(exist_ok=True)
+    tmp_context = tempfile.TemporaryDirectory(prefix=".tmp-macrophage-", dir=out_dir)
+    tmpdir = Path(tmp_context.name)
 
     uni = root / "universe"
     cre_bed = uni / "cre_universe.bed"
@@ -246,7 +251,8 @@ def main():
             if idx is None or len(idx) == 0:
                 continue
             cov, acc, n_orph = incidence_for_chrom(chrom, cre_bed, spans, fe,
-                                                   args.read_rule, tmpdir)
+                                                   args.read_rule, tmpdir,
+                                                   args.fire_overlap_fraction)
             orphans += n_orph
             n_cre_seen += len(cov)
             c1s = pairs["CRE1"].to_numpy()[idx]
@@ -324,6 +330,7 @@ def main():
             "cre1_in_tp_peaks": flags.loc[pairs["CRE1"], f"in_{s}_peaks"].to_numpy(),
             "cre2_in_tp_peaks": flags.loc[pairs["CRE2"], f"in_{s}_peaks"].to_numpy(),
             "read_rule": args.read_rule,
+            "fire_overlap_fraction": args.fire_overlap_fraction,
             "min_dist": args.min_dist,
             "max_dist": args.max_dist,
             "pseudocount": pc,
@@ -370,10 +377,7 @@ def main():
               f"{int((pairs_df['pval'] < 0.05).sum())} with pval < 0.05, "
               f"{int((pairs_df['fdr'] < 0.05).sum())} at FDR < 0.05", flush=True)
 
-    try:
-        tmpdir.rmdir()
-    except OSError:
-        pass
+    tmp_context.cleanup()
 
 
 if __name__ == "__main__":

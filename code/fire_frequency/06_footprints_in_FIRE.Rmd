@@ -35,7 +35,7 @@ suppressPackageStartupMessages({
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 
 input_dir      <- "/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency"
-plot_dir       <- file.path(input_dir, "plots", "footprints_in_FIRE")
+plot_dir       <- file.path(input_dir, "TF_FIRE", "footprints_in_FIRE")
 annotation_dir <- "/project/spott/cshan/annotations"
 timepoints     <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
 ```

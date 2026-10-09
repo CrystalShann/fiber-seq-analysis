@@ -18,8 +18,7 @@ reads split by the topic-model read clusters.
 Inputs are the per-region extractions under `extract_root`. `plot_region_example()`
 (`code/parsing_functions/plotting_functions.r`) runs
 `code/parsing_functions/extract_region_result_macrophage.sh` for any timepoint whose
-`parsed/fire.bed` is missing - the same files `run_extract_regions.sh` writes as a SLURM
-array - and then loads and plots the region.
+`parsed/fire.bed` is missing, and then loads and plots the region.
 
 # Functions
 
@@ -79,7 +78,7 @@ Same nine regions as the topic model
 # )
 
 # TSS +/- 1000 bp, matching the TSS-centered regions in
-# code/topic_model/1_m6a_promoter_topic_modelling.Rmd and run_extract_regions.sh
+# code/topic_model/1_m6a_promoter_topic_modelling.Rmd
 # (dominant THP-1 CAGE peak: IL1B/TNF/IL8; GENCODE v49 TSS fallback:
 # IL1A/PTGS2/CXCL2/IL6/RELB). rs2836882 is a SNP locus with no TSS - it keeps
 # its explicit interval.

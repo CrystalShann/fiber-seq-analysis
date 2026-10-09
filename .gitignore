@@ -5,6 +5,6 @@
 !docs/
 !docs/**
 
-# Snakemake runtime state and generated results stay local.
+# Snakemake
 code/**/.snakemake/
 snakemake_results/

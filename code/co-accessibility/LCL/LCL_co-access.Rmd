@@ -1,0 +1,1078 @@
+---
+title: "Genome-wide LCL co-accessibility: top five pairs"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  sample_sheet: "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+  fire_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+  tf_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model"
+  tabix: "/project/spott/cshan/envs/dimelo/bin/tabix"
+  code_root: "/project/spott/cshan/fiber-seq/code"
+  reference_fasta: "/project/spott/reference/human/GRCh38.p14/hg38.fa"
+  tss_bed: "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
+  genome_build: "GRCh38"
+  summarize_lengths: true
+  triangle_tile_bp: null
+  locus_flank_bp: 1000
+  footprint_flank_bp: 200
+  footprint_max_length_bp: 400
+  footprint_bin_bp: 5
+  tf_format: "bed15_fiberhmm_tf"
+  make_plots: true
+  max_plot_reads: 120
+  seed: 20261009
+  allow_partial_results: false
+---
+
+This notebook reads the completed **genome-wide, pooled 31-sample LCL analysis**
+from `LCL_coaccess_cres.py`. Run `LCL_fire_universe.sh`, `LCL_read_spans.sh`, and
+`LCL_run_coaccess.sh` first. Donor labels are metadata only; there are no donor
+strata, haplotype tests, or timepoints.
+
+The plotting workflow is written directly below in separate chunks. Source the
+shared parsing and plotting functions, then run the chunks in order, or knit this
+notebook. `LCL_plot_coaccess.sh` is an optional SLURM launcher for the same notebook.
+
+All 31 LCL samples form one pooled group. The additional figures are cCRE and
+tiled FIRE correlation triangles around the current top-five pairs, and footprint
+midpoint–length plots anchored at **each member cCRE's midpoint**. There is no
+motif orientation or MNase input. Length and coverage summaries are descriptive:
+this notebook adds no QC stage, sample exclusions, or quality-score thresholds.
+
+Candidate cCREs overlap the union of all 31 samples' FIRE peaks. Pairs share a
+canonical TSS ±10 kb window and have **500 < gap < 20,000 bp**. A shared fiber
+overlaps both cCREs by at least one base. It is accessible at a cCRE when **one
+FIRE element on that same sample/read overlaps at least 50% of the cCRE length**.
+Several smaller FIRE elements do not combine to meet the threshold. The fraction
+is relative to cCRE length, not to FIRE-element length.
+
+The four configuration counts are pooled across samples before testing. The
+primary FDR comes from the macrophage-compatible **two-sided Fisher test after
+adding one pseudocount to each pooled cell**, corrected across all tested unique
+pairs genome-wide. Positive pairs require `fdr < 0.05`, `OR > 1`, and observed
+joint accessibility greater than its pooled independence expectation. This
+notebook selects the top five by FDR, decreasing OR, then decreasing shared-fiber
+coverage, using pair ID to resolve ties. It does not recalculate FDR after selection.
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     fig.width = 11, fig.height = 6, cache = FALSE)
+```
+
+```{r packages-and-functions}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+})
+source(file.path(params$code_root, "parsing_functions", "parsing_footprints_functions.r"), local = TRUE)
+source(file.path(params$code_root, "parsing_functions", "plotting_functions.r"), local = TRUE)
+options(scipen = 999)
+```
+
+```{r settings}
+root <- params$root
+coaccess_dir <- file.path(root, "coaccess")
+universe_dir <- file.path(root, "universe")
+plot_dir <- file.path(coaccess_dir, "plots", "top5")
+read_rule <- "any"
+fire_overlap_fraction <- 0.5
+fdr_cutoff <- 0.05
+max_plot_reads <- as.integer(params$max_plot_reads)
+stopifnot(length(max_plot_reads) == 1L, !is.na(max_plot_reads), max_plot_reads > 0L)
+paths <- list(root = root, fire_root = params$fire_root,
+              ft_root = params$fire_root, tf_root = params$tf_root,
+              tabix_bin = params$tabix, fire_ver = "v0.1")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+summary_dir <- file.path(coaccess_dir, "plots", "summaries")
+dir.create(summary_dir, recursive = TRUE, showWarnings = FALSE)
+stopifnot(params$locus_flank_bp >= 0, params$footprint_flank_bp > 0,
+          params$footprint_max_length_bp > 0, params$footprint_bin_bp > 0)
+```
+
+# Input provenance
+
+```{r validate-all-31-samples}
+sample_meta <- fread(params$sample_sheet)
+manifest <- fread(file.path(universe_dir, "sample_manifest.tsv"))
+stopifnot(all(c("sample_name", "cell_line") %in% names(sample_meta)),
+          all(c("sample_name", "donor") %in% names(manifest)),
+          nrow(sample_meta) == 31L, nrow(manifest) == 31L,
+          !anyDuplicated(sample_meta$sample_name), !anyDuplicated(manifest$sample_name),
+          setequal(sample_meta$sample_name, manifest$sample_name))
+sample_meta[, donor := as.character(cell_line)]
+samples <- as.character(manifest$sample_name)
+stopifnot(identical(as.character(manifest$donor),
+                    sample_meta$donor[match(samples, sample_meta$sample_name)]))
+knitr::kable(sample_meta[, .(sample_name, donor)])
+```
+
+```{r validate-completed-run}
+# This marker is published last and removed at the start of a rerun. Do not
+# combine old pair tables with an unfinished run or a changed input manifest.
+run_info_file <- file.path(coaccess_dir, "run_info.json")
+if (!file.exists(run_info_file))
+  stop("No completed-run marker: ", run_info_file,
+       ". Finish LCL_run_coaccess.sh before rendering.")
+run_info <- jsonlite::fromJSON(run_info_file)
+stopifnot(isTRUE(run_info$dataset == "LCL"), isTRUE(run_info$n_samples == 31L),
+          isTRUE(run_info$read_rule == read_rule),
+          isTRUE(run_info$fire_overlap_fraction == fire_overlap_fraction),
+          isFALSE(run_info$donor_used_in_testing),
+          length(run_info$sample_names) == 31L,
+          !anyDuplicated(run_info$sample_names),
+          setequal(run_info$sample_names, samples),
+          length(run_info$analysis_scope) == 1L, !is.na(run_info$analysis_scope),
+          length(run_info$tested_pairs) == 1L, !is.na(run_info$tested_pairs))
+if (!isTRUE(params$allow_partial_results) && run_info$analysis_scope != "genome-wide")
+  stop("Completed run covers ", run_info$analysis_scope, "; genome-wide results are required.")
+
+run_manifest <- fread(file.path(coaccess_dir, "sample_manifest.tsv"))
+provenance_columns <- c("sample_name", "donor", "fire_dir", "cram_path", "elements_path", "spans_path")
+stopifnot(all(provenance_columns %in% names(run_manifest)),
+          all(provenance_columns %in% names(manifest)),
+          nrow(run_manifest) == 31L, !anyDuplicated(run_manifest$sample_name),
+          setequal(run_manifest$sample_name, samples))
+run_manifest <- run_manifest[match(samples, sample_name)]
+for (column in provenance_columns)
+  if (!identical(as.character(run_manifest[[column]]), as.character(manifest[[column]])))
+    stop("Universe and completed-run manifests differ in ", column, "; rerun the analysis.")
+same_paths <- function(a, b)
+  identical(normalizePath(a, mustWork = FALSE), normalizePath(b, mustWork = FALSE))
+stopifnot(same_paths(run_manifest$spans_path,
+  file.path(root, samples, paste0(samples, ".read_spans.bed.gz"))),
+  same_paths(run_manifest$elements_path,
+    file.path(paths$fire_root, samples, "additional-outputs-v0.1", "fire-peaks",
+              paste0(samples, "-v0.1-fire-elements.bed.gz"))))
+```
+
+```{r read-genome-wide-pair-results}
+pairs_file <- file.path(coaccess_dir, "LCL_coaccess_pairs.tsv.gz")
+pairs_dt <- fread(pairs_file)
+required_columns <- c("CRE_pair", "CRE1", "CRE2", "chrom", "cre1_start", "cre1_end",
+  "cre2_start", "cre2_end", "gene_names", "CRE_pair_labels", "dist", "n_shared_reads",
+  "co_access", "co_closed", "CRE1_access", "CRE2_access", "OR", "fdr", "fdr_raw",
+  "expected_co_access", "observed_expected_ratio", "excess_fraction", "read_rule",
+  "fire_overlap_fraction", "dataset", "analysis_scope")
+if (!all(required_columns %in% names(pairs_dt)))
+  stop("Missing result columns: ", paste(setdiff(required_columns, names(pairs_dt)), collapse = ", "))
+stopifnot(!anyDuplicated(pairs_dt$CRE_pair),
+          nrow(pairs_dt) == run_info$tested_pairs,
+          all(pairs_dt$dataset == "LCL"),
+          all(pairs_dt$analysis_scope == run_info$analysis_scope),
+          all(pairs_dt$read_rule == read_rule),
+          all(pairs_dt$fire_overlap_fraction == fire_overlap_fraction),
+          all(pairs_dt$dist > 500 & pairs_dt$dist < 20000),
+          all(pairs_dt$n_shared_reads > 0),
+          all(pairs_dt$n_shared_reads == pairs_dt$co_access + pairs_dt$co_closed +
+                pairs_dt$CRE1_access + pairs_dt$CRE2_access))
+if (!isTRUE(params$allow_partial_results) && any(pairs_dt$analysis_scope != "genome-wide"))
+  stop("Partial chromosome results supplied. Run the genome-wide analysis before rendering.")
+expected_from_counts <- with(pairs_dt,
+  (co_access + CRE1_access) * (co_access + CRE2_access) / n_shared_reads)
+stopifnot(isTRUE(all.equal(as.numeric(pairs_dt$expected_co_access), as.numeric(expected_from_counts),
+                          tolerance = 1e-8, check.attributes = FALSE)))
+cat(nrow(pairs_dt), "unique tested pairs loaded.\n")
+```
+
+```{r read-ccre-and-gene-annotations}
+cre_universe <- fread(file.path(universe_dir, "cre_universe.bed"), header = FALSE,
+  col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
+tss_bed <- params$tss_bed
+tss <- fread(tss_bed, header = FALSE, select = 1:6,
+  col.names = c("chrom", "start", "end", "annotation", "score", "strand"))
+tss[, gene_name := tstrsplit(annotation, ";", fixed = TRUE, keep = 3L)[[1L]]]
+```
+
+# Descriptive read-length and coverage summaries
+
+The existing FIRE report's `fiber_length` frequency table supplies sequencing
+fiber lengths for its reported population. Only that table is read; no QC is run.
+The primary BED files separately supply **reference-alignment span lengths** for
+the analysis population. These lengths may differ because of clipping, indels,
+and the input populations. Pooled quantiles and N50 are calculated from combined
+length counts, never by averaging sample medians or N50s.
+
+```{r length-summary-functions}
+summarize_length_histogram <- function(histogram) {
+  h <- copy(as.data.table(histogram))[, .(n = sum(as.numeric(n))), by = length_bp]
+  h <- h[n > 0]
+  if (!nrow(h)) return(data.table(n_reads = 0, total_bp = 0, mean_bp = NA_real_,
+    median_bp = NA_real_, p90_bp = NA_real_, n50_bp = NA_real_, max_bp = NA_real_))
+  stopifnot(all(is.finite(h$length_bp)), all(h$length_bp > 0), all(is.finite(h$n)))
+  setorder(h, length_bp)
+  total <- sum(h$n)
+  cumulative <- cumsum(h$n)
+  quantile_at <- function(p) {
+    index <- 1 + (total - 1) * p
+    lower <- h$length_bp[which(cumulative >= floor(index))[1]]
+    upper <- h$length_bp[which(cumulative >= ceiling(index))[1]]
+    lower + (index - floor(index)) * (upper - lower)
+  }
+  bases <- sum(h$length_bp * h$n)
+  descending <- h[order(-length_bp)]
+  n50 <- descending$length_bp[which(cumsum(descending$length_bp * descending$n) >= bases / 2)[1]]
+  data.table(n_reads = total, total_bp = bases, mean_bp = bases / total,
+    median_bp = quantile_at(.5), p90_bp = quantile_at(.9), n50_bp = n50,
+    max_bp = max(h$length_bp))
+}
+```
+
+```{r calculate-read-length-summaries}
+length_histograms <- data.table(sample_name = character(), length_type = character(),
+  length_bp = numeric(), n = numeric())
+length_sources <- data.table()
+length_summary <- data.table()
+if (isTRUE(params$summarize_lengths)) {
+  length_sources <- rbindlist(lapply(seq_along(samples), function(i) {
+    s <- samples[i]
+    data.table(sample_name = s,
+      length_type = c("FIRE_report_fiber_length", "primary_reference_span"),
+      path = c(file.path(paths$fire_root, s, paste0(s, "-", paths$fire_ver, "-qc.tbl.gz")),
+        run_manifest$spans_path[i]))
+  }))
+  length_sources[, `:=`(available = file.exists(path),
+    size = file.info(path)$size, mtime = as.numeric(file.info(path)$mtime))]
+  cache_file <- file.path(summary_dir, "length_histograms.rds")
+  cache <- if (file.exists(cache_file)) readRDS(cache_file) else NULL
+  if (!is.null(cache) && identical(cache$sources, length_sources) && identical(cache$version, 1L)) {
+    length_histograms <- cache$histograms
+  } else {
+    pieces <- vector("list", nrow(length_sources))
+    for (i in seq_len(nrow(length_sources))) {
+      input <- length_sources[i]
+      if (!input$available) next
+      if (input$length_type == "FIRE_report_fiber_length") {
+        report <- fread(input$path, showProgress = FALSE)
+        h <- report[statistic == "fiber_length",
+          .(length_bp = as.numeric(value), n = as.numeric(count))]
+      } else {
+        spans_for_lengths <- fread(input$path, header = FALSE, select = c(2L, 3L),
+          col.names = c("start", "end"), showProgress = FALSE)
+        h <- spans_for_lengths[, .(n = .N), by = .(length_bp = end - start)]
+      }
+      h[, `:=`(sample_name = input$sample_name, length_type = input$length_type)]
+      pieces[[i]] <- h
+    }
+    length_histograms <- rbindlist(pieces, use.names = TRUE, fill = TRUE)
+    saveRDS(list(version = 1L, sources = copy(length_sources), histograms = length_histograms), cache_file)
+  }
+  if (nrow(length_histograms)) {
+    length_summary <- length_histograms[, summarize_length_histogram(.SD),
+      by = .(sample_name, length_type), .SDcols = c("length_bp", "n")]
+    pooled <- length_histograms[, summarize_length_histogram(.SD),
+      by = length_type, .SDcols = c("length_bp", "n")]
+    pooled[, sample_name := "pooled"]
+    length_summary <- rbindlist(list(length_summary, pooled), use.names = TRUE)
+    length_summary[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
+    fwrite(length_histograms, file.path(summary_dir, "LCL_read_length_histograms.tsv.gz"), sep = "\t")
+    fwrite(length_summary, file.path(summary_dir, "LCL_read_length_summary.tsv"), sep = "\t")
+    knitr::kable(length_summary, digits = 1)
+  }
+  fwrite(length_sources, file.path(summary_dir, "LCL_read_length_sources.tsv"), sep = "\t")
+  if (any(!length_sources$available))
+    cat("Length reports unavailable for", sum(!length_sources$available),
+      "inputs; see the source table. No lengths are inferred for missing files.\n")
+}
+```
+
+```{r genome-wide-pair-coverage-summary}
+# Existing pair counts are descriptive here; no coverage filter or new test.
+distance_summary <- if (nrow(pairs_dt)) pairs_dt[, .(n_pairs = .N, min_shared = min(n_shared_reads),
+  median_shared = median(n_shared_reads), p90_shared = as.numeric(quantile(n_shared_reads, .9)),
+  max_shared = max(n_shared_reads)), by = .(gap_bin_start_bp = floor(dist / 1000) * 1000)] else
+  data.table(gap_bin_start_bp = numeric(), n_pairs = integer(), min_shared = numeric(),
+    median_shared = numeric(), p90_shared = numeric(), max_shared = numeric())
+setorder(distance_summary, gap_bin_start_bp)
+fwrite(distance_summary, file.path(summary_dir, "LCL_pair_coverage_by_distance.tsv"), sep = "\t")
+if (nrow(distance_summary)) {
+  coverage_plot <- ggplot(distance_summary, aes(gap_bin_start_bp / 1000, median_shared)) +
+    geom_line() + geom_point() + theme_bw() +
+    labs(x = "cCRE gap bin start (kb; 1 kb bins)", y = "Median jointly observed fibers",
+      title = "Observed support within the existing genome-wide pair search",
+      subtitle = "Descriptive only; no added coverage threshold or change to the tested distance range")
+  print(coverage_plot)
+  ggsave(file.path(summary_dir, "LCL_pair_coverage_by_distance.pdf"), coverage_plot, width = 8, height = 5)
+}
+```
+
+# Top five positive associations
+
+```{r select-top-five}
+eligible <- pairs_dt[!is.na(fdr) & fdr < fdr_cutoff & !is.na(OR) & OR > 1 &
+                       co_access > expected_co_access]
+setorderv(eligible, c("fdr", "OR", "n_shared_reads", "CRE_pair"), c(1L, -1L, -1L, 1L))
+selected <- head(eligible, 5L)
+selected[, pair_id := sprintf("LCL_top%02d", seq_len(.N))]
+fwrite(selected, file.path(plot_dir, "LCL_top5_pairs.tsv"), sep = "\t")
+cat(nrow(eligible), "pairs pass the positive-association criteria; selected",
+    nrow(selected), "for plotting.\n")
+if (nrow(selected) < 5L)
+  cat("Fewer than five pairs qualify; only qualifying pairs will be shown.\n")
+knitr::kable(selected[, .(pair_id, gene_names, CRE_pair, dist, n_shared_reads,
+  co_access, expected_co_access, observed_expected_ratio, OR, fdr, fdr_raw)], digits = 4)
+```
+
+```{r observed-versus-expected, fig.height=5}
+if (nrow(selected)) {
+  oe <- melt(selected[, .(pair_id, observed = co_access, expected = expected_co_access)],
+             id.vars = "pair_id", variable.name = "count_type", value.name = "fibers")
+  oe_plot <- ggplot(oe, aes(pair_id, fibers, fill = count_type)) +
+    geom_col(position = "dodge") + theme_bw() +
+    scale_fill_manual(values = c(observed = "#B2182B", expected = "grey70")) +
+    labs(x = NULL, y = "Jointly accessible fibers", fill = NULL,
+         title = "Observed and expected co-accessibility",
+         subtitle = "Expectation uses pooled margins among the same jointly covered fibers")
+  print(oe_plot)
+  ggsave(file.path(plot_dir, "LCL_top5_observed_expected.pdf"), oe_plot, width = 9, height = 5)
+}
+```
+
+# Fiber plots and count checks
+
+The following code reloads **all 31 samples** from the same primary-read-span and
+FIRE-element files used for counting. The complete reloaded 2×2 must match the
+saved result; a discrepancy stops rendering. The raster shows at most
+`r max_plot_reads` randomly selected shared fibers per pair; the m6A profile uses
+those displayed fibers. Configuration bars, count checks, and statistical
+annotations always use all shared fibers.
+
+m6A, nucleosome, and TF-footprint tracks are display annotations restricted to
+those same read identities. Missing optional display tracks produce warnings;
+they never change the FIRE accessibility call. Donor identifiers are attached to
+the exported read labels and sample contributions without entering a test.
+
+```{r validate-plot-inputs}
+if (isTRUE(params$make_plots) && nrow(selected)) {
+  spans <- file.path(root, samples, paste0(samples, ".read_spans.bed.gz"))
+  elements <- file.path(paths$fire_root, samples, "additional-outputs-v0.1", "fire-peaks",
+                         paste0(samples, "-v0.1-fire-elements.bed.gz"))
+  needed <- c(paths$tabix_bin, spans, paste0(spans, ".tbi"), elements, paste0(elements, ".tbi"))
+  if (any(!file.exists(needed)))
+    stop("Missing plotting inputs: ", paste(needed[!file.exists(needed)], collapse = "\n"))
+}
+```
+
+## Load fibers and assign accessibility
+
+`load_region()`, `label_reads()`, and `coaccess_2x2()` come from
+`parsing_footprints_functions.r`. Read keys include the sample name so that equal
+read names from different samples cannot be joined. Keep these complete labels
+for count verification, configuration bars, and metadata exports.
+
+```{r load-pair-fibers}
+pair_data <- list()
+if (isTRUE(params$make_plots) && nrow(selected)) {
+  for (i in seq_len(nrow(selected))) {
+    pair <- selected[i]
+    region <- list(chrom = pair$chrom,
+      start = max(0, min(pair$cre1_start, pair$cre2_start) - params$locus_flank_bp),
+      end = max(pair$cre1_end, pair$cre2_end) + params$locus_flank_bp)
+    cre1 <- list(start = pair$cre1_start, end = pair$cre1_end)
+    cre2 <- list(start = pair$cre2_start, end = pair$cre2_end)
+    res <- load_region(region, samples, paths$root, paths$fire_root,
+      fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
+      span_source = "read_spans")
+    labels <- label_reads(res, cre1, cre2, read_rule = read_rule,
+      fire_overlap_fraction = fire_overlap_fraction)
+    pair_data[[pair$pair_id]] <- list(pair = pair, region = region,
+      cre1 = cre1, cre2 = cre2, res = res, labels = labels,
+      counts = coaccess_2x2(labels))
+  }
+}
+```
+
+```{r verify-reloaded-counts}
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  pair <- entry$pair
+  actual <- unlist(entry$counts[1, c("neither", "cre1_only", "cre2_only", "both", "n_shared")],
+                   use.names = FALSE)
+  expected <- unlist(pair[, .(co_closed, CRE1_access, CRE2_access, co_access, n_shared_reads)],
+                     use.names = FALSE)
+  if (!identical(as.numeric(actual), as.numeric(expected)))
+    stop("Reloaded counts differ from the analysis table for ", pair$CRE_pair,
+         "; reloaded: ", paste(actual, collapse = ","),
+         "; saved: ", paste(expected, collapse = ","))
+}
+```
+
+```{r export-fiber-metadata}
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  pair <- entry$pair
+  read_labels <- copy(entry$labels)[shared == TRUE]
+  read_labels[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
+  read_labels[, `:=`(pair_id = pair$pair_id, CRE_pair = pair$CRE_pair)]
+  fwrite(read_labels, file.path(plot_dir, paste0(pair$pair_id, "_read_labels.tsv.gz")), sep = "\t")
+  contributions <- read_labels[, .(n_shared = .N, co_access = sum(acc1 & acc2),
+    CRE1_access = sum(acc1 & !acc2), CRE2_access = sum(!acc1 & acc2),
+    co_closed = sum(!acc1 & !acc2)), by = .(pair_id, sample_name, donor)]
+  fwrite(contributions, file.path(plot_dir, paste0(pair$pair_id, "_sample_counts.tsv")), sep = "\t")
+}
+```
+
+## Prepare the displayed fibers and annotation tracks
+
+Sample up to `r max_plot_reads` shared fibers with a fixed seed. Load m6A,
+ft nucleosomes, and FiberHMM TF footprints only for these display keys using
+`load_ft_tracks()` from the parsing functions. Copies of the display tables are
+labelled `pooled`; the original sample/read keys and complete labels are retained.
+
+```{r prepare-display-fibers}
+display_data <- list()
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  drawn_labels <- copy(entry$labels)[shared == TRUE]
+  set.seed(as.integer(params$seed))
+  if (nrow(drawn_labels) > max_plot_reads) {
+    drawn_keys <- sample(drawn_labels$key, max_plot_reads)
+    drawn_labels <- drawn_labels[key %in% drawn_keys]
+  }
+
+  display_res <- load_ft_tracks(copy(entry$res), keys = drawn_labels$key,
+    ft_root = paths$ft_root, tabix_bin = paths$tabix_bin,
+    nuc_source = "ft", tf_source = "recalled_tf", tf_root = paths$tf_root)
+  for (track in c("spans", "elements", "m6a", "nuc", "size_fps")) {
+    if (!is.null(display_res[[track]]) && nrow(display_res[[track]]))
+      display_res[[track]][, sample_name := "pooled"]
+  }
+  display_res$samples <- "pooled"
+  drawn_labels[, sample_name := "pooled"]
+
+  region <- entry$region
+  cres_here <- cre_universe[chrom == region$chrom & end > region$start & start < region$end]
+  region_res <- coaccess_region_result(display_res, entry$cre1, entry$cre2,
+    drawn_labels, cres = cres_here)
+
+  # Keep the cCRE class order used by the shared plotting functions.
+  pk <- as.data.frame(cres_here)
+  cls <- factor(pk$CRE_label, levels = c(intersect(CCRE_CLASSES, pk$CRE_label),
+    setdiff(unique(pk$CRE_label), CCRE_CLASSES)))
+  pk <- pk[order(cls, pk$start), , drop = FALSE]
+  peaks_df <- data.frame(chr = pk$chrom, start = pk$start, end = pk$end,
+    group = as.character(pk$CRE_label))
+  display_data[[id]] <- list(region_res = region_res, peaks_df = peaks_df,
+    n_drawn = nrow(drawn_labels))
+}
+```
+
+## Draw the fiber panels
+
+`coaccess_region_result()` above adapts the display data for
+`plot_region_panels()` from `plotting_functions.r`. Panel choices, colours,
+relative heights, titles, and the highlighted pair are set explicitly here.
+
+```{r draw-fiber-panels}
+fiber_plots <- list()
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  pair <- entry$pair
+  region <- entry$region
+  counts <- entry$counts
+  display <- display_data[[id]]
+  region_res <- display$region_res
+
+  subtitle <- sprintf(paste0("%s:%d-%d | gap %d bp | O %.0f / E %.2f | ",
+    "OR %.3g | genome-wide FDR %.3g"), region$chrom, region$start, region$end,
+    pair$dist, pair$co_access, pair$expected_co_access, pair$OR, pair$fdr)
+  subtitle <- paste0(subtitle, "\n", sprintf(paste0(
+    "%d fibers span both cCREs: both %d | CRE1 only %d | CRE2 only %d | neither %d",
+    " | Fisher OR (table + 1) = %.2f, p = %.2g"), counts$n_shared,
+    counts$both, counts$cre1_only, counts$cre2_only, counts$neither,
+    counts$fisher_or, counts$fisher_p))
+  if (display$n_drawn < counts$n_shared)
+    subtitle <- paste0(subtitle, sprintf("\ndrawn: %d of %d fibers (seed %d)",
+      display$n_drawn, counts$n_shared, as.integer(params$seed)))
+
+  raster_height <- max(2, 0.025 * display$n_drawn + 0.3)
+  heights <- c(pileup = 1.5, peaks = 0.3 + 0.3 * length(unique(display$peaks_df$group)),
+    reads = raster_height, fire_fiberHMM = raster_height)
+  read_theme <- list(axis.ticks.y = element_blank(), panel.grid.major.y = element_blank())
+  fiber_plots[[id]] <- plot_region_panels(region_res,
+    plot_name = paste(id, pair$gene_names, pair$CRE_pair_labels, sep = " | "),
+    subtitle = subtitle, peaks_df = display$peaks_df, highlight = region_res$highlight,
+    linewidth = 1.1, expand = TRUE, heights = heights,
+    profile_options = list(colour_by = "group", colors = cluster_palette("pooled"),
+      y_col = "frac", linewidth = 0.4, facet_scales = "fixed",
+      facet_space = "fixed", require_data = TRUE),
+    read_options = list(tile_width = 8, tile_height = 0.85,
+      backbone_col = BACKBONE_COL, arrows = FALSE,
+      base_colors = c(A = M6A_COL), require_data = TRUE),
+    peaks_options = list(variant = "intervals"),
+    footprint_options = list(draw_order = c("linker", "nucleosome", "FIRE element",
+      rev(region_res$size_levels)), backbone = FALSE, always = TRUE,
+      legend_title = NULL, legend_drop = FALSE, legend_linewidth = 3),
+    theme_options = list(base = "bw", base_size = 11,
+      pileup = list(strip.text.y = element_text(angle = 0)),
+      reads = read_theme, fire_fiberHMM = read_theme),
+    y_labels = c(pileup = "m6A fraction", reads = "m6A",
+      fire_fiberHMM = "ft nucleosomes + FIRE + FiberHMM TF"),
+    panel_names = c(peaks = "cres", pileup = "m6a_prop", reads = "m6a", fire_fiberHMM = "reads"))
+}
+```
+
+```{r add-canonical-tss-panel}
+for (id in names(pair_data)) {
+  region <- pair_data[[id]]$region
+  genes_here <- tss[chrom == region$chrom & end > region$start & start < region$end]
+  if (nrow(genes_here)) {
+    gene_plot <- ggplot(genes_here, aes(start, gene_name)) +
+      geom_point(aes(shape = strand), size = 2) + theme_bw() +
+      coord_cartesian(xlim = c(region$start, region$end), expand = TRUE) +
+      labs(x = NULL, y = "Canonical TSS", shape = "Strand")
+    fiber_plots[[id]]$combined <- gene_plot / fiber_plots[[id]]$combined +
+      plot_layout(heights = c(1, 12))
+  }
+}
+```
+
+## Draw configuration bars using all shared fibers
+
+`configuration_proportion_inputs()` and `plot_stacked_proportion()` come from
+`plotting_functions.r`. Each sample retains its original label, and an additional
+pooled bar combines all samples. Counts above the bars use all shared fibers.
+
+```{r draw-configuration-bars}
+configuration_plots <- list()
+for (id in names(pair_data)) {
+  labels <- copy(pair_data[[id]]$labels)[shared == TRUE]
+  pooled_labels <- copy(labels)[, sample_name := "pooled"]
+  bar_levels <- c("pooled", samples)
+  config_inputs <- configuration_proportion_inputs(rbind(pooled_labels, labels), bar_levels)
+  configuration_plots[[id]] <- plot_stacked_proportion(config_inputs$rows,
+    "sample_name", "config", CONFIG_COLS,
+    position = "fill", width = .7, legend = list(drop = FALSE),
+    totals = list(data = config_inputs$totals, x = "sample_name", y = 1.04,
+      label = "lab", style = list(size = 3)),
+    scales = list(scale_y_continuous(labels = scales::percent, limits = c(0, 1.08),
+      breaks = c(0, .25, .5, .75, 1))),
+    labels = list(x = NULL, y = "fibers spanning both cCREs", fill = "configuration",
+      title = paste(id, "all shared fibers; sample labels are metadata")),
+    theme = theme_fiberseq("bw", base_size = 11,
+      overrides = list(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))))
+}
+```
+
+## Save and display the figures
+
+```{r save-pair-figures}
+for (id in names(pair_data)) {
+  ggsave(file.path(plot_dir, paste0(id, "_reads.pdf")),
+    fiber_plots[[id]]$combined, width = 12, height = 16, limitsize = FALSE)
+  ggsave(file.path(plot_dir, paste0(id, "_config_bars.pdf")),
+    configuration_plots[[id]], width = 13, height = 5)
+}
+```
+
+```{r plot-top-five, results="asis", fig.width=12, fig.height=16}
+if (length(pair_data)) {
+  for (id in names(pair_data)) {
+    pair <- pair_data[[id]]$pair
+    cat("\n\n## ", pair$pair_id, ": ", pair$gene_names, "\n\n", sep = "")
+    print(fiber_plots[[id]]$combined)
+    print(configuration_plots[[id]])
+  }
+} else {
+  cat("No fiber plots requested or no qualifying pairs.\n")
+}
+```
+
+```{r verified-configuration-counts}
+if (length(pair_data)) {
+  verified <- rbindlist(lapply(pair_data, function(entry) entry$counts), idcol = "pair_id")
+  fwrite(verified, file.path(plot_dir, "LCL_top5_verified_counts.tsv"), sep = "\t")
+  knitr::kable(verified)
+  cat("Every displayed pair reproduces the pooled analysis counts exactly.\n")
+}
+```
+
+# Correlation triangles at the top-five pairs
+
+Each cCRE triangle includes the FIRE-overlapping cCREs fully inside that pair's
+plotting window. Rows are all primary fibers overlapping the window, before
+raster downsampling. An unobserved cCRE is `NA`; an observed cCRE lacking a
+qualifying FIRE is zero. Pearson correlation of binary cCRE states is the phi
+coefficient. There is no additional minimum-coverage or accessibility filter.
+Cells with fewer than two observations or a constant state are undefined and
+shown in grey. The accompanying triangle gives the exact pairwise read counts.
+
+The companion tiled triangle uses the union of FIRE intervals as a **continuous
+fraction of each tile**, rather than the binary cCRE rule. A tile is observed
+only when its entire interval is within a primary read span; this defines its
+denominator, without changing the cCRE tests. Internal alignment deletions are
+not resolved by the BED span inputs. All correlations describe the pooled LCL
+group; donor is metadata only. The single highlighted arc is the selected cCRE
+pair and carries its saved genome-wide statistics, not a test of the tile cells.
+
+```{r triangle-matrix-functions}
+pairwise_triangle_values <- function(states, features) {
+  n <- crossprod(1L * !is.na(states))
+  r <- suppressWarnings(cor(states, use = "pairwise.complete.obs", method = "pearson"))
+  r[!is.finite(r) | n < 2] <- NA_real_
+  indexes <- which(upper.tri(n), arr.ind = TRUE)
+  cells <- data.table(i = indexes[, 1], j = indexes[, 2],
+    feature1 = colnames(states)[indexes[, 1]], feature2 = colnames(states)[indexes[, 2]],
+    correlation = r[indexes], n_shared = n[indexes])
+  list(states = states, features = features, correlation = r, coverage = n, cells = cells)
+}
+
+# Draw a 45-degree triangle in feature-index space. The coordinate map below
+# supplies the actual intervals; unequal cCRE spacing is not genomic distance.
+triangle_panel <- function(cells, n_features, value, title, labels) {
+  if (!nrow(cells)) return(ggplot() + theme_void() + labs(title = title,
+    subtitle = "Fewer than two features; no off-diagonal correlation"))
+  polygons <- rbindlist(lapply(seq_len(nrow(cells)), function(k) {
+    a <- cells$i[k] + c(-.5, .5, .5, -.5)
+    b <- cells$j[k] + c(-.5, -.5, .5, .5)
+    data.table(cell = k, x = (a + b) / 2, y = (b - a) / 2,
+      value = cells[[value]][k])
+  }))
+  p <- ggplot(polygons, aes(x, y, group = cell, fill = value)) +
+    geom_polygon(colour = "white", linewidth = .15) +
+    coord_fixed(xlim = c(.5, n_features + .5), ylim = c(0, n_features / 2), expand = FALSE) +
+    scale_x_continuous(breaks = seq_len(n_features), labels = labels) +
+    theme_bw() + theme(panel.grid = element_blank(), axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(), axis.text.x = element_text(angle = 90, hjust = 1)) +
+    labs(title = title, x = NULL, y = NULL)
+  if (value == "correlation")
+    p <- p + scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+      midpoint = 0, limits = c(-1, 1), na.value = "grey75", name = "Pearson r")
+  else p <- p + scale_fill_viridis_c(name = "Shared fibers", na.value = "grey75")
+  if (n_features <= 12 && value == "n_shared")
+    p <- p + geom_text(data = cells, aes(x = (i + j) / 2, y = (j - i) / 2,
+      label = n_shared), inherit.aes = FALSE, size = 3)
+  p
+}
+```
+
+```{r build-ccre-triangles}
+ccre_triangles <- list()
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  region <- entry$region
+  features <- copy(cre_universe[chrom == region$chrom & start >= region$start & end <= region$end])
+  setorder(features, start, end, CRE_ID)
+  features[, feature_label := paste0("C", seq_len(.N))]
+  states <- matrix(NA_real_, nrow(entry$res$spans), nrow(features),
+    dimnames = list(entry$res$spans$key, features$CRE_ID))
+  for (j in seq_len(nrow(features))) {
+    cre <- as.list(features[j, .(start, end)])
+    labels <- label_reads(entry$res, cre, cre, read_rule = read_rule,
+      fire_overlap_fraction = fire_overlap_fraction)
+    states[labels$shared, j] <- as.integer(labels$acc1[labels$shared])
+  }
+  triangle <- pairwise_triangle_values(states, features)
+  a <- match(entry$pair$CRE1, features$CRE_ID)
+  b <- match(entry$pair$CRE2, features$CRE_ID)
+  stopifnot(!is.na(a), !is.na(b), triangle$coverage[a, b] == entry$counts$n_shared)
+  ccre_triangles[[id]] <- triangle
+  saveRDS(list(states = states, features = features,
+    read_metadata = entry$res$spans[, .(key, sample_name,
+      donor = sample_meta$donor[match(sample_name, sample_meta$sample_name)])]),
+    file.path(plot_dir, paste0(id, "_ccre_states.rds")))
+  fwrite(triangle$cells, file.path(plot_dir, paste0(id, "_ccre_correlations.tsv")), sep = "\t")
+  fwrite(features, file.path(plot_dir, paste0(id, "_ccre_coordinate_map.tsv")), sep = "\t")
+}
+```
+
+```{r draw-ccre-triangles, fig.width=12, fig.height=14}
+for (id in names(ccre_triangles)) {
+  entry <- pair_data[[id]]
+  pair <- entry$pair
+  triangle <- ccre_triangles[[id]]
+  features <- triangle$features
+  feature_labels <- paste(features$feature_label, features$CRE_label)
+  correlation_plot <- triangle_panel(triangle$cells, nrow(features), "correlation",
+    paste(id, "pooled LCL cCRE accessibility correlation"), feature_labels)
+  count_plot <- triangle_panel(triangle$cells, nrow(features), "n_shared",
+    "Exact joint-read support", feature_labels)
+  marginal <- data.table(index = seq_len(nrow(features)),
+    accessibility = colMeans(triangle$states, na.rm = TRUE),
+    n_observed = colSums(!is.na(triangle$states)))
+  marginal_plot <- ggplot(marginal, aes(index, accessibility)) + geom_col(fill = "grey45") +
+    scale_x_continuous(breaks = marginal$index, labels = features$feature_label) +
+    scale_y_continuous(limits = c(0, 1)) + theme_bw() +
+    labs(x = "cCRE order (see coordinate map)", y = "Accessible fraction")
+  a <- match(pair$CRE1, features$CRE_ID)
+  b <- match(pair$CRE2, features$CRE_ID)
+  arc <- data.table(x = seq(min(a, b), max(a, b), length.out = 101),
+    y = sin(seq(0, pi, length.out = 101)))
+  arc_plot <- ggplot(arc, aes(x, y)) + geom_line(colour = "#B2182B", linewidth = .8) +
+    scale_x_continuous(limits = c(.5, nrow(features) + .5),
+      breaks = seq_len(nrow(features)), labels = features$feature_label) +
+    theme_void() + labs(subtitle = sprintf(
+      "%s—%s | n=%d | OR(table+1)=%.3g | genome-wide FDR=%.3g",
+      features$feature_label[a], features$feature_label[b], pair$n_shared_reads, pair$OR, pair$fdr))
+  combined <- (correlation_plot / count_plot / arc_plot / marginal_plot) +
+    plot_layout(heights = c(4, 4, 1, 1.5))
+  print(combined)
+  knitr::kable(features[, .(feature_label, CRE_ID, CRE_label, chrom, start, end)]) |> print()
+  ggsave(file.path(plot_dir, paste0(id, "_ccre_triangle.pdf")), combined,
+    width = 12, height = 14, limitsize = FALSE)
+}
+```
+
+```{r build-tiled-fire-triangles}
+tile_triangles <- list()
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  region <- entry$region
+  sp <- entry$res$spans
+  el <- entry$res$elements
+  typical_span <- median(sp$end - sp$start)
+  if (nrow(length_summary)) {
+    pooled_span <- length_summary[sample_name == "pooled" & length_type == "primary_reference_span", median_bp]
+    if (length(pooled_span) && is.finite(pooled_span)) typical_span <- pooled_span
+  }
+  # Descriptive resolution heuristic: about 20 tiles per typical span, with
+  # at most about 80 tiles per locus. This is not a coverage/power threshold.
+  target <- max(100, typical_span / 20, (region$end - region$start) / 80)
+  candidates <- c(100, 250, 500, 1000, 2000, 5000)
+  auto_width <- candidates[which.min(abs(log(candidates / target)))]
+  tile_bp <- if (is.null(params$triangle_tile_bp)) auto_width else as.integer(params$triangle_tile_bp)
+  stopifnot(length(tile_bp) == 1L, is.finite(tile_bp), tile_bp > 0)
+  starts <- seq(region$start, region$end - 1, by = tile_bp)
+  tiles <- data.table(chrom = region$chrom, start = starts,
+    end = pmin(starts + tile_bp, region$end), CRE_ID = paste0("T", seq_along(starts)))
+  values <- matrix(NA_real_, nrow(sp), nrow(tiles), dimnames = list(sp$key, tiles$CRE_ID))
+  for (j in seq_len(nrow(tiles))) {
+    left <- tiles$start[j]; right <- tiles$end[j]
+    observed <- sp$start <= left & sp$end >= right
+    values[observed, j] <- 0
+    if (nrow(el)) {
+      hits <- copy(el[start < right & end > left & key %in% sp$key[observed]])
+      if (nrow(hits)) {
+        fractions <- hits[, .(fraction = sum(IRanges::width(IRanges::reduce(
+          IRanges::IRanges(pmax(start, left) + 1, pmin(end, right))))) / (right - left)), by = key]
+        values[match(fractions$key, sp$key), j] <- fractions$fraction
+      }
+    }
+  }
+  tile_triangles[[id]] <- pairwise_triangle_values(values, tiles)
+  tile_triangles[[id]]$tile_bp <- tile_bp
+  saveRDS(tile_triangles[[id]], file.path(plot_dir, paste0(id, "_tile_states.rds")))
+  fwrite(tile_triangles[[id]]$cells, file.path(plot_dir, paste0(id, "_tile_correlations.tsv")), sep = "\t")
+  fwrite(tiles, file.path(plot_dir, paste0(id, "_tile_coordinate_map.tsv")), sep = "\t")
+}
+```
+
+```{r draw-tiled-fire-triangles, fig.width=12, fig.height=12}
+for (id in names(tile_triangles)) {
+  triangle <- tile_triangles[[id]]
+  tiles <- triangle$features
+  labels <- format((tiles$start + tiles$end) / 2000, trim = TRUE)
+  correlation_plot <- triangle_panel(triangle$cells, nrow(tiles), "correlation",
+    sprintf("%s | %d bp tiles | pooled FIRE-fraction correlation", id, triangle$tile_bp), labels)
+  count_plot <- triangle_panel(triangle$cells, nrow(tiles), "n_shared",
+    "Fibers fully covering both tiles (tile midpoint in kb)", labels)
+  combined <- correlation_plot / count_plot
+  print(combined)
+  ggsave(file.path(plot_dir, paste0(id, "_tile_triangle.pdf")), combined, width = 12, height = 12)
+}
+```
+
+```{r top-five-statistics-and-coverage}
+pair_statistics <- list()
+coverage_by_sample <- list()
+for (id in names(pair_data)) {
+  entry <- pair_data[[id]]
+  pair <- entry$pair
+  c <- entry$counts
+  contingency <- matrix(c(c$neither, c$cre2_only, c$cre1_only, c$both), 2, byrow = TRUE)
+  raw <- fisher.test(contingency)
+  corrected <- fisher.test(contingency + 1)
+  pair_statistics[[id]] <- data.table(pair_id = id, CRE_pair = pair$CRE_pair,
+    neither = c$neither, CRE1_only = c$cre1_only, CRE2_only = c$cre2_only,
+    both = c$both, n_shared = c$n_shared,
+    observed_both = c$both, expected_both = pair$expected_co_access,
+    raw_fisher_conditional_OR = unname(raw$estimate),
+    raw_OR_CI_low = raw$conf.int[1], raw_OR_CI_high = raw$conf.int[2],
+    raw_fisher_p = raw$p.value, raw_genomewide_FDR = pair$fdr_raw,
+    corrected_crossproduct_OR = pair$OR,
+    corrected_fisher_conditional_OR = unname(corrected$estimate),
+    corrected_fisher_p = corrected$p.value, corrected_genomewide_FDR = pair$fdr,
+    phi = ccre_triangles[[id]]$correlation[pair$CRE1, pair$CRE2])
+  sp <- entry$res$spans
+  sample_counts <- entry$labels[, .(overlap_locus = .N,
+    jointly_observed = sum(shared)), by = sample_name]
+  sample_counts <- merge(data.table(sample_name = samples), sample_counts, all.x = TRUE)
+  for (column in c("overlap_locus", "jointly_observed"))
+    set(sample_counts, which(is.na(sample_counts[[column]])), column, 0L)
+  sample_counts[, `:=`(pair_id = id,
+    donor = sample_meta$donor[match(sample_name, sample_meta$sample_name)])]
+  coverage_by_sample[[id]] <- sample_counts
+}
+if (length(pair_statistics)) {
+  statistics_table <- rbindlist(pair_statistics)
+  fwrite(statistics_table, file.path(plot_dir, "LCL_top5_pair_statistics.tsv"), sep = "\t")
+  fwrite(rbindlist(coverage_by_sample), file.path(plot_dir, "LCL_top5_coverage_by_sample.tsv"), sep = "\t")
+  knitr::kable(statistics_table, digits = 4)
+}
+```
+
+# Footprint midpoint–length plots at the same top-five pairs
+
+Each member cCRE's **midpoint** is an anchor, in reference-genome orientation.
+Shared cCREs are loaded once and linked back to every selected pair. These are
+footprint midpoint–length density plots, not MNase fragment V-plots: a V shape
+or secondary vertex is not assumed, and separate footprints are never joined.
+The selected cCREs may contain several binding sites; their midpoints are not
+necessarily TF binding centres. CpG calls do not define accessibility here.
+
+For each anchor, the denominator is all primary fibers covering the displayed
+window plus half the displayed maximum footprint length on each side. This
+ensures every displayed complete footprint could have been observed. It is an
+observability definition, not a QC or score filter. Densities use all eligible
+fibers, not the 120-read raster subset. TF calls and nucleosome calls retain
+separate densities and available-input denominators. All called TF lengths and
+scores are retained; the legacy raster's selected TF size bins are not used.
+Missing files are labelled unavailable, rather than counted as zero-footprint
+fibers. Longer footprints remain in the exported event table.
+
+```{r define-top-five-footprint-anchors}
+anchor_links <- data.table()
+anchors <- data.table()
+if (length(pair_data)) {
+  anchor_links <- rbindlist(lapply(names(pair_data), function(id) {
+    pair <- pair_data[[id]]$pair
+    data.table(pair_id = id, side = c("CRE1", "CRE2"), chrom = pair$chrom,
+      CRE_ID = c(pair$CRE1, pair$CRE2), start = c(pair$cre1_start, pair$cre2_start),
+      end = c(pair$cre1_end, pair$cre2_end))
+  }))
+  anchors <- unique(anchor_links, by = c("chrom", "start", "end", "CRE_ID"))
+  anchors[, `:=`(anchor_id = sprintf("anchor%02d", seq_len(.N)),
+    centre = (start + end) / 2, origin_pair = pair_id)]
+  anchor_links <- merge(anchor_links, anchors[, .(chrom, start, end, CRE_ID, anchor_id, centre)],
+    by = c("chrom", "start", "end", "CRE_ID"), sort = FALSE)
+  fwrite(anchors, file.path(plot_dir, "LCL_top5_footprint_anchors.tsv"), sep = "\t")
+  fwrite(anchor_links, file.path(plot_dir, "LCL_top5_pair_anchor_links.tsv"), sep = "\t")
+}
+```
+
+```{r footprint-block-loader}
+load_anchor_footprints <- function(anchor, spans, region) {
+  sources <- c("FiberHMM_TF", "ft_nucleosome")
+  events <- list(); availability <- list()
+  query <- GenomicRanges::GRanges(region$chrom, IRanges::IRanges(region$start + 1, region$end))
+  for (sample in samples) {
+    sample_spans <- spans[sample_name == sample]
+    for (track_source in sources) {
+      path <- if (track_source == "FiberHMM_TF")
+        file.path(paths$tf_root, sample, paste0(sample, ".recalled_tf.bed.gz")) else
+        file.path(paths$ft_root, sample, "extracted_results", "nuc_by_chr",
+          paste0(sample, ".ft_extracted_nuc.", region$chrom, ".bed.gz"))
+      available <- file.exists(path) && file.exists(paste0(path, ".tbi"))
+      availability[[length(availability) + 1L]] <- data.table(anchor_id = anchor$anchor_id,
+        sample_name = sample, source = track_source, path = path, available = available,
+        n_window_spanning = nrow(sample_spans),
+        n_eligible = if (available) nrow(sample_spans) else 0L)
+      if (!available || !nrow(sample_spans)) next
+      bed <- read_tabix_region(path, query)
+      if (!nrow(bed)) next
+      bed <- bed[paste(sample, bed[[4]]) %in% sample_spans$key, , drop = FALSE]
+      if (!nrow(bed)) next
+      format <- if (track_source == "FiberHMM_TF") params$tf_format else "bed12_fibertools"
+      blocks <- as.data.table(convert_ft_bed12_to_bed6(bed, format = format,
+        keep_block_scores = track_source == "FiberHMM_TF", source = path))
+      if (!nrow(blocks)) next
+      blocks[, key := paste(sample, RID)]
+      blocks <- merge(blocks, sample_spans[, .(key, span_start = start, span_end = end)], by = "key")
+      # Match the primary alignment used for the denominator, not a different
+      # alignment of the same RID. There is no new footprint-score cutoff.
+      blocks <- blocks[end > start & start >= span_start & end <= span_end]
+      if (!nrow(blocks)) next
+      blocks[, `:=`(anchor_id = anchor$anchor_id, sample_name = sample, source = track_source,
+        length_bp = end - start, midpoint = (start + end) / 2,
+        offset_bp = (start + end) / 2 - anchor$centre)]
+      if (!"block_score" %in% names(blocks)) blocks[, block_score := NA_real_]
+      blocks <- unique(blocks[, .(anchor_id, sample_name, source, key, RID,
+        start, end, length_bp, midpoint, offset_bp, block_score)],
+        by = c("anchor_id", "source", "key", "start", "end"))
+      events[[length(events) + 1L]] <- blocks
+    }
+  }
+  empty_events <- data.table(anchor_id = character(), sample_name = character(), source = character(),
+    key_id = character(), RID = character(), start = numeric(), end = numeric(),
+    length_bp = numeric(), midpoint = numeric(), offset_bp = numeric(), block_score = numeric())
+  setnames(empty_events, "key_id", "key")
+  list(events = if (length(events)) rbindlist(events) else empty_events,
+    availability = rbindlist(availability))
+}
+```
+
+```{r load-all-footprints-at-anchors}
+footprint_data <- list()
+if (nrow(anchors)) {
+  for (i in seq_len(nrow(anchors))) {
+    anchor <- anchors[i]
+    padding <- params$footprint_flank_bp + params$footprint_max_length_bp / 2
+    region <- list(chrom = anchor$chrom,
+      start = max(0, floor(anchor$centre - padding)), end = ceiling(anchor$centre + padding))
+    res <- pair_data[[anchor$origin_pair]]$res
+    if (region$start < res$region$start || region$end > res$region$end)
+      res <- load_region(region, samples, paths$root, paths$fire_root,
+        fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin, span_source = "read_spans")
+    eligible_spans <- copy(res$spans[start <= region$start & end >= region$end])
+    footprint_data[[anchor$anchor_id]] <- load_anchor_footprints(anchor, eligible_spans, region)
+    footprint_data[[anchor$anchor_id]]$region <- region
+  }
+}
+footprint_events <- rbindlist(lapply(footprint_data, function(x) x$events), fill = TRUE)
+footprint_availability <- rbindlist(lapply(footprint_data, function(x) x$availability), fill = TRUE)
+if (length(footprint_data)) {
+  footprint_events[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
+  footprint_availability[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
+  fwrite(footprint_events, file.path(plot_dir, "LCL_top5_footprint_events.tsv.gz"), sep = "\t")
+  fwrite(footprint_availability, file.path(plot_dir, "LCL_top5_footprint_input_coverage.tsv"), sep = "\t")
+}
+```
+
+```{r bin-footprint-midpoints-and-lengths}
+footprint_bins <- list()
+flank <- params$footprint_flank_bp
+max_length <- params$footprint_max_length_bp
+bin_bp <- params$footprint_bin_bp
+stopifnot((2 * flank) %% bin_bp == 0, max_length %% bin_bp == 0)
+for (id in names(footprint_data)) {
+  input <- footprint_data[[id]]
+  support <- input$availability[, .(n_eligible = sum(n_eligible),
+    n_available_samples = sum(available), n_missing_samples = sum(!available)), by = source]
+  events <- copy(input$events[offset_bp >= -flank & offset_bp < flank & length_bp <= max_length])
+  events[, `:=`(x_bin = floor((offset_bp + flank) / bin_bp),
+    y_bin = pmin(floor(length_bp / bin_bp), max_length / bin_bp - 1))]
+  counts <- events[, .(n_footprints = .N), by = .(source, x_bin, y_bin)]
+  grid <- CJ(source = c("FiberHMM_TF", "ft_nucleosome"),
+    x_bin = seq_len(2 * flank / bin_bp) - 1, y_bin = seq_len(max_length / bin_bp) - 1)
+  grid <- merge(grid, counts, by = c("source", "x_bin", "y_bin"), all.x = TRUE)
+  grid[is.na(n_footprints), n_footprints := 0L]
+  grid <- merge(grid, support, by = "source", all.x = TRUE)
+  grid[, `:=`(anchor_id = id, offset_bp = -flank + (x_bin + .5) * bin_bp,
+    length_bp = (y_bin + .5) * bin_bp,
+    calls_per_100_fibers = fifelse(n_eligible > 0, 100 * n_footprints / n_eligible, NA_real_))]
+  footprint_bins[[id]] <- grid
+}
+if (length(footprint_bins))
+  fwrite(rbindlist(footprint_bins), file.path(plot_dir, "LCL_top5_footprint_density_bins.tsv.gz"), sep = "\t")
+```
+
+```{r draw-footprint-midpoint-length-plots, fig.width=12, fig.height=10}
+for (pair_id in names(pair_data)) {
+  # Use an explicit external variable to avoid data.table's column precedence.
+  current_pair <- pair_id
+  links <- anchor_links[pair_id == current_pair]
+  grid <- merge(rbindlist(footprint_bins[links$anchor_id]),
+    links[, .(anchor_id, side, CRE_ID, centre)], by = "anchor_id")
+  grid[, anchor_label := paste(side, CRE_ID, paste0("midpoint ", centre))]
+  grid[, source_label := source]
+  support_labels <- unique(grid[, .(anchor_label, source_label, n_eligible, n_available_samples)])
+  density_plot <- ggplot(grid, aes(offset_bp, length_bp, fill = calls_per_100_fibers)) +
+    geom_tile(width = bin_bp, height = bin_bp) +
+    geom_vline(xintercept = 0, colour = "grey50", linewidth = .25) +
+    geom_text(data = support_labels, aes(x = -flank + bin_bp, y = max_length - bin_bp,
+      label = paste0("n=", n_eligible, "; files ", n_available_samples, "/", length(samples))),
+      inherit.aes = FALSE, hjust = 0, vjust = 1, size = 3) +
+    facet_grid(source_label ~ anchor_label) +
+    scale_fill_viridis_c(name = "Calls / 100\neligible fibers", na.value = "grey80") +
+    coord_cartesian(xlim = c(-flank, flank), ylim = c(0, max_length), expand = FALSE) +
+    theme_bw() + labs(x = "Footprint midpoint relative to cCRE midpoint (bp)",
+      y = "Called footprint length (bp)", title = paste(current_pair, "pooled LCL footprints"),
+      subtitle = "cCRE midpoint anchors; all eligible fibers; TF and nucleosome calls shown separately")
+  print(density_plot)
+  ggsave(file.path(plot_dir, paste0(current_pair, "_footprint_midpoint_length.pdf")),
+    density_plot, width = 12, height = 10)
+
+  # Fixed length slices permit comparison to the reference figures without
+  # treating the protected intervals as MNase fragments.
+  short_plot <- density_plot + coord_cartesian(xlim = c(-flank, flank), ylim = c(0, 100), expand = FALSE)
+  nuc_plot <- density_plot + coord_cartesian(xlim = c(-flank, flank), ylim = c(100, 200), expand = FALSE)
+  ggsave(file.path(plot_dir, paste0(current_pair, "_footprint_length_slices.pdf")),
+    short_plot / nuc_plot, width = 12, height = 14)
+}
+```
+
+```{r footprint-length-side-profiles, fig.width=10, fig.height=6}
+side_profiles <- list()
+for (id in names(footprint_data)) {
+  input <- footprint_data[[id]]
+  support <- input$availability[, .(n_eligible = sum(n_eligible)), by = source]
+  # The central +/- one histogram bin is explicit, rather than claiming
+  # 2 bp boundary resolution from the footprint calls.
+  central <- input$events[abs(offset_bp) <= bin_bp & length_bp <= max_length]
+  counts <- central[, .(n_footprints = .N),
+    by = .(source, length_bin = pmin(floor(length_bp / bin_bp), max_length / bin_bp - 1))]
+  grid <- CJ(source = c("FiberHMM_TF", "ft_nucleosome"), length_bin = seq_len(max_length / bin_bp) - 1)
+  grid <- merge(grid, counts, by = c("source", "length_bin"), all.x = TRUE)
+  grid[is.na(n_footprints), n_footprints := 0L]
+  grid <- merge(grid, support, by = "source")
+  grid[, `:=`(anchor_id = id, length_bp = (length_bin + .5) * bin_bp,
+    calls_per_100_fibers = fifelse(n_eligible > 0, 100 * n_footprints / n_eligible, NA_real_))]
+  side_profiles[[id]] <- grid
+}
+if (length(side_profiles)) {
+  profiles <- merge(rbindlist(side_profiles), anchors[, .(anchor_id, CRE_ID)], by = "anchor_id")
+  p <- ggplot(profiles, aes(calls_per_100_fibers, length_bp, colour = source)) +
+    geom_path() + facet_wrap(~CRE_ID) + theme_bw() +
+    labs(x = "Calls / 100 eligible fibers", y = "Footprint length (bp)",
+      title = sprintf("Length profiles within +/- %g bp of each cCRE midpoint", bin_bp))
+  print(p)
+  ggsave(file.path(plot_dir, "LCL_top5_footprint_length_profiles.pdf"), p, width = 12, height = 8)
+  fwrite(profiles, file.path(plot_dir, "LCL_top5_footprint_length_profiles.tsv"), sep = "\t")
+}
+```
+
+```{r anchor-sequence-resolution-summary}
+# Descriptive sequence context only: reference A/T spacing is a potential
+# methylation-site spacing across both strands, not measured boundary precision.
+sequence_resolution <- list()
+if (nrow(anchors) && file.exists(params$reference_fasta) &&
+    file.exists(paste0(params$reference_fasta, ".fai"))) {
+  for (i in seq_len(nrow(anchors))) {
+    anchor <- anchors[i]
+    left <- max(0, floor(anchor$centre - params$footprint_flank_bp))
+    right <- ceiling(anchor$centre + params$footprint_flank_bp)
+    region <- GenomicRanges::GRanges(anchor$chrom, IRanges::IRanges(left + 1, right))
+    sequence <- as.character(Rsamtools::scanFa(params$reference_fasta, param = region)[[1]])
+    bases <- strsplit(toupper(sequence), "", fixed = TRUE)[[1]]
+    sites <- which(bases %in% c("A", "T"))
+    gaps <- diff(sites)
+    sequence_resolution[[anchor$anchor_id]] <- data.table(anchor_id = anchor$anchor_id,
+      genome_build = params$genome_build, chrom = anchor$chrom, start = left, end = right,
+      n_potential_AT_sites = length(sites),
+      median_AT_gap_bp = if (length(gaps)) median(gaps) else NA_real_,
+      max_AT_gap_bp = if (length(gaps)) max(gaps) else NA_real_,
+      plot_bin_bp = bin_bp)
+  }
+  sequence_table <- rbindlist(sequence_resolution)
+  fwrite(sequence_table, file.path(plot_dir, "LCL_top5_anchor_sequence_spacing.tsv"), sep = "\t")
+  knitr::kable(sequence_table)
+}
+```
+
+A broad or secondary density peak describes the called intervals at these cCRE
+anchors. It is not evidence by itself for a co-bound particle or cooperative
+binding. There is no MNase arm projection or artificial joining of footprints.
+The existing 2×2 test measures cCRE co-accessibility, not TF co-occupancy.
+
+```{r figure-parameter-record}
+jsonlite::write_json(list(params = params, n_samples = length(samples),
+  group = "pooled_LCL", donor_used_in_testing = FALSE, added_qc_filters = FALSE,
+  ccre_read_rule = read_rule, ccre_fire_overlap_fraction = fire_overlap_fraction,
+  tile_observability = "entire tile within primary reference span",
+  footprint_anchor = "each selected cCRE midpoint; reference orientation",
+  footprint_denominator = "primary fibers covering flank + half displayed maximum length; available input files",
+  triangle_tile_bp = lapply(tile_triangles, function(x) x$tile_bp)),
+  file.path(plot_dir, "LCL_figure_parameters.json"), auto_unbox = TRUE, pretty = TRUE, null = "null")
+```
+
+```{r session-information}
+sessionInfo()
+```
