@@ -3,9 +3,10 @@
 
 Adapted from macrophage/03_coaccess_cres.py. Candidate cCREs overlap the union
 of LCL FIRE peaks and share a canonical TSS +/-10 kb window. The interval gap
-must satisfy 500 < gap < 20000. Shared reads overlap both cCREs (default any).
+must satisfy 500 < gap < 20000. Shared reads have aligned bases at both cCREs.
 A cCRE is accessible when ONE FIRE element on that same read covers >=50% of
-the cCRE length. The overlap is neither reciprocal nor summed across elements.
+the cCRE length after intersecting with CIGAR M/= /X blocks. D/N gaps never
+contribute coverage or accessibility; separate FIRE elements are not combined.
 
 Sum raw 2x2 cells across samples before testing. Preserve macrophage two-sided
 Fisher tests on both table+1 and raw counts; apply BH once across unique pooled
@@ -14,7 +15,6 @@ pairs. Donor information is metadata only; there are no LCL timepoints.
 
 import argparse
 import gzip
-import json
 import os
 import subprocess
 import tempfile
@@ -32,6 +32,7 @@ BEDTOOLS = "/project/spott/cshan/envs/bedtools/bin/bedtools"
 TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
 CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
 CELLS = ["co_closed", "CRE1_access", "CRE2_access", "co_access"]
+COVERAGE_MODE = "aligned_blocks_v1"
 
 
 def sample_manifest(path, root):
@@ -51,6 +52,7 @@ def sample_manifest(path, root):
     samples["peaks_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-peaks.bed.gz") for r in samples.itertuples()]
     samples["elements_path"] = [str(Path(r.fire_dir) / "additional-outputs-v0.1/fire-peaks" / f"{r.sample_name}-v0.1-fire-elements.bed.gz") for r in samples.itertuples()]
     samples["spans_path"] = [str(root / s / f"{s}.read_spans.bed.gz") for s in samples.sample_name]
+    samples["blocks_path"] = [str(root / s / f"{s}.aligned_blocks.bed.gz") for s in samples.sample_name]
     return samples
 
 
@@ -104,23 +106,53 @@ def command_lines(command):
             raise RuntimeError(f"{command[0]} failed: {err.read()[:4000]}")
 
 
-def incidence_for_chrom(chrom, cre_bed, spans_path, elements_path, read_rule, fire_fraction, tmpdir):
-    """Covered/accessibility sets stay within one sample and chromosome."""
+def aligned_blocks(fields):
+    """Decode sentinel-free BED12 from bamtobed -bed12 -splitD."""
+    start, end, count = int(fields[1]), int(fields[2]), int(fields[9])
+    sizes = [int(x) for x in fields[10].rstrip(",").split(",")]
+    offsets = [int(x) for x in fields[11].rstrip(",").split(",")]
+    blocks = [(start + offset, start + offset + size) for offset, size in zip(offsets, sizes)]
+    if len(sizes) != count or len(offsets) != count or not blocks or any(
+            s < start or e > end or e < s or (i and s < blocks[i-1][1])
+            for i, (s, e) in enumerate(blocks)):
+        raise ValueError(f"Invalid aligned BED12 blocks for {fields[3]}")
+    # bedtools emits zero-size blocks at terminal/adjacent D/N operators.
+    # They contain no aligned bases and are not an error or a QC exclusion.
+    return [(s, e) for s, e in blocks if e > s]
+
+
+def aligned_overlap(blocks, start, end):
+    return sum(max(0, min(e, end) - max(s, start)) for s, e in blocks)
+
+
+def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, fire_fraction, tmpdir):
+    """Intersect each original FIRE with its own primary aligned blocks."""
     spans = tmpdir / "spans.bed"
     elements = tmpdir / "elements.bed"
-    for source, destination in ((spans_path, spans), (elements_path, elements)):
+    for source, destination in ((blocks_path, spans), (elements_path, elements)):
         with destination.open("w") as output:
             subprocess.run([TABIX, str(source), chrom], stdout=output, check=True)
     coverage = defaultdict(set)
+    blocks_by_read = {}
     command = [BEDTOOLS, "intersect", "-a", str(cre_bed), "-b", str(spans), "-wa", "-wb"]
-    if read_rule == "contain":
-        command += ["-f", "1.0"]
     for fields in command_lines(command):
-        coverage[fields[3]].add(fields[8])  # BED5 cCRE then BED6 read; read ID is B column 4.
+        rid = fields[8]  # BED5 cCRE followed by BED12 primary alignment.
+        if rid not in blocks_by_read:
+            blocks_by_read[rid] = aligned_blocks(fields[5:17])
+        start, end = int(fields[1]), int(fields[2])
+        overlap = aligned_overlap(blocks_by_read[rid], start, end)
+        if overlap > 0 and (read_rule == "any" or overlap == end - start):
+            coverage[fields[3]].add(rid)
     accessible = defaultdict(set)
     for fields in command_lines([BEDTOOLS, "intersect", "-a", str(cre_bed), "-b", str(elements),
                                   "-f", str(fire_fraction), "-wa", "-wb"]):
-        accessible[fields[3]].add(fields[8])
+        # The BED interval fraction is only a cheap upper-bound prefilter.
+        # Sum aligned pieces of THIS element, never pieces of different elements.
+        rid = fields[8]
+        start, end = max(int(fields[1]), int(fields[6])), min(int(fields[2]), int(fields[7]))
+        overlap = aligned_overlap(blocks_by_read.get(rid, ()), start, end)
+        if overlap > 0 and overlap >= fire_fraction * (int(fields[2]) - int(fields[1])):
+            accessible[fields[3]].add(rid)
     orphan_hits = 0
     for cre_id in accessible:
         before = len(accessible[cre_id])
@@ -202,8 +234,14 @@ def main():
     compare = ["sample_name", "fire_dir", "donor", "spans_path", "elements_path"]
     if not saved_manifest[compare].equals(samples[compare]):
         raise ValueError("Manifest differs from current sample CSV/root; rebuild LCL_fire_universe.sh")
-    require_files([p for col in ("spans_path", "elements_path") for p in samples[col]] +
-                  [p + ".tbi" for col in ("spans_path", "elements_path") for p in samples[col]])
+    require_files([p for col in ("blocks_path", "elements_path") for p in samples[col]] +
+                  [p + ".tbi" for col in ("blocks_path", "elements_path") for p in samples[col]])
+    for sample in samples.itertuples(index=False):
+        marker = Path(sample.blocks_path + ".source.tsv")
+        if not marker.exists() or marker.read_text().splitlines()[:2] != [sample.cram_path, COVERAGE_MODE]:
+            raise ValueError(f"Rebuild aligned blocks for {sample.sample_name}: missing/current provenance required")
+        if Path(sample.blocks_path).stat().st_mtime < Path(sample.cram_path).stat().st_mtime:
+            raise ValueError(f"Aligned blocks predate CRAM for {sample.sample_name}")
     cre = pd.read_csv(uni / "cre_universe.bed", sep="\t", header=None,
                      names=["chrom", "start", "end", "CRE_ID", "CRE_label"])
     memberships = pd.read_csv(uni / "cre_gene_map.tsv.gz", sep="\t", keep_default_na=False)
@@ -217,8 +255,6 @@ def main():
         raise ValueError("No candidate pairs after gene-window and distance filters")
     out_dir = args.out_dir or (args.root / "coaccess" if not args.chrom else args.root / "smoke" / args.chrom)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # A successful run is published by run_info.json LAST. The Rmd rejects incomplete reruns.
-    (out_dir / "run_info.json").unlink(missing_ok=True)
     pooled = np.zeros((len(pairs), 4), dtype=np.int64)
     contributing_samples = np.zeros(len(pairs), dtype=np.int64)
     qc = []
@@ -237,7 +273,7 @@ def main():
             involved = set(chrom_pairs.CRE1) | set(chrom_pairs.CRE2)
             cre[cre.CRE_ID.isin(involved)].to_csv(cre_bed, sep="\t", index=False, header=False)
             for sample in samples.itertuples(index=False):
-                cov, acc, orphans = incidence_for_chrom(chrom, cre_bed, sample.spans_path, sample.elements_path,
+                cov, acc, orphans = incidence_for_chrom(chrom, cre_bed, sample.blocks_path, sample.elements_path,
                                                        args.read_rule, args.fire_overlap_fraction, temp)
                 cells = count_pairs(chrom_pairs, cov, acc)
                 pooled[idx] += cells
@@ -278,6 +314,7 @@ def main():
     result["dataset"] = "LCL"
     result["analysis_scope"] = args.chrom or "genome-wide"
     result["n_samples"] = len(samples)
+    result["coverage_mode"] = COVERAGE_MODE
     for field in ("read_rule", "fire_overlap_fraction", "min_dist", "max_dist", "pseudocount"):
         result[field] = getattr(args, field)
     annotations = gene_map.groupby("CRE_pair", sort=False).agg(
@@ -296,11 +333,7 @@ def main():
         temporary.replace(destination)
     sample_counts_tmp.replace(out_dir / "LCL_pair_sample_counts.tsv.gz")
     samples.to_csv(out_dir / "sample_manifest.tsv", sep="\t", index=False)
-    info = vars(args).copy()
-    info.update(dataset="LCL", n_samples=len(samples), analysis_scope=args.chrom or "genome-wide",
-                candidate_pairs=len(pairs), tested_pairs=len(result), fdr_scope="all unique tested pairs in analysis_scope",
-                sample_names=samples.sample_name.tolist(), donor_used_in_testing=False)
-    (out_dir / "run_info.json").write_text(json.dumps(info, indent=2, default=str) + "\n")
+    (out_dir / "RERUN_PENDING.txt").unlink(missing_ok=True)
     print(f"Completed: {len(result)} pooled pairs; {int((result.fdr < .05).sum())} with FDR <0.05 -> {out_dir}", flush=True)
 
 

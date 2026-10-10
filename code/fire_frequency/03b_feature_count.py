@@ -7,6 +7,8 @@ one-to-one on region_id + timepoint. For every union region and timepoint:
     n_reads              distinct reads whose aligned span fully covers the region
     n_fire               spanning reads with >= 1 FIRE element covering >= 50% of the
                          region (= fire_n_reads; equals 03's n_fire)
+    peak_bp              bp of the region covered by this timepoint's own FIRE peaks
+                         (peaks file columns 1-3, merged); 0 if it called no peak there
     <k>_n_elements       feature-k elements on spanning reads
     <k>_n_reads          spanning reads with >= 1 feature-k element
     <k>_n_elements_gated / <k>_n_reads_gated
@@ -17,6 +19,8 @@ Features (ex: footprints, FIRE regions):
     fire   FIRE elements (same file as 03), element covers >= 50% of the region
     fp     FiberHMM TF footprints, score >= 50 and 10-80 bp, footprint lies 100%
            inside the region; not required to sit inside a FIRE element; gate = fire
+    fp_peak  the same footprints, but only those also lying 100% inside one of this
+           timepoint's FIRE peaks (the peak_bp intervals); same reads and gate as fp
 
 Rates (NA when the denominator is 0):
     fire_freq                fire_n_reads / n_reads        (= 03's freq)
@@ -68,6 +72,13 @@ def run_intersect(args_list, desc):
     if p.returncode != 0:
         sys.exit(f"ERROR: {desc} failed:\n{p.stderr[:2000]}")
     return p.stdout
+
+
+def run_to_file(args_list, out_bed, desc):
+    with open(out_bed, "w") as fh:
+        p = subprocess.run(args_list, stdout=fh, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        sys.exit(f"ERROR: {desc} failed:\n{p.stderr[:2000]}")
 
 
 def tabix_awk(path, chrom, out_bed, program, awk_vars=None):
@@ -135,6 +146,20 @@ def fiberhmm_label(s):
     return s.replace("_", "")       # LPS_5 -> LPS5
 
 
+# FIRE peaks bed: '#chrom' header, columns 1-3 are the full peak interval (the same
+# columns 01_make_fire_universe.sh merges into the union). Peaks overlap within a
+# timepoint, so they are merged.
+def peaks_path(s):
+    return Path(FIRE_ROOT) / s / f"{s}-fire-v0.1-peaks.bed.gz"
+
+
+def load_merged_peaks(path, chrom, out_bed):
+    raw = out_bed.with_suffix(".raw.bed")
+    tabix_awk(path, chrom, raw, 'BEGIN { FS = OFS = "\\t" } { print $1, $2, $3 }')
+    run_to_file([BEDTOOLS, "merge", "-i", str(raw)], out_bed, f"merge {raw.name}")
+    raw.unlink()
+
+
 ###############################
 # feature registry. Rules are bedtools intersect flags with regions as -a:
 #   -f x   element covers >= x of the region     -F x   >= x of the element is inside
@@ -158,6 +183,14 @@ FEATURES = {
         "flag": "-F", "min_frac": 1.0,
         "gate": "fire",
     },
+    "fp_peak": {
+        "path": lambda s, chrom, args: Path(args.tf_root) / fiberhmm_label(s) /
+                f"{fiberhmm_label(s)}_hmm_extracted_tf_{chrom}.bed.gz",
+        "load": load_fiberhmm_blocks,
+        "flag": "-F", "min_frac": 1.0,
+        "gate": "fire",
+        "within_peaks": True,                   # also 100% inside a merged peak
+    },
 }
 
 ###############################
@@ -176,7 +209,7 @@ FEATURES = {
 
 
 def count_columns():
-    cols = ["n_reads"]
+    cols = ["n_reads", "peak_bp"]
     for k, spec in FEATURES.items():
         cols += [f"{k}_n_elements", f"{k}_n_reads"]
         if spec["gate"]:
@@ -205,7 +238,7 @@ def feature_hits(regions_bed, feature_bed, flag, min_frac):
 def counts_for_chrom(chrom, regions, s, spans_path, args, tmpdir):
     """({region_id: {count column: value}}, {feature: dropped hits}) for one chromosome.
 
-    Only regions with >= 1 spanning read are returned; missing columns are 0.
+    Only regions with >= 1 spanning read or peak bp are returned; missing columns are 0.
     """
     
     sub = regions[regions["chrom"] == chrom]
@@ -223,11 +256,27 @@ def counts_for_chrom(chrom, regions, s, spans_path, args, tmpdir):
     spans_chr.unlink()
 
     counts = {r: {"n_reads": len(reads)} for r, reads in cov.items()}
+
+    # this timepoint's merged FIRE peaks; each lies inside one union region
+    peaks_chr = tmpdir / f"peaks.{chrom}.bed"
+    load_merged_peaks(peaks_path(s), chrom, peaks_chr)
+    for line in run_intersect(
+            [BEDTOOLS, "intersect", "-a", str(reg_chr), "-b", str(peaks_chr), "-wo"],
+            f"intersect {peaks_chr.name}").splitlines():
+        f = line.split("\t")
+        c = counts.setdefault(f[3], {})
+        c["peak_bp"] = c.get("peak_bp", 0) + int(f[-1])
+
     positive = {}       # feature -> {region_id: spanning reads with >= 1 element}
     dropped = {}
     for k, spec in FEATURES.items():
         feat_chr = tmpdir / f"{k}.{chrom}.bed"
         spec["load"](spec["path"](s, chrom, args), chrom, feat_chr, args)
+        if spec.get("within_peaks"):
+            inside = tmpdir / f"{k}.{chrom}.in_peaks.bed"
+            run_to_file([BEDTOOLS, "intersect", "-a", str(feat_chr), "-b", str(peaks_chr),
+                         "-f", "1.0", "-u"], inside, f"intersect {feat_chr.name} with peaks")
+            inside.replace(feat_chr)
         hits = feature_hits(reg_chr, feat_chr, spec["flag"], spec["min_frac"])
         feat_chr.unlink()
 
@@ -253,6 +302,7 @@ def counts_for_chrom(chrom, regions, s, spans_path, args, tmpdir):
                 c[f"{k}_n_reads_gated"] = len(reads & g)
 
     reg_chr.unlink()
+    peaks_chr.unlink()
     return counts, dropped
 
 
@@ -276,6 +326,9 @@ def check(df):
         if spec["gate"]:
             assert (df[f"{k}_n_elements_gated"] <= df[f"{k}_n_elements"]).all(), k
             assert (df[f"{k}_n_reads_gated"] <= df[f"{k}_n_reads"]).all(), k
+    assert (df["peak_bp"] <= df["width"]).all()
+    assert (df["fp_peak_n_elements"] <= df["fp_n_elements"]).all()
+    assert (df["fp_peak_n_elements_gated"] <= df["fp_n_elements_gated"]).all()
     for col, den in [("fire_freq", "n_reads"), ("fp_freq_given_fire", "n_fire")]:
         assert df[col].dropna().between(0, 1).all(), col
         assert (df[col].isna() == (df[den] == 0)).all(), col
@@ -320,7 +373,7 @@ def main():
 
     # fail before any counting if an input is missing
     for s in args.timepoints:
-        need = [Path(args.spans_root) / s / f"{s}.read_spans.bed.gz"]
+        need = [Path(args.spans_root) / s / f"{s}.read_spans.bed.gz", peaks_path(s)]
         need += [spec["path"](s, c, args) for spec in FEATURES.values() for c in region_chroms]
         for f in need:
             if not f.is_file():

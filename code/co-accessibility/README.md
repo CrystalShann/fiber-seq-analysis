@@ -3,8 +3,13 @@
 The two datasets have separate scripts. Both retain cCRE pairs sharing canonical
 TSS +/-10 kb windows, with strict `500 < interval gap < 20000` on chr1-22/X/Y.
 A same-read FIRE element must cover **at least 50% of the cCRE length**. The
-denominator uses primary alignment spans overlapping both cCREs (`any` by default).
+LCL denominator uses primary **aligned blocks** overlapping both cCREs (`any`
+by default); CIGAR `D` and `N` gaps are unobserved. Macrophage scripts retain
+their existing primary-span rule.
 Different FIRE elements are not combined to reach 50%; the overlap is not reciprocal.
+For LCL, only the intersection of a FIRE element with its own read's aligned
+blocks contributes to the 50% threshold. Pieces of the same element are summed,
+but gaps and separate elements never contribute to that sum.
 
 FIRE peaks select the candidate cCRE universe by >=1 bp overlap, retaining cCRE
 coordinates. Per-read FIRE elements provide accessibility calls. These are different
@@ -43,7 +48,7 @@ Annotations: `/project/spott/cshan/annotations/GRCh38-cCREs.bed` and
 | Script | Action |
 |---|---|
 | [LCL_fire_universe.sh](LCL/LCL_fire_universe.sh) | Validate the 31-sample manifest; build genome-wide FIRE peak union, cCRE/gene universe, and sample peak metadata |
-| [LCL_read_spans.sh](LCL/LCL_read_spans.sh) | SLURM array, one task per sample, at most six concurrent; extract/index primary alignment BED6 spans |
+| [LCL_read_spans.sh](LCL/LCL_read_spans.sh) | SLURM array, one task per sample, at most six concurrent; extract/index primary aligned BED12 blocks using `bamtobed -bed12 -splitD` |
 | [LCL_coaccess_cres.py](LCL/LCL_coaccess_cres.py) | Count per sample/chromosome, pool raw counts across all31, test once per unique pair, correct genome-wide |
 | [LCL_run_coaccess.sh](LCL/LCL_run_coaccess.sh) | SLURM launcher for the standalone LCL Python script |
 | [LCL_plot_coaccess.sh](LCL/LCL_plot_coaccess.sh) | Render the top-five notebook after the analysis job succeeds |
@@ -55,7 +60,8 @@ mkdir -p /project/spott/cshan/fiber-seq/results/logs
 bash LCL_fire_universe.sh
 span_job=$(sbatch --parsable LCL_read_spans.sh)
 analysis_job=$(sbatch --parsable --dependency="afterok:${span_job}" LCL_run_coaccess.sh)
-sbatch --dependency="afterok:${analysis_job}" LCL_plot_coaccess.sh
+# After counting completes, run/knit LCL_co-access.Rmd in R.
+# LCL_plot_coaccess.sh is an optional launcher, not required for plotting.
 ```
 
 `LCL_COACCESS_ROOT` can set a separate output root and `LCL_SAMPLE_METATABLE`
@@ -84,18 +90,21 @@ Outputs under `LCL_project/co-accessibility/`:
 - `universe/sample_manifest.tsv`, `sample_inputs.tsv`: all31 input identities and paths.
 - `universe/{fire_peaks_union.bed,cre_universe.bed,gene_windows.bed,cre_gene_map.tsv.gz,cre_in_sample_peaks.tsv.gz}`.
 - `universe/universe.complete`: published last; interrupted universe builds cannot be used for counting.
-- `<sample>/<sample>.read_spans.bed.gz`, `.tbi`, `.source.tsv`.
+- `<sample>/<sample>.aligned_blocks.bed.gz`, `.tbi`, `.source.tsv`: sentinel-free BED12, one primary read per row; only M/= /X blocks. Old `.read_spans.bed.gz` files are not used for LCL counting.
 - `coaccess/LCL_coaccess_pairs.tsv.gz`: one row per unique pair with both FDRs, effects and rule metadata.
 - `coaccess/LCL_coaccess_stat.tsv.gz`: gene-oriented results; a pair may occur for multiple genes.
 - `coaccess/LCL_pair_sample_counts.tsv.gz`: raw per-sample cells, including zeros, with donor labels.
-- `coaccess/LCL_count_qc.tsv.gz`, `sample_manifest.tsv`, `run_info.json`: provenance and completion marker.
+- `coaccess/LCL_count_qc.tsv.gz`, `sample_manifest.tsv`: provenance.
 - `coaccess/plots/top5/`: selected pairs, fiber metadata, read plots and configuration bars.
 
 The notebook selects `fdr < 0.05`, `OR > 1`, and `co_access > expected_co_access`,
 then orders by FDR, descending OR, descending shared coverage and pair ID. It
 shows fewer than five if necessary. Display downsampling never changes counts
 or tests. Recompute older outputs made with >=1 bp FIRE overlap; the notebook
-requires matching `fire_overlap_fraction=0.5` and `read_rule=any` metadata.
+requires matching `fire_overlap_fraction=0.5`, `read_rule=any`, and
+`coverage_mode=aligned_blocks_v1` metadata. Old continuous-span results must be
+recomputed genome-wide, including both FDR columns. The candidate FIRE/cCRE
+universe does not change. No new MAPQ, donor, or sample filters are applied.
 
 The plotting steps are directly in `LCL/LCL_co-access.Rmd`, in separate chunks
 for loading fibers, verifying counts, exporting metadata, preparing display
@@ -105,6 +114,14 @@ sources `parsing_footprints_functions.r` and `plotting_functions.r` from
 Run the chunks in order or knit the notebook; `LCL_plot_coaccess.sh` remains an
 optional SLURM launcher. The m6A profile and rasters use the displayed subset
 (at most 120 fibers per pair by default); counts and bars use all shared fibers.
+Backbones and annotation intervals are split at alignment gaps, and the m6A
+denominator uses distinct fibers actually aligned at each position. Fibers with
+no aligned bases at either cCRE are excluded from that pair, not labelled closed.
+
+Regression checks are in `LCL/tests/test_aligned_blocks.py` and
+`LCL/tests/test_aligned_blocks.R` (run from the repository root). They cover D/N
+gaps, M/= /X bases, same-element sums, separate-element exclusion, the exact 50%
+boundary, clipped plotting tracks and preservation of the macrophage code path.
 
 `--chrom chr21` is an explicit smoke-test mode, written by default under
 `smoke/chr21/`. Its FDR is chromosome-scoped and it is not a genome-wide result.

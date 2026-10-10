@@ -1522,8 +1522,11 @@ tabix_region <- function(path, chrom, start, end, col_names, tabix_bin) {
   if (!is.null(status) && status != 0L)
     stop("tabix failed (status ", status, ") for ", path, " at ", q)
   if (length(txt) == 0)
-    return(data.table::data.table(matrix(character(0), ncol = length(col_names),
-                                         dimnames = list(NULL, col_names))))
+    # Logical empty columns adopt the populated columns' types in rbindlist.
+    # Character empty columns would convert BED coordinates to text when a
+    # sample has no overlaps, breaking subsequent overlap arithmetic.
+    return(data.table::as.data.table(stats::setNames(
+      rep(list(logical(0)), length(col_names)), col_names)))
   dt <- data.table::fread(text = paste(txt, collapse = "\n"), header = FALSE,
                           sep = "\t", showProgress = FALSE)
   data.table::setnames(dt, seq_along(col_names), col_names)
@@ -1550,19 +1553,27 @@ tabix_region <- function(path, chrom, start, end, col_names, tabix_bin) {
 #                 their respective *_read_spans.sh); "fire_all": `ft fire --extract --all` rows
 #                 collapsed to one span per read (min start, max end of the rows
 #                 overlapping the window) with the read's HP tag (LCL)
+#                 "aligned_blocks": sentinel-free primary BED12 from
+#                 <root>/<s>/<s>.aligned_blocks.bed.gz (LCL); retain D/N gaps.
 # Output:
 #   list(region, samples, spans, elements); spans and elements carry
-#   sample_name and key. Stops when no fiber overlaps the window
+#   sample_name and key. In aligned_blocks mode, blocks stores aligned intervals
+#   and elements contains clipped pieces with original element_id preserved.
+#   Stops when no fiber overlaps the window
 # ---------------------------------------------------------------------------
 load_region <- function(region, samples, root, fire_root, fire_ver = "v0.1",
-                        tabix_bin, span_source = c("read_spans", "fire_all")) {
+                        tabix_bin, span_source = c("read_spans", "fire_all", "aligned_blocks")) {
   span_source <- match.arg(span_source)
   span_cols <- c("chrom", "start", "end", "RID", "mapq", "strand")
   elem_cols <- c("chrom", "start", "end", "RID", "score", "strand",
                  "tstart", "tend", "rgb", "fdr", "HP")
 
   spans <- data.table::rbindlist(lapply(samples, function(s) {
-    if (span_source == "read_spans") {
+    if (span_source == "aligned_blocks") {
+      d <- tabix_region(file.path(root, s, paste0(s, ".aligned_blocks.bed.gz")),
+        region$chrom, region$start, region$end,
+        c(span_cols, "tstart", "tend", "rgb", "blockCount", "blockSizes", "blockStarts"), tabix_bin)
+    } else if (span_source == "read_spans") {
       d <- tabix_region(file.path(root, s, paste0(s, ".read_spans.bed.gz")),
                         region$chrom, region$start, region$end, span_cols, tabix_bin)
     } else {
@@ -1591,7 +1602,45 @@ load_region <- function(region, samples, root, fire_root, fire_ver = "v0.1",
   spans[, key := paste(sample_name, RID)]
   if (nrow(elements)) elements[, key := paste(sample_name, RID)]
 
-  list(region = region, samples = samples, spans = spans, elements = elements)
+  blocks <- NULL
+  if (span_source == "aligned_blocks") {
+    if (anyDuplicated(spans$key)) stop("Duplicate primary read identities in aligned blocks")
+    sizes <- strsplit(sub(",$", "", as.character(spans$blockSizes)), ",", fixed = TRUE)
+    offsets <- strsplit(sub(",$", "", as.character(spans$blockStarts)), ",", fixed = TRUE)
+    counts <- lengths(sizes)
+    if (any(counts != as.integer(spans$blockCount)) || any(lengths(offsets) != counts))
+      stop("Invalid aligned BED12 block counts")
+    blocks <- spans[rep(seq_len(.N), counts), .(chrom, start, end, RID, sample_name, key)]
+    blocks[, start := start + as.numeric(unlist(offsets))]
+    blocks[, end := start + as.numeric(unlist(sizes))]
+    if (anyNA(blocks$start) || anyNA(blocks$end) || any(blocks$end < blocks$start))
+      stop("Invalid aligned BED12 coordinates")
+    # bamtobed -splitD emits empty blocks around terminal/adjacent D/N gaps.
+    blocks <- blocks[end > start]
+    # Preserve original element identity when its aligned pieces are split.
+    elements[, element_id := seq_len(.N)]
+    elements <- clip_to_aligned_blocks(elements, blocks)
+  }
+  list(region = region, samples = samples, spans = spans, elements = elements,
+       blocks = blocks)
+}
+
+
+# Intersect annotations with blocks from the same sample/read. Keep every
+# original row's metadata (especially element_id); use half-open BED intervals.
+clip_to_aligned_blocks <- function(track, blocks) {
+  if (is.null(track) || !nrow(track) || is.null(blocks)) return(track)
+  if (!nrow(blocks)) return(track[0])
+  query <- track[, .(key = as.character(key), start, end = end - 1)]
+  subject <- blocks[, .(key = as.character(key), start, end = end - 1)]
+  data.table::setkeyv(subject, c("key", "start", "end"))
+  hits <- data.table::foverlaps(query, subject, by.x = c("key", "start", "end"),
+    by.y = c("key", "start", "end"), type = "any", nomatch = 0L, which = TRUE)
+  if (!nrow(hits)) return(track[0])
+  out <- data.table::copy(track[hits$xid])
+  out[, start := pmax(start, subject$start[hits$yid])]
+  out[, end := pmin(end, subject$end[hits$yid] + 1)]
+  out[]
 }
 
 
@@ -1729,6 +1778,10 @@ load_ft_tracks <- function(res, keys = NULL, ft_root, hmm_root = NULL, tabix_bin
     by_size     = data.table::rbindlist(lapply(FP_SIZE_BINS, grab_size), fill = TRUE),
     recalled_tf = grab_recalled_tf(),
     none        = data.table::data.table())
+  if (!is.null(res$blocks)) {
+    for (track in c("m6a", "nuc", "size_fps"))
+      res[[track]] <- clip_to_aligned_blocks(res[[track]], res$blocks)
+  }
   res
 }
 
@@ -1763,6 +1816,11 @@ label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain"),
 
   # which fibers cover the interval s-e under read_rule
   covers <- function(s, e) {
+    if (!is.null(res$blocks)) {
+      b <- res$blocks[start < e & end > s]
+      covered <- b[, .(bp = sum(pmin(end, e) - pmax(start, s))), by = key]
+      return(sp$key %in% covered[bp > 0 & (read_rule == "any" | bp >= e - s), key])
+    }
     if (read_rule == "contain") sp$start <= s & sp$end >= e
     else sp$start < e & sp$end > s
   }
@@ -1772,6 +1830,11 @@ label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain"),
   # Apply the threshold to each single element, then take distinct fiber keys.
   hit <- function(s, e) {
     if (nrow(el) == 0) return(character(0))
+    if (!is.null(res$blocks)) {
+      pieces <- el[start < e & end > s]
+      overlap <- pieces[, .(bp = sum(pmin(end, e) - pmax(start, s))), by = .(key, element_id)]
+      return(unique(overlap[bp > 0 & bp >= fire_overlap_fraction * (e - s), key]))
+    }
     overlap <- pmin(el$end, e) - pmax(el$start, s)
     unique(el$key[overlap > 0 & overlap >= fire_overlap_fraction * (e - s)])
   }
@@ -1826,14 +1889,14 @@ order_reads <- function(res, labels, samples) {
 # Output:
 #   data.table pos, sample_name (factor), frac; empty when there are no calls
 # ---------------------------------------------------------------------------
-coaccess_m6a_fraction <- function(m, sp, samples) {
+coaccess_m6a_fraction <- function(m, sp, samples, blocks = NULL) {
   if (is.null(m) || nrow(m) == 0) return(data.table::data.table())
   prop <- data.table::rbindlist(lapply(samples, function(s) {
     ms <- m[sample_name == s]
-    ss <- sp[sample_name == s]
+    ss <- if (is.null(blocks)) sp[sample_name == s] else blocks[sample_name == s & key %in% sp$key]
     if (nrow(ms) == 0 || nrow(ss) == 0) return(NULL)
     d <- ms[, .(met_n = data.table::uniqueN(key)), by = .(pos = start)]
-    d[, cov_n := vapply(pos, function(x) sum(ss$start <= x & ss$end > x),
+    d[, cov_n := vapply(pos, function(x) data.table::uniqueN(ss$key[ss$start <= x & ss$end > x]),
                         numeric(1))]
     d[, .(pos, sample_name = s, frac = met_n / cov_n)]
   }))

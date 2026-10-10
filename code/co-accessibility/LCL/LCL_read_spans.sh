@@ -11,8 +11,8 @@
 #SBATCH --output=/project/spott/cshan/fiber-seq/results/logs/LCL_coaccess_spans_%A_%a.out
 #SBATCH --error=/project/spott/cshan/fiber-seq/results/logs/LCL_coaccess_spans_%A_%a.err
 
-# One indexed genome-wide BED6 per sample; no donor filtering, MAPQ cutoff, or
-# reconstruction from fire_all segments. Same primary alignment rule as macrophages.
+# One BED12 per primary alignment with only M/= /X blocks (split on D and N).
+# Keep BED6 outer spans for metadata; LCL counting uses aligned_blocks only.
 set -euo pipefail
 OUT_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-accessibility}
 INPUTS="$OUT_ROOT/universe/sample_inputs.tsv"
@@ -35,29 +35,32 @@ fi
 IFS=$'\t' read -r sample_name cram_path peaks_path elements_path spans_path <<< "$record"
 [[ -s "$cram_path" && -s "$cram_path.crai" && -s "$REF" ]] || { echo "Missing CRAM/reference" >&2; exit 1; }
 mkdir -p -- "$(dirname -- "$spans_path")"
+blocks_path="$(dirname -- "$spans_path")/$sample_name.aligned_blocks.bed.gz"
 
-if [[ -s "$spans_path" && -s "$spans_path.tbi" && -s "$spans_path.source.tsv" ]]; then
-    if [[ $(head -n 1 "$spans_path.source.tsv") == "$cram_path" && "$spans_path" -nt "$cram_path" ]]; then
-        "$TABIX" -l "$spans_path" > /dev/null
-        echo "Reusing primary read spans for $sample_name"
+if [[ -s "$blocks_path" && -s "$blocks_path.tbi" && -s "$blocks_path.source.tsv" ]]; then
+    if [[ $(head -n 1 "$blocks_path.source.tsv") == "$cram_path" &&
+          $(sed -n '2p' "$blocks_path.source.tsv") == aligned_blocks_v1 && "$blocks_path" -nt "$cram_path" ]]; then
+        "$TABIX" -l "$blocks_path" > /dev/null
+        echo "Reusing aligned blocks for $sample_name"
         exit 0
     fi
 fi
 tmpdir=$(mktemp -d "${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/lcl-spans.XXXXXX")
-partial="$spans_path.partial.${SLURM_JOB_ID:-$$}.gz"
+partial="$blocks_path.partial.${SLURM_JOB_ID:-$$}.gz"
 trap 'rm -rf -- "$tmpdir"; rm -f -- "$partial" "$partial.tbi"' EXIT
 threads=${SLURM_CPUS_PER_TASK:-8}
 export LC_ALL=C
-echo "Extracting genome-wide primary spans for $sample_name"
+echo "Extracting genome-wide primary aligned blocks for $sample_name"
 for chrom in chr{1..22} chrX chrY; do
     "$SAMTOOLS" view -T "$REF" -F 0x900 -@ "$threads" -b "$cram_path" "$chrom" \
-        | "$BEDTOOLS" bamtobed -i stdin
+        | "$BEDTOOLS" bamtobed -bed12 -splitD -i stdin
 done | "$BGZIP" -@ "$threads" -c > "$partial"
 "$TABIX" -p bed "$partial"
 # Counting uses read IDs within samples; duplicate primary names must not be fused.
 gzip -cd -- "$partial" | cut -f4 | sort -S 2G -T "$tmpdir" | uniq -d > "$tmpdir/duplicate_ids"
 [[ ! -s "$tmpdir/duplicate_ids" ]] || { echo "Duplicate primary read IDs in $sample_name" >&2; exit 1; }
-mv -- "$partial" "$spans_path"
-mv -- "$partial.tbi" "$spans_path.tbi"
-{ printf '%s\n' "$cram_path"; printf 'alignment_filter\tprimary (-F 0x900)\n'; } > "$spans_path.source.tsv"
-echo "Read spans ready: $spans_path"
+rm -f -- "$blocks_path.source.tsv"
+mv -- "$partial" "$blocks_path"
+mv -- "$partial.tbi" "$blocks_path.tbi"
+{ printf '%s\n' "$cram_path" aligned_blocks_v1; printf 'alignment_filter\tprimary (-F 0x900); no MAPQ cutoff\n'; } > "$blocks_path.source.tsv"
+echo "Aligned blocks ready: $blocks_path"

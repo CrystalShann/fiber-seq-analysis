@@ -1066,7 +1066,7 @@ coaccess_region_result <- function(res, cre1, cre2, labels, cres = NULL,
     m[, key := factor(key, levels = lev)]
     m[, sample_name := factor(sample_name, levels = samples)]
   }
-  prop <- as.data.frame(coaccess_m6a_fraction(m, sp, samples))
+  prop <- as.data.frame(coaccess_m6a_fraction(m, sp, samples, blocks = res$blocks))
   prop$base <- rep("A", nrow(prop))
 
   # Return consistently typed empty tables when an optional track is absent.
@@ -1089,7 +1089,8 @@ coaccess_region_result <- function(res, cre1, cre2, labels, cres = NULL,
   reads <- as_region_rows(m)
   reads$pos <- reads$start
   reads$base <- factor(rep("A", nrow(reads)), levels = c("A", "CG"))
-  fire <- rbind(as_region_rows(sp, "linker"), as_region_rows(el, "FIRE element"))
+  backbones <- if (is.null(res$blocks)) sp else res$blocks[key %in% keep]
+  fire <- rbind(as_region_rows(backbones, "linker"), as_region_rows(el, "FIRE element"))
   nucs <- as_region_rows(res$nuc, "nucleosome")
   fps <- as_region_rows(res$size_fps)
   # The old drawing loop included exactly these bins, in descending size order.
@@ -1102,7 +1103,7 @@ coaccess_region_result <- function(res, cre1, cre2, labels, cres = NULL,
                  (ct$start == cre2$start & ct$end == cre2$end)
   }
   list(region = list(chr = res$region$chrom, start = res$region$start, end = res$region$end),
-    sample_names = samples, reads = reads, rids_df = as_region_rows(sp),
+    sample_names = samples, reads = reads, rids_df = as_region_rows(backbones),
     fire = fire, fire_peaks = NULL, fps = fps, fps_infire = fps, nucs = nucs,
     pileup = prop, size_levels = FP_SIZE_BINS, nuc_label = "nucleosome",
     group_col = "sample_name", peaks_df = ct,
@@ -1172,7 +1173,7 @@ configuration_proportion_inputs <- function(labels, samples) {
 #   result, bars, region, height = suggested figure height in inches)
 # ---------------------------------------------------------------------------
 plot_coaccess_pair <- function(pair, samples, paths,
-                               span_source = c("read_spans", "fire_all"),
+                               span_source = c("read_spans", "fire_all", "aligned_blocks"),
                                nuc_source = c("fiberhmm", "ft"),
                                tf_source = c("by_size", "recalled_tf", "none"),
                                facet_by = c("sample", "pooled", "hp"),
@@ -1231,7 +1232,7 @@ plot_coaccess_pair <- function(pair, samples, paths,
       if (!is.null(d) && nrow(d)) d[, sample_name := unname(facet_of[key])]
       d
     }
-    for (nm in c("spans", "elements", "m6a", "nuc", "size_fps")) res[[nm]] <- relabel(res[[nm]])
+    for (nm in c("spans", "blocks", "elements", "m6a", "nuc", "size_fps")) res[[nm]] <- relabel(res[[nm]])
     labs_facet <- data.table::copy(labs)[, sample_name := unname(facet_of[key])]
     res$samples <- facets
   }

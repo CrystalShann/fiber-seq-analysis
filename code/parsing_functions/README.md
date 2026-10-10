@@ -82,6 +82,7 @@ raster of the co-accessibility figures) and, sliced into `parsed/`, by
 | FIRE peaks | 29 (v0.1) | `<FIRE root>/<sample>/<sample>-fire-v0.1-peaks.bed.gz` | sliced to `parsed/fire_peaks.bed` by both scripts, read by `read_fire_peaks_region()` |
 | `fire_all` (`ft fire --extract --all`) | 11 (`FIRE_BED_COLS`): per-read segments coloured nucleosome (169,169,169), linker (147,112,219) or FIRE, with the HP tag | LCL only: `/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results/<sample>/extracted_results/<sample>.fire_all.bed.gz` | `load_region(span_source = "fire_all")`; sliced to `parsed/fire.bed` by `extract_region_result_lcl.sh` |
 | read spans | one primary alignment per row | macrophage only: `/project/spott/cshan/fiber-seq/macrophage_project/co-accessibility/<sample>/<sample>.read_spans.bed.gz` (`co-accessibility/macrophage/02_read_spans.sh`) | `load_region(span_source = "read_spans")` |
+| aligned blocks | primary BED12, split at CIGAR D/N; no sentinels | LCL: `LCL_project/co-accessibility/<sample>/<sample>.aligned_blocks.bed.gz` | `load_region(span_source = "aligned_blocks")` |
 
 `<FIRE root>` is `/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE`
 (macrophage) or `/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results` (LCL).
@@ -190,7 +191,7 @@ and TF footprint tracks are display only. Fibers are keyed `"<sample> <read name
 | `CONFIG_LEVELS` | Fiber configurations: both accessible, CRE1 only, CRE2 only, neither | character |
 | `CCRE_CLASSES` | ENCODE SCREEN v4 cCRE classes: `PLS`, `pELS`, `dELS`, `CA-H3K4me3`, `CA-CTCF`, `CA-TF`, `CA`, `TF` | character |
 | `tabix_region()` | Tabix query of a BED region with the command line tool (1-based query) | data.table |
-| `load_region()` | Fiber spans and FIRE elements of one window across samples; `span_source = "read_spans"` (macrophage) or `"fire_all"` (LCL, collapsed per read, with HP) | list `region, samples, spans, elements` |
+| `load_region()` | Fiber spans and FIRE elements; `span_source = "aligned_blocks"` for LCL co-accessibility, `"read_spans"` for macrophage, or legacy `"fire_all"` for HP displays | list `region, samples, spans, elements, blocks`; aligned mode clips elements while preserving their IDs |
 | `load_ft_tracks()` | Adds the display tracks: `ft extract` m6A; nucleosomes (`nuc_source = "fiberhmm"` or `"ft"`); TF footprints (`tf_source = "by_size"`, `"recalled_tf"` or `"none"`) | the result with `m6a, nuc, size_fps` |
 | `label_reads()` | Per-fiber configuration at the pair: accessible when one of its FIRE elements overlaps the cCRE by >= 1 bp; `read_rule = "any"` or `"contain"` | data.table `key, sample_name, shared, acc1, acc2, config` |
 | `order_reads()` | Raster order: sample, configuration, start | character vector of keys |
@@ -229,7 +230,8 @@ and `select_cre_pairs()`).
 | Dataset | `span_source` | `nuc_source` | `tf_source` | `facet_by` |
 |---|---|---|---|---|
 | Macrophage | `"read_spans"` | `"fiberhmm"` | `"by_size"` | `"sample"` (one facet per timepoint) |
-| LCL | `"fire_all"` | `"ft"` | `"recalled_tf"` | `"pooled"`, `"hp"` (H1 / H2 / UNK) or `"sample"` |
+| LCL co-accessibility | `"aligned_blocks"` | `"ft"` | `"recalled_tf"` | `"pooled"` or `"sample"` |
+| Legacy LCL HP display | `"fire_all"` | `"ft"` | `"recalled_tf"` | `"hp"` (H1 / H2 / UNK); not the co-accessibility denominator |
 
 
 ## Extraction scripts
@@ -297,7 +299,7 @@ modification time).
 
 
 The pooled all31 LCL notebook is `code/co-accessibility/LCL/LCL_co-access.Rmd`.
-Its read spans are produced by `code/co-accessibility/LCL/LCL_read_spans.sh`.
+Its aligned blocks are produced by `code/co-accessibility/LCL/LCL_read_spans.sh`.
 The LCL notebook contains separate chunks that call `load_region()`,
 `label_reads()`, `coaccess_2x2()`, and `load_ft_tracks()` directly, then use
 `coaccess_region_result()`, `plot_region_panels()`,
@@ -307,3 +309,7 @@ Both notebooks explicitly pass `fire_overlap_fraction = 0.5` to their respective
 entry points: one FIRE element on that fiber must overlap at least 50% of the
 cCRE length. The shared helper default remains any positive overlap for
 backwards compatibility with other callers.
+In LCL aligned-block mode, only aligned bases of the same FIRE element count
+toward that threshold. D/N gaps are unobserved. `clip_to_aligned_blocks()` also
+breaks display annotations at those gaps, and the m6A profile denominator counts
+only fibers aligned at each position. Macrophage behavior is unchanged.

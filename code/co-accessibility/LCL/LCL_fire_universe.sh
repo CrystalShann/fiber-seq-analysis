@@ -1,6 +1,6 @@
 #!/bin/bash
 # Genome-wide cCRE universe from FIRE peaks across all 31 LCL samples.
-# Run before LCL_read_spans.sh and LCL_run_coaccess.sh.
+
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -19,8 +19,7 @@ uni="$OUT_ROOT/universe"
 tmpdir=$(mktemp -d "${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/lcl-universe.XXXXXX")
 trap 'rm -rf -- "$tmpdir"' EXIT
 
-# Peak selection retains macrophage's >=1bp rule. The 50% rule applies later to
-# per-read FIRE ELEMENTS, not to this population-level peak universe.
+# Peak selection 
 : > "$tmpdir/peaks.bed"
 while IFS=$'\t' read -r sample_name cram_path peaks_path elements_path spans_path; do
     echo "FIRE peaks: $sample_name"
@@ -46,7 +45,7 @@ awk -F'\t' -v OFS='\t' -v W="$WINDOW" -v re="$CHROM_RE" '
         | awk 'BEGIN{OFS="\t"} {print $4,$1,$2,$3,$5,$9,$10,$11}'
 } | "$BGZIP" -c > "$tmpdir/cre_gene_map.tsv.gz"
 
-# Sample peak membership is metadata, never a per-sample testing restriction.
+# Sample peak membership
 cut -f4 "$tmpdir/cre_universe.bed" > "$tmpdir/ids"
 flag_files=("$tmpdir/ids")
 printf 'CRE_ID' > "$tmpdir/flags_header"

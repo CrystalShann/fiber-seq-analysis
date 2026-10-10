@@ -5,18 +5,24 @@ date: "`r Sys.Date()`"
 output: html_document
 ---
 
+
 # FIRE frequency vs absolute footprint counts, timepoints pooled
 
 The four LPS timepoints are treated as one pooled sample. For each region, this notebook relates
-FIRE frequency to the absolute number of TF footprints in that region. Regions are then ranked on
-three continuous scores:
+FIRE frequency to the absolute number of TF footprints in that region. FIRE frequency is always
+measured on the union region; the footprint-vs-FIRE correlations and plots count only the
+footprints inside each timepoint's own FIRE peaks. Each region gets an absolute `fire_rank` and
+`fp_rank`, and the regions are put in three rank orderings:
 
-1. `open_fp_poor_score`: high FIRE frequency, few footprints
-2. `open_fp_rich_score`: high FIRE frequency, many footprints
-3. `closed_fp_rich_score`: low FIRE frequency, many footprints
+1. `open_fp_poor_gap` (largest first): high FIRE frequency, few footprints
+2. `open_fp_rich_sum` (smallest first): high FIRE frequency, many footprints
+3. `closed_fp_rich_gap` (largest first): low FIRE frequency, many footprints
 
-All filtering, ranking, scoring, correlations, summaries and plots use the pooled values. There
-are no cutoffs or categories; the pooled coverage window is the only filter.
+All filtering, ranking, correlations, summaries and plots use the pooled values. There
+are no cutoffs or categories; the pooled coverage window is the only filter
+
+per read FIRE elements `/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results/[SAMPLE]/additional-outputs-v0.1/fire-peaks/[SAMPLE]-v0.1-fire-elements.bed.gz`
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -42,10 +48,11 @@ timepoints     <- c("LPS_0", "LPS_5", "LPS_10", "LPS_15")
 
 Parameters:
 
-- `fp_rank_col`: the footprint count used for `fp_rank` and for the scores. Options are
-  `fp_count_all`, `fp_count_fire` and `fp_count_nonfire`.
+- `fp_rank_col`: the column used for `fp_rank`. Options are
+  `fp_count_all`, `fp_count_fire` and `fp_count_nonfire` (union region), or `fp_peak_count_all`,
+  `fp_peak_count_fire` and `fp_peak_count_nonfire` (per-timepoint FIRE peaks).
 - `top_n_show`: how many rows the top tables show. It is for display only and filters nothing.
-- `top_n_region_plots`: how many top regions per score get a read-level region plot (section 11).
+- `top_n_region_plots`: how many top regions per ordering get a read-level region plot (section 11).
 - `region_pad`: how many bp of flank to show on each side of the region in those plots.
 
 ```{r parameters}
@@ -61,9 +68,9 @@ region_pad  <- 1000
 - `feature_count_long.tsv.gz` (03b_feature_count.py): one row per region and timepoint
 - `n_reads` = reads spanning the whole region, `n_fire` = those with a FIRE element covering >= 50% of it, `fp_*` = FiberHMM TF footprints
   (score >= 50, 10-80 bp) lying fully inside the region `_gated` columns count footprints on the FIRE-positive reads only.
+- `peak_bp` = bp of the union region covered by that timepoint's own FIRE peaks, `fp_peak_*` = the same footprints,
+  same reads, but only those lying fully inside one of those peaks
 - the GENCODE v46 Ensembl-canonical TSSs (1 bp BED, start = 0-based TSS)
-
-
 
 ```{r load_tables}
 load_tables <- function(input_dir, annotation_dir) {
@@ -107,6 +114,9 @@ tables <- load_tables(input_dir, annotation_dir)
 | `fp_per_fire_read` | Footprints per FIRE-positive read (`fp_n_elements_gated / n_fire`). Main footprint frequency; can exceed 1. NA when `n_fire = 0`. |
 | `fp_freq_given_fire` | Fraction of FIRE-positive reads carrying at least one footprint (`fp_n_reads_gated / n_fire`). Bounded 0-1. NA when `n_fire = 0`. |
 | `fp_per_fire_read_per_kb` | `fp_per_fire_read` divided by region width in kb, so wide and narrow regions can be compared. |
+| `peak_bp` | bp of the region covered by this timepoint's FIRE peaks (peaks file columns 1-3, merged). 0 when this timepoint called no peak in the region. |
+| `fp_peak_n_elements` | Footprints lying fully inside this timepoint's FIRE peaks, on any spanning read. 0 when `peak_bp = 0`. |
+| `fp_peak_n_elements_gated` | The same, on FIRE-positive reads only. |
 
 
 # 2. Pool the timepoints
@@ -114,11 +124,24 @@ tables <- load_tables(input_dir, annotation_dir)
 For each region, the counts are summed over the four timepoints. Every pooled rate below is
 recomputed from these summed counts; per-timepoint rates are never averaged.
 
+A timepoint that called no FIRE peak in the region adds reads but no peak footprints, so the peak
+rates are divided only by the reads from timepoints that did:
+
+- `n_reads_peak`: spanning reads from timepoints with `peak_bp > 0`
+- `peak_bp`: the mean `peak_bp` over those timepoints, weighted by `n_reads`
+- `fire_read_peak_kb`: sum over timepoints of `n_fire * peak_bp / 1000`
+
 ```{r pool_timepoints}
 pool_timepoints <- function(long) {
   long %>%
     group_by(region_id, chrom, start, end, width) %>%
-    summarise(across(c(n_reads, n_fire, fp_n_elements, fp_n_elements_gated), sum),
+    # the peak terms come first: they need the per-timepoint n_reads and n_fire
+    summarise(n_reads_peak = sum(n_reads[peak_bp > 0]),
+              fire_read_peak_kb = sum(n_fire * peak_bp) / 1000,
+              peak_bp = if_else(n_reads_peak > 0, sum(n_reads * peak_bp) / n_reads_peak,
+                                NA_real_),
+              across(c(n_reads, n_fire, fp_n_elements, fp_n_elements_gated,
+                       fp_peak_n_elements, fp_peak_n_elements_gated), sum),
               .groups = "drop")
 }
 
@@ -128,17 +151,16 @@ pooled <- pool_timepoints(tables$long)
 
 # 3. Per-timepoint information columns
 
-The per-timepoint values are attached as wide columns named `<column>_<timepoint>`, plus
-`min_timepoint_n_reads` and `n_timepoints_with_reads`. They are carried for reference only and are
-not used in filtering, ranking, scoring, correlations or plots.
+timepoint information is attached in `<column>_<timepoint>`,  `min_timepoint_n_reads` and `n_timepoints_with_reads` for metadata only
 
 ```{r timepoint_info}
-# reference only: these columns never enter a filter, rank, score, correlation or plot
 timepoint_info <- function(long) {
   per_timepoint <- long %>%
-    select(region_id, timepoint, n_reads, n_fire, fp_n_elements, fp_n_elements_gated, fire_freq) %>%
+    select(region_id, timepoint, n_reads, n_fire, fp_n_elements, fp_n_elements_gated, fire_freq,
+           peak_bp, fp_peak_n_elements) %>%
     pivot_wider(names_from = timepoint, names_sort = TRUE,
-                values_from = c(n_reads, n_fire, fp_n_elements, fp_n_elements_gated, fire_freq))
+                values_from = c(n_reads, n_fire, fp_n_elements, fp_n_elements_gated, fire_freq,
+                                peak_bp, fp_peak_n_elements))
   long %>%
     group_by(region_id) %>%
     summarise(min_timepoint_n_reads = min(n_reads),
@@ -149,15 +171,15 @@ timepoint_info <- function(long) {
 info <- timepoint_info(tables$long)
 info_cols <- setdiff(names(info), "region_id")
 pooled <- left_join(pooled, info, by = "region_id")
+head(pooled)
 ```
 
 
 # 4. Coverage filter
 
-This is the only filter. It uses the pooled `n_reads`: a region is kept when
-max(M - 3 sqrt(M), 10) <= n_reads <= M + 3 sqrt(M), where M is the median pooled `n_reads` over all
-regions. The kept regions all have similar total coverage, so their absolute footprint counts can
-be compared directly, without dividing by depth.
+It uses the pooled `n_reads`: a region is kept when max(M - 3 sqrt(M), 10) <= n_reads <= M + 3 sqrt(M), where M is the median pooled `n_reads` over all regions
+  - coverage filter applied on all reads combining all timepoints
+
 
 ```{r coverage_filter}
 cov_median <- median(pooled$n_reads)
@@ -188,105 +210,107 @@ There is one row per region, and every value comes from the pooled counts.
 - `fp_per_fire_read_per_kb` = `fp_count_fire / n_fire / (width / 1000)`: a secondary metric. It is
   NA when `n_fire == 0`.
 
+The same metrics on the footprints inside each timepoint's FIRE peaks:
+
+- `fp_peak_count_all` = summed `fp_peak_n_elements`, `fp_peak_count_fire` = summed
+  `fp_peak_n_elements_gated`, `fp_peak_count_nonfire` = `fp_peak_count_all - fp_peak_count_fire`
+- `fp_peak_per_read` = `fp_peak_count_all / n_reads_peak`. NA when `n_reads_peak == 0`.
+- `fp_peak_per_fire_read_per_kb` = `fp_peak_count_fire / fire_read_peak_kb`. NA when
+  `fire_read_peak_kb == 0`.
+
 ```{r metrics}
 regions <- regions %>%
-  rename(fp_count_all = fp_n_elements, fp_count_fire = fp_n_elements_gated) %>%
+  rename(fp_count_all = fp_n_elements, fp_count_fire = fp_n_elements_gated,
+         fp_peak_count_all = fp_peak_n_elements, fp_peak_count_fire = fp_peak_n_elements_gated) %>%
   mutate(fp_count_nonfire = fp_count_all - fp_count_fire,
          fire_freq = n_fire / n_reads,
          fp_per_read = fp_count_all / n_reads,
          fp_per_fire_read_per_kb = if_else(n_fire > 0, fp_count_fire / n_fire / (width / 1000),
                                            NA_real_),
-         .after = fp_count_fire)
-stopifnot(all(regions$fp_count_nonfire >= 0))
+         .after = fp_count_fire) %>%
+  mutate(fp_peak_count_nonfire = fp_peak_count_all - fp_peak_count_fire,
+         fp_peak_per_read = if_else(n_reads_peak > 0, fp_peak_count_all / n_reads_peak, NA_real_),
+         fp_peak_per_fire_read_per_kb = if_else(fire_read_peak_kb > 0,
+                                                fp_peak_count_fire / fire_read_peak_kb, NA_real_),
+         .after = fp_peak_count_fire)
+stopifnot(all(regions$fp_count_nonfire >= 0), all(regions$fp_peak_count_nonfire >= 0))
+
+head(regions)
 ```
 
 
-# 6. FIRE frequency vs footprint counts
+### Relationship between footprint frequency and FIRE frequency in a given FIRE region
 
-Spearman correlations on the pooled values. The first column is each footprint metric against
-`fire_freq`. The other two columns check how much each metric follows region width and depth.
+Footprints are counted inside each timepoint's own FIRE peaks; `fire_freq` is still the union region's.
+Only regions with a FIRE peak at all four timepoints are used here. In the other regions, the
+timepoints without a peak add reads but no peak footprints, and those regions are mostly the less
+open ones, which would tie the peak counts to `fire_freq`.
 
-`fp_count_fire` is partly tied to `fire_freq` by construction: the more reads are FIRE-positive,
-the more reads its footprints are counted on. `fp_count_all` and `fp_count_nonfire` are therefore
-the fairer readouts.
+ - fp_peak_count_all: total footprints in the peaks on all reads
+ - fp_peak_count_fire: footprints on FIRE (open) reads
+ - fp_peak_count_nonfire: footprints on non-FIRE (closed) reads
+ - fp_peak_per_read: total footprints divided by reads from timepoints that called a peak
+ - fp_peak_per_fire_read_per_kb: footprint density on open fibers, per kb of peak
+ - rho_peak_bp: correlation with the peak width (`peak_bp`)
+
+ 1. More open regions have many more footprints in total
+ 2. footprints on closed fibers don't change with openess, even though open regions have fewer closed fibers
+ 3. per open fiber and per kb, footprint density barely rises with openness
+ 4. Wider FIRE regions tend to have more footprints
 
 ```{r correlations}
 spearman <- function(x, y) cor(x, y, method = "spearman", use = "complete.obs")
 
-fp_metrics <- c("fp_count_all", "fp_count_fire", "fp_count_nonfire", "fp_per_read",
-                "fp_per_fire_read_per_kb")
+all_peak_regions <- regions %>%
+  filter(if_all(all_of(paste0("peak_bp_", timepoints)), ~ .x > 0))
+cat(nrow(all_peak_regions), "of", nrow(regions), "regions have a FIRE peak at all four timepoints\n")
+
+fp_metrics <- c("fp_peak_count_all", "fp_peak_count_fire", "fp_peak_count_nonfire",
+                "fp_peak_per_read", "fp_peak_per_fire_read_per_kb")
 tibble(metric = fp_metrics,
-       n = sapply(fp_metrics, function(m) sum(!is.na(regions[[m]]))),
-       rho_fire_freq = sapply(fp_metrics, function(m) spearman(regions$fire_freq, regions[[m]])),
-       rho_width = sapply(fp_metrics, function(m) spearman(regions$width, regions[[m]])),
-       rho_n_reads = sapply(fp_metrics, function(m) spearman(regions$n_reads, regions[[m]]))) %>%
+       n = sapply(fp_metrics, function(m) sum(!is.na(all_peak_regions[[m]]))),
+       rho_fire_freq = sapply(fp_metrics, function(m)
+         spearman(all_peak_regions$fire_freq, all_peak_regions[[m]])),
+       rho_peak_bp = sapply(fp_metrics, function(m)
+         spearman(all_peak_regions$peak_bp, all_peak_regions[[m]])),
+       rho_n_reads = sapply(fp_metrics, function(m)
+         spearman(all_peak_regions$n_reads, all_peak_regions[[m]]))) %>%
   knitr::kable(digits = 3)
 ```
 
-### Relationship between footprint frequency and FIRE frequency in a given FIRE region
 
-1. More open regions have many more footprints in total
-2. rise in total footprints is mostly because open regions have more open fibers, not because each open fiber gets more footprints
-3. Footprints on closed fibers is not related with FIRE frequency
-4. Wider FIRE regions tend to have more footprints
+ 
 
+# Rank region by footprint and FIRE frequency
 
-The counts by `fire_freq` bin. The bins are only a description of the relationship; they are not
-used for ranking or scoring.
+The ranks are absolute, from 1 to the number of regions. Ties share the lowest rank
+(`min_rank`), and NA values stay NA and sort last.
 
-1. Most regions have FIRE peaks are moderately open
+- `fire_rank` ranks `fire_freq`. 1 = most open.
+- `fp_rank` ranks the column named by `fp_rank_col`. 1 = most footprints.
 
-```{r counts_by_fire_bin}
-regions %>%
-  mutate(fire_freq_bin = cut(fire_freq, c(0, 0.1, 0.25, 0.5, 0.75, 1), include.lowest = TRUE)) %>%
-  select(fire_freq_bin, fp_count_all, fp_count_fire, fp_count_nonfire) %>%
-  pivot_longer(-fire_freq_bin, names_to = "count") %>%
-  group_by(count = factor(count, levels = c("fp_count_all", "fp_count_fire", "fp_count_nonfire")),
-           fire_freq_bin) %>%
-  summarise(regions = n(), median = median(value),
-            p25 = quantile(value, 0.25), p75 = quantile(value, 0.75), .groups = "drop") %>%
-  knitr::kable(digits = 1)
-```
+| Pattern | Ranks | Sort by |
+|---|---|---|
+| Open, footprint-poor | `fire_rank` small, `fp_rank` large | `open_fp_poor_gap = fp_rank - fire_rank`, largest first |
+| Open, footprint-rich | both small | `open_fp_rich_sum = fire_rank + fp_rank`, smallest first |
+| Closed, footprint-rich | `fire_rank` large, `fp_rank` small | `closed_fp_rich_gap = fire_rank - fp_rank`, largest first |
 
+The sum and the gaps let one rank make up for the other: a region can sort high by being very
+extreme on one axis and only moderate on the other. They do not require both ranks to be extreme.
 
-# 7. Ranks and scores
-
-The ranks are pooled percentile ranks from 0 to 1, with ties averaged and NAs kept as NA.
-
-- `fire_rank` ranks `fire_freq` over all kept regions, including the `n_fire == 0` regions
-  (`fire_freq = 0`). 1 = most open.
-- `fp_rank` ranks the count named by `fp_rank_col`. 1 = most footprints.
-
-Each score is the smaller of two ranks, so a region scores high only when both conditions hold. A
-score of 0.9 means the region is in the top 10% on both axes, and being extreme on one axis does
-not make up for the other.
-
-- `open_fp_poor_score = pmin(fire_rank, 1 - fp_rank)`: the region is open and has few footprints.
-- `open_fp_rich_score = pmin(fire_rank, fp_rank)`: the region is open and has many footprints.
-- `closed_fp_rich_score = pmin(1 - fire_rank, fp_rank)`: the region is mostly closed but still has
-  many footprints.
-- `fp_resid_rank`: the percentile rank of the residual from `lm(log1p(<fp_rank_col>) ~ fire_freq)`.
-  1 = more footprints than expected for that openness, 0 = fewer. It measures footprints relative
-  to openness rather than requiring a particular level of openness.
-
-```{r scores}
-pct_rank <- function(x) {
-  (rank(x, ties.method = "average", na.last = "keep") - 1) / (sum(!is.na(x)) - 1)
-}
-
-add_scores <- function(regions, fp_col) {
-  fit <- lm(log1p(fp) ~ fire_freq, na.action = na.exclude,
-            data = tibble(fp = regions[[fp_col]], fire_freq = regions$fire_freq))
+```{r ranks}
+add_ranks <- function(regions, fp_col) {
   regions %>%
-    mutate(fire_rank = pct_rank(fire_freq),
-           fp_rank = pct_rank(.data[[fp_col]]),
-           open_fp_poor_score = pmin(fire_rank, 1 - fp_rank),
-           open_fp_rich_score = pmin(fire_rank, fp_rank),
-           closed_fp_rich_score = pmin(1 - fire_rank, fp_rank),
-           fp_resid_rank = pct_rank(unname(residuals(fit))))
+    mutate(fire_rank = min_rank(desc(fire_freq)),
+           fp_rank = min_rank(desc(.data[[fp_col]])),
+           open_fp_poor_gap = fp_rank - fire_rank,
+           open_fp_rich_sum = fire_rank + fp_rank,
+           closed_fp_rich_gap = fire_rank - fp_rank)
 }
 
-regions <- add_scores(regions, fp_rank_col)
+regions <- add_ranks(regions, fp_rank_col)
+
+head(regions)
 ```
 
 
@@ -314,7 +338,7 @@ regions <- annotate_regions(regions, tables$tss)
 
 # 9. Output table
 
-`region_scores_pooled.tsv.gz` has one row per kept region: pooled counts, rates, ranks, scores and
+`region_scores_pooled.tsv.gz` has one row per kept region: pooled counts, rates, ranks and
 `tss_distance`. The per-timepoint information columns come last.
 
 ```{r write_table}
@@ -322,29 +346,38 @@ regions <- relocate(regions, all_of(info_cols), .after = last_col())
 write_tsv(regions, file.path(input_dir, "region_scores_pooled.tsv.gz"))
 ```
 
-The top regions by each score:
+The top regions of each ordering:
 
 ```{r top_regions}
-show_top <- function(regions, score, top_n) {
-  regions %>%
-    slice_max(.data[[score]], n = top_n, with_ties = FALSE) %>%
-    select(region_id, all_of(score), fire_freq, n_reads, n_fire, fp_count_all, fp_count_fire,
-           fp_count_nonfire, width, tss_distance) %>%
-    knitr::kable(digits = 3, caption = sprintf("Top %d regions by %s", top_n, score))
+# each ordering and whether it sorts largest first
+orderings <- c(open_fp_poor_gap = TRUE, open_fp_rich_sum = FALSE, closed_fp_rich_gap = TRUE)
+
+# arrange() always sorts NA last, also under desc()
+top_by <- function(df, sort_col, decreasing, n) {
+  df %>%
+    arrange(if (decreasing) desc(.data[[sort_col]]) else .data[[sort_col]]) %>%
+    slice_head(n = n)
 }
 
-show_top(regions, "open_fp_poor_score", top_n_show)
-show_top(regions, "open_fp_rich_score", top_n_show)
-show_top(regions, "closed_fp_rich_score", top_n_show)
+show_ranked <- function(regions, sort_col, decreasing, top_n) {
+  top_by(regions, sort_col, decreasing, top_n) %>%
+    select(region_id, fire_rank, fp_rank, all_of(sort_col), fire_freq, n_reads, n_fire,
+           fp_count_all, fp_count_fire, fp_count_nonfire, width, tss_distance) %>%
+    knitr::kable(digits = 3, caption = sprintf("Top %d regions by %s, %s first", top_n, sort_col,
+                                               if (decreasing) "largest" else "smallest"))
+}
+
+show_ranked(regions, "open_fp_poor_gap", decreasing = TRUE, top_n_show)
+show_ranked(regions, "open_fp_rich_sum", decreasing = FALSE, top_n_show)
+show_ranked(regions, "closed_fp_rich_gap", decreasing = TRUE, top_n_show)
 ```
 
 ```{r top-ranked-regions}
-scores <- read_tsv(file.path(input_dir, "region_scores_pooled.tsv.gz"), show_col_types = FALSE) %>%
+ranked <- read_tsv(file.path(input_dir, "region_scores_pooled.tsv.gz"), show_col_types = FALSE) %>%
   mutate(fp_per_nonfire_read_per_kb = if_else(n_reads > n_fire,
            fp_count_nonfire / (n_reads - n_fire) / (width / 1000), NA_real_),
          nonfire_fraction = fp_count_nonfire / fp_count_all)
 
-score_cols <- c("open_fp_poor_score", "open_fp_rich_score", "closed_fp_rich_score")
 top_n <- 500
 
 profile <- function(df, label) {
@@ -361,20 +394,21 @@ profile <- function(df, label) {
 }
 
 bind_rows(
-  profile(scores, "all regions"),
-  lapply(score_cols, function(s) profile(slice_max(scores, .data[[s]], n = top_n,
-                                                   with_ties = FALSE), s))) %>%
+  profile(ranked, "all regions"),
+  lapply(names(orderings), function(o) profile(top_by(ranked, o, orderings[[o]], top_n), o))) %>%
   knitr::kable(digits = 2)
 ```
 
+`open_fp_rich_sum` sorts smallest first, so a negative rho there means the property is higher at
+the top of that ordering.
 
-```{r score_correlation}
+```{r rank_correlation}
 props <- c("width", "tss_distance", "fire_freq", "n_reads",
            "fp_per_fire_read_per_kb", "fp_per_nonfire_read_per_kb")
 
-expand_grid(score = score_cols, property = props) %>%
+expand_grid(ordering = names(orderings), property = props) %>%
   rowwise() %>%
-  mutate(rho = cor(scores[[score]], scores[[property]],
+  mutate(rho = cor(ranked[[ordering]], ranked[[property]],
                    method = "spearman", use = "complete.obs")) %>%
   ungroup() %>%
   pivot_wider(names_from = property, values_from = rho) %>%
@@ -383,10 +417,10 @@ expand_grid(score = score_cols, property = props) %>%
 
 # 10. Plots
 
-## FIRE frequency vs footprint counts
+## FIRE frequency vs footprint counts in the FIRE peaks
 
-Each panel shows the pooled values, one hexbin of regions per panel. The y axis is on a log1p
-scale.
+Each panel shows the pooled values, one hexbin of regions per panel. The footprints are those
+inside each timepoint's FIRE peaks. The y axis is on a log1p scale.
 
 ```{r plot_count_hex, fig.width=5.5, fig.height=10}
 plot_count_hex <- function(regions, y_col) {
@@ -401,17 +435,17 @@ plot_count_hex <- function(regions, y_col) {
     theme_fiberseq("classic")
 }
 
-p_count_hex <- plot_count_hex(regions, "fp_count_all") /
-  plot_count_hex(regions, "fp_count_fire") /
-  plot_count_hex(regions, "fp_count_nonfire")
-save_figure(p_count_hex, file.path(plot_dir, "fire_freq_vs_fp_counts_hex.pdf"),
+p_count_hex <- plot_count_hex(regions, "fp_peak_count_all") /
+  plot_count_hex(regions, "fp_peak_count_fire") /
+  plot_count_hex(regions, "fp_peak_count_nonfire")
+save_figure(p_count_hex, file.path(plot_dir, "fire_freq_vs_fp_peak_counts_hex.pdf"),
             width = 5.5, height = 10)
 p_count_hex
 ```
 
-## The same, colored by region width
+## The same, colored by peak width
 
-Each hex is colored by the median width of its regions.
+Each hex is colored by the median `peak_bp` of its regions.
 
 ```{r plot_width_hex, fig.width=5.5, fig.height=3.5}
 plot_summary_hex <- function(regions, y_col, z_col, fun, fill_lab) {
@@ -423,32 +457,25 @@ plot_summary_hex <- function(regions, y_col, z_col, fun, fill_lab) {
     theme_fiberseq("classic")
 }
 
-p_width_hex <- plot_summary_hex(regions, "fp_count_all", "width", "median", "median width (bp)")
-save_figure(p_width_hex, file.path(plot_dir, "fire_freq_vs_fp_count_all_median_width_hex.pdf"),
+p_width_hex <- plot_summary_hex(regions, "fp_peak_count_all", "peak_bp", "median",
+                                "median peak_bp (bp)")
+save_figure(p_width_hex,
+            file.path(plot_dir, "fire_freq_vs_fp_peak_count_all_median_peak_bp_hex.pdf"),
             width = 5.5, height = 3.5)
 p_width_hex
 ```
 
-## The same, colored by score
-
-Each hex is colored by the mean score of its regions. The y axis is the count used for the scores
-(`fp_rank_col`).
-
-```{r plot_score_hex, fig.width=14, fig.height=4}
-scores <- c("open_fp_poor_score", "open_fp_rich_score", "closed_fp_rich_score")
-p_score_hex <- wrap_plots(lapply(scores, function(s)
-  plot_summary_hex(regions, fp_rank_col, s, "mean", "mean score") + labs(title = s)), nrow = 1)
-save_figure(p_score_hex, file.path(plot_dir, "fire_freq_vs_fp_count_score_hex.pdf"),
-            width = 14, height = 4)
-p_score_hex
-```
-
 ## FIRE rank vs footprint rank
+
+Both axes are absolute ranks and are reversed, so the most open and most footprinted regions sit
+at the top right.
 
 ```{r plot_rank_hex, fig.width=5, fig.height=4.5}
 plot_rank_hex <- function(regions, fp_col) {
   ggplot(regions, aes(fire_rank, fp_rank)) +
     geom_hex(bins = 50) +
+    scale_x_reverse() +
+    scale_y_reverse() +
     scale_fill_viridis_c(name = "regions") +
     coord_equal() +
     labs(x = "fire_rank (1 = most open)", y = paste0("fp_rank of ", fp_col, " (1 = most footprints)")) +
@@ -462,20 +489,29 @@ p_rank_hex
 ```
 
 
-# 11. Region plots: top regions per score
+# 11. Region plots: top regions per ordering
 
-This section plots the top `top_n_region_plots` regions by each score with `plot_region_panels()`
+This section plots the top `top_n_region_plots` regions of each ordering with `plot_region_panels()`
 from `plotting_functions.r`. Each window is the region +/- `region_pad` bp, and the yellow band
-marks the region itself. Reads from the four timepoints are pooled.
+marks the region itself.
 
 - Only reads that span the whole region are shown, which is the read set counted in `n_reads`.
-- The reads are split into two groups. FIRE-positive reads have an element from the FIRE per-read
-  elements file covering >= 50% of the region (the `03b_feature_count.py` rule). Non-FIRE reads
-  do not.
-- The footprint panel shows every FiberHMM TF footprint (score >= 50, 10-80 bp), not only the
-  footprints inside FIRE elements that `plot_region_panels()` draws by default. This matches
-  `fp_count_all`, which counts footprints on every spanning read.
-- The FIRE peaks row shows the per-timepoint peak calls in the window. The region is their union.
+- The accessibility panel is one panel with one m6A-fraction line per timepoint, in the
+  `LEIDEN_TIMEPOINT_COLORS` of `plotting_functions.r`. `plot_region_panels()` would draw one panel
+  per timepoint, so this panel is drawn with `plot_group_profile()` instead. CpG is not drawn.
+- The FIRE peaks panel has one row per timepoint, LPS_0 at the top, each showing that
+  timepoint's own peak calls in the window, colored by -log10(FDR). The yellow band is their union,
+  the region the reads and counts are taken from. `plot_region_panels()` can only draw the peaks
+  of all timepoints on one row, so `plot_timepoint_peaks()` below draws this panel.
+- The SMF reads and footprint panels are split by timepoint, LPS_0 at the top. The footprint
+  panel shows every FiberHMM TF footprint (score >= 50, 10-80 bp), not only the footprints inside
+  FIRE elements that `plot_region_panels()` draws by default. This matches `fp_count_all`, which
+  counts footprints on every spanning read.
+- The figure is reassembled from these panels and the reads and footprint panels of
+  `plot_region_panels()`.
+- The subtitle gives the FIRE-positive read count (an element from the FIRE per-read elements file
+  covering >= 50% of the region, the `03b_feature_count.py` rule) and the footprint counts for the
+  whole region and for inside the peaks.
 
 ```{r region_plot_setup}
 code_dir <- "/project/spott/cshan/fiber-seq/code/parsing_functions"
@@ -489,11 +525,9 @@ source(file.path(code_dir, "plotting_functions.r"), local = TRUE)
 extract_script <- file.path(code_dir, "extract_region_result_macrophage.sh")
 extract_root   <- file.path(input_dir, "region_plots")
 
-top_regions <- bind_rows(lapply(
-  c("open_fp_poor_score", "open_fp_rich_score", "closed_fp_rich_score"), function(s)
-    regions %>%
-      slice_max(.data[[s]], n = top_n_region_plots, with_ties = FALSE) %>%
-      mutate(score = s, score_value = .data[[s]], rank = row_number()))) %>%
+top_regions <- bind_rows(lapply(names(orderings), function(o)
+    top_by(regions, o, orderings[[o]], top_n_region_plots) %>%
+      mutate(score = o, score_value = .data[[o]], rank = row_number()))) %>%
   mutate(outname = paste(chrom, start, end, sep = "_"),
          window_start = as.integer(start - region_pad),
          window_end   = as.integer(end + region_pad))
@@ -521,41 +555,45 @@ fire_positive_reads <- function(parsed_dirs, region_start, region_end) {
   unique(elements$RID[overlap >= 0.5 * (region_end - region_start)])
 }
 
+# one row per timepoint (LPS_0 on top) with that timepoint's own FIRE peak calls, colored like
+# the single-row FIRE peaks track of plot_region_panels(); highlight = the union region
+plot_timepoint_peaks <- function(parsed_dirs, timepoints, xlims, highlight) {
+  peaks <- bind_rows(lapply(seq_along(timepoints), function(i) {
+    pk <- read_fire_peaks_region(file.path(parsed_dirs[i], "fire_peaks.bed"))
+    if (is.null(pk)) NULL else mutate(pk, y = length(timepoints) + 1 - i)
+  }))
+  ggplot(peaks, aes(x = start, xend = end, y = y, yend = y, colour = logFDR)) +
+    annotate("rect", xmin = highlight[1], xmax = highlight[2], ymin = -Inf, ymax = Inf,
+             fill = "yellow", alpha = 0.3) +
+    geom_segment(linewidth = 1.5) +
+    scale_colour_gradient2(low = "black", mid = "gray", high = "red", midpoint = 1.3,
+                           limits = c(0, 5.2), oob = scales::squish, name = "-log10(FDR)") +
+    scale_y_continuous(breaks = seq_along(timepoints), labels = rev(timepoints)) +
+    coord_cartesian(xlim = xlims, ylim = c(0.5, length(timepoints) + 0.5), expand = FALSE) +
+    labs(x = NULL, y = "FIRE peaks") +
+    theme_fiberseq("bw", base_size = 11)
+}
+
 plot_top_region <- function(row, extract_root, timepoints) {
   parsed_dirs <- file.path(extract_root, row$outname, timepoints, "parsed")
 
   # draw every TF footprint, not only those inside a FIRE element, and split the
-  # spanning reads into FIRE-positive and non-FIRE
+  # spanning reads by timepoint; the pooled one-row FIRE peaks track is dropped,
+  # plot_timepoint_peaks() replaces it
   group_reads <- function(res) {
+    res$fire_peaks <- NULL
     res$fps_infire <- res$fps
-    spans <- res$rids_df
-    spanning <- as.character(spans$RID[spans$start <= row$start & spans$end >= row$end])
-    fire_pos <- fire_positive_reads(parsed_dirs, row$start, row$end)
-    labels <- setNames(ifelse(spanning %in% fire_pos, "FIRE-positive", "non-FIRE"), spanning)
-    add_read_groups(res, labels, group_col = "read_class",
-                    group_levels = c("FIRE-positive", "non-FIRE"), verbose = FALSE)
+    spans <- res$rids_df[res$rids_df$start <= row$start & res$rids_df$end >= row$end, ]
+    labels <- setNames(as.character(spans$sample_name), as.character(spans$RID))
+    add_read_groups(res, labels, group_col = "timepoint", group_levels = timepoints,
+                    verbose = FALSE)
   }
 
-  # the subtitle counts the grouped (spanning) reads
-  panel_options <- function(res) {
-    read_class <- res$rids_df$read_class
-    subtitle <- sprintf(paste0("%s = %.3f | fire_freq %.2f | %d bp | TSS distance %s bp\n",
-                               "spanning reads plotted %d (table n_reads %d), FIRE-positive %d ",
-                               "(table n_fire %d) | footprints all %d, FIRE %d, non-FIRE %d"),
-                        row$score, row$score_value, row$fire_freq, row$width,
-                        format(row$tss_distance, big.mark = ","),
-                        length(read_class), row$n_reads, sum(read_class == "FIRE-positive"),
-                        row$n_fire, row$fp_count_all, row$fp_count_fire, row$fp_count_nonfire)
-    list(plot_name = row$region_id,
-         subtitle = subtitle,
-         highlight = c(row$start, row$end),
-         y_labels = c(pileup = "Met. prop.", reads = "SMF reads",
-                      fire_fiberHMM = "FiberHMM TF footprints (all)"),
-         heights = c(pileup = 6, peaks = 2, fire_peaks = 1,
-                     reads = 8, fire_fiberHMM = 8))
-  }
+  panel_options <- list(highlight = c(row$start, row$end),
+                        y_labels = c(pileup = "Met. prop.", reads = "SMF reads",
+                                     fire_fiberHMM = "FiberHMM TF footprints (all)"))
 
-  plot_region_example(
+  out <- plot_region_example(
     region       = data.frame(chr = row$chrom, start = row$window_start, end = row$window_end),
     sample_names = timepoints,
     out_root     = extract_root,
@@ -566,16 +604,48 @@ plot_top_region <- function(row, extract_root, timepoints) {
                         fiberHMM_size_breaks  = c(10, 30, 60, 80),
                         verbose = FALSE),
     group = group_reads,
-    panel_options = panel_options)$plot
+    panel_options = panel_options)
+
+  # the subtitle counts the plotted (spanning) reads
+  res <- out$res
+  fire_pos <- fire_positive_reads(parsed_dirs, row$start, row$end)
+  subtitle <- sprintf(paste0("%s = %.0f | fire_freq %.2f | %d bp | TSS distance %s bp\n",
+                             "spanning reads plotted %d (table n_reads %d), FIRE-positive %d ",
+                             "(table n_fire %d)\nfootprints all %d, FIRE %d, non-FIRE %d | ",
+                             "in peaks all %d, FIRE %d, non-FIRE %d"),
+                      row$score, row$score_value, row$fire_freq, row$width,
+                      format(row$tss_distance, big.mark = ","),
+                      nrow(res$rids_df), row$n_reads,
+                      sum(as.character(res$rids_df$RID) %in% fire_pos), row$n_fire,
+                      row$fp_count_all, row$fp_count_fire, row$fp_count_nonfire,
+                      row$fp_peak_count_all, row$fp_peak_count_fire, row$fp_peak_count_nonfire)
+
+  # one accessibility panel, one m6A line per timepoint
+  xlims <- c(res$region$start, res$region$end)
+  accessibility <- plot_group_profile(
+    filter(res$pileup, base == "A"), group_col = "timepoint", y_col = "smooth_frac",
+    colors = LEIDEN_TIMEPOINT_COLORS,
+    highlight = list(start = row$start, end = row$end, fill = "yellow", alpha = 0.3,
+                     position = "under"),
+    scales = list(scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1))),
+    theme = theme_fiberseq("bw", base_size = 11),
+    labels = list(x = NULL, y = "m6A prop.", colour = "timepoint",
+                  title = row$region_id, subtitle = subtitle)) +
+    coord_cartesian(xlim = xlims, expand = FALSE)
+
+  peaks <- plot_timepoint_peaks(parsed_dirs, timepoints, xlims = xlims,
+                                highlight = c(row$start, row$end))
+  panels <- out$plot$panels
+  wrap_plots(accessibility, peaks, panels$reads, panels$fire_fiberHMM, ncol = 1,
+             heights = c(4, 2.5, 10, 10))
 }
 
 for (i in seq_len(nrow(top_regions))) {
   row <- top_regions[i, ]
   p <- plot_top_region(row, extract_root, timepoints)
-  save_figure(p$combined,
-              file.path(plot_dir, "region_plots",
-                        sprintf("%s_%d_%s.pdf", row$score, row$rank, row$outname)),
+  save_figure(p, file.path(plot_dir, "region_plots",
+                           sprintf("%s_%d_%s.pdf", row$score, row$rank, row$outname)),
               width = 10, height = 14)
-  print(p$combined)
+  print(p)
 }
 ```

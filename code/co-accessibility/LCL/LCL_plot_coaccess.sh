@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
+#SBATCH --export=ALL,LC_ALL=C,LANG=C
 #SBATCH --output=/project/spott/cshan/fiber-seq/results/logs/LCL_coaccess_plots_%j.out
 #SBATCH --error=/project/spott/cshan/fiber-seq/results/logs/LCL_coaccess_plots_%j.err
 
@@ -18,7 +19,7 @@ if [[ ! -f "$LCL_SCRIPT_DIR/LCL_co-access.Rmd" ]]; then
 fi
 export LCL_SCRIPT_DIR
 export LCL_COACCESS_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-accessibility}
-export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 TZ=America/Chicago
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 TZ=America/Chicago LC_ALL=C LANG=C
 export RSTUDIO_PANDOC=/software/pandoc-2.17.1.1-el8-x86_64/bin
 export LD_LIBRARY_PATH=/software/gcc-13.2.0-el8-x86_64/lib64:/software/openblas-0.3.29-el8-x86_64/lib:${LD_LIBRARY_PATH:-}
 exec /software/R-4.4.1-el8-x86_64/bin/Rscript --vanilla -e '
