@@ -51,8 +51,7 @@ Annotations: `/project/spott/cshan/annotations/GRCh38-cCREs.bed` and
 | [LCL_read_spans.sh](LCL/LCL_read_spans.sh) | SLURM array, one task per sample, at most six concurrent; extract/index primary aligned BED12 blocks using `bamtobed -bed12 -splitD` |
 | [LCL_coaccess_cres.py](LCL/LCL_coaccess_cres.py) | Count per sample/chromosome, pool raw counts across all31, test once per unique pair, correct genome-wide |
 | [LCL_run_coaccess.sh](LCL/LCL_run_coaccess.sh) | SLURM launcher for the standalone LCL Python script |
-| [LCL_plot_coaccess.sh](LCL/LCL_plot_coaccess.sh) | Render the top-five notebook after the analysis job succeeds |
-| [LCL_co-access.Rmd](LCL/LCL_co-access.Rmd) | Read completed results, select up to five significant positive pairs, and verify plotted read states against saved counts |
+| [LCL_co-access.Rmd](LCL/LCL_co-access.Rmd) | Read completed results, select up to ten significant positive pairs, and verify plotted read states against saved counts |
 
 ```bash
 cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL
@@ -61,7 +60,6 @@ bash LCL_fire_universe.sh
 span_job=$(sbatch --parsable LCL_read_spans.sh)
 analysis_job=$(sbatch --parsable --dependency="afterok:${span_job}" LCL_run_coaccess.sh)
 # After counting completes, run/knit LCL_co-access.Rmd in R.
-# LCL_plot_coaccess.sh is an optional launcher, not required for plotting.
 ```
 
 `LCL_COACCESS_ROOT` can set a separate output root and `LCL_SAMPLE_METATABLE`
@@ -95,25 +93,26 @@ Outputs under `LCL_project/co-accessibility/`:
 - `coaccess/LCL_coaccess_stat.tsv.gz`: gene-oriented results; a pair may occur for multiple genes.
 - `coaccess/LCL_pair_sample_counts.tsv.gz`: raw per-sample cells, including zeros, with donor labels.
 - `coaccess/LCL_count_qc.tsv.gz`, `sample_manifest.tsv`: provenance.
-- `coaccess/plots/top5/`: selected pairs, fiber metadata, read plots and configuration bars.
+- `coaccess/plots/top10/tables/`: selected pairs, per-fiber labels, per-sample counts, verified counts.
+- `coaccess/plots/top10/plots/`: volcano, observed-vs-expected and per-region read plots.
 
 The notebook selects `fdr < 0.05`, `OR > 1`, and `co_access > expected_co_access`,
 then orders by FDR, descending OR, descending shared coverage and pair ID. It
-shows fewer than five if necessary. Display downsampling never changes counts
+shows fewer than ten if necessary. Display downsampling never changes counts
 or tests. Recompute older outputs made with >=1 bp FIRE overlap; the notebook
-requires matching `fire_overlap_fraction=0.5`, `read_rule=any`, and
+requires matching `fire_overlap_fraction=0.5`, `read_rule=contain`, and
 `coverage_mode=aligned_blocks_v1` metadata. Old continuous-span results must be
 recomputed genome-wide, including both FDR columns. The candidate FIRE/cCRE
 universe does not change. No new MAPQ, donor, or sample filters are applied.
 
 The plotting steps are directly in `LCL/LCL_co-access.Rmd`, in separate chunks
 for loading fibers, verifying counts, exporting metadata, preparing display
-tracks, drawing fiber panels and configuration bars, and saving figures. It
+tracks, drawing fiber panels, and saving figures. It
 sources `parsing_footprints_functions.r` and `plotting_functions.r` from
 `code/parsing_functions/` and calls their reusable functions at each step.
-Run the chunks in order or knit the notebook; `LCL_plot_coaccess.sh` remains an
-optional SLURM launcher. The m6A profile and rasters use the displayed subset
-(at most 120 fibers per pair by default); counts and bars use all shared fibers.
+Run the chunks in order or knit the notebook. The m6A profile and rasters use the
+displayed subset (window-spanning fibers, co-accessible first, at most 500 per
+pair); counts and tests use all shared fibers.
 Backbones and annotation intervals are split at alignment gaps, and the m6A
 denominator uses distinct fibers actually aligned at each position. Fibers with
 no aligned bases at either cCRE are excluded from that pair, not labelled closed.

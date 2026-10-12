@@ -1,5 +1,5 @@
 ---
-title: "Genome-wide LCL co-accessibility: top five pairs"
+title: "Genome-wide LCL co-accessibility: top ten pairs"
 author: "Crystal Shan"
 output:
   html_document:
@@ -13,11 +13,8 @@ params:
   tf_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model"
   tabix: "/project/spott/cshan/envs/dimelo/bin/tabix"
   code_root: "/project/spott/cshan/fiber-seq/code"
-  tss_bed: "/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed"
   locus_flank_bp: 1000
   make_plots: true
-  max_plot_reads: 120
-  seed: 20261009
   allow_partial_results: false
 ---
 
@@ -28,11 +25,13 @@ strata, haplotype tests, or timepoints.
 
 The plotting workflow is written directly below in separate chunks. Source the
 shared parsing and plotting functions, then run the chunks in order, or knit this
-notebook. `LCL_plot_coaccess.sh` is an optional SLURM launcher for the same notebook.
+notebook.
 
 Candidate cCREs overlap the union of all 31 samples' FIRE peaks. Pairs share a
-canonical TSS ±10 kb window and have **500 < gap < 20,000 bp**. A shared fiber
-has aligned bases at both cCREs (at least one base each). It is accessible at a
+canonical TSS ±10 kb window and have **500 < gap < 20,000 bp**. A shared fiber's
+aligned blocks **cover the full length of both cCREs** (`read_rule = "contain"`),
+so a fiber whose alignment gap or end falls inside either cCRE is not counted for
+that pair. It is accessible at a
 cCRE when **one FIRE element on that same sample/read, intersected with the
 read's aligned blocks, overlaps at least 50% of the cCRE length**. CIGAR deletions
 and skipped reference regions are unobserved, not closed. Aligned pieces of one
@@ -44,7 +43,7 @@ primary FDR comes from the macrophage-compatible **two-sided Fisher test after
 adding one pseudocount to each pooled cell**, corrected across all tested unique
 pairs genome-wide. Positive pairs require `fdr < 0.05`, `OR > 1`, and observed
 joint accessibility greater than its pooled independence expectation. This
-notebook selects the top five by FDR, decreasing OR, then decreasing shared-fiber
+notebook selects the top ten by FDR, decreasing OR, then decreasing shared-fiber
 coverage, using pair ID to resolve ties. It does not recalculate FDR after selection.
 
 # Setup
@@ -72,16 +71,16 @@ options(scipen = 999)
 root <- params$root
 coaccess_dir <- file.path(root, "coaccess")
 universe_dir <- file.path(root, "universe")
-plot_dir <- file.path(coaccess_dir, "plots", "top5")
-read_rule <- "any"
+out_dir <- file.path(coaccess_dir, "plots", "top10")
+table_dir <- file.path(out_dir, "tables")
+plot_dir <- file.path(out_dir, "plots")
+read_rule <- "contain"
 fire_overlap_fraction <- 0.5
 fdr_cutoff <- 0.05
-max_plot_reads <- as.integer(params$max_plot_reads)
-stopifnot(length(max_plot_reads) == 1L, !is.na(max_plot_reads), max_plot_reads > 0L)
 paths <- list(root = root, fire_root = params$fire_root,
               ft_root = params$fire_root, tf_root = params$tf_root,
               tabix_bin = params$tabix, fire_ver = "v0.1")
-dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+for (d in c(table_dir, plot_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
 stopifnot(params$locus_flank_bp >= 0)
 ```
 
@@ -152,28 +151,28 @@ stopifnot(isTRUE(all.equal(as.numeric(pairs_dt$expected_co_access), as.numeric(e
 cat(nrow(pairs_dt), "unique tested pairs loaded.\n")
 ```
 
-```{r read-ccre-and-gene-annotations}
+```{r read-ccre-annotations}
 cre_universe <- fread(file.path(universe_dir, "cre_universe.bed"), header = FALSE,
   col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
-tss_bed <- params$tss_bed
-tss <- fread(tss_bed, header = FALSE, select = 1:6,
-  col.names = c("chrom", "start", "end", "annotation", "score", "strand"))
-tss[, gene_name := tstrsplit(annotation, ";", fixed = TRUE, keep = 3L)[[1L]]]
 ```
 
-# Top five co-accessible pairs
+# Top ten co-accessible pairs
 
-```{r select-top-five}
+```{r select-top-ten}
 eligible <- pairs_dt[!is.na(fdr) & fdr < fdr_cutoff & !is.na(OR) & OR > 1 &
                        co_access > expected_co_access]
 setorderv(eligible, c("fdr", "OR", "n_shared_reads", "CRE_pair"), c(1L, -1L, -1L, 1L))
-selected <- head(eligible, 5L)
-selected[, pair_id := sprintf("LCL_top%02d", seq_len(.N))]
-fwrite(selected, file.path(plot_dir, "LCL_top5_pairs.tsv"), sep = "\t")
+selected <- head(eligible, 10L)
+# The plotted window is the pair span +/- locus_flank_bp and it names the region.
+selected[, `:=`(
+  region_start = pmax(0L, pmin(cre1_start, cre2_start) - as.integer(params$locus_flank_bp)),
+  region_end = pmax(cre1_end, cre2_end) + as.integer(params$locus_flank_bp))]
+selected[, pair_id := sprintf("top%d_%s_%d_%d", seq_len(.N), chrom, region_start, region_end)]
+fwrite(selected, file.path(table_dir, "LCL_top10_pairs.tsv"), sep = "\t")
 cat(nrow(eligible), "pairs pass the positive-association criteria; selected",
     nrow(selected), "for plotting.\n")
-if (nrow(selected) < 5L)
-  cat("Fewer than five pairs qualify; only qualifying pairs will be shown.\n")
+if (nrow(selected) < 10L)
+  cat("Fewer than ten pairs qualify; only qualifying pairs will be shown.\n")
 knitr::kable(selected[, .(pair_id, gene_names, CRE_pair, dist, n_shared_reads,
   co_access, expected_co_access, observed_expected_ratio, OR, fdr, fdr_raw)], digits = 4)
 ```
@@ -187,20 +186,96 @@ if (nrow(selected)) {
     scale_fill_manual(values = c(observed = "#B2182B", expected = "grey70")) +
     labs(x = NULL, y = "Jointly accessible fibers", fill = NULL,
          title = "Observed and expected co-accessibility",
-         subtitle = "Expectation uses pooled margins among the same jointly covered fibers")
+         subtitle = "Expectation uses pooled margins among the same jointly covered fibers") +
+    # region names carry the coordinates, so the ten labels are turned upright
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
   print(oe_plot)
-  ggsave(file.path(plot_dir, "LCL_top5_observed_expected.pdf"), oe_plot, width = 9, height = 5)
+  ggsave(file.path(plot_dir, "LCL_top10_observed_expected.pdf"), oe_plot, width = 11, height = 5)
 }
+```
+
+# Genome-wide volcano
+
+Every tested pair, so the selection threshold can be read against the null mass.
+`fdr` is already BH-corrected across all tested pairs, so the dashed line is the
+same cutoff used above and nothing is corrected again here. Three features of
+this data shape the figure: the null cloud sits right of zero, because
+accessibility is positively correlated along a fiber; the Fisher test is
+two-sided, so significant `OR < 1` pairs appear on the left even though the
+selection above keeps only `OR > 1`; and `fdr` is discrete, so points form
+horizontal bands and pile up at `fdr = 1`. The y axis is square-root scaled to
+keep the most extreme pairs on the panel without hiding the threshold.
+
+Significant pairs are coloured by chromosome class because chrX is heavily
+overrepresented: it holds about 2% of the tested pairs but over 11% of the
+significant ones. chrX points are drawn last so they stay visible inside the
+dense right-hand lobe. The figure shows the overrepresentation; it cannot
+attribute it. X-inactivation partitions pooled reads into uniformly closed Xi
+and open Xa molecules, which inflates a 2x2 odds ratio in exactly the way real
+co-accessibility does, and this table carries no haplotype, allele, or donor
+field with which to separate them.
+
+```{r volcano-all-tested-pairs, fig.height=6}
+volcano <- pairs_dt[!is.na(fdr) & is.finite(OR) & OR > 0, .(
+  chrom,
+  log2_OR = log2(OR),
+  neg_log10_fdr = -log10(pmax(fdr, .Machine$double.xmin)),
+  significant = fdr < fdr_cutoff,
+  direction = ifelse(OR > 1, "co-accessible", "co-inaccessible"))]
+# chrY is tested too, so the contrast is chrX against everything else, not autosomes.
+volcano[, chrom_class := ifelse(chrom == "chrX", "chrX",
+  ifelse(direction == "co-accessible", "other, OR > 1", "other, OR < 1"))]
+median_log2_or <- median(volcano$log2_OR)
+chosen <- selected[, .(log2_OR = log2(OR),
+  neg_log10_fdr = -log10(pmax(fdr, .Machine$double.xmin)))]
+signif_pairs <- volcano[significant == TRUE]
+cat(nrow(volcano), "tested pairs;", nrow(signif_pairs), "at FDR <", fdr_cutoff,
+    "of which", sum(signif_pairs$direction == "co-accessible"), "have OR > 1 and",
+    sum(signif_pairs$direction == "co-inaccessible"), "have OR < 1.\n")
+cat(sprintf("chrX: %d of %d tested (%.2f%%) but %d of %d significant (%.2f%%).\n",
+    sum(volcano$chrom == "chrX"), nrow(volcano),
+    100 * mean(volcano$chrom == "chrX"),
+    sum(signif_pairs$chrom == "chrX"), nrow(signif_pairs),
+    100 * mean(signif_pairs$chrom == "chrX")))
+
+volcano_plot <- ggplot(volcano, aes(log2_OR, neg_log10_fdr)) +
+  # 400k points cannot be drawn individually; the null mass is binned
+  geom_bin2d(bins = 120) +
+  scale_fill_gradient(low = "grey88", high = "grey25", trans = "log10",
+                      name = "tested pairs") +
+  geom_point(data = signif_pairs[chrom != "chrX"], aes(colour = chrom_class),
+             size = 0.5, alpha = 0.6) +
+  geom_point(data = signif_pairs[chrom == "chrX"], aes(colour = chrom_class),
+             size = 0.9, alpha = 0.9) +
+  scale_colour_manual(values = c("chrX" = "#1B7837", "other, OR > 1" = "#B2182B",
+                                 "other, OR < 1" = "#2166AC"), name = NULL) +
+  geom_point(data = chosen, shape = 21, size = 2.4, colour = "black", fill = NA,
+             stroke = 0.6) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey40") +
+  geom_vline(xintercept = median_log2_or, linetype = "dotted", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed", linewidth = 0.4) +
+  scale_y_sqrt(breaks = c(0, 1.3, 5, 20, 50, 100)) +
+  theme_bw(base_size = 11) +
+  labs(x = expression(log[2]~odds~ratio), y = expression(-log[10]~FDR~(sqrt~scale)),
+       title = "Pooled co-accessibility of all tested cCRE pairs",
+       subtitle = sprintf(paste("dashed: FDR %.2f | dotted: median log2 OR %.2f |",
+         "rings: the %d plotted below | chrX %.1f%% of significant pairs"),
+         fdr_cutoff, median_log2_or, nrow(chosen),
+         100 * mean(signif_pairs$chrom == "chrX")))
+print(volcano_plot)
+ggsave(file.path(plot_dir, "LCL_coaccess_volcano.pdf"), volcano_plot,
+       width = 9, height = 6)
 ```
 
 # Fiber plots and count checks
 
 The following code reloads **all 31 samples** from the same primary aligned-block and
 FIRE-element files used for counting. The complete reloaded 2×2 must match the
-saved result; a discrepancy stops rendering. The raster shows at most
-`r max_plot_reads` randomly selected shared fibers per pair; the m6A profile uses
-those displayed fibers. Configuration bars, count checks, and statistical
-annotations always use all shared fibers.
+saved result; a discrepancy stops rendering. The rasters draw only fibers whose
+alignment covers the whole window, at most `r max_drawn` of them, taken in
+configuration order so the co-accessible fibers are always kept and drawn on top.
+Count checks and statistical annotations always use all shared fibers, so the
+subtitle counts describe the complete set and not the drawn subset.
 
 m6A, nucleosome, and TF-footprint tracks are display annotations restricted to
 those same read identities. Missing optional display tracks produce warnings;
@@ -232,16 +307,14 @@ if (isTRUE(params$make_plots) && nrow(selected)) {
 `load_region()`, `label_reads()`, and `coaccess_2x2()` come from
 `parsing_footprints_functions.r`. Read keys include the sample name so that equal
 read names from different samples cannot be joined. Keep these complete labels
-for count verification, configuration bars, and metadata exports.
+for count verification and metadata exports.
 
 ```{r load-pair-fibers}
 pair_data <- list()
 if (isTRUE(params$make_plots) && nrow(selected)) {
   for (i in seq_len(nrow(selected))) {
     pair <- selected[i]
-    region <- list(chrom = pair$chrom,
-      start = max(0, min(pair$cre1_start, pair$cre2_start) - params$locus_flank_bp),
-      end = max(pair$cre1_end, pair$cre2_end) + params$locus_flank_bp)
+    region <- list(chrom = pair$chrom, start = pair$region_start, end = pair$region_end)
     cre1 <- list(start = pair$cre1_start, end = pair$cre1_end)
     cre2 <- list(start = pair$cre2_start, end = pair$cre2_end)
     res <- load_region(region, samples, paths$root, paths$fire_root,
@@ -278,17 +351,18 @@ for (id in names(pair_data)) {
   read_labels <- copy(entry$labels)[shared == TRUE]
   read_labels[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
   read_labels[, `:=`(pair_id = pair$pair_id, CRE_pair = pair$CRE_pair)]
-  fwrite(read_labels, file.path(plot_dir, paste0(pair$pair_id, "_read_labels.tsv.gz")), sep = "\t")
+  fwrite(read_labels, file.path(table_dir, paste0(pair$pair_id, "_read_labels.tsv.gz")), sep = "\t")
   contributions <- read_labels[, .(n_shared = .N, co_access = sum(acc1 & acc2),
     CRE1_access = sum(acc1 & !acc2), CRE2_access = sum(!acc1 & acc2),
     co_closed = sum(!acc1 & !acc2)), by = .(pair_id, sample_name, donor)]
-  fwrite(contributions, file.path(plot_dir, paste0(pair$pair_id, "_sample_counts.tsv")), sep = "\t")
+  fwrite(contributions, file.path(table_dir, paste0(pair$pair_id, "_sample_counts.tsv")), sep = "\t")
 }
 ```
 
 ## Prepare the displayed fibers and annotation tracks
 
-Sample up to `r max_plot_reads` shared fibers with a fixed seed. Load m6A,
+Keep the window-spanning shared fibers, co-accessible first, up to
+`r max_drawn`. Load m6A,
 ft nucleosomes, and FiberHMM TF footprints only for these display keys using
 `load_ft_tracks()` from the parsing functions. Copies of the display tables are
 labelled `pooled`; the original sample/read keys and complete labels are retained.
@@ -296,15 +370,20 @@ Read backbones, FIRE, nucleosome and TF intervals are broken at alignment gaps;
 the m6A denominator counts only fibers with an aligned base at that position.
 
 ```{r prepare-display-fibers}
+max_drawn <- 500L
 display_data <- list()
 for (id in names(pair_data)) {
   entry <- pair_data[[id]]
-  drawn_labels <- copy(entry$labels)[shared == TRUE]
-  set.seed(as.integer(params$seed))
-  if (nrow(drawn_labels) > max_plot_reads) {
-    drawn_keys <- sample(drawn_labels$key, max_plot_reads)
-    drawn_labels <- drawn_labels[key %in% drawn_keys]
-  }
+  region <- entry$region
+  # Draw only fibers whose alignment covers the whole window, so every drawn row
+  # is informative at both cCREs. config is a factor ordered "both accessible",
+  # "CRE1 only", "CRE2 only", "neither", so sorting on it before the cap keeps
+  # the co-accessible fibers first.
+  spanning <- entry$res$spans[start <= region$start & end >= region$end, key]
+  drawn_labels <- copy(entry$labels)[shared == TRUE & key %in% spanning]
+  setorder(drawn_labels, config)
+  n_spanning <- nrow(drawn_labels)
+  if (n_spanning > max_drawn) drawn_labels <- drawn_labels[seq_len(max_drawn)]
 
   display_res <- load_ft_tracks(copy(entry$res), keys = drawn_labels$key,
     ft_root = paths$ft_root, tabix_bin = paths$tabix_bin,
@@ -316,10 +395,20 @@ for (id in names(pair_data)) {
   display_res$samples <- "pooled"
   drawn_labels[, sample_name := "pooled"]
 
-  region <- entry$region
   cres_here <- cre_universe[chrom == region$chrom & end > region$start & start < region$end]
   region_res <- coaccess_region_result(display_res, entry$cre1, entry$cre2,
     drawn_labels, cres = cres_here)
+
+  # order_reads() ranks "both accessible" first, which a discrete ggplot axis
+  # draws at the bottom. Reverse the shared RID levels so those fibers sit on
+  # top instead. The m6A raster and the footprint raster map y to the same
+  # factor, so both panels keep the identical order.
+  rid_levels <- rev(levels(region_res$rids_df$RID))
+  for (tb in c("reads", "rids_df", "fire", "nucs", "fps", "fps_infire")) {
+    if (!is.null(region_res[[tb]]) && nrow(region_res[[tb]]))
+      region_res[[tb]][["RID"]] <- factor(as.character(region_res[[tb]][["RID"]]),
+                                          levels = rid_levels)
+  }
 
   # Keep the cCRE class order used by the shared plotting functions.
   pk <- as.data.frame(cres_here)
@@ -329,7 +418,7 @@ for (id in names(pair_data)) {
   peaks_df <- data.frame(chr = pk$chrom, start = pk$start, end = pk$end,
     group = as.character(pk$CRE_label))
   display_data[[id]] <- list(region_res = region_res, peaks_df = peaks_df,
-    n_drawn = nrow(drawn_labels))
+    n_drawn = nrow(drawn_labels), n_spanning = n_spanning)
 }
 ```
 
@@ -349,24 +438,21 @@ for (id in names(pair_data)) {
   display <- display_data[[id]]
   region_res <- display$region_res
 
-  subtitle <- sprintf(paste0("%s:%d-%d | gap %d bp | O %.0f / E %.2f | ",
-    "OR %.3g | genome-wide FDR %.3g"), region$chrom, region$start, region$end,
-    pair$dist, pair$co_access, pair$expected_co_access, pair$OR, pair$fdr)
+  subtitle <- sprintf("%s:%d-%d", region$chrom, region$start, region$end)
   subtitle <- paste0(subtitle, "\n", sprintf(paste0(
-    "%d fibers have aligned bases at both cCREs: both %d | CRE1 only %d | CRE2 only %d | neither %d",
+    "%d fibers fully cover both cCREs: both %d | CRE1 only %d | CRE2 only %d | neither %d",
     " | Fisher OR (table + 1) = %.2f, p = %.2g"), counts$n_shared,
     counts$both, counts$cre1_only, counts$cre2_only, counts$neither,
     counts$fisher_or, counts$fisher_p))
-  if (display$n_drawn < counts$n_shared)
-    subtitle <- paste0(subtitle, sprintf("\ndrawn: %d of %d fibers (seed %d)",
-      display$n_drawn, counts$n_shared, as.integer(params$seed)))
 
   raster_height <- max(2, 0.025 * display$n_drawn + 0.3)
   heights <- c(pileup = 1.5, peaks = 0.3 + 0.3 * length(unique(display$peaks_df$group)),
     reads = raster_height, fire_fiberHMM = raster_height)
   read_theme <- list(axis.ticks.y = element_blank(), panel.grid.major.y = element_blank())
   fiber_plots[[id]] <- plot_region_panels(region_res,
-    plot_name = paste(id, pair$gene_names, pair$CRE_pair_labels, sep = " | "),
+    plot_name = paste(id, pair$gene_names, pair$CRE_pair_labels,
+      sprintf("%d of %d window-spanning fibers drawn, co-accessible first",
+              display$n_drawn, display$n_spanning), sep = " | "),
     subtitle = subtitle, peaks_df = display$peaks_df, highlight = region_res$highlight,
     linewidth = 1.1, expand = TRUE, heights = heights,
     profile_options = list(colour_by = "group", colors = cluster_palette("pooled"),
@@ -388,66 +474,24 @@ for (id in names(pair_data)) {
 }
 ```
 
-```{r add-canonical-tss-panel}
-for (id in names(pair_data)) {
-  region <- pair_data[[id]]$region
-  genes_here <- tss[chrom == region$chrom & end > region$start & start < region$end]
-  if (nrow(genes_here)) {
-    gene_plot <- ggplot(genes_here, aes(start, gene_name)) +
-      geom_point(aes(shape = strand), size = 2) + theme_bw() +
-      coord_cartesian(xlim = c(region$start, region$end), expand = TRUE) +
-      labs(x = NULL, y = "Canonical TSS", shape = "Strand")
-    fiber_plots[[id]]$combined <- gene_plot / fiber_plots[[id]]$combined +
-      plot_layout(heights = c(1, 12))
-  }
-}
-```
-
-## Draw configuration bars using all shared fibers
-
-`configuration_proportion_inputs()` and `plot_stacked_proportion()` come from
-`plotting_functions.r`. Each sample retains its original label, and an additional
-pooled bar combines all samples. Counts above the bars use all shared fibers.
-
-```{r draw-configuration-bars}
-configuration_plots <- list()
-for (id in names(pair_data)) {
-  labels <- copy(pair_data[[id]]$labels)[shared == TRUE]
-  pooled_labels <- copy(labels)[, sample_name := "pooled"]
-  bar_levels <- c("pooled", samples)
-  config_inputs <- configuration_proportion_inputs(rbind(pooled_labels, labels), bar_levels)
-  configuration_plots[[id]] <- plot_stacked_proportion(config_inputs$rows,
-    "sample_name", "config", CONFIG_COLS,
-    position = "fill", width = .7, legend = list(drop = FALSE),
-    totals = list(data = config_inputs$totals, x = "sample_name", y = 1.04,
-      label = "lab", style = list(size = 3)),
-    scales = list(scale_y_continuous(labels = scales::percent, limits = c(0, 1.08),
-      breaks = c(0, .25, .5, .75, 1))),
-    labels = list(x = NULL, y = "fibers spanning both cCREs", fill = "configuration",
-      title = paste(id, "all shared fibers; sample labels are metadata")),
-    theme = theme_fiberseq("bw", base_size = 11,
-      overrides = list(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))))
-}
-```
-
 ## Save and display the figures
 
 ```{r save-pair-figures}
+# The page grows with the drawn fiber count: 0.025 in per fiber in each of the
+# two read rasters, plus the fixed panels. At the max_drawn cap this is 31 in.
 for (id in names(pair_data)) {
+  fig_height <- 6 + 0.05 * display_data[[id]]$n_drawn
   ggsave(file.path(plot_dir, paste0(id, "_reads.pdf")),
-    fiber_plots[[id]]$combined, width = 12, height = 16, limitsize = FALSE)
-  ggsave(file.path(plot_dir, paste0(id, "_config_bars.pdf")),
-    configuration_plots[[id]], width = 13, height = 5)
+    fiber_plots[[id]]$combined, width = 12, height = fig_height, limitsize = FALSE)
 }
 ```
 
-```{r plot-top-five, results="asis", fig.width=12, fig.height=16}
+```{r plot-top-ten, results="asis", fig.width=12, fig.height=16}
 if (length(pair_data)) {
   for (id in names(pair_data)) {
     pair <- pair_data[[id]]$pair
     cat("\n\n## ", pair$pair_id, ": ", pair$gene_names, "\n\n", sep = "")
     print(fiber_plots[[id]]$combined)
-    print(configuration_plots[[id]])
   }
 } else {
   cat("No fiber plots requested or no qualifying pairs.\n")
@@ -457,12 +501,12 @@ if (length(pair_data)) {
 ```{r verified-configuration-counts}
 if (length(pair_data)) {
   verified <- rbindlist(lapply(pair_data, function(entry) entry$counts), idcol = "pair_id")
-  fwrite(verified, file.path(plot_dir, "LCL_top5_verified_counts.tsv"), sep = "\t")
+  fwrite(verified, file.path(table_dir, "LCL_top10_verified_counts.tsv"), sep = "\t")
   knitr::kable(verified)
   cat("Every displayed pair reproduces the pooled analysis counts exactly.\n")
 }
 ```
 
-```{r session-information}
+```{r session-information, eval=FALSE}
 sessionInfo()
 ```

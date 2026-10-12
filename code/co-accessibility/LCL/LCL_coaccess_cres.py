@@ -3,7 +3,10 @@
 
 Adapted from macrophage/03_coaccess_cres.py. Candidate cCREs overlap the union
 of LCL FIRE peaks and share a canonical TSS +/-10 kb window. The interval gap
-must satisfy 500 < gap < 20000. Shared reads have aligned bases at both cCREs.
+must satisfy 500 < gap < 20000. Shared reads have aligned bases covering the
+FULL length of both cCREs (--read-rule contain): every base of each cCRE must
+fall inside the read's M/= /X blocks, so a read whose alignment gap or end lands
+inside either cCRE is not counted for that pair.
 A cCRE is accessible when ONE FIRE element on that same read covers >=50% of
 the cCRE length after intersecting with CIGAR M/= /X blocks. D/N gaps never
 contribute coverage or accessibility; separate FIRE elements are not combined.
@@ -34,7 +37,10 @@ CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
 CELLS = ["co_closed", "CRE1_access", "CRE2_access", "co_access"]
 COVERAGE_MODE = "aligned_blocks_v1"
 
-
+#################################################
+# build sample meta table
+#################################################
+# read the sample metatable and FIRE element and FIRE peaks file path for all 31 samples
 def sample_manifest(path, root):
     samples = pd.read_csv(path, dtype=str, keep_default_na=False)
     required = {"sample_name", "cell_line", "fire_dir"}
@@ -55,29 +61,49 @@ def sample_manifest(path, root):
     samples["blocks_path"] = [str(root / s / f"{s}.aligned_blocks.bed.gz") for s in samples.sample_name]
     return samples
 
-
+#################################################
+# check every file exists in sample meta table
+#################################################
 def require_files(paths):
     missing = [str(p) for p in paths if not Path(p).is_file() or Path(p).stat().st_size == 0]
     if missing:
         raise FileNotFoundError("Missing/empty inputs:\n" + "\n".join(missing))
 
+#################################################
+# builds the candidate CRE pairs test
+#################################################
+# a pair must share a gene's TSS window and should be 500-20,000 bp distance
+
+# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/universe/cre_universe.bed -> 
+  # this the the overlap ENCODE cCREs /project/spott/cshan/annotations/GRCh38-cCREs.bedand merged FIRE peaks across all 31 samples 
+  # /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/universe/fire_peaks_union.bed
+  
+  
+# TSS: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
+
 
 def build_pairs(cre, membership, min_dist, max_dist):
     """Gene memberships plus one stable coordinate-oriented record per pair."""
+    # look up key by cCRE ID
     pos = cre.set_index("CRE_ID")
     records = []
+    # loop over genes, each group hold rows for the cCREs that fall in that gene's TSS window, 10kb on each side
     for gene_id, group in membership.groupby("gene_id", sort=False):
+        # sort the gene's CRE ID by chr, start, end
         ids = sorted(group.CRE_ID.unique(), key=lambda c: (pos.at[c, "chrom"], pos.at[c, "start"], pos.at[c, "end"], c))
+        # select the first row and get every pair once
         gene = group.iloc[0]
         for i, c1 in enumerate(ids):
             for c2 in ids[i + 1:]:
                 if pos.at[c1, "chrom"] != pos.at[c2, "chrom"]:
                     continue
+                  # distance from the end the c1 (first CRE) to the start of c2, overlapping CREs get 0
                 gap = max(0, int(pos.at[c2, "start"]) - int(pos.at[c1, "end"]))
                 if gap >= max_dist:
                     break
                 if gap > min_dist:
                     records.append((c1, c2, gap, gene_id, gene.gene_name, gene.transcript_type))
+    # pairwise cCRE id table, and add CRE coordinates
     gm = pd.DataFrame(records, columns=["CRE1", "CRE2", "dist", "gene_id", "gene_name", "transcript_type"])
     gm["CRE_pair"] = gm.CRE1 + "-" + gm.CRE2
     pairs = gm.drop_duplicates("CRE_pair")[["CRE_pair", "CRE1", "CRE2", "dist"]].reset_index(drop=True)
@@ -90,7 +116,9 @@ def build_pairs(cre, membership, min_dist, max_dist):
         pairs["CRE_pair_labels"] = pos.loc[pairs.CRE1, "CRE_label"].to_numpy() + "-" + pos.loc[pairs.CRE2, "CRE_label"].to_numpy()
     return pairs, gm
 
-
+#################################################
+# run bedtools and outputs error message
+#################################################
 def command_lines(command):
     """Stream bedtools output; do not hold every overlap line in memory."""
     with tempfile.TemporaryFile(mode="w+t") as err:
@@ -104,55 +132,93 @@ def command_lines(command):
         if code:
             err.seek(0)
             raise RuntimeError(f"{command[0]} failed: {err.read()[:4000]}")
-
-
+          
+#################################################
+# Convert bed12 to bed3
+#################################################
+# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/<sample>/<sample>.aligned_blocks.bed.gz
 def aligned_blocks(fields):
-    """Decode sentinel-free BED12 from bamtobed -bed12 -splitD."""
+    """Decode BED12 (without zeros at the end and beginning) from bamtobed -bed12 -splitD to a list of genomic coordinates"""
+    # read the read's outer start and end, and the number of blocks from bed12
     start, end, count = int(fields[1]), int(fields[2]), int(fields[9])
+    # size = size of the block
+    # offsets = distance to the start 
     sizes = [int(x) for x in fields[10].rstrip(",").split(",")]
     offsets = [int(x) for x in fields[11].rstrip(",").split(",")]
+    # block start = read start + offset
+    # block end - block start + size
     blocks = [(start + offset, start + offset + size) for offset, size in zip(offsets, sizes)]
     if len(sizes) != count or len(offsets) != count or not blocks or any(
             s < start or e > end or e < s or (i and s < blocks[i-1][1])
             for i, (s, e) in enumerate(blocks)):
         raise ValueError(f"Invalid aligned BED12 blocks for {fields[3]}")
-    # bedtools emits zero-size blocks at terminal/adjacent D/N operators.
-    # They contain no aligned bases and are not an error or a QC exclusion.
     return [(s, e) for s, e in blocks if e > s]
 
+#################################################
+# counts how many bases of an interval [start, end) are covered by a read’s aligned blocks
+#################################################
+
+# Example: A read has blocks (1000, 1200) and (1300, 1500), and the cCRE is (1150, 1350).
+# Block 1: min(1200, 1350) − max(1000, 1150) = 1200 − 1150 = 50
+# Block 2: min(1500, 1350) − max(1300, 1150) = 1350 − 1300 = 50
+# Total = 100 bp
 
 def aligned_overlap(blocks, start, end):
+    # overlap length between the block and the interval
     return sum(max(0, min(e, end) - max(s, start)) for s, e in blocks)
 
-
+#################################################
+# get spanning reads, and accessible reads for every CRE
+#################################################
 def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, fire_fraction, tmpdir):
-    """Intersect each original FIRE with its own primary aligned blocks."""
+    """Intersect each FIRE with aligned blocks."""
+    # pull only chrom out of the sample's aligned blocks file and its FIRE elements file
     spans = tmpdir / "spans.bed"
     elements = tmpdir / "elements.bed"
     for source, destination in ((blocks_path, spans), (elements_path, elements)):
         with destination.open("w") as output:
             subprocess.run([TABIX, str(source), chrom], stdout=output, check=True)
+    # maps cCRE ID to read ID
     coverage = defaultdict(set)
     blocks_by_read = {}
+    # which read covers the CRE by at least 1bp
+    #################################################
+    # find every read that has outer span overlaps a cCRE, holds CRE and read side by side
+    # -wa -wb prints both the cCRE record and the read record on one line
     command = [BEDTOOLS, "intersect", "-a", str(cre_bed), "-b", str(spans), "-wa", "-wb"]
+    # pull out the read ID, and take the CRE end and start, 
+    # count how many bases of CRE fall inside the read's aligned block
     for fields in command_lines(command):
-        rid = fields[8]  # BED5 cCRE followed by BED12 primary alignment.
+        rid = fields[8]  # BED5 cCRE followed by BED12 primary alignment
         if rid not in blocks_by_read:
             blocks_by_read[rid] = aligned_blocks(fields[5:17])
         start, end = int(fields[1]), int(fields[2])
         overlap = aligned_overlap(blocks_by_read[rid], start, end)
+        # default rule for alignment: fully align both CREs
         if overlap > 0 and (read_rule == "any" or overlap == end - start):
+          # if the read pass, write the read ID in CRE coverage
             coverage[fields[3]].add(rid)
+            
+    # For the reads that cover CRE by at least 1bp, on which read is each CRE accessible?
+    #################################################
+    # accessible = FIRE element overlap with 50% of the CRE length
+    
+    # Example. The cCRE is 200 bp, so the threshold is 100 bp. One FIRE element covers 160 bp of it, 
+    # but a deletion removes 70 bp of that stretch, leaving 90 aligned bp. That is below 100, 
+    # so the read is not accessible. If the aligned part were 110 bp, it would be
+    
     accessible = defaultdict(set)
+    
     for fields in command_lines([BEDTOOLS, "intersect", "-a", str(cre_bed), "-b", str(elements),
                                   "-f", str(fire_fraction), "-wa", "-wb"]):
-        # The BED interval fraction is only a cheap upper-bound prefilter.
-        # Sum aligned pieces of THIS element, never pieces of different elements.
         rid = fields[8]
+        # take only FIRE element that sits inside the CRE
         start, end = max(int(fields[1]), int(fields[6])), min(int(fields[2]), int(fields[7]))
+        # count the # of aligned blocks, using the read's aligned blocks from coverage step
         overlap = aligned_overlap(blocks_by_read.get(rid, ()), start, end)
         if overlap > 0 and overlap >= fire_fraction * (int(fields[2]) - int(fields[1])):
             accessible[fields[3]].add(rid)
+    # For each cCRE, only keep accessible regions that apear in CRE coverage read     
     orphan_hits = 0
     for cre_id in accessible:
         before = len(accessible[cre_id])
@@ -161,10 +227,34 @@ def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, f
     spans.unlink(); elements.unlink()
     return coverage, accessible, orphan_hits
 
+#################################################
+# build 2x2 table for every CRE pair, for one sample and on one chr
+#################################################
+
+# table1: one pair, one sample
+# co_closed	CRE1_access	CRE2_access	co_access
+# 60	20	10	10
+# 
+# table2: 2x2 table
+# 	CRE2 closed	CRE2 accessible
+# CRE1 closed	60	10
+# CRE1 accessible	20	10
+# 
+# table3: pooling across samples
+# sample	co_closed	CRE1_access	CRE2_access	co_access	shared
+# sample 1	60	20	10	10	100
+# sample 2	45	15	8	12	80
+# sample 3	30	10	5	5	50
+# pooled	135	45	23	27	230
+# 
+# Expected co-access if independent = (27 + 45) × (27 + 23) / 230 = 72 × 50 / 230 ≈ 15.7
+# Observed co-access = 27, so observed/expected ≈ 1.7. The two cCREs are accessible together more often than chance.
+# OR = (27 + 1)(135 + 1) / ((45 + 1)(23 + 1)) = 28 × 136 / (46 × 24) ≈ 3.45
 
 def count_pairs(pairs, coverage, accessible):
     counts = np.zeros((len(pairs), 4), dtype=np.int64)
     empty = set()
+    # loop over the pairs, 
     for i, pair in enumerate(pairs.itertuples(index=False)):
         shared = coverage.get(pair.CRE1, empty) & coverage.get(pair.CRE2, empty)
         a = accessible.get(pair.CRE1, empty) & shared
@@ -204,7 +294,7 @@ def main():
     ap.add_argument("--sample-metatable", default=METATABLE)
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--prepare-manifest", action="store_true", help="Validate all31 source inputs and write universe/sample_manifest.tsv only")
-    ap.add_argument("--read-rule", choices=["any", "contain"], default="any")
+    ap.add_argument("--read-rule", choices=["any", "contain"], default="contain")
     ap.add_argument("--fire-overlap-fraction", type=float, default=0.5, help="Fraction of cCRE covered by ONE same-read FIRE element")
     ap.add_argument("--min-dist", type=int, default=500)
     ap.add_argument("--max-dist", type=int, default=20000)

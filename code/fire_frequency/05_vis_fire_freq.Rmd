@@ -646,10 +646,7 @@ fp_cols <- c("linker (non-FIRE MSP)"  = "darkgray",
              "TF footprint 30-60 bp"  = "magenta",
              "TF footprint 60-80 bp"  = "#41c4e1")
 
-# ENCODE SCREEN cCRE colours
-ccre_cols <- c(PLS = "#FF0000", pELS = "#FFA700", dELS = "#FFCD00",
-               "CA-H3K4me3" = "#FFAAAA", "CA-CTCF" = "#00B0F0", "CA-TF" = "#BE28E5",
-               CA = "#06DA93", TF = "#D876EC", "tested FIRE region" = "black")
+# cCRE colours come from CCRE_COLORS in plotting_functions.r
 ```
 
 ```{r top10_examples_regions}
@@ -906,7 +903,7 @@ for (i in seq_len(nrow(top10_examples_regions))) {
     cc <- list(n_tracks = nrow(tr), plot = plot_interval_track(tr,
       c(ex$window_start, ex$window_end), fill_col = "class", row_col = "y",
       geometry = "rect", height = .7, clip_intervals = TRUE,
-      color_scale = scale_fill_manual(values = ccre_cols, guide = "none"),
+      color_scale = scale_fill_manual(values = CCRE_COLORS, guide = "none"),
       scales = list(y = scale_y_continuous(breaks = tr$y, labels = tr$label, expand = expansion(add = .5)),
         x = scale_x_continuous(breaks = window_breaks(ex), labels = scales::comma),
         coord = coord_cartesian(xlim = xlim, expand = FALSE)),

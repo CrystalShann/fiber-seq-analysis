@@ -10,6 +10,15 @@ LEIDEN_CLUSTER_COLORS <- c(
 LEIDEN_TIMEPOINT_COLORS <- c("LPS_0" = "#bdbdbd", "LPS_5" = "#6baed6",
                              "LPS_10" = "#2171b5", "LPS_15" = "#08306b")
 
+# ENCODE SCREEN cCRE colours, named by CCRE_CLASSES
+# (parsing_footprints_functions.r) plus the tested-region row of the
+# FIRE-frequency interval tracks. The cCRE panel of plot_region_panels() and
+# the molecule panels of 05_vis_fire_freq.Rmd share these values; classes
+# outside this palette are drawn black.
+CCRE_COLORS <- c(PLS = "#FF0000", pELS = "#FFA700", dELS = "#FFCD00",
+                 "CA-H3K4me3" = "#FFAAAA", "CA-CTCF" = "#00B0F0", "CA-TF" = "#BE28E5",
+                 CA = "#06DA93", TF = "#D876EC", "tested FIRE region" = "black")
+
 # ---------------------------------------------------------------------------
 # Colour each cluster level by its position: the first level gets the first
 # LEIDEN_CLUSTER_COLORS colour, and so on. More than 25 levels are
@@ -523,6 +532,8 @@ plot_group_profile <- function(profile, window = NULL, group_col = NULL,
 #'   backbone_col, arrows, base_colors, require_data.
 #' peaks_options: variant (intervals/tested); tested is one row, linewidth 3,
 #'   tested #B2182B / other grey55 with the original co-accessibility legend.
+#'   intervals is one row per group, CCRE_COLORS by group with no legend
+#'   (the y axis names the rows) and black for groups outside the palette.
 #' footprint_options: draw_order (NULL retains separate FIRE, nuc, TF layers;
 #'   class names combine/sort them into one layer), backbone, always,
 #'   legend_title, legend_drop, legend_linewidth.
@@ -636,8 +647,14 @@ plot_region_panels <- function(res,
         pk$group <- factor(pk$group, levels = unique(pk$group))
         pk <- pk[order(pk$group, pk$start), , drop = FALSE]
         pk$y <- rev(seq_len(nrow(pk)))
-        gg$peaks <- plot_interval_track(pk, xlims, row_col = "y", geometry = "segment",
-          linewidth = 1.5, color = "black", highlight = highlights,
+        # Colour the rows by cCRE class. The y axis already names every row, so
+        # the legend is dropped and this panel keeps the plot width of the other
+        # stacked panels. Groups outside CCRE_COLORS stay black.
+        cre_cols <- stats::setNames(unname(CCRE_COLORS[levels(pk$group)]), levels(pk$group))
+        cre_cols[is.na(cre_cols)] <- "black"
+        gg$peaks <- plot_interval_track(pk, xlims, fill_col = "group", row_col = "y",
+          geometry = "segment", linewidth = 1.5, highlight = highlights,
+          color_scale = ggplot2::scale_colour_manual(values = cre_cols, guide = "none"),
           labels = list(x = NULL, y = NULL),
           scales = list(y = ggplot2::scale_y_continuous(breaks = pk$y,
             labels = as.character(pk$group), expand = ggplot2::expansion(mult = c(.15, .15))),
