@@ -209,11 +209,10 @@ keep the most extreme pairs on the panel without hiding the threshold.
 Significant pairs are coloured by chromosome class because chrX is heavily
 overrepresented: it holds about 2% of the tested pairs but over 11% of the
 significant ones. chrX points are drawn last so they stay visible inside the
-dense right-hand lobe. The figure shows the overrepresentation; it cannot
-attribute it. X-inactivation partitions pooled reads into uniformly closed Xi
-and open Xa molecules, which inflates a 2x2 odds ratio in exactly the way real
-co-accessibility does, and this table carries no haplotype, allele, or donor
-field with which to separate them.
+dense right-hand lobe. X-inactivation partitions pooled reads into uniformly
+closed Xi and open Xa molecules, which inflates a 2x2 odds ratio in exactly the
+way real co-accessibility does. This figure shows the overrepresentation; the
+X-inactivation section below attributes it.
 
 ```{r volcano-all-tested-pairs, fig.height=6}
 volcano <- pairs_dt[!is.na(fdr) & is.finite(OR) & OR > 0, .(
@@ -498,13 +497,375 @@ if (length(pair_data)) {
 }
 ```
 
-```{r verified-configuration-counts}
-if (length(pair_data)) {
-  verified <- rbindlist(lapply(pair_data, function(entry) entry$counts), idcol = "pair_id")
-  fwrite(verified, file.path(table_dir, "LCL_top10_verified_counts.tsv"), sep = "\t")
-  knitr::kable(verified)
-  cat("Every displayed pair reproduces the pooled analysis counts exactly.\n")
+# X-inactivation
+
+chrX supplies about 2% of the tested pairs and over 11% of the significant ones.
+The four panels below attribute that to X-inactivation rather than to
+cCRE co-accessibility. Each X in a female cell is either active or inactive, and
+a fiber comes from one X in one cell, so the pooled fiber set is a mixture of
+uniformly closed Xi and open Xa molecules. For a mixture over latent classes
+whose two per-cCRE rates are `a_c` and `b_c`, and with the two cCREs independent
+inside every class, `Cov(open1, open2) = Cov_c(a_c, b_c)`. X-inactivation makes
+`a_c` and `b_c` move together across classes, so the covariance is large and the
+pooled 2x2 shows association with no local co-accessibility at all. With Xi fully
+closed and an active fraction `p` the inflation is exactly `1/p`. The Fisher test
+assumes one exchangeable fiber pool and has no term for this.
+
+Panel A derives donor sex from coverage and shows the inflation against it.
+Panel B shows the two fiber populations directly. Panel C re-runs the pooled test
+in each sex separately. Panel D uses the pseudoautosomal regions, which escape
+X-inactivation, as an internal negative control.
+
+These panels diagnose the pooled test; they do not change it. Nothing here feeds
+back into the pair table, the FDR, or the top-ten selection above.
+
+## Panel A: donor sex against chrX inflation
+
+One pass over the per-sample counts. Coverage uses every row. The
+observed/expected ratio uses only pairs with at least `xci_min_fibers` fibers in
+that sample, since below that the expectation is not worth forming, and it is
+computed **within** each sample, so no part of it can come from pooling donors.
+Both quantities are divided by the number of pairs their chromosome class
+contributes, which puts chrX and autosomal fiber depth on the same per-pair
+footing.
+
+```{r xci-sex-and-inflation, fig.height=5}
+xci_min_fibers <- 6L
+counts_file <- file.path(coaccess_dir, "LCL_pair_sample_counts.tsv.gz")
+stopifnot(file.exists(counts_file))
+
+per_sample <- fread(cmd = sprintf(
+  "zcat %s | awk -F'\\t' -v OFS='\\t' -v m=%d '
+     NR == 1 { next }
+     { cls = ($6 == \"chrX\") ? \"chrX\" : (($6 == \"chrY\") ? \"chrY\" : \"autosome\")
+       k = $7 SUBSEP cls
+       cov[k] += $9; np[k]++
+       if ($9 >= m) { obs[k] += $5; ex[k] += ($5 + $3) * ($5 + $4) / $9 } }
+     END { for (k in cov) { split(k, p, SUBSEP)
+             print p[1], p[2], cov[k], np[k], obs[k], ex[k] } }'",
+  shQuote(counts_file), xci_min_fibers),
+  col.names = c("sample_name", "class", "fibers", "n_pairs", "obs", "exp"))
+stopifnot(setequal(per_sample$sample_name, samples))
+
+wide <- dcast(per_sample, sample_name ~ class,
+              value.var = c("fibers", "n_pairs", "obs", "exp"))
+wide[, `:=`(
+  x_depth = (fibers_chrX / n_pairs_chrX) / (fibers_autosome / n_pairs_autosome),
+  oe_chrX = obs_chrX / exp_chrX,
+  oe_auto = obs_autosome / exp_autosome)]
+wide[, oe_ratio := oe_chrX / oe_auto]
+
+# Two X copies put chrX fiber depth at parity with the autosomes; one copy
+# halves it. The observed values fall in two blocks with nothing between them,
+# so the cut sits in that gap and the gap itself is asserted.
+sex_depth_cut <- 0.9
+stopifnot(!any(wide$x_depth > 0.8 & wide$x_depth < 1.0))
+wide[, sex := ifelse(x_depth >= sex_depth_cut, "female (XX)", "male (XY)")]
+sample_sex <- wide[, .(sample_name, sex, x_depth, oe_chrX, oe_auto, oe_ratio)]
+sample_sex[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
+fwrite(sample_sex, file.path(table_dir, "LCL_xci_sample_sex.tsv"), sep = "\t")
+
+# Sex is read off coverage alone. The inflation is then measured on that
+# pre-existing grouping, so the two axes are not the same quantity twice.
+f_ratio <- sample_sex[sex == "female (XX)", oe_ratio]
+m_ratio <- sample_sex[sex == "male (XY)", oe_ratio]
+sep_p <- if (min(f_ratio) > max(m_ratio))
+  1 / choose(length(f_ratio) + length(m_ratio), length(f_ratio)) else NA_real_
+cat(sprintf("%d female and %d male donors; median chrX/autosome O/E %.3f vs %.3f.\n",
+            length(f_ratio), length(m_ratio), median(f_ratio), median(m_ratio)))
+cat(if (is.na(sep_p)) "The two groups overlap.\n" else
+  sprintf("Every female sample exceeds every male sample; exact one-sided p = %.3g.\n", sep_p))
+
+panel_a <- ggplot(sample_sex, aes(x_depth, oe_ratio, colour = sex)) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4, colour = "grey40") +
+  geom_vline(xintercept = sex_depth_cut, linetype = "dotted", linewidth = 0.4) +
+  geom_point(size = 2.6, alpha = 0.9) +
+  scale_colour_manual(values = c("female (XX)" = "#1B7837", "male (XY)" = "#762A83"),
+                      name = NULL) +
+  theme_bw(base_size = 11) +
+  labs(x = "chrX : autosome fiber depth, per pair",
+       y = "chrX O/E divided by the same sample's autosomal O/E",
+       title = "Co-accessibility inflation on chrX tracks donor sex",
+       subtitle = sprintf(paste("one point per sample | dotted: sex cut %.2f |",
+         "dashed: no inflation%s"), sex_depth_cut,
+         if (is.na(sep_p)) "" else sprintf(" | separation p = %.1g", sep_p)))
+print(panel_a)
+ggsave(file.path(plot_dir, "LCL_xci_panelA_sex_vs_inflation.pdf"), panel_a,
+       width = 7.5, height = 5)
+```
+
+## Panel B: the two fiber populations
+
+Chromosome state is not a local property, so this measures each fiber along its
+whole length rather than inside the plotted window: FIRE elements per aligned kb
+over the fiber's entire aligned span, with **both tested cCREs cut out of every
+interval**. The measurement therefore never touches the sites the 2x2 is built
+from, so it cannot restate the test. Reaching the fiber ends needs a wider tabix
+query than the plotted window, which is the cost of this panel; FIRE-element
+density per kb is already length-normalised, so fibers from all ten pairs pool.
+
+Counting elements rather than bp matters. FIRE elements are punctate calls a few
+hundred bp wide, so an element **fraction** over a multi-kb span is near zero for
+every fiber and separates nothing; a per-kb **rate** is the quantity that
+distinguishes a fiber carrying several accessible patches from one carrying none.
+
+If the association comes from chromosome state, the fibers split into a closed
+mode with no accessible patch anywhere along their length and an open mode, and
+the fibers scored `neither` at the tested pair are the closed mode. The
+closed/open split is visible at autosomal pairs too, which is the same
+fiber-level heterogeneity that puts the autosomal null cloud slightly right of
+zero; what is specific to chrX is that the split is set by donor sex.
+
+```{r xci-fiber-state, fig.height=5}
+xci_wide_flank_bp <- 25000L   # reach past the ends of fibers spanning the pair
+xci_min_span_kb <- 5
+
+fiber_state <- rbindlist(lapply(names(pair_data), function(id) {
+  entry <- pair_data[[id]]
+  wide <- list(chrom = entry$region$chrom,
+               start = max(0L, entry$region$start - xci_wide_flank_bp),
+               end = entry$region$end + xci_wide_flank_bp)
+  res <- load_region(wide, samples, paths$root, paths$fire_root,
+    fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
+    span_source = "aligned_blocks")
+  shared <- entry$labels[shared == TRUE]
+
+  # Subtract both tested cCREs from every interval, so what is measured is the
+  # rest of the fiber and not the two sites the 2x2 is built from.
+  cut_cres <- function(tb) {
+    for (cc in list(entry$cre1, entry$cre2)) {
+      left <- copy(tb[start < cc$start])[, end := pmin(end, cc$start)]
+      right <- copy(tb[end > cc$end])[, start := pmax(start, cc$end)]
+      tb <- rbind(left, right)[end > start]
+    }
+    tb
+  }
+  aligned <- cut_cres(res$blocks[key %in% shared$key, .(key, start, end)])
+  fire <- cut_cres(res$elements[key %in% shared$key, .(key, element_id, start, end)])
+  # Count distinct elements, not interval pieces: clipping at a cCRE edge or an
+  # alignment gap splits one element across rows that share an element_id.
+  fire_n <- if (nrow(fire)) fire[, .(n_fire = uniqueN(element_id)), by = key] else
+    data.table(key = character(), n_fire = integer())
+
+  out <- merge(aligned[, .(span_kb = sum(end - start) / 1000), by = key],
+               fire_n, by = "key", all.x = TRUE)
+  out[is.na(n_fire), n_fire := 0L]
+  out <- merge(out, shared[, .(key, sample_name, config)], by = "key")
+  out[span_kb >= xci_min_span_kb,
+      .(pair_id = id, chrom_class = ifelse(entry$pair$chrom == "chrX", "chrX", "autosome"),
+        sample_name, config, span_kb, n_fire, fire_per_kb = n_fire / span_kb)]
+}))
+fiber_state[, sex := sample_sex$sex[match(sample_name, sample_sex$sample_name)]]
+stopifnot(!anyNA(fiber_state$sex), nrow(fiber_state) > 0)
+fwrite(fiber_state, file.path(table_dir, "LCL_xci_fiber_states.tsv.gz"), sep = "\t")
+
+state_summary <- fiber_state[, .(fibers = .N, median_span_kb = round(median(span_kb), 1),
+  median_fire_per_kb = round(median(fire_per_kb), 3),
+  pct_no_element = round(100 * mean(n_fire == 0), 1)), by = .(chrom_class, sex)]
+setorder(state_summary, chrom_class, sex)
+knitr::kable(state_summary)
+
+# the closed mode is the same fiber set the 2x2 scores as doubly closed
+by_config <- fiber_state[, .(fibers = .N,
+  median_fire_per_kb = round(median(fire_per_kb), 3)), by = .(chrom_class, sex, config)]
+setorder(by_config, chrom_class, sex, config)
+knitr::kable(by_config)
+
+# explicit binning: the mass sits exactly at zero, which a kernel density hides
+bw <- 0.05
+bins <- fiber_state[, .(n = .N), by = .(chrom_class, sex,
+  bin = pmin(floor(fire_per_kb / bw) * bw, 0.6))]
+bins[, prop := n / sum(n), by = .(chrom_class, sex)]
+
+panel_b <- ggplot(bins, aes(bin, prop, fill = sex)) +
+  geom_col(position = position_dodge(width = bw * 0.9), width = bw * 0.85) +
+  facet_wrap(~ chrom_class, nrow = 1) +
+  scale_fill_manual(values = c("female (XX)" = "#1B7837", "male (XY)" = "#762A83"),
+                    name = NULL) +
+  theme_bw(base_size = 11) +
+  labs(x = "FIRE elements per aligned kb, whole fiber span, both tested cCREs removed",
+       y = "fraction of fibers in the group",
+       title = "chrX fibers in female donors split into a closed and an open population",
+       subtitle = sprintf(paste("fibers from all %d plotted pairs with >= %g kb aligned |",
+         "no accessible element anywhere along the fiber: chrX %.0f%% of female vs %.0f%% of male"),
+         length(pair_data), xci_min_span_kb,
+         state_summary[chrom_class == "chrX" & sex == "female (XX)", pct_no_element],
+         state_summary[chrom_class == "chrX" & sex == "male (XY)", pct_no_element]))
+print(panel_b)
+ggsave(file.path(plot_dir, "LCL_xci_panelB_fiber_states.pdf"), panel_b,
+       width = 9, height = 5)
+```
+
+## Panel C: the pooled test re-run within each sex
+
+The same statistic as the main analysis, recomputed on fibers from one sex at a
+time: four pooled counts, one pseudocount per cell, two-sided Fisher, BH within
+the panel. Splitting the cohort halves the coverage, so a pair is kept only when
+**both** groups reach `xci_min_split` shared fibers; without a common floor the
+male panel would look emptier for want of depth rather than for want of signal.
+chrX fiber depth is still lower in males even after the filter, which the
+subtitle reports, so the male panel remains the more conservative of the two.
+
+```{r xci-sex-split-test}
+xci_min_split <- 50L
+
+# Two-sided Fisher exact p under the probability-ordering convention of
+# stats::fisher.test: the hypergeometric mass of every table no more likely than
+# the observed one. Tables sharing margins share a density vector, so the work
+# is done once per distinct margin set rather than once per pair.
+fisher_p_two_sided <- function(a, b, c, d) {
+  m <- a + b; n <- c + d; k <- a + c
+  out <- numeric(length(a))
+  for (idx in split(seq_along(a), paste(m, n, k, sep = "/"))) {
+    i <- idx[1L]
+    support <- max(0L, k[i] - n[i]):min(k[i], m[i])
+    dens <- dhyper(support, m[i], n[i], k[i])
+    o <- order(dens)
+    ds <- dens[o]
+    # the tolerance matches fisher.test's relErr so tied densities sum together
+    grp <- cumsum(c(TRUE, diff(ds) > ds[-length(ds)] * 1e-7))
+    pv <- numeric(length(ds))
+    pv[o] <- as.numeric(tapply(cumsum(ds), grp, max))[grp]
+    out[idx] <- pmin(1, pv[match(a[idx], support)])
+  }
+  out
 }
+# hold the fast path to the reference implementation it replaces
+set.seed(1)
+chk <- data.table(a = rpois(200, 40) + 1, b = rpois(200, 12) + 1,
+                  c = rpois(200, 12) + 1, d = rpois(200, 40) + 1)
+stopifnot(all.equal(fisher_p_two_sided(chk$a, chk$b, chk$c, chk$d),
+  vapply(seq_len(nrow(chk)), function(i)
+    fisher.test(matrix(c(chk$a[i], chk$b[i], chk$c[i], chk$d[i]), 2, byrow = TRUE))$p.value, 0),
+  tolerance = 1e-10))
+
+fem <- sample_sex[sex == "female (XX)", sample_name]
+split_counts <- fread(cmd = sprintf("zcat %s | awk -F'\\t' -v OFS='\\t' -v m=%d %s",
+  shQuote(counts_file), xci_min_fibers, shQuote(sprintf(
+  'BEGIN { split("%s", s, " "); for (i in s) fem[s[i]] = 1 }
+   NR == 1 { next }
+   { g = ($7 in fem) ? "female (XX)" : "male (XY)"; k = $1 SUBSEP g
+     cc[k] += $2; c1[k] += $3; c2[k] += $4; bo[k] += $5; n[k] += $9
+     if ($9 >= m) { obs[k] += $5; ex[k] += ($5 + $3) * ($5 + $4) / $9 } }
+   END { for (k in n) { split(k, p, SUBSEP)
+           print p[1], p[2], cc[k], c1[k], c2[k], bo[k], n[k], obs[k], ex[k] } }',
+  paste(fem, collapse = " ")))),
+  col.names = c("CRE_pair", "sex", "co_closed", "CRE1_access", "CRE2_access",
+                "co_access", "n_shared_reads", "obs", "exp"))
+# The per-sample file also carries candidate pairs no fiber covered, which the
+# pooled analysis never tested. Keep the tested universe and check that the
+# dropped pairs are exactly those with no fibers.
+untested <- split_counts[!CRE_pair %in% pairs_dt$CRE_pair]
+stopifnot(all(untested$n_shared_reads == 0L))
+split_counts <- split_counts[CRE_pair %in% pairs_dt$CRE_pair]
+split_counts[, chrom := pairs_dt$chrom[match(CRE_pair, pairs_dt$CRE_pair)]]
+stopifnot(!anyNA(split_counts$chrom),
+          split_counts[, all(n_shared_reads ==
+            co_closed + CRE1_access + CRE2_access + co_access)])
+
+# keep pairs both panels can speak to, then test each panel on its own fibers
+depth <- dcast(split_counts, CRE_pair ~ sex, value.var = "n_shared_reads")
+keep <- depth[get("female (XX)") >= xci_min_split & get("male (XY)") >= xci_min_split,
+              CRE_pair]
+split_test <- split_counts[CRE_pair %in% keep]
+split_test[, `:=`(
+  OR = ((co_closed + 1) * (co_access + 1)) / ((CRE1_access + 1) * (CRE2_access + 1)),
+  pval = fisher_p_two_sided(co_closed + 1, CRE2_access + 1, CRE1_access + 1, co_access + 1))]
+split_test[, fdr := p.adjust(pval, "BH"), by = sex]
+split_test[, significant := fdr < fdr_cutoff & OR > 1 & obs > exp]
+fwrite(split_test, file.path(table_dir, "LCL_xci_sex_split_pairs.tsv.gz"), sep = "\t")
+
+split_summary <- split_test[, .(tested = .N, chrX_tested = sum(chrom == "chrX"),
+  significant = sum(significant), chrX_significant = sum(significant & chrom == "chrX"),
+  median_chrX_fibers = median(n_shared_reads[chrom == "chrX"])), by = sex]
+split_summary[, pct_chrX_of_significant := 100 * chrX_significant / significant]
+knitr::kable(split_summary, digits = 2)
+```
+
+```{r xci-panel-c-plot, fig.height=5.5}
+volc_split <- split_test[is.finite(OR) & OR > 0, .(sex, chrom, significant,
+  log2_OR = log2(OR), neg_log10_fdr = -log10(pmax(fdr, .Machine$double.xmin)))]
+volc_split[, chrom_class := ifelse(chrom == "chrX", "chrX", "other")]
+sig_split <- volc_split[significant == TRUE]
+facet_note <- split_summary[, setNames(sprintf("%s\nchrX %.1f%% of significant pairs",
+  sex, pct_chrX_of_significant), sex)]
+
+panel_c <- ggplot(volc_split, aes(log2_OR, neg_log10_fdr)) +
+  geom_bin2d(bins = 100) +
+  scale_fill_gradient(low = "grey88", high = "grey25", trans = "log10",
+                      name = "tested pairs") +
+  geom_point(data = sig_split[chrom_class != "chrX"], colour = "#B2182B",
+             size = 0.4, alpha = 0.5) +
+  geom_point(data = sig_split[chrom_class == "chrX"], colour = "#1B7837",
+             size = 0.9, alpha = 0.9) +
+  geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey40") +
+  facet_wrap(~ sex, nrow = 1, labeller = labeller(sex = facet_note)) +
+  scale_y_sqrt(breaks = c(0, 1.3, 5, 20, 50)) +
+  theme_bw(base_size = 11) +
+  labs(x = expression(log[2]~odds~ratio), y = expression(-log[10]~FDR~(sqrt~scale)),
+       title = "The chrX excess is present in female donors and absent in male donors",
+       subtitle = sprintf(paste("green: chrX | red: other chromosomes |",
+         "%d pairs with >= %d shared fibers in both groups |",
+         "median chrX fibers %.0f female vs %.0f male"),
+         length(keep), xci_min_split,
+         split_summary[sex == "female (XX)", median_chrX_fibers],
+         split_summary[sex == "male (XY)", median_chrX_fibers]))
+print(panel_c)
+ggsave(file.path(plot_dir, "LCL_xci_panelC_sex_split_volcano.pdf"), panel_c,
+       width = 11, height = 5.5)
+```
+
+## Panel D: the pseudoautosomal regions as a negative control
+
+PAR1 and PAR2 escape X-inactivation, so they are the one part of chrX that
+should behave like an autosome in female donors. Female samples only, reusing
+the per-pair expectations from Panel C. The interval is a bootstrap over pairs;
+only a few hundred PAR pairs are tested, so this panel supports the direction
+and is not on its own decisive.
+
+```{r xci-par, fig.height=4.5}
+# hg38 pseudoautosomal regions
+par_regions <- data.table(start = c(10001L, 155701383L), end = c(2781479L, 156030895L))
+coords <- pairs_dt[, .(CRE_pair, chrom,
+  lo = pmin(cre1_start, cre2_start), hi = pmax(cre1_end, cre2_end))]
+coords[, in_par := chrom == "chrX" &
+  Reduce(`|`, lapply(seq_len(nrow(par_regions)), function(i)
+    lo >= par_regions$start[i] & hi <= par_regions$end[i]))]
+coords[, region := ifelse(chrom != "chrX", "autosome",
+  ifelse(in_par, "chrX PAR", "chrX non-PAR"))]
+
+par_dt <- split_counts[sex == "female (XX)"]
+par_dt[, region := coords$region[match(CRE_pair, coords$CRE_pair)]]
+par_dt <- par_dt[region %in% c("autosome", "chrX PAR", "chrX non-PAR") & exp > 0]
+
+set.seed(1)
+boot_oe <- function(obs, exp, reps = 2000L) {
+  draws <- replicate(reps, {
+    i <- sample.int(length(obs), replace = TRUE)
+    sum(obs[i]) / sum(exp[i])
+  })
+  as.list(setNames(quantile(draws, c(0.025, 0.975)), c("lo", "hi")))
+}
+par_summary <- par_dt[, c(.(n_pairs = .N, obs = sum(obs), exp = sum(exp),
+  oe = sum(obs) / sum(exp)), boot_oe(obs, exp)), by = region]
+setorder(par_summary, -oe)
+knitr::kable(par_summary, digits = 3)
+
+panel_d <- ggplot(par_summary, aes(reorder(region, -oe), oe)) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4, colour = "grey40") +
+  geom_col(fill = "grey75", width = 0.6) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.18, linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%d pairs", n_pairs)), vjust = -0.6, size = 3.1,
+            y = par_summary$hi) +
+  theme_bw(base_size = 11) +
+  labs(x = NULL, y = "observed / expected co-accessible fibers",
+       title = "The part of chrX that escapes X-inactivation behaves like an autosome",
+       subtitle = paste("female donors only | expectation formed within each sample |",
+                        "95% bootstrap interval over pairs"))
+print(panel_d)
+ggsave(file.path(plot_dir, "LCL_xci_panelD_par_control.pdf"), panel_d,
+       width = 7, height = 4.5)
 ```
 
 ```{r session-information, eval=FALSE}

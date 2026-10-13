@@ -1,5 +1,10 @@
 #!/bin/bash
-# Genome-wide cCRE universe from FIRE peaks across all 31 LCL samples.
+# Genome-wide cCRE universe from FIRE peaks across all 31 LCL samples
+
+# 1. merge FIRE peaks from all 31 samples into one union
+# 2. keep only the CREs that overlap with the FIRE peaks union, and links each one to genes whose TSS is 
+# within 10 kb window of the CRE
+# 3. record which samples have a FIRE peak at each CRE
 
 set -euo pipefail
 
@@ -11,44 +16,81 @@ OUT_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-acce
 CRE_BED=/project/spott/cshan/annotations/GRCh38-cCREs.bed
 TSS_BED=/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
 WINDOW=10000
+
+# chr1-22, X, Y
 CHROM_RE='^chr([1-9]|1[0-9]|2[0-2]|X|Y)$'
 
+# check if the samples' FIRE CRAM, FIRE peak and element files exist, and writes the sample input file
 [[ -s "$CRE_BED" && -s "$TSS_BED" ]] || { echo "Missing annotations; see ../make_gencode_v46_all_tss.sh" >&2; exit 1; }
 "$PYTHON" "$SCRIPT_DIR/LCL_coaccess_cres.py" --root "$OUT_ROOT" --prepare-manifest
 uni="$OUT_ROOT/universe"
 tmpdir=$(mktemp -d "${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/lcl-universe.XXXXXX")
 trap 'rm -rf -- "$tmpdir"' EXIT
 
-# Peak selection 
+######################################
+# 1. union of FIRE peaks
+######################################
 : > "$tmpdir/peaks.bed"
 while IFS=$'\t' read -r sample_name cram_path peaks_path elements_path spans_path; do
     echo "FIRE peaks: $sample_name"
+    
+    # keeps only the selected chrs and the first 3 columns (chrom, start, end), and sorts by chr and start
     gzip -cd -- "$peaks_path" | awk -v re="$CHROM_RE" 'BEGIN{OFS="\t"} $1 ~ re {print $1,$2,$3}' \
         | LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" > "$tmpdir/$sample_name.peaks.bed"
     cat "$tmpdir/$sample_name.peaks.bed" >> "$tmpdir/peaks.bed"
 done < "$uni/sample_inputs.tsv"
+
+# append the sample's peaks to the combined file, and sort all peaks together
 LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" "$tmpdir/peaks.bed" \
+    # bedtools merges overlapping peaks into single interval 
     | "$BEDTOOLS" merge -i stdin > "$tmpdir/fire_peaks_union.bed"
+
+
+######################################
+# build CRE universe
+######################################
+
+# input: /project/spott/cshan/annotations/GRCh38-cCREs.bed
+
+# keep each CRE that overlaps the FIRE union by at least 1bp
 
 awk -v re="$CHROM_RE" 'BEGIN{OFS="\t"} $1 ~ re {print $1,$2,$3,$4,$5,$6}' "$CRE_BED" \
     | "$BEDTOOLS" intersect -a stdin -b "$tmpdir/fire_peaks_union.bed" -u \
     | awk 'BEGIN{OFS="\t"} {print $1,$2,$3,$4"."$5"."$6,$6}' \
     | LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" > "$tmpdir/cre_universe.bed"
+
+# reformat into chr, start, end, id = encode accession columns + class, class label
 [[ -s "$tmpdir/cre_universe.bed" ]] || { echo "No cCRE overlaps LCL FIRE peaks" >&2; exit 1; }
+
+
+######################################
+# 3. TSS window and CRE gene maps
+######################################
+
+# input: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
+
+# build each -10000 to + 10000 window for each TSS, and pulls the gene ID, gene name and transcript type
 
 awk -F'\t' -v OFS='\t' -v W="$WINDOW" -v re="$CHROM_RE" '
     $1 ~ re {s=$2-W; if(s<0)s=0; split($4,a,";"); print $1,s,$2+W,a[1],a[3],a[4],$6}' "$TSS_BED" \
     | LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" > "$tmpdir/gene_windows.bed"
+    
+    # intersect CRE with the gene windows, every CRE that overlaps a window gives one row
 {
     printf 'CRE_ID\tchrom\tstart\tend\tCRE_label\tgene_id\tgene_name\ttranscript_type\n'
     "$BEDTOOLS" intersect -a "$tmpdir/cre_universe.bed" -b "$tmpdir/gene_windows.bed" -wa -wb \
         | awk 'BEGIN{OFS="\t"} {print $4,$1,$2,$3,$5,$9,$10,$11}'
 } | "$BGZIP" -c > "$tmpdir/cre_gene_map.tsv.gz"
 
-# Sample peak membership
+
+######################################
+# Assign sample information to FIRE peaks at CRE
+######################################
 cut -f4 "$tmpdir/cre_universe.bed" > "$tmpdir/ids"
 flag_files=("$tmpdir/ids")
 printf 'CRE_ID' > "$tmpdir/flags_header"
+
+# for each sample, count how many of the sample's peak overlap each CRE and append the count
 while IFS=$'\t' read -r sample_name cram_path peaks_path elements_path spans_path; do
     "$BEDTOOLS" intersect -a "$tmpdir/cre_universe.bed" -b "$tmpdir/$sample_name.peaks.bed" -c \
         | awk '{print ($6>0)?1:0}' > "$tmpdir/$sample_name.flags"

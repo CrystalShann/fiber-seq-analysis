@@ -254,41 +254,74 @@ def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, f
 def count_pairs(pairs, coverage, accessible):
     counts = np.zeros((len(pairs), 4), dtype=np.int64)
     empty = set()
-    # loop over the pairs, 
+    # loop over the pairs, and pair.CRE1 and pair.CRE2 are CRE ids
     for i, pair in enumerate(pairs.itertuples(index=False)):
+        # shared reads = reads covering both CREs
         shared = coverage.get(pair.CRE1, empty) & coverage.get(pair.CRE2, empty)
+        # a = shared reads where CRE1 is acessible, b = shared reads where CRE2 is accessible
         a = accessible.get(pair.CRE1, empty) & shared
         b = accessible.get(pair.CRE2, empty) & shared
         both = len(a & b)
+        # co_closed (neither accessible) is shared − |a| − |b| + both
+          # Adding both back is needed because reads in both a and b were subtracted twice
+        # CRE1_access (CRE1 only) is |a| − both
+        # CRE2_access (CRE2 only) is |b| − both
+        # co_access (both) is both
+        
         counts[i] = len(shared) - len(a) - len(b) + both, len(a) - both, len(b) - both, both
     return counts
 
-
+#################################################
+# BH correction
+#################################################
 def bh(p):
     p = np.asarray(p, dtype=float)
     if not len(p):
         return p.copy()
+    # sort p values from smallest to largest
     order = np.argsort(p)
+    # takes each sorted p-value and multiplies it by n / rank. The smallest p gets rank 1 and the largest gets rank n
+    # [::-1] largest p values come first
     adjusted = np.minimum.accumulate((p[order] * len(p) / np.arange(1, len(p) + 1))[::-1])[::-1]
+    # running min: each value becomes the smallest value seen so fat 
     out = np.empty(len(p)); out[order] = np.minimum(adjusted, 1)
     return out
 
-
+#################################################
+# Fisher test on 2x2 table
+#################################################
 def test_counts(counts, pseudocount):
-    """Add pseudocount only once, AFTER pooling all 31 samples."""
+    """Fisher test on all CRE pairs, add pseudocount after pooling all 31 samples."""
+    # only keep distinct read counts to run fisher on
     unique, inverse = np.unique(counts, axis=0, return_inverse=True)
     rows = []
     for closed, first, second, both in unique:
+        # raw count
         raw = np.array([[closed, second], [first, both]], dtype=np.int64)
+        # +1 to every count to avoid division by -
         corrected = raw + pseudocount
+        # pval is the two-sided Fisher p-value on the +1 table
+        # pval_raw is the two-sided Fisher p-value on the raw table,
+        # fisher_estimate is the conditional maximum-likelihood odds ratio of the +1 table
         rows.append((fisher_exact(corrected, alternative="two-sided").pvalue,
                      conditional_odds_ratio(corrected, kind="conditional").statistic,
                      fisher_exact(raw, alternative="two-sided").pvalue))
     stats = np.array(rows, dtype=float)[inverse] if rows else np.empty((0, 3))
     return pd.DataFrame(stats, columns=["pval", "fisher_estimate", "pval_raw"])
 
+#################################################
+# Parse options and validates inputs
+#################################################
+
+# --fire-overlap-fraction: Minimum fraction of a cCRE's length that must be covered by ONE FIRE,
+# element on the same read, counting only aligned bases, for the cCRE to be called accessible on that read
+
+# --min-dist and --max-dist default to 500 and 20000: distance between CRE pairs
+
+# --pseudocount defaults to 1
 
 def main():
+    # build command line parser
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=ROOT)
     ap.add_argument("--sample-metatable", default=METATABLE)
@@ -308,6 +341,7 @@ def main():
     manifest_path = uni / "sample_manifest.tsv"
     if args.prepare_manifest:
         uni.mkdir(parents=True, exist_ok=True)
+        # creates folder
         (uni / "universe.complete").unlink(missing_ok=True)
         source_files = [p for col in ("cram_path", "peaks_path", "elements_path") for p in samples[col]]
         source_files += [p + ".crai" for p in samples.cram_path]
@@ -380,7 +414,7 @@ def main():
                 qc.append((chrom, sample.sample_name, sample.donor, len(cov), orphans, int(shared.sum())))
                 print(f"{chrom} {sample.sample_name}: {int((shared > 0).sum())} covered pairs", flush=True)
                 del cov, acc
-    # No per-donor filtering: any shared fiber contributes to the pooled table.
+
     keep = pooled.sum(axis=1) > 0
     counts = pooled[keep]
     result = pairs.loc[keep].reset_index(drop=True)

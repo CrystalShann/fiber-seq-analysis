@@ -10,11 +10,12 @@
 #SBATCH --output=/project/spott/cshan/fiber-seq/results/logs/LCL_coaccess_%j.out
 #SBATCH --error=/project/spott/cshan/fiber-seq/results/logs/LCL_coaccess_%j.err
 
-# Submit after the complete 31-task read-span array succeeds. No --chrom means
-# all chr1-22/X/Y and one genome-wide BH family of unique pooled pairs.
+# Submit after the complete 31-task read-span array succeeds
+# No --chrom = all chr1-22/X/Y and one genome-wide BH family of unique pooled pairs.
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# SLURM copies the batch file to its spool; resolve the installed sibling then.
+
+
 if [[ ! -f "$SCRIPT_DIR/LCL_coaccess_cres.py" ]]; then
     SCRIPT_DIR=/project/spott/cshan/fiber-seq/code/co-accessibility/LCL
 fi
