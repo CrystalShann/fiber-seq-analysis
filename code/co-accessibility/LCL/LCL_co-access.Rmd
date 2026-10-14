@@ -6,6 +6,7 @@ output:
     toc: true
     toc_float: true
     code_folding: hide
+    self_contained: true
 params:
   root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
   sample_sheet: "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
@@ -18,38 +19,26 @@ params:
   allow_partial_results: false
 ---
 
-This notebook reads the completed **genome-wide, pooled 31-sample LCL analysis**
-from `LCL_coaccess_cres.py`. Run `LCL_fire_universe.sh`, `LCL_read_spans.sh`, and
-`LCL_run_coaccess.sh` first. Donor labels are metadata only; there are no donor
-strata, haplotype tests, or timepoints.
+# Co-accessibility analysis
 
-The plotting workflow is written directly below in separate chunks. Source the
-shared parsing and plotting functions, then run the chunks in order, or knit this
-notebook.
+This analysis looks for co-accessibility CREs in pooled 31 sample LCL data
 
-Candidate cCREs overlap the union of all 31 samples' FIRE peaks. Pairs share a
-canonical TSS ±10 kb window and have **500 < gap < 20,000 bp**. A shared fiber's
-aligned blocks **cover the full length of both cCREs** (`read_rule = "contain"`),
-so a fiber whose alignment gap or end falls inside either cCRE is not counted for
-that pair. It is accessible at a
-cCRE when **one FIRE element on that same sample/read, intersected with the
-read's aligned blocks, overlaps at least 50% of the cCRE length**. CIGAR deletions
-and skipped reference regions are unobserved, not closed. Aligned pieces of one
-element can be summed; separate FIRE elements cannot. The fraction is relative
-to cCRE length, not to FIRE-element length.
+## Analysis overview
 
-The four configuration counts are pooled across samples before testing. The
-primary FDR comes from the macrophage-compatible **two-sided Fisher test after
-adding one pseudocount to each pooled cell**, corrected across all tested unique
-pairs genome-wide. Positive pairs require `fdr < 0.05`, `OR > 1`, and observed
-joint accessibility greater than its pooled independence expectation. This
-notebook selects the top ten by FDR, decreasing OR, then decreasing shared-fiber
-coverage, using pair ID to resolve ties. It does not recalculate FDR after selection.
+1. Merge FIRE peaks from all samples -> union FIRE peaks
+2. Define CREs universe by overlap with the union FIRE peaks
+3. Link CRE to genes -> build 10kb window around TSS for each canonical TSS (MANE Select: The gold-standard joint NCBI/EMBL-EBI default transcript for human protein-coding genes)
+4. Extract each sample's aligned blocks from FIRE CRAM -> aligned blocks
+5. Build candidate CRE pairs, the two CREs must share the 10kb TSS window and 500 < gap < 20,000 bp
+6. Filter for reads that fully cover both CREs
+7. Identify which reads are accessible at each CRE -> a CRE is accessible if it 50% overlaps with a FIRE element, and restrict this to the aligned blocks
+8. Build 2x2 table for fisher test on reads fully spanning both CREs: neither, CRE1 only, CRE2 only, both, and sum the counts across all samples
+9. Fisher test + 1 pseudocount on row counts from 2x2 table, and calculate OR
+
 
 # Setup
 
 ```{r setup, include=FALSE}
-# Use a portable locale for tabix and other child processes on compute nodes.
 Sys.setenv(LC_ALL = "C")
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
                      fig.width = 11, fig.height = 6, cache = FALSE)
@@ -71,7 +60,7 @@ options(scipen = 999)
 root <- params$root
 coaccess_dir <- file.path(root, "coaccess")
 universe_dir <- file.path(root, "universe")
-out_dir <- file.path(coaccess_dir, "plots", "top10")
+out_dir <- file.path(coaccess_dir, "all_chr")
 table_dir <- file.path(out_dir, "tables")
 plot_dir <- file.path(out_dir, "plots")
 read_rule <- "contain"
@@ -84,7 +73,13 @@ for (d in c(table_dir, plot_dir)) dir.create(d, recursive = TRUE, showWarnings =
 stopifnot(params$locus_flank_bp >= 0)
 ```
 
-# Input provenance
+# Input data
+
+read sample metadata: 
+`/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv`
+
+sample manifest - containing the file path to FIRE CRAM, element and peaks:
+`/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/universe/sample_manifest.tsv`
 
 ```{r validate-all-31-samples}
 sample_meta <- fread(params$sample_sheet)
@@ -98,11 +93,14 @@ sample_meta[, donor := as.character(cell_line)]
 samples <- as.character(manifest$sample_name)
 stopifnot(identical(as.character(manifest$donor),
                     sample_meta$donor[match(samples, sample_meta$sample_name)]))
-knitr::kable(sample_meta[, .(sample_name, donor)])
+head(sample_meta[, .(sample_name, donor)], 5)
 ```
 
+Reads sample_manifest.tsv, and check it has 31 unique sample names
+
+  - saved co-accessibility results came from the same inputs as the cCRE universe. It compares the sample manifest saved with the finished counting run against the universe’s manifest, checking the sample names, donors, and file paths
+
 ```{r validate-completed-run}
-# Do not combine old pair tables with a changed input manifest.
 run_manifest <- fread(file.path(coaccess_dir, "sample_manifest.tsv"))
 provenance_columns <- c("sample_name", "donor", "fire_dir", "cram_path", "elements_path", "spans_path")
 stopifnot(all(provenance_columns %in% names(run_manifest)),
@@ -123,47 +121,40 @@ stopifnot("blocks_path" %in% names(run_manifest),
               paste0(samples, "-v0.1-fire-elements.bed.gz"))))
 ```
 
+Read Co-accessible CRE pairs 
 ```{r read-genome-wide-pair-results}
 pairs_file <- file.path(coaccess_dir, "LCL_coaccess_pairs.tsv.gz")
 pairs_dt <- fread(pairs_file)
-required_columns <- c("CRE_pair", "CRE1", "CRE2", "chrom", "cre1_start", "cre1_end",
-  "cre2_start", "cre2_end", "gene_names", "CRE_pair_labels", "dist", "n_shared_reads",
-  "co_access", "co_closed", "CRE1_access", "CRE2_access", "OR", "fdr", "fdr_raw",
-  "expected_co_access", "observed_expected_ratio", "excess_fraction", "read_rule",
-  "fire_overlap_fraction", "dataset", "analysis_scope", "coverage_mode")
-if (!all(required_columns %in% names(pairs_dt)))
-  stop("Missing result columns: ", paste(setdiff(required_columns, names(pairs_dt)), collapse = ", "))
-stopifnot(!anyDuplicated(pairs_dt$CRE_pair),
-          all(pairs_dt$dataset == "LCL"),
-          all(pairs_dt$read_rule == read_rule),
-          all(pairs_dt$coverage_mode == "aligned_blocks_v1"),
-          all(pairs_dt$fire_overlap_fraction == fire_overlap_fraction),
-          all(pairs_dt$dist > 500 & pairs_dt$dist < 20000),
-          all(pairs_dt$n_shared_reads > 0),
-          all(pairs_dt$n_shared_reads == pairs_dt$co_access + pairs_dt$co_closed +
-                pairs_dt$CRE1_access + pairs_dt$CRE2_access))
-if (!isTRUE(params$allow_partial_results) && any(pairs_dt$analysis_scope != "genome-wide"))
-  stop("Partial chromosome results supplied. Run the genome-wide analysis before rendering.")
-expected_from_counts <- with(pairs_dt,
-  (co_access + CRE1_access) * (co_access + CRE2_access) / n_shared_reads)
-stopifnot(isTRUE(all.equal(as.numeric(pairs_dt$expected_co_access), as.numeric(expected_from_counts),
-                          tolerance = 1e-8, check.attributes = FALSE)))
 cat(nrow(pairs_dt), "unique tested pairs loaded.\n")
+
+head(pairs_dt)
 ```
 
+CRE annotations: accessible CREs that overlap with a FIRE peak
 ```{r read-ccre-annotations}
 cre_universe <- fread(file.path(universe_dir, "cre_universe.bed"), header = FALSE,
   col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
+
+head(cre_universe)
 ```
 
-# Top ten co-accessible pairs
+### Top ten co-accessible pairs
+
+1. Pick pairs with fdr < 0.05
+2. OR > 1
+3. observed co-accessiblility > number expected under independence
+
+smallest FDR -> largest OR -> highest # of spanning molecules -> pair ID alphabetical order
 
 ```{r select-top-ten}
 eligible <- pairs_dt[!is.na(fdr) & fdr < fdr_cutoff & !is.na(OR) & OR > 1 &
                        co_access > expected_co_access]
+
+# smallest FDR -> largest OR -> highest # of spanning molecules -> pair ID alphabetical order
 setorderv(eligible, c("fdr", "OR", "n_shared_reads", "CRE_pair"), c(1L, -1L, -1L, 1L))
 selected <- head(eligible, 10L)
-# The plotted window is the pair span +/- locus_flank_bp and it names the region.
+
+# define plotting window for each pair: start = CRE1 - 1000, end = CRE2 + 1000
 selected[, `:=`(
   region_start = pmax(0L, pmin(cre1_start, cre2_start) - as.integer(params$locus_flank_bp)),
   region_end = pmax(cre1_end, cre2_end) + as.integer(params$locus_flank_bp))]
@@ -173,61 +164,63 @@ cat(nrow(eligible), "pairs pass the positive-association criteria; selected",
     nrow(selected), "for plotting.\n")
 if (nrow(selected) < 10L)
   cat("Fewer than ten pairs qualify; only qualifying pairs will be shown.\n")
-knitr::kable(selected[, .(pair_id, gene_names, CRE_pair, dist, n_shared_reads,
-  co_access, expected_co_access, observed_expected_ratio, OR, fdr, fdr_raw)], digits = 4)
+
+top10_coaccess_df <- selected[, .(pair_id, gene_names, CRE_pair, dist, n_shared_reads,
+  co_access, expected_co_access, observed_expected_ratio, OR, fdr, fdr_raw)]
+
+print(top10_coaccess_df)
 ```
+
+### observed co-accessible pairs vs expected co-accessible pairs for top 10 regions
 
 ```{r observed-versus-expected, fig.height=5}
 if (nrow(selected)) {
-  oe <- melt(selected[, .(pair_id, observed = co_access, expected = expected_co_access)],
-             id.vars = "pair_id", variable.name = "count_type", value.name = "fibers")
+  oe <- melt(selected[, .(pair_id, observed = as.numeric(co_access), expected = expected_co_access)],
+           id.vars = "pair_id", variable.name = "count_type", value.name = "fibers")
   oe_plot <- ggplot(oe, aes(pair_id, fibers, fill = count_type)) +
     geom_col(position = "dodge") + theme_bw() +
     scale_fill_manual(values = c(observed = "#B2182B", expected = "grey70")) +
-    labs(x = NULL, y = "Jointly accessible fibers", fill = NULL,
-         title = "Observed and expected co-accessibility",
-         subtitle = "Expectation uses pooled margins among the same jointly covered fibers") +
-    # region names carry the coordinates, so the ten labels are turned upright
+    labs(x = NULL, y = "Co-accessible fibers", fill = NULL,
+         title = "Observed and expected co-accessibility") +
     theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
   print(oe_plot)
   ggsave(file.path(plot_dir, "LCL_top10_observed_expected.pdf"), oe_plot, width = 11, height = 5)
 }
 ```
 
-# Genome-wide volcano
+### Genome-wide volcano plot of cRE pair
 
-Every tested pair, so the selection threshold can be read against the null mass.
-`fdr` is already BH-corrected across all tested pairs, so the dashed line is the
-same cutoff used above and nothing is corrected again here. Three features of
-this data shape the figure: the null cloud sits right of zero, because
-accessibility is positively correlated along a fiber; the Fisher test is
-two-sided, so significant `OR < 1` pairs appear on the left even though the
-selection above keeps only `OR > 1`; and `fdr` is discrete, so points form
-horizontal bands and pile up at `fdr = 1`. The y axis is square-root scaled to
-keep the most extreme pairs on the panel without hiding the threshold.
+From the top 10 co-accessible regions, 6/10 are on chrX, I wonder if chrX is enriched for co-accessible pairs genome wide?
 
-Significant pairs are coloured by chromosome class because chrX is heavily
-overrepresented: it holds about 2% of the tested pairs but over 11% of the
-significant ones. chrX points are drawn last so they stay visible inside the
-dense right-hand lobe. X-inactivation partitions pooled reads into uniformly
-closed Xi and open Xa molecules, which inflates a 2x2 odds ratio in exactly the
-way real co-accessibility does. This figure shows the overrepresentation; the
-X-inactivation section below attributes it.
+- x = effect size (log2 odds ratio)
+- y = sigificance (-log10 FDR)
+
+Dotted line at the median log2 OR of all pairs + an open black ring around each of the ten selected pairs
+
 
 ```{r volcano-all-tested-pairs, fig.height=6}
+
+# filter for pairs with OR > 0
 volcano <- pairs_dt[!is.na(fdr) & is.finite(OR) & OR > 0, .(
   chrom,
   log2_OR = log2(OR),
+  # replace FDR = 0 with the smallest positive value
   neg_log10_fdr = -log10(pmax(fdr, .Machine$double.xmin)),
   significant = fdr < fdr_cutoff,
   direction = ifelse(OR > 1, "co-accessible", "co-inaccessible"))]
-# chrY is tested too, so the contrast is chrX against everything else, not autosomes.
+
+# add chrX as a separate color group
 volcano[, chrom_class := ifelse(chrom == "chrX", "chrX",
   ifelse(direction == "co-accessible", "other, OR > 1", "other, OR < 1"))]
+
+# median log OR across all pairs
 median_log2_or <- median(volcano$log2_OR)
+
+# top 10 pairs
 chosen <- selected[, .(log2_OR = log2(OR),
   neg_log10_fdr = -log10(pmax(fdr, .Machine$double.xmin)))]
 signif_pairs <- volcano[significant == TRUE]
+
 cat(nrow(volcano), "tested pairs;", nrow(signif_pairs), "at FDR <", fdr_cutoff,
     "of which", sum(signif_pairs$direction == "co-accessible"), "have OR > 1 and",
     sum(signif_pairs$direction == "co-inaccessible"), "have OR < 1.\n")
@@ -238,7 +231,6 @@ cat(sprintf("chrX: %d of %d tested (%.2f%%) but %d of %d significant (%.2f%%).\n
     100 * mean(signif_pairs$chrom == "chrX")))
 
 volcano_plot <- ggplot(volcano, aes(log2_OR, neg_log10_fdr)) +
-  # 400k points cannot be drawn individually; the null mass is binned
   geom_bin2d(bins = 120) +
   scale_fill_gradient(low = "grey88", high = "grey25", trans = "log10",
                       name = "tested pairs") +
@@ -266,47 +258,13 @@ ggsave(file.path(plot_dir, "LCL_coaccess_volcano.pdf"), volcano_plot,
        width = 9, height = 6)
 ```
 
-# Fiber plots and count checks
 
-The following code reloads **all 31 samples** from the same primary aligned-block and
-FIRE-element files used for counting. The complete reloaded 2×2 must match the
-saved result; a discrepancy stops rendering. The rasters draw only fibers whose
-alignment covers the whole window, at most `r max_drawn` of them, taken in
-configuration order so the co-accessible fibers are always kept and drawn on top.
-Count checks and statistical annotations always use all shared fibers, so the
-subtitle counts describe the complete set and not the drawn subset.
 
-m6A, nucleosome, and TF-footprint tracks are display annotations restricted to
-those same read identities. Missing optional display tracks produce warnings;
-they never change the FIRE accessibility call. Donor identifiers are attached to
-the exported read labels and sample contributions without entering a test.
+### Load fibers and assign accessibility
 
-```{r validate-plot-inputs}
-if (isTRUE(params$make_plots) && nrow(selected)) {
-  spans <- file.path(root, samples, paste0(samples, ".aligned_blocks.bed.gz"))
-  elements <- file.path(paths$fire_root, samples, "additional-outputs-v0.1", "fire-peaks",
-                         paste0(samples, "-v0.1-fire-elements.bed.gz"))
-  needed <- c(paths$tabix_bin, spans, paste0(spans, ".tbi"), elements, paste0(elements, ".tbi"))
-  if (any(!file.exists(needed)))
-    stop("Missing plotting inputs: ", paste(needed[!file.exists(needed)], collapse = "\n"))
-  for (i in seq_along(samples)) {
-    marker <- paste0(spans[i], ".source.tsv")
-    if (!file.exists(marker) || !identical(readLines(marker, n = 2L),
-        c(run_manifest$cram_path[i], "aligned_blocks_v1")))
-      stop("Missing/current aligned-block provenance required for ", samples[i])
-    if (file.info(spans[i])$mtime > file.info(pairs_file)$mtime ||
-        file.info(elements[i])$mtime > file.info(pairs_file)$mtime)
-      stop("Plot inputs changed after counting; rerun the analysis for ", samples[i])
-  }
-}
-```
+`load_region()`, `label_reads()`, and `coaccess_2x2()` come from `parsing_footprints_functions.r`
 
-## Load fibers and assign accessibility
-
-`load_region()`, `label_reads()`, and `coaccess_2x2()` come from
-`parsing_footprints_functions.r`. Read keys include the sample name so that equal
-read names from different samples cannot be joined. Keep these complete labels
-for count verification and metadata exports.
+For each of the ten selected pairs, this reloads the fibers from all 31 samples in that pair’s plotting window and get the fibers cover each cCRE and which are accessible. It then builds the 2×2 table
 
 ```{r load-pair-fibers}
 pair_data <- list()
@@ -316,6 +274,8 @@ if (isTRUE(params$make_plots) && nrow(selected)) {
     region <- list(chrom = pair$chrom, start = pair$region_start, end = pair$region_end)
     cre1 <- list(start = pair$cre1_start, end = pair$cre1_end)
     cre2 <- list(start = pair$cre2_start, end = pair$cre2_end)
+    
+    # pull the data for this window from all 31 samples, get spanning reads from aligned blocks
     res <- load_region(region, samples, paths$root, paths$fire_root,
       fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
       span_source = "aligned_blocks")
@@ -326,22 +286,11 @@ if (isTRUE(params$make_plots) && nrow(selected)) {
       counts = coaccess_2x2(labels))
   }
 }
+
+head(pair_data[[selected$pair_id[1]]])
 ```
 
-```{r verify-reloaded-counts}
-for (id in names(pair_data)) {
-  entry <- pair_data[[id]]
-  pair <- entry$pair
-  actual <- unlist(entry$counts[1, c("neither", "cre1_only", "cre2_only", "both", "n_shared")],
-                   use.names = FALSE)
-  expected <- unlist(pair[, .(co_closed, CRE1_access, CRE2_access, co_access, n_shared_reads)],
-                     use.names = FALSE)
-  if (!identical(as.numeric(actual), as.numeric(expected)))
-    stop("Reloaded counts differ from the analysis table for ", pair$CRE_pair,
-         "; reloaded: ", paste(actual, collapse = ","),
-         "; saved: ", paste(expected, collapse = ","))
-}
-```
+For each of the ten selected pairs, 1) get every fiber that covers both cCREs, labelled with its sample, donor and accessibility state 2) summary of how much each sample contributes to the pair’s 2×2 table
 
 ```{r export-fiber-metadata}
 for (id in names(pair_data)) {
@@ -356,17 +305,21 @@ for (id in names(pair_data)) {
     co_closed = sum(!acc1 & !acc2)), by = .(pair_id, sample_name, donor)]
   fwrite(contributions, file.path(table_dir, paste0(pair$pair_id, "_sample_counts.tsv")), sep = "\t")
 }
+
+id <- names(pair_data)[1]
+pair_id <- pair_data[[id]]$pair$pair_id
+
+read_labels <- fread(file.path(table_dir, paste0(pair_id, "_read_labels.tsv.gz")))
+print(head(read_labels, 10))
+
+sample_counts <- fread(file.path(table_dir, paste0(pair_id, "_sample_counts.tsv")))
+print(sample_counts)
 ```
 
-## Prepare the displayed fibers and annotation tracks
 
-Keep the window-spanning shared fibers, co-accessible first, up to
-`r max_drawn`. Load m6A,
-ft nucleosomes, and FiberHMM TF footprints only for these display keys using
-`load_ft_tracks()` from the parsing functions. Copies of the display tables are
-labelled `pooled`; the original sample/read keys and complete labels are retained.
-Read backbones, FIRE, nucleosome and TF intervals are broken at alignment gaps;
-the m6A denominator counts only fibers with an aligned base at that position.
+### Single molecule view of top 10 co-accessibel regions
+
+prepares the data for the single molecule plots of the ten selected pairs. For each pair, it picks which read to draw: those that span the whole window, with co-accessible ones first, and plots at most 500 reads. It then loads the m6A, nucleosome and TF-footprint tracks for just those fibers
 
 ```{r prepare-display-fibers}
 max_drawn <- 500L
@@ -374,10 +327,7 @@ display_data <- list()
 for (id in names(pair_data)) {
   entry <- pair_data[[id]]
   region <- entry$region
-  # Draw only fibers whose alignment covers the whole window, so every drawn row
-  # is informative at both cCREs. config is a factor ordered "both accessible",
-  # "CRE1 only", "CRE2 only", "neither", so sorting on it before the cap keeps
-  # the co-accessible fibers first.
+  # only reads whose alignment covers the whole window
   spanning <- entry$res$spans[start <= region$start & end >= region$end, key]
   drawn_labels <- copy(entry$labels)[shared == TRUE & key %in% spanning]
   setorder(drawn_labels, config)
@@ -398,10 +348,7 @@ for (id in names(pair_data)) {
   region_res <- coaccess_region_result(display_res, entry$cre1, entry$cre2,
     drawn_labels, cres = cres_here)
 
-  # order_reads() ranks "both accessible" first, which a discrete ggplot axis
-  # draws at the bottom. Reverse the shared RID levels so those fibers sit on
-  # top instead. The m6A raster and the footprint raster map y to the same
-  # factor, so both panels keep the identical order.
+  # order_reads() ranks "both accessible" first
   rid_levels <- rev(levels(region_res$rids_df$RID))
   for (tb in c("reads", "rids_df", "fire", "nucs", "fps", "fps_infire")) {
     if (!is.null(region_res[[tb]]) && nrow(region_res[[tb]]))
@@ -409,7 +356,7 @@ for (id in names(pair_data)) {
                                           levels = rid_levels)
   }
 
-  # Keep the cCRE class order used by the shared plotting functions.
+
   pk <- as.data.frame(cres_here)
   cls <- factor(pk$CRE_label, levels = c(intersect(CCRE_CLASSES, pk$CRE_label),
     setdiff(unique(pk$CRE_label), CCRE_CLASSES)))
@@ -421,11 +368,12 @@ for (id in names(pair_data)) {
 }
 ```
 
-## Draw the fiber panels
+For each of the ten pairs, this chunk builds a multi-panel single-fiber figure and stores it in fiber_plots. From top to bottom, the panels are:
 
-`coaccess_region_result()` above adapts the display data for
-`plot_region_panels()` from `plotting_functions.r`. Panel choices, colours,
-relative heights, titles, and the highlighted pair are set explicitly here.
+- the m6A fraction along the window
+- the cCRE track
+- m6A per fiber
+- nucleosomes, FIRE elements and TF footprints, one row per fiber
 
 ```{r draw-fiber-panels}
 fiber_plots <- list()
@@ -473,11 +421,8 @@ for (id in names(pair_data)) {
 }
 ```
 
-## Save and display the figures
 
 ```{r save-pair-figures}
-# The page grows with the drawn fiber count: 0.025 in per fiber in each of the
-# two read rasters, plus the fixed panels. At the max_drawn cap this is 31 in.
 for (id in names(pair_data)) {
   fig_height <- 6 + 0.05 * display_data[[id]]$n_drawn
   ggsave(file.path(plot_dir, paste0(id, "_reads.pdf")),
@@ -485,55 +430,55 @@ for (id in names(pair_data)) {
 }
 ```
 
-```{r plot-top-ten, results="asis", fig.width=12, fig.height=16}
-if (length(pair_data)) {
-  for (id in names(pair_data)) {
-    pair <- pair_data[[id]]$pair
-    cat("\n\n## ", pair$pair_id, ": ", pair$gene_names, "\n\n", sep = "")
-    print(fiber_plots[[id]]$combined)
+```{r plot-top-ten, results="asis"}
+show_region_figures <- function(plots, heights, titles, fig_dir, header = "##") {
+  fig_path <- if (isTRUE(getOption("knitr.in.progress"))) "" else
+    sprintf(", fig.path='%s/'", fig_dir)
+  for (id in names(plots)) {
+    child <- paste0(header, " ", titles[[id]], "\n\n",
+      "```{r fiber-", id, ", echo=FALSE, fig.width=12, fig.height=", heights[[id]], fig_path, "}\n",
+      "print(plots[[\"", id, "\"]]$combined)\n",
+      "```\n")
+    cat(knitr::knit_child(text = child, envir = environment(), quiet = TRUE), sep = "\n")
   }
+}
+if (length(pair_data)) {
+  show_region_figures(fiber_plots,
+    heights = sapply(names(pair_data), function(id) 6 + 0.05 * display_data[[id]]$n_drawn),
+    titles = sapply(names(pair_data), function(id)
+      paste0(id, ": ", pair_data[[id]]$pair$gene_names)),
+    fig_dir = plot_dir)
 } else {
   cat("No fiber plots requested or no qualifying pairs.\n")
 }
 ```
 
-# X-inactivation
+# Enrichment of co-accessible CREs on chrX 
 
-chrX supplies about 2% of the tested pairs and over 11% of the significant ones.
-The four panels below attribute that to X-inactivation rather than to
-cCRE co-accessibility. Each X in a female cell is either active or inactive, and
-a fiber comes from one X in one cell, so the pooled fiber set is a mixture of
-uniformly closed Xi and open Xa molecules. For a mixture over latent classes
-whose two per-cCRE rates are `a_c` and `b_c`, and with the two cCREs independent
-inside every class, `Cov(open1, open2) = Cov_c(a_c, b_c)`. X-inactivation makes
-`a_c` and `b_c` move together across classes, so the covariance is large and the
-pooled 2x2 shows association with no local co-accessibility at all. With Xi fully
-closed and an active fraction `p` the inflation is exactly `1/p`. The Fisher test
-assumes one exchangeable fiber pool and has no term for this.
+ChrX is enriched for co-accessible pairs, and check if this is because of X chr inactivation
 
-Panel A derives donor sex from coverage and shows the inflation against it.
-Panel B shows the two fiber populations directly. Panel C re-runs the pooled test
-in each sex separately. Panel D uses the pseudoautosomal regions, which escape
-X-inactivation, as an internal negative control.
+### donor sex against chrX inflation
 
-These panels diagnose the pooled test; they do not change it. Nothing here feeds
-back into the pair table, the FDR, or the top-ten selection above.
+1. Is the excess of significant ChrX pairs come from X inactivation and not from co-accessibility?
 
-## Panel A: donor sex against chrX inflation
+- infer donor sex from chrx read depth
+- measures how inflated chrx co-accessibility is relative to the same sample's autosomes -> if this is because of x inactivation, female samples should be inflated and males should not
 
-One pass over the per-sample counts. Coverage uses every row. The
-observed/expected ratio uses only pairs with at least `xci_min_fibers` fibers in
-that sample, since below that the expectation is not worth forming, and it is
-computed **within** each sample, so no part of it can come from pooling donors.
-Both quantities are divided by the number of pairs their chromosome class
-contributes, which puts chrX and autosomal fiber depth on the same per-pair
-footing.
+x_depth: the average number of shared fibers per pair on chrX, divided by the same average on autosomes. It compares chrX coverage with autosomal coverage in the same sample. It is about 1 with two X copies (female) and about 0.5 with one (male), so it is used to infer sex
+  - oe_chrX: observed over expected co-accessible fibers on chrX pairs. A value above 1 means more joint accessibility than independence predicts
+  - oe_auto: the same measure for autosomal pairs
 
 ```{r xci-sex-and-inflation, fig.height=5}
+# min # of spanning reads = 6
 xci_min_fibers <- 6L
 counts_file <- file.path(coaccess_dir, "LCL_pair_sample_counts.tsv.gz")
 stopifnot(file.exists(counts_file))
 
+# For each sample, count
+  # 1. the total number of shared reads for each pair
+  # 2. number of pairs
+  # 3. sum of observed co-accessible fibers
+  # 4. sum of expcted co-accessible fibers (both + CRE1 only) x(both + CRE2 only) / shared reads
 per_sample <- fread(cmd = sprintf(
   "zcat %s | awk -F'\\t' -v OFS='\\t' -v m=%d '
      NR == 1 { next }
@@ -545,7 +490,9 @@ per_sample <- fread(cmd = sprintf(
              print p[1], p[2], cov[k], np[k], obs[k], ex[k] } }'",
   shQuote(counts_file), xci_min_fibers),
   col.names = c("sample_name", "class", "fibers", "n_pairs", "obs", "exp"))
+
 stopifnot(setequal(per_sample$sample_name, samples))
+
 
 wide <- dcast(per_sample, sample_name ~ class,
               value.var = c("fibers", "n_pairs", "obs", "exp"))
@@ -555,9 +502,9 @@ wide[, `:=`(
   oe_auto = obs_autosome / exp_autosome)]
 wide[, oe_ratio := oe_chrX / oe_auto]
 
-# Two X copies put chrX fiber depth at parity with the autosomes; one copy
-# halves it. The observed values fall in two blocks with nothing between them,
-# so the cut sits in that gap and the gap itself is asserted.
+print(wide)
+
+# infer sex based on chrx coverage: females should have near 1 coverage and males should have 0.5
 sex_depth_cut <- 0.9
 stopifnot(!any(wide$x_depth > 0.8 & wide$x_depth < 1.0))
 wide[, sex := ifelse(x_depth >= sex_depth_cut, "female (XX)", "male (XY)")]
@@ -565,8 +512,7 @@ sample_sex <- wide[, .(sample_name, sex, x_depth, oe_chrX, oe_auto, oe_ratio)]
 sample_sex[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
 fwrite(sample_sex, file.path(table_dir, "LCL_xci_sample_sex.tsv"), sep = "\t")
 
-# Sex is read off coverage alone. The inflation is then measured on that
-# pre-existing grouping, so the two axes are not the same quantity twice.
+
 f_ratio <- sample_sex[sex == "female (XX)", oe_ratio]
 m_ratio <- sample_sex[sex == "male (XY)", oe_ratio]
 sep_p <- if (min(f_ratio) > max(m_ratio))
@@ -590,129 +536,39 @@ panel_a <- ggplot(sample_sex, aes(x_depth, oe_ratio, colour = sex)) +
          "dashed: no inflation%s"), sex_depth_cut,
          if (is.na(sep_p)) "" else sprintf(" | separation p = %.1g", sep_p)))
 print(panel_a)
-ggsave(file.path(plot_dir, "LCL_xci_panelA_sex_vs_inflation.pdf"), panel_a,
+ggsave(file.path(plot_dir, "LCL_xci_sex_vs_inflation.pdf"), panel_a,
        width = 7.5, height = 5)
 ```
 
-## Panel B: the two fiber populations
 
-Chromosome state is not a local property, so this measures each fiber along its
-whole length rather than inside the plotted window: FIRE elements per aligned kb
-over the fiber's entire aligned span, with **both tested cCREs cut out of every
-interval**. The measurement therefore never touches the sites the 2x2 is built
-from, so it cannot restate the test. Reaching the fiber ends needs a wider tabix
-query than the plotted window, which is the cost of this panel; FIRE-element
-density per kb is already length-normalised, so fibers from all ten pairs pool.
 
-Counting elements rather than bp matters. FIRE elements are punctate calls a few
-hundred bp wide, so an element **fraction** over a multi-kb span is near zero for
-every fiber and separates nothing; a per-kb **rate** is the quantity that
-distinguishes a fiber carrying several accessible patches from one carrying none.
+### Fisher test separately on female vs male
 
-If the association comes from chromosome state, the fibers split into a closed
-mode with no accessible patch anywhere along their length and an open mode, and
-the fibers scored `neither` at the tested pair are the closed mode. The
-closed/open split is visible at autosomal pairs too, which is the same
-fiber-level heterogeneity that puts the autosomal null cloud slightly right of
-zero; what is specific to chrX is that the split is set by donor sex.
+Do 2x2 table (pooled counts, +1 pseudocount, two-sided Fisher test, BH correction) separately on female samples and on male samples
 
-```{r xci-fiber-state, fig.height=5}
-xci_wide_flank_bp <- 25000L   # reach past the ends of fibers spanning the pair
-xci_min_span_kb <- 5
+  - whether chrX’s excess of significant pairs appears in females but not in males, which is what X-inactivation would predict
+  
+Input: `LCL_pair_sample_counts.tsv.gz` has one row per pair per sample, with these columns: pair, co_closed, CRE1 only, CRE2 only, both, chromosome, sample name, donor, shared fibers
 
-fiber_state <- rbindlist(lapply(names(pair_data), function(id) {
-  entry <- pair_data[[id]]
-  wide <- list(chrom = entry$region$chrom,
-               start = max(0L, entry$region$start - xci_wide_flank_bp),
-               end = entry$region$end + xci_wide_flank_bp)
-  res <- load_region(wide, samples, paths$root, paths$fire_root,
-    fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
-    span_source = "aligned_blocks")
-  shared <- entry$labels[shared == TRUE]
+Output: `LCL_xci_sex_split_pairs.tsv.gz` 
 
-  # Subtract both tested cCREs from every interval, so what is measured is the
-  # rest of the fiber and not the two sites the 2x2 is built from.
-  cut_cres <- function(tb) {
-    for (cc in list(entry$cre1, entry$cre2)) {
-      left <- copy(tb[start < cc$start])[, end := pmin(end, cc$start)]
-      right <- copy(tb[end > cc$end])[, start := pmax(start, cc$end)]
-      tb <- rbind(left, right)[end > start]
-    }
-    tb
-  }
-  aligned <- cut_cres(res$blocks[key %in% shared$key, .(key, start, end)])
-  fire <- cut_cres(res$elements[key %in% shared$key, .(key, element_id, start, end)])
-  # Count distinct elements, not interval pieces: clipping at a cCRE edge or an
-  # alignment gap splits one element across rows that share an element_id.
-  fire_n <- if (nrow(fire)) fire[, .(n_fire = uniqueN(element_id)), by = key] else
-    data.table(key = character(), n_fire = integer())
+| Column | Meaning |
+|---|---|
+| `sex` | The donor group, female (XX) or male (XY). |
+| `tested` | The number of cCRE pairs tested in that group. These are the pairs with at least 50 shared fibers in both groups, so the number is the same for both rows. |
+| `chrX_tested` | How many of those pairs are on chrX. This is also the same for both rows. |
+| `significant` | The number of pairs that pass all three criteria in that group: FDR below 0.05, OR above 1, and observed co-accessibility above expected. |
+| `chrX_significant` | How many of the significant pairs are on chrX. |
+| `median_chrX_fibers` | The median number of shared fibers on chrX pairs in that group. It shows how much depth the chrX tests had. |
+| `pct_chrX_of_significant` | The share of significant pairs that are on chrX: `chrX_significant` / `significant` × 100. |
 
-  out <- merge(aligned[, .(span_kb = sum(end - start) / 1000), by = key],
-               fire_n, by = "key", all.x = TRUE)
-  out[is.na(n_fire), n_fire := 0L]
-  out <- merge(out, shared[, .(key, sample_name, config)], by = "key")
-  out[span_kb >= xci_min_span_kb,
-      .(pair_id = id, chrom_class = ifelse(entry$pair$chrom == "chrX", "chrX", "autosome"),
-        sample_name, config, span_kb, n_fire, fire_per_kb = n_fire / span_kb)]
-}))
-fiber_state[, sex := sample_sex$sex[match(sample_name, sample_sex$sample_name)]]
-stopifnot(!anyNA(fiber_state$sex), nrow(fiber_state) > 0)
-fwrite(fiber_state, file.path(table_dir, "LCL_xci_fiber_states.tsv.gz"), sep = "\t")
-
-state_summary <- fiber_state[, .(fibers = .N, median_span_kb = round(median(span_kb), 1),
-  median_fire_per_kb = round(median(fire_per_kb), 3),
-  pct_no_element = round(100 * mean(n_fire == 0), 1)), by = .(chrom_class, sex)]
-setorder(state_summary, chrom_class, sex)
-knitr::kable(state_summary)
-
-# the closed mode is the same fiber set the 2x2 scores as doubly closed
-by_config <- fiber_state[, .(fibers = .N,
-  median_fire_per_kb = round(median(fire_per_kb), 3)), by = .(chrom_class, sex, config)]
-setorder(by_config, chrom_class, sex, config)
-knitr::kable(by_config)
-
-# explicit binning: the mass sits exactly at zero, which a kernel density hides
-bw <- 0.05
-bins <- fiber_state[, .(n = .N), by = .(chrom_class, sex,
-  bin = pmin(floor(fire_per_kb / bw) * bw, 0.6))]
-bins[, prop := n / sum(n), by = .(chrom_class, sex)]
-
-panel_b <- ggplot(bins, aes(bin, prop, fill = sex)) +
-  geom_col(position = position_dodge(width = bw * 0.9), width = bw * 0.85) +
-  facet_wrap(~ chrom_class, nrow = 1) +
-  scale_fill_manual(values = c("female (XX)" = "#1B7837", "male (XY)" = "#762A83"),
-                    name = NULL) +
-  theme_bw(base_size = 11) +
-  labs(x = "FIRE elements per aligned kb, whole fiber span, both tested cCREs removed",
-       y = "fraction of fibers in the group",
-       title = "chrX fibers in female donors split into a closed and an open population",
-       subtitle = sprintf(paste("fibers from all %d plotted pairs with >= %g kb aligned |",
-         "no accessible element anywhere along the fiber: chrX %.0f%% of female vs %.0f%% of male"),
-         length(pair_data), xci_min_span_kb,
-         state_summary[chrom_class == "chrX" & sex == "female (XX)", pct_no_element],
-         state_summary[chrom_class == "chrX" & sex == "male (XY)", pct_no_element]))
-print(panel_b)
-ggsave(file.path(plot_dir, "LCL_xci_panelB_fiber_states.pdf"), panel_b,
-       width = 9, height = 5)
-```
-
-## Panel C: the pooled test re-run within each sex
-
-The same statistic as the main analysis, recomputed on fibers from one sex at a
-time: four pooled counts, one pseudocount per cell, two-sided Fisher, BH within
-the panel. Splitting the cohort halves the coverage, so a pair is kept only when
-**both** groups reach `xci_min_split` shared fibers; without a common floor the
-male panel would look emptier for want of depth rather than for want of signal.
-chrX fiber depth is still lower in males even after the filter, which the
-subtitle reports, so the male panel remains the more conservative of the two.
 
 ```{r xci-sex-split-test}
+# min # of reads spanning both CREs
 xci_min_split <- 50L
 
-# Two-sided Fisher exact p under the probability-ordering convention of
-# stats::fisher.test: the hypergeometric mass of every table no more likely than
-# the observed one. Tables sharing margins share a density vector, so the work
-# is done once per distinct margin set rather than once per pair.
+# fisher test
+# m and n are the two row totals and k is the first column total.
 fisher_p_two_sided <- function(a, b, c, d) {
   m <- a + b; n <- c + d; k <- a + c
   out <- numeric(length(a))
@@ -720,9 +576,10 @@ fisher_p_two_sided <- function(a, b, c, d) {
     i <- idx[1L]
     support <- max(0L, k[i] - n[i]):min(k[i], m[i])
     dens <- dhyper(support, m[i], n[i], k[i])
+    
+    # Sorts the probabilities from smallest to largest and takes a running sum. A table’s two-sided p-value is the total probability of all tables no more likely than it
     o <- order(dens)
     ds <- dens[o]
-    # the tolerance matches fisher.test's relErr so tied densities sum together
     grp <- cumsum(c(TRUE, diff(ds) > ds[-length(ds)] * 1e-7))
     pv <- numeric(length(ds))
     pv[o] <- as.numeric(tapply(cumsum(ds), grp, max))[grp]
@@ -730,16 +587,15 @@ fisher_p_two_sided <- function(a, b, c, d) {
   }
   out
 }
-# hold the fast path to the reference implementation it replaces
-set.seed(1)
-chk <- data.table(a = rpois(200, 40) + 1, b = rpois(200, 12) + 1,
-                  c = rpois(200, 12) + 1, d = rpois(200, 40) + 1)
-stopifnot(all.equal(fisher_p_two_sided(chk$a, chk$b, chk$c, chk$d),
-  vapply(seq_len(nrow(chk)), function(i)
-    fisher.test(matrix(c(chk$a[i], chk$b[i], chk$c[i], chk$d[i]), 2, byrow = TRUE))$p.value, 0),
-  tolerance = 1e-10))
 
+
+# summarize counts by pair and sex
 fem <- sample_sex[sex == "female (XX)", sample_name]
+
+# combines the per sample counts into one 2×2 table per cCRE pair for females and one for males
+  # 1. group males and females
+  # 2. add up the counts for each pair within each group -> for every pair, it sums the four fiber counts and the number of shared fibers across all samples of that sex
+  # 3. For each sample that has at least 6 shared fibers on a pair, it adds that sample’s observed number of fibers open at both cCREs
 split_counts <- fread(cmd = sprintf("zcat %s | awk -F'\\t' -v OFS='\\t' -v m=%d %s",
   shQuote(counts_file), xci_min_fibers, shQuote(sprintf(
   'BEGIN { split("%s", s, " "); for (i in s) fem[s[i]] = 1 }
@@ -750,13 +606,13 @@ split_counts <- fread(cmd = sprintf("zcat %s | awk -F'\\t' -v OFS='\\t' -v m=%d 
    END { for (k in n) { split(k, p, SUBSEP)
            print p[1], p[2], cc[k], c1[k], c2[k], bo[k], n[k], obs[k], ex[k] } }',
   paste(fem, collapse = " ")))),
-  col.names = c("CRE_pair", "sex", "co_closed", "CRE1_access", "CRE2_access",
-                "co_access", "n_shared_reads", "obs", "exp"))
-# The per-sample file also carries candidate pairs no fiber covered, which the
-# pooled analysis never tested. Keep the tested universe and check that the
-# dropped pairs are exactly those with no fibers.
+  col.names = c("CRE_pair", "sex", "co_closed", "CRE1_access", "CRE2_access", "co_access", "n_shared_reads", "obs", "exp"))
+
+# check if there are pairs that are not tested
 untested <- split_counts[!CRE_pair %in% pairs_dt$CRE_pair]
 stopifnot(all(untested$n_shared_reads == 0L))
+
+# keep only the tested paris
 split_counts <- split_counts[CRE_pair %in% pairs_dt$CRE_pair]
 split_counts[, chrom := pairs_dt$chrom[match(CRE_pair, pairs_dt$CRE_pair)]]
 stopifnot(!anyNA(split_counts$chrom),
@@ -775,12 +631,16 @@ split_test[, fdr := p.adjust(pval, "BH"), by = sex]
 split_test[, significant := fdr < fdr_cutoff & OR > 1 & obs > exp]
 fwrite(split_test, file.path(table_dir, "LCL_xci_sex_split_pairs.tsv.gz"), sep = "\t")
 
+# result table for chrX
 split_summary <- split_test[, .(tested = .N, chrX_tested = sum(chrom == "chrX"),
   significant = sum(significant), chrX_significant = sum(significant & chrom == "chrX"),
   median_chrX_fibers = median(n_shared_reads[chrom == "chrX"])), by = sex]
 split_summary[, pct_chrX_of_significant := 100 * chrX_significant / significant]
-knitr::kable(split_summary, digits = 2)
+print(split_summary, digits = 2)
 ```
+
+### genome wide co-accessibility separated
+
 
 ```{r xci-panel-c-plot, fig.height=5.5}
 volc_split <- split_test[is.finite(OR) & OR > 0, .(sex, chrom, significant,
@@ -790,7 +650,7 @@ sig_split <- volc_split[significant == TRUE]
 facet_note <- split_summary[, setNames(sprintf("%s\nchrX %.1f%% of significant pairs",
   sex, pct_chrX_of_significant), sex)]
 
-panel_c <- ggplot(volc_split, aes(log2_OR, neg_log10_fdr)) +
+volc_by_sex <- ggplot(volc_split, aes(log2_OR, neg_log10_fdr)) +
   geom_bin2d(bins = 100) +
   scale_fill_gradient(low = "grey88", high = "grey25", trans = "log10",
                       name = "tested pairs") +
@@ -804,68 +664,421 @@ panel_c <- ggplot(volc_split, aes(log2_OR, neg_log10_fdr)) +
   scale_y_sqrt(breaks = c(0, 1.3, 5, 20, 50)) +
   theme_bw(base_size = 11) +
   labs(x = expression(log[2]~odds~ratio), y = expression(-log[10]~FDR~(sqrt~scale)),
-       title = "The chrX excess is present in female donors and absent in male donors",
-       subtitle = sprintf(paste("green: chrX | red: other chromosomes |",
-         "%d pairs with >= %d shared fibers in both groups |",
-         "median chrX fibers %.0f female vs %.0f male"),
-         length(keep), xci_min_split,
-         split_summary[sex == "female (XX)", median_chrX_fibers],
-         split_summary[sex == "male (XY)", median_chrX_fibers]))
-print(panel_c)
-ggsave(file.path(plot_dir, "LCL_xci_panelC_sex_split_volcano.pdf"), panel_c,
+       title = "Genome wide enrichment of co-accessible pairs by sex",
+       subtitle = "green: chrX | red: other chromosomes")
+print(volc_by_sex)
+ggsave(file.path(plot_dir, "LCL_xci_sex_split_volcano.pdf"), volc_by_sex,
        width = 11, height = 5.5)
 ```
+# Co-accessibility with X-inactivation excluded
 
-## Panel D: the pseudoautosomal regions as a negative control
+ChrX on female is excluded, chrX pairs are couted using male samples only - `LCL_coaccess_noXCI.py` -> this is because males only have one X, and it's active, so there is no closed inactivated chrX to inflate the table
 
-PAR1 and PAR2 escape X-inactivation, so they are the one part of chrX that
-should behave like an autosome in female donors. Female samples only, reusing
-the per-pair expectations from Panel C. The interval is a bootstrap over pairs;
-only a few hundred PAR pairs are tested, so this panel supports the direction
-and is not on its own decisive.
+1. call sex using chrx coverage - computes the average spanning fibers per CRE pair on chrx and on autosomes -> chrx spanning fibers/autosomes spanning fibers = depth
+  
+    - depth > 0.9 the female
+    
+2. remove chrx counts from females -> every per sample counts row on chrX from females are removed
+3. for each pair, the 2x2 tables are summed across remaing rows, chrX comes from males only
+4. run fisher test on the new tables without female chrx
 
-```{r xci-par, fig.height=4.5}
-# hg38 pseudoautosomal regions
-par_regions <- data.table(start = c(10001L, 155701383L), end = c(2781479L, 156030895L))
-coords <- pairs_dt[, .(CRE_pair, chrom,
-  lo = pmin(cre1_start, cre2_start), hi = pmax(cre1_end, cre2_end))]
-coords[, in_par := chrom == "chrX" &
-  Reduce(`|`, lapply(seq_len(nrow(par_regions)), function(i)
-    lo >= par_regions$start[i] & hi <= par_regions$end[i]))]
-coords[, region := ifelse(chrom != "chrX", "autosome",
-  ifelse(in_par, "chrX PAR", "chrX non-PAR"))]
+```{r no-chrx-setup}
+noxci_dir <- file.path(coaccess_dir, "noXCI")
+table_dir_noxci <- file.path(coaccess_dir, "no_female_chrx", "tables")
+plot_dir_noxci <- file.path(coaccess_dir, "no_female_chrx", "plots")
+for (d in c(table_dir_noxci, plot_dir_noxci)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
 
-par_dt <- split_counts[sex == "female (XX)"]
-par_dt[, region := coords$region[match(CRE_pair, coords$CRE_pair)]]
-par_dt <- par_dt[region %in% c("autosome", "chrX PAR", "chrX non-PAR") & exp > 0]
+pairs_file_noxci <- file.path(noxci_dir, "LCL_coaccess_pairs_noXCI.tsv.gz")
+pairs_noxci <- fread(pairs_file_noxci)
+sex_noxci <- fread(file.path(noxci_dir, "LCL_sample_sex_noXCI.tsv"))
 
-set.seed(1)
-boot_oe <- function(obs, exp, reps = 2000L) {
-  draws <- replicate(reps, {
-    i <- sample.int(length(obs), replace = TRUE)
-    sum(obs[i]) / sum(exp[i])
-  })
-  as.list(setNames(quantile(draws, c(0.025, 0.975)), c("lo", "hi")))
+male_samples_noxci <- samples[samples %in% sex_noxci[sex == "male (XY)", sample_name]]
+cat(nrow(pairs_noxci), "pairs tested after the removing female chrX;", length(male_samples_noxci),
+    "male samples supply the chrX pairs.\n")
+```
+
+### Compare the genome wide significant pairs before and after removing chrx in females
+
+see if significant pairs on chrx decreases as we remove chrx from females
+
+```{r no-chrx-compare}
+summarise_test <- function(label, chrom, fdr, OR, obs, exp) {
+  significant <- !is.na(fdr) & fdr < fdr_cutoff
+  positive <- significant & !is.na(OR) & OR > 1 & obs > exp
+  data.table(test = label, tested = length(chrom),
+    pct_chrX_tested = 100 * mean(chrom == "chrX"),
+    significant = sum(significant), pct_chrX_significant = 100 * mean(chrom[significant] == "chrX"),
+    positive = sum(positive), pct_chrX_positive = 100 * mean(chrom[positive] == "chrX"))
 }
-par_summary <- par_dt[, c(.(n_pairs = .N, obs = sum(obs), exp = sum(exp),
-  oe = sum(obs) / sum(exp)), boot_oe(obs, exp)), by = region]
-setorder(par_summary, -oe)
-knitr::kable(par_summary, digits = 3)
+compare_noxci <- rbind(
+  pairs_dt[, summarise_test("pooled, all 31 samples", chrom, fdr, OR, co_access,
+                            expected_co_access)],
+  pairs_noxci[, summarise_test("chrX from male samples only", chrom, fdr_noXCI, OR_noXCI,
+                               co_access_noXCI, expected_co_access_noXCI)])
+print(head(compare_noxci), digits = 2)
 
-panel_d <- ggplot(par_summary, aes(reorder(region, -oe), oe)) +
-  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4, colour = "grey40") +
-  geom_col(fill = "grey75", width = 0.6) +
-  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.18, linewidth = 0.5) +
-  geom_text(aes(label = sprintf("%d pairs", n_pairs)), vjust = -0.6, size = 3.1,
-            y = par_summary$hi) +
+chrX_depth_noxci <- merge(pairs_dt[chrom == "chrX", .(CRE_pair, n_pooled = n_shared_reads)],
+  pairs_noxci[chrom == "chrX", .(CRE_pair, n_male = n_shared_reads_noXCI)],
+  by = "CRE_pair", all.x = TRUE)
+cat(sprintf(paste("chrX: %d of %d pooled pairs have no male fiber and drop out;",
+    "the rest keep a median %.0f%% of their pooled fibers.\n"),
+    sum(is.na(chrX_depth_noxci$n_male)), nrow(chrX_depth_noxci),
+    100 * median(chrX_depth_noxci[!is.na(n_male), n_male / n_pooled])))
+```
+
+### Top ten co-accessible pairs without female chrx
+
+
+```{r noxci-select-top-ten}
+eligible_noxci <- pairs_noxci[!is.na(fdr_noXCI) & fdr_noXCI < fdr_cutoff &
+  !is.na(OR_noXCI) & OR_noXCI > 1 & co_access_noXCI > expected_co_access_noXCI]
+setorderv(eligible_noxci, c("fdr_noXCI", "OR_noXCI", "n_shared_reads_noXCI", "CRE_pair"),
+          c(1L, -1L, -1L, 1L))
+selected_noxci <- head(eligible_noxci, 10L)
+selected_noxci[, `:=`(
+  region_start = pmax(0L, pmin(cre1_start, cre2_start) - as.integer(params$locus_flank_bp)),
+  region_end = pmax(cre1_end, cre2_end) + as.integer(params$locus_flank_bp))]
+selected_noxci[, pair_id := sprintf("noXCI_top%d_%s_%d_%d", seq_len(.N), chrom,
+                                    region_start, region_end)]
+fwrite(selected_noxci, file.path(table_dir_noxci, "LCL_top10_pairs_noXCI.tsv"), sep = "\t")
+cat(nrow(eligible_noxci), "pairs pass the positive-association criteria; selected",
+    nrow(selected_noxci), "for plotting.\n")
+
+selected_noxci_df<- selected_noxci[, .(pair_id, gene_names, CRE_pair, chrX_rule, dist,
+  n_shared_reads_noXCI, co_access_noXCI, expected_co_access_noXCI,
+  observed_expected_ratio_noXCI, OR_noXCI, fdr_noXCI, fdr_raw_noXCI)]
+
+head(selected_noxci_df)
+```
+
+```{r noxci-observed-expected, fig.height=5}
+if (nrow(selected_noxci)) {
+  oe_noxci <- melt(selected_noxci[, .(pair_id, observed = co_access_noXCI,
+                                      expected = expected_co_access_noXCI)],
+                   id.vars = "pair_id", variable.name = "count_type", value.name = "fibers")
+  oe_plot_noxci <- ggplot(oe_noxci, aes(pair_id, fibers, fill = count_type)) +
+    geom_col(position = "dodge") + theme_bw() +
+    scale_fill_manual(values = c(observed = "#B2182B", expected = "grey70")) +
+    labs(x = NULL, y = "Jointly accessible fibers", fill = NULL,
+         title = "Observed and expected co-accessibility",
+         subtitle = "chrX pairs from male samples only; other pairs from all 31 samples") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  print(oe_plot_noxci)
+  ggsave(file.path(plot_dir_noxci, "LCL_top10_observed_expected_noXCI.pdf"), oe_plot_noxci,
+         width = 11, height = 5)
+}
+```
+
+### Genome-wide volcano of enriched pairs without chrx from females
+
+```{r noxci-volcano, fig.height=6}
+volcano_noxci <- pairs_noxci[!is.na(fdr_noXCI) & is.finite(OR_noXCI) & OR_noXCI > 0, .(
+  chrom,
+  log2_OR = log2(OR_noXCI),
+  neg_log10_fdr = -log10(pmax(fdr_noXCI, .Machine$double.xmin)),
+  significant = fdr_noXCI < fdr_cutoff,
+  direction = ifelse(OR_noXCI > 1, "co-accessible", "co-inaccessible"))]
+volcano_noxci[, chrom_class := ifelse(chrom == "chrX", "chrX",
+  ifelse(direction == "co-accessible", "other, OR > 1", "other, OR < 1"))]
+median_log2_or_noxci <- median(volcano_noxci$log2_OR)
+chosen_noxci <- selected_noxci[, .(log2_OR = log2(OR_noXCI),
+  neg_log10_fdr = -log10(pmax(fdr_noXCI, .Machine$double.xmin)))]
+signif_noxci <- volcano_noxci[significant == TRUE]
+
+volcano_plot_noxci <- ggplot(volcano_noxci, aes(log2_OR, neg_log10_fdr)) +
+  geom_bin2d(bins = 120) +
+  scale_fill_gradient(low = "grey88", high = "grey25", trans = "log10",
+                      name = "tested pairs") +
+  geom_point(data = signif_noxci[chrom != "chrX"], aes(colour = chrom_class),
+             size = 0.5, alpha = 0.6) +
+  geom_point(data = signif_noxci[chrom == "chrX"], aes(colour = chrom_class),
+             size = 0.9, alpha = 0.9) +
+  scale_colour_manual(values = c("chrX" = "#1B7837", "other, OR > 1" = "#B2182B",
+                                 "other, OR < 1" = "#2166AC"), name = NULL) +
+  geom_point(data = chosen_noxci, shape = 21, size = 2.4, colour = "black", fill = NA,
+             stroke = 0.6) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey40") +
+  geom_vline(xintercept = median_log2_or_noxci, linetype = "dotted", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed", linewidth = 0.4) +
+  scale_y_sqrt(breaks = c(0, 1.3, 5, 20, 50, 100)) +
   theme_bw(base_size = 11) +
-  labs(x = NULL, y = "observed / expected co-accessible fibers",
-       title = "The part of chrX that escapes X-inactivation behaves like an autosome",
-       subtitle = paste("female donors only | expectation formed within each sample |",
-                        "95% bootstrap interval over pairs"))
-print(panel_d)
-ggsave(file.path(plot_dir, "LCL_xci_panelD_par_control.pdf"), panel_d,
-       width = 7, height = 4.5)
+  labs(x = expression(log[2]~odds~ratio), y = expression(-log[10]~FDR~(sqrt~scale)),
+       title = "Co-accessibility of all tested cCRE pairs, chrX from male samples only",
+       subtitle = sprintf(paste("dashed: FDR %.2f | dotted: median log2 OR %.2f |",
+         "rings: the %d plotted below | chrX %.1f%% of tested, %.1f%% of significant pairs"),
+         fdr_cutoff, median_log2_or_noxci, nrow(chosen_noxci),
+         100 * mean(volcano_noxci$chrom == "chrX"),
+         100 * mean(signif_noxci$chrom == "chrX")))
+print(volcano_plot_noxci)
+ggsave(file.path(plot_dir_noxci, "LCL_coaccess_volcano_noXCI.pdf"), volcano_plot_noxci,
+       width = 9, height = 6)
+```
+### single molecule view of top10 co-accessible regions with chrx removed from females
+
+
+```{r noxci-load-and-verify}
+pair_data_noxci <- list()
+if (isTRUE(params$make_plots) && nrow(selected_noxci)) {
+  for (i in seq_len(nrow(selected_noxci))) {
+    pair <- selected_noxci[i]
+    pair_samples <- if (pair$chrom == "chrX") male_samples_noxci else samples
+    region <- list(chrom = pair$chrom, start = pair$region_start, end = pair$region_end)
+    cre1 <- list(start = pair$cre1_start, end = pair$cre1_end)
+    cre2 <- list(start = pair$cre2_start, end = pair$cre2_end)
+    res <- load_region(region, pair_samples, paths$root, paths$fire_root,
+      fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
+      span_source = "aligned_blocks")
+    labels <- label_reads(res, cre1, cre2, read_rule = read_rule,
+      fire_overlap_fraction = fire_overlap_fraction)
+    counts <- coaccess_2x2(labels)
+
+    actual <- unlist(counts[1, c("neither", "cre1_only", "cre2_only", "both", "n_shared")],
+                     use.names = FALSE)
+    expected <- unlist(pair[, .(co_closed_noXCI, CRE1_access_noXCI, CRE2_access_noXCI,
+                                co_access_noXCI, n_shared_reads_noXCI)], use.names = FALSE)
+    if (!identical(as.numeric(actual), as.numeric(expected)))
+      stop("Reloaded counts differ from the rebuilt table for ", pair$CRE_pair,
+           "; reloaded: ", paste(actual, collapse = ","),
+           "; rebuilt: ", paste(expected, collapse = ","))
+
+    read_labels <- copy(labels)[shared == TRUE]
+    read_labels[, donor := sample_meta$donor[match(sample_name, sample_meta$sample_name)]]
+    read_labels[, `:=`(pair_id = pair$pair_id, CRE_pair = pair$CRE_pair)]
+    fwrite(read_labels, file.path(table_dir_noxci,
+      paste0(pair$pair_id, "_read_labels_noXCI.tsv.gz")), sep = "\t")
+    contributions <- read_labels[, .(n_shared = .N, co_access = sum(acc1 & acc2),
+      CRE1_access = sum(acc1 & !acc2), CRE2_access = sum(!acc1 & acc2),
+      co_closed = sum(!acc1 & !acc2)), by = .(pair_id, sample_name, donor)]
+    fwrite(contributions, file.path(table_dir_noxci,
+      paste0(pair$pair_id, "_sample_counts_noXCI.tsv")), sep = "\t")
+
+    pair_data_noxci[[pair$pair_id]] <- list(pair = pair, region = region,
+      cre1 = cre1, cre2 = cre2, res = res, labels = labels, counts = counts)
+  }
+}
+```
+
+```{r noxci-fiber-panels}
+fiber_plots_noxci <- list()
+fig_heights_noxci <- c()
+for (id in names(pair_data_noxci)) {
+  entry <- pair_data_noxci[[id]]
+  pair <- entry$pair
+  region <- entry$region
+  counts <- entry$counts
+
+  # window-spanning shared fibers, co-accessible first, capped at max_drawn
+  spanning <- entry$res$spans[start <= region$start & end >= region$end, key]
+  drawn_labels <- copy(entry$labels)[shared == TRUE & key %in% spanning]
+  setorder(drawn_labels, config)
+  n_spanning <- nrow(drawn_labels)
+  if (n_spanning > max_drawn) drawn_labels <- drawn_labels[seq_len(max_drawn)]
+
+  display_res <- load_ft_tracks(copy(entry$res), keys = drawn_labels$key,
+    ft_root = paths$ft_root, tabix_bin = paths$tabix_bin,
+    nuc_source = "ft", tf_source = "recalled_tf", tf_root = paths$tf_root)
+  for (track in c("spans", "blocks", "elements", "m6a", "nuc", "size_fps")) {
+    if (!is.null(display_res[[track]]) && nrow(display_res[[track]]))
+      display_res[[track]][, sample_name := "pooled"]
+  }
+  display_res$samples <- "pooled"
+  drawn_labels[, sample_name := "pooled"]
+
+  cres_here <- cre_universe[chrom == region$chrom & end > region$start & start < region$end]
+  region_res <- coaccess_region_result(display_res, entry$cre1, entry$cre2,
+    drawn_labels, cres = cres_here)
+  # co-accessible fibers on top, in both rasters
+  rid_levels <- rev(levels(region_res$rids_df$RID))
+  for (tb in c("reads", "rids_df", "fire", "nucs", "fps", "fps_infire")) {
+    if (!is.null(region_res[[tb]]) && nrow(region_res[[tb]]))
+      region_res[[tb]][["RID"]] <- factor(as.character(region_res[[tb]][["RID"]]),
+                                          levels = rid_levels)
+  }
+  pk <- as.data.frame(cres_here)
+  cls <- factor(pk$CRE_label, levels = c(intersect(CCRE_CLASSES, pk$CRE_label),
+    setdiff(unique(pk$CRE_label), CCRE_CLASSES)))
+  pk <- pk[order(cls, pk$start), , drop = FALSE]
+  peaks_df <- data.frame(chr = pk$chrom, start = pk$start, end = pk$end,
+    group = as.character(pk$CRE_label))
+
+  subtitle <- sprintf("%s:%d-%d | %s", region$chrom, region$start, region$end,
+    if (pair$chrom == "chrX") sprintf("chrX: %d male samples", length(male_samples_noxci))
+    else sprintf("all %d samples", length(samples)))
+  subtitle <- paste0(subtitle, "\n", sprintf(paste0(
+    "%d fibers fully cover both cCREs: both %d | CRE1 only %d | CRE2 only %d | neither %d",
+    " | Fisher OR (table + 1) = %.2f, p = %.2g"), counts$n_shared,
+    counts$both, counts$cre1_only, counts$cre2_only, counts$neither,
+    counts$fisher_or, counts$fisher_p))
+
+  raster_height <- max(2, 0.025 * nrow(drawn_labels) + 0.3)
+  heights <- c(pileup = 1.5, peaks = 0.3 + 0.3 * length(unique(peaks_df$group)),
+    reads = raster_height, fire_fiberHMM = raster_height)
+  read_theme <- list(axis.ticks.y = element_blank(), panel.grid.major.y = element_blank())
+  fiber_plots_noxci[[id]] <- plot_region_panels(region_res,
+    plot_name = paste(id, pair$gene_names, pair$CRE_pair_labels,
+      sprintf("%d of %d window-spanning fibers drawn, co-accessible first",
+              nrow(drawn_labels), n_spanning), sep = " | "),
+    subtitle = subtitle, peaks_df = peaks_df, highlight = region_res$highlight,
+    linewidth = 1.1, expand = TRUE, heights = heights,
+    profile_options = list(colour_by = "group", colors = cluster_palette("pooled"),
+      y_col = "frac", linewidth = 0.4, facet_scales = "fixed",
+      facet_space = "fixed", require_data = TRUE),
+    read_options = list(tile_width = 8, tile_height = 0.85,
+      backbone_col = BACKBONE_COL, arrows = FALSE,
+      base_colors = c(A = M6A_COL), require_data = TRUE),
+    peaks_options = list(variant = "intervals"),
+    footprint_options = list(draw_order = c("linker", "nucleosome", "FIRE element",
+      rev(region_res$size_levels)), backbone = FALSE, always = TRUE,
+      legend_title = NULL, legend_drop = FALSE, legend_linewidth = 3),
+    theme_options = list(base = "bw", base_size = 11,
+      pileup = list(strip.text.y = element_text(angle = 0)),
+      reads = read_theme, fire_fiberHMM = read_theme),
+    y_labels = c(pileup = "m6A fraction", reads = "m6A",
+      fire_fiberHMM = "ft nucleosomes + FIRE + FiberHMM TF"),
+    panel_names = c(peaks = "cres", pileup = "m6a_prop", reads = "m6a", fire_fiberHMM = "reads"))
+  fig_heights_noxci[id] <- 6 + 0.05 * nrow(drawn_labels)
+  ggsave(file.path(plot_dir_noxci, paste0(id, "_reads_noXCI.pdf")),
+    fiber_plots_noxci[[id]]$combined, width = 12, height = fig_heights_noxci[[id]],
+    limitsize = FALSE)
+}
+```
+
+```{r noxci-plot-top-ten, results="asis"}
+if (length(pair_data_noxci)) {
+  show_region_figures(fiber_plots_noxci, heights = fig_heights_noxci,
+    titles = sapply(names(pair_data_noxci), function(id)
+      paste0(id, ": ", pair_data_noxci[[id]]$pair$gene_names)),
+    fig_dir = plot_dir_noxci, header = "###")
+} else {
+  cat("No fiber plots requested or no qualifying pairs.\n")
+}
+```
+
+### top 5 co-accessible pairs ranked by # of co-accessible fibers
+
+same filters as the top 10 without female chrx: fdr < 0.05, OR > 1, observed co-accessibility > expected
+
+highest # of co-accessible fibers -> smallest FDR -> largest OR -> highest # of spanning molecules -> pair ID alphabetical order
+
+```{r top-five-by-coaccess}
+top5_noxci <- copy(eligible_noxci)
+setorderv(top5_noxci, c("co_access_noXCI", "fdr_noXCI", "OR_noXCI", "n_shared_reads_noXCI", "CRE_pair"),
+          c(-1L, 1L, -1L, -1L, 1L))
+top5_noxci <- head(top5_noxci, 5L)
+top5_noxci[, `:=`(
+  region_start = pmax(0L, pmin(cre1_start, cre2_start) - as.integer(params$locus_flank_bp)),
+  region_end = pmax(cre1_end, cre2_end) + as.integer(params$locus_flank_bp))]
+top5_noxci[, pair_id := sprintf("noXCI_coaccess_top%d_%s_%d_%d", seq_len(.N), chrom,
+                                region_start, region_end)]
+fwrite(top5_noxci, file.path(table_dir_noxci, "LCL_top5_coaccess_pairs_noXCI.tsv"), sep = "\t")
+
+head(top5_noxci[, .(pair_id, gene_names, CRE_pair, n_shared_reads_noXCI, co_access_noXCI,
+  expected_co_access_noXCI, observed_expected_ratio_noXCI, OR_noXCI, fdr_noXCI)])
+```
+
+```{r top-five-fiber-panels}
+fiber_plots_top5 <- list()
+fig_heights_top5 <- c()
+if (isTRUE(params$make_plots) && nrow(top5_noxci)) {
+  for (i in seq_len(nrow(top5_noxci))) {
+    pair <- top5_noxci[i]
+    id <- pair$pair_id
+    pair_samples <- if (pair$chrom == "chrX") male_samples_noxci else samples
+    region <- list(chrom = pair$chrom, start = pair$region_start, end = pair$region_end)
+    cre1 <- list(start = pair$cre1_start, end = pair$cre1_end)
+    cre2 <- list(start = pair$cre2_start, end = pair$cre2_end)
+    res <- load_region(region, pair_samples, paths$root, paths$fire_root,
+      fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
+      span_source = "aligned_blocks")
+    labels <- label_reads(res, cre1, cre2, read_rule = read_rule,
+      fire_overlap_fraction = fire_overlap_fraction)
+    counts <- coaccess_2x2(labels)
+
+    # window-spanning shared fibers, co-accessible first, capped at max_drawn
+    spanning <- res$spans[start <= region$start & end >= region$end, key]
+    drawn_labels <- copy(labels)[shared == TRUE & key %in% spanning]
+    setorder(drawn_labels, config)
+    n_spanning <- nrow(drawn_labels)
+    if (n_spanning > max_drawn) drawn_labels <- drawn_labels[seq_len(max_drawn)]
+
+    display_res <- load_ft_tracks(copy(res), keys = drawn_labels$key,
+      ft_root = paths$ft_root, tabix_bin = paths$tabix_bin,
+      nuc_source = "ft", tf_source = "recalled_tf", tf_root = paths$tf_root)
+    for (track in c("spans", "blocks", "elements", "m6a", "nuc", "size_fps")) {
+      if (!is.null(display_res[[track]]) && nrow(display_res[[track]]))
+        display_res[[track]][, sample_name := "pooled"]
+    }
+    display_res$samples <- "pooled"
+    drawn_labels[, sample_name := "pooled"]
+
+    cres_here <- cre_universe[chrom == region$chrom & end > region$start & start < region$end]
+    region_res <- coaccess_region_result(display_res, cre1, cre2,
+      drawn_labels, cres = cres_here)
+    # co-accessible fibers on top, in both rasters
+    rid_levels <- rev(levels(region_res$rids_df$RID))
+    for (tb in c("reads", "rids_df", "fire", "nucs", "fps", "fps_infire")) {
+      if (!is.null(region_res[[tb]]) && nrow(region_res[[tb]]))
+        region_res[[tb]][["RID"]] <- factor(as.character(region_res[[tb]][["RID"]]),
+                                            levels = rid_levels)
+    }
+    pk <- as.data.frame(cres_here)
+    cls <- factor(pk$CRE_label, levels = c(intersect(CCRE_CLASSES, pk$CRE_label),
+      setdiff(unique(pk$CRE_label), CCRE_CLASSES)))
+    pk <- pk[order(cls, pk$start), , drop = FALSE]
+    peaks_df <- data.frame(chr = pk$chrom, start = pk$start, end = pk$end,
+      group = as.character(pk$CRE_label))
+
+    subtitle <- sprintf("%s:%d-%d | %s", region$chrom, region$start, region$end,
+      if (pair$chrom == "chrX") sprintf("chrX: %d male samples", length(male_samples_noxci))
+      else sprintf("all %d samples", length(samples)))
+    subtitle <- paste0(subtitle, "\n", sprintf(paste0(
+      "%d fibers fully cover both cCREs: both %d | CRE1 only %d | CRE2 only %d | neither %d",
+      " | Fisher OR (table + 1) = %.2f, p = %.2g"), counts$n_shared,
+      counts$both, counts$cre1_only, counts$cre2_only, counts$neither,
+      counts$fisher_or, counts$fisher_p))
+
+    raster_height <- max(2, 0.025 * nrow(drawn_labels) + 0.3)
+    heights <- c(pileup = 1.5, peaks = 0.3 + 0.3 * length(unique(peaks_df$group)),
+      reads = raster_height, fire_fiberHMM = raster_height)
+    read_theme <- list(axis.ticks.y = element_blank(), panel.grid.major.y = element_blank())
+    fiber_plots_top5[[id]] <- plot_region_panels(region_res,
+      plot_name = paste(id, pair$gene_names, pair$CRE_pair_labels,
+        sprintf("%d of %d window-spanning fibers drawn, co-accessible first",
+                nrow(drawn_labels), n_spanning), sep = " | "),
+      subtitle = subtitle, peaks_df = peaks_df, highlight = region_res$highlight,
+      linewidth = 1.1, expand = TRUE, heights = heights,
+      profile_options = list(colour_by = "group", colors = cluster_palette("pooled"),
+        y_col = "frac", linewidth = 0.4, facet_scales = "fixed",
+        facet_space = "fixed", require_data = TRUE),
+      read_options = list(tile_width = 8, tile_height = 0.85,
+        backbone_col = BACKBONE_COL, arrows = FALSE,
+        base_colors = c(A = M6A_COL), require_data = TRUE),
+      peaks_options = list(variant = "intervals"),
+      footprint_options = list(draw_order = c("linker", "nucleosome", "FIRE element",
+        rev(region_res$size_levels)), backbone = FALSE, always = TRUE,
+        legend_title = NULL, legend_drop = FALSE, legend_linewidth = 3),
+      theme_options = list(base = "bw", base_size = 11,
+        pileup = list(strip.text.y = element_text(angle = 0)),
+        reads = read_theme, fire_fiberHMM = read_theme),
+      y_labels = c(pileup = "m6A fraction", reads = "m6A",
+        fire_fiberHMM = "ft nucleosomes + FIRE + FiberHMM TF"),
+      panel_names = c(peaks = "cres", pileup = "m6a_prop", reads = "m6a", fire_fiberHMM = "reads"))
+    fig_heights_top5[id] <- 6 + 0.05 * nrow(drawn_labels)
+    ggsave(file.path(plot_dir_noxci, paste0(id, "_reads_noXCI.pdf")),
+      fiber_plots_top5[[id]]$combined, width = 12, height = fig_heights_top5[[id]],
+      limitsize = FALSE)
+  }
+}
+```
+
+```{r top-five-plot, results="asis"}
+if (length(fiber_plots_top5)) {
+  show_region_figures(fiber_plots_top5, heights = fig_heights_top5,
+    titles = setNames(paste0(top5_noxci$pair_id, ": ", top5_noxci$gene_names), top5_noxci$pair_id),
+    fig_dir = plot_dir_noxci, header = "####")
+} else {
+  cat("No fiber plots requested or no qualifying pairs.\n")
+}
 ```
 
 ```{r session-information, eval=FALSE}
