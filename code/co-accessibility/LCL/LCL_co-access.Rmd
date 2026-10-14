@@ -431,12 +431,14 @@ for (id in names(pair_data)) {
 ```
 
 ```{r plot-top-ten, results="asis"}
-show_region_figures <- function(plots, heights, titles, fig_dir, header = "##") {
+show_region_figures <- function(plots, heights, titles, fig_dir, header = "##", label_prefix = "fiber-") {
+  old_opts <- options(knitr.duplicate.label = "allow")
+  on.exit(options(old_opts), add = TRUE)
   fig_path <- if (isTRUE(getOption("knitr.in.progress"))) "" else
     sprintf(", fig.path='%s/'", fig_dir)
   for (id in names(plots)) {
     child <- paste0(header, " ", titles[[id]], "\n\n",
-      "```{r fiber-", id, ", echo=FALSE, fig.width=12, fig.height=", heights[[id]], fig_path, "}\n",
+      "```{r ", label_prefix, id, ", echo=FALSE, fig.width=12, fig.height=", heights[[id]], fig_path, "}\n",
       "print(plots[[\"", id, "\"]]$combined)\n",
       "```\n")
     cat(knitr::knit_child(text = child, envir = environment(), quiet = TRUE), sep = "\n")
@@ -948,7 +950,7 @@ if (length(pair_data_noxci)) {
   show_region_figures(fiber_plots_noxci, heights = fig_heights_noxci,
     titles = sapply(names(pair_data_noxci), function(id)
       paste0(id, ": ", pair_data_noxci[[id]]$pair$gene_names)),
-    fig_dir = plot_dir_noxci, header = "###")
+    fig_dir = plot_dir_noxci, header = "###", label_prefix = "noxci-fiber-")
 } else {
   cat("No fiber plots requested or no qualifying pairs.\n")
 }
