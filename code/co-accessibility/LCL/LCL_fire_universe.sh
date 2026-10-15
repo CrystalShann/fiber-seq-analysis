@@ -41,8 +41,8 @@ while IFS=$'\t' read -r sample_name cram_path peaks_path elements_path spans_pat
 done < "$uni/sample_inputs.tsv"
 
 # append the sample's peaks to the combined file, and sort all peaks together
+# bedtools merges overlapping peaks into a single interval
 LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" "$tmpdir/peaks.bed" \
-    # bedtools merges overlapping peaks into single interval 
     | "$BEDTOOLS" merge -i stdin > "$tmpdir/fire_peaks_union.bed"
 
 

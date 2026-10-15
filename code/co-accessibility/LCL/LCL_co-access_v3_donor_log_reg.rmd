@@ -1,0 +1,406 @@
+---
+title: "Genome-wide LCL co-accessibility adjusted for donor"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  code_root: "/project/spott/cshan/fiber-seq/code"
+  min_reads_per_donor: 2
+  cores: 4
+  chrom: null
+---
+
+# Model and scope
+
+The default runs every covered pair genome-wide, twice: **all_chr** uses
+all samples on every chromosome; **noXCI** uses male samples only on chrX and
+all samples elsewhere. Existing sex calls are required and never recomputed.
+Samples are first summed within the existing `donor` (cell-line) column.
+No CRAM, FIRE, or methylation track is read. The Python scripts and existing
+pooled results are read-only references.
+
+For each donor, two grouped-binomial rows represent all shared reads exactly:
+
+| CRE1 status `x` | CRE2 open `y1` | CRE2 closed `y0` |
+|---|---|---|
+| 0 | `CRE2_access` | `co_closed` |
+| 1 | `co_access` | `CRE1_access` |
+
+Donors with fewer than `min_reads_per_donor` reads, constant CRE1 status, or
+constant CRE2 status are excluded separately for each pair. `n_donors_total`
+counts donors represented before this filter, including donors with zero reads;
+`n_donors_informative` counts retained donors. All reported adjusted cells and
+`n_shared_reads` refer only to retained donors. The original pooled cells and
+statistics are separately labelled.
+
+The full model adds `x` to donor-specific intercepts. Its likelihood-ratio test
+against the donor-only null has one degree of freedom. With one informative
+donor, these are `~ x` and `~ 1`. The positive-association p-value is `p_LRT / 2`
+when beta > 0 and `1 - p_LRT / 2` otherwise. No Wald p-value or pseudocount is
+used for non-separated pairs. Their confidence intervals are 95% likelihood-profile
+intervals; a failed profile falls back to a flagged Wald interval only.
+Separated pairs instead use a Rao score test and Firth odds ratios with penalized
+profile-likelihood intervals, as described below.
+
+BH is applied once after combining chromosomes, separately for the two analyses.
+Its family is all pairs with at least one informative donor, including separated
+pairs. Truly failed fits retain NA statistics but still count in this family
+(equivalent to a conservative p=1 placeholder for multiplicity only).
+Zero-coverage pairs are excluded, matching the original notebook; covered pairs
+with no informative donors remain as rows outside BH. Set `chrom: "chr21"`
+for a smoke test: its FDR is explicitly chromosome-scoped, and its outputs are
+isolated from genome-wide outputs. The original pooled FDR remains genome-wide
+even in this smoke-test comparison.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     cache = FALSE, fig.width = 9, fig.height = 6)
+suppressPackageStartupMessages({library(data.table); library(ggplot2)})
+source(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r"), local = TRUE)
+.libPaths(c(file.path(params$root, "coaccess", "donor_adjusted", "R_library"), .libPaths()))
+if (!requireNamespace("logistf", quietly = TRUE))
+  stop("Install logistf before running this notebook; no substitute estimator is used.")
+# Avoid data.table thread multiplication inside forked fitting workers.
+data.table::setDTthreads(1L)
+```
+
+# Load inputs
+
+```{r load-inputs}
+chrom_scope <- params$chrom
+cores <- as.integer(params$cores)
+input_paths <- c(
+  counts = file.path(params$root, "coaccess", "LCL_pair_sample_counts.tsv.gz"),
+  pooled = file.path(params$root, "coaccess", "LCL_coaccess_pairs.tsv.gz"),
+  sex = file.path(params$root, "coaccess", "noXCI", "LCL_sample_sex_noXCI.tsv"))
+input_md5 <- tools::md5sum(input_paths)
+cells <- c("co_closed", "CRE1_access", "CRE2_access", "co_access")
+sex <- fread(input_paths[["sex"]])
+pooled <- fread(input_paths[["pooled"]])
+annotation_columns <- c("CRE_pair", "CRE1", "CRE2", "chrom", "cre1_start", "cre1_end",
+  "cre2_start", "cre2_end", "dist", "CRE_pair_labels", "gene_ids", "gene_names", "n_genes")
+# Preserve the ORIGINAL genome-wide positive pooled top ten for the comparison.
+top10_genome_wide <- copy(pooled[!is.na(fdr) & fdr < 0.05 & !is.na(OR) & OR > 1 &
+                          co_access > expected_co_access])
+setorderv(top10_genome_wide, c("fdr", "OR", "n_shared_reads", "CRE_pair"), c(1L, -1L, -1L, 1L))
+top10_genome_wide <- head(top10_genome_wide, 10L)[, .(CRE_pair, pooled_rank = seq_len(.N))]
+
+# Counts are already collapsed by sample: do not expand them into individual reads.
+counts <- fread(input_paths[["counts"]])
+# Match the original notebook: exclude pairs absent from pooled results.
+counts <- counts[CRE_pair %in% pooled$CRE_pair]
+ann <- pooled[, .(CRE_pair, OR_pooled = OR, fdr_pooled = fdr, n_shared_reads_pooled = n_shared_reads,
+                   co_access_pooled = co_access, expected_co_access_pooled = expected_co_access)]
+annotations <- merge(pooled[, ..annotation_columns], ann, by = "CRE_pair", sort = FALSE)
+if (!is.null(chrom_scope)) {
+  counts <- counts[chrom == chrom_scope]
+  annotations <- annotations[chrom == chrom_scope]
+  pooled <- pooled[chrom == chrom_scope]
+}
+setorder(annotations, chrom, CRE_pair)
+fdr_scope <- if (is.null(chrom_scope)) "genome-wide" else paste0("chromosome:", chrom_scope)
+output_base <- file.path(params$root, "coaccess", "donor_adjusted")
+output_dir <- if (is.null(chrom_scope)) output_base else
+  file.path(output_base, "smoke_tests", chrom_scope)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+cat(nrow(annotations), "pairs; FDR scope:", fdr_scope, "\n")
+```
+
+# Aggregate by donor
+
+The noXCI sample filter is applied **before** donor aggregation. Donors excluded
+as uninformative are never pooled with other donors to rescue a fit.
+
+```{r aggregate-by-donor}
+# Shared implementation: stats_testing_functions.r.
+donor_all <- aggregate_donors(counts)
+male_samples <- sex[sex == "male (XY)", sample_name]
+stopifnot(length(male_samples) > 0L)
+donor_male_x <- aggregate_donors(counts[chrom == "chrX" & sample_name %in% male_samples])
+rm(counts)
+invisible(gc())
+```
+
+# Fit function
+
+Separation is detected from cells before fitting. Positive separation means
+every informative donor has `CRE1_access == 0 | CRE2_access == 0`; negative
+separation means every informative donor has `co_access == 0 | co_closed == 0`.
+These pairs use `anova(null, full, test = "Rao")` for the p-value, with direction
+from the separation sign. Their effect is estimated by `logistf` using the same
+donor + x model and penalized profile-likelihood intervals for x only.
+Four binary rows per donor, weighted by the four cell counts, give the same
+likelihood and information as the individual reads; zero-weight rows are removed.
+Firth p-values are not used. See the
+[logistf reference](https://search.r-project.org/CRAN/refmans/logistf/help/logistf.html)
+for case weights and penalized profile intervals. Warnings and fallback reasons
+are recorded; Firth failures are never replaced by huge ordinary GLM effects.
+
+`fit_pair()` and `capture_fit()` are sourced from `stats_testing_functions.r`.
+
+# Parallel fitting and summary
+
+Per-chromosome fit summaries live only under `coaccess/donor_adjusted/summary/`.
+Their key includes MD5
+digests of all three inputs, the minimum donor depth, fitting/aggregation code,
+R version, and `logistf` version. Each chromosome is an atomic checkpoint.
+An unchanged knit reads these checkpoints instead of refitting. The chr21 smoke
+summary is reusable in a later genome-wide run. Outside chrX the two analyses have
+identical data and reuse the same fits, but their BH corrections are separate.
+The number of cores does not change the summary key or statistical method.
+
+```{r parallel-and-summary-functions}
+hash_object <- function(x) {
+  tmp <- tempfile(fileext = ".rds")
+  on.exit(unlink(tmp))
+  saveRDS(x, tmp, version = 3)
+  unname(tools::md5sum(tmp))
+}
+atomic_rds <- function(x, path) {
+  partial <- paste0(path, ".partial")
+  if (file.exists(path) || file.exists(partial))
+    stop("Refusing to overwrite summary or incomplete file: ", path)
+  saveRDS(x, partial)
+  if (!file.rename(partial, path)) stop("Atomic summary rename failed: ", path)
+}
+fit_chromosome <- function(d, chromosome, male_only = FALSE) {
+  expected_ids <- sort(unique(d$CRE_pair), method = "radix")
+  fit_summary_file <- file.path(fit_summary_dir, paste0(chromosome,
+    if (male_only) "_male_only" else "_all_donors", ".rds"))
+  if (file.exists(fit_summary_file)) {
+    saved <- readRDS(fit_summary_file)
+    stopifnot(identical(saved$signature, summary_signature),
+              !anyDuplicated(saved$fits$CRE_pair),
+              identical(sort(saved$fits$CRE_pair, method = "radix"), expected_ids))
+    message("Reusing summary: ", basename(fit_summary_file))
+    return(saved$fits)
+  }
+  setorder(d, CRE_pair, donor)
+  groups <- d[, .(first = .I[1], last = .I[.N]), by = CRE_pair]
+  message("Fitting ", nrow(groups), " pairs on ", chromosome,
+          if (male_only) " (male only)" else " (all donors)", " using ", cores, " cores")
+  fits <- parallel::mclapply(seq_len(nrow(groups)), function(i) {
+    fit_pair(d[seq.int(groups$first[i], groups$last[i])], params$min_reads_per_donor)
+  }, mc.cores = cores, mc.preschedule = TRUE, mc.set.seed = FALSE)
+  # An unexpected worker/code error stops the run; model errors are captured in fit_pair.
+  if (any(vapply(fits, inherits, logical(1), what = "try-error")) ||
+      any(vapply(fits, is.null, logical(1))))
+    stop("A fitting worker failed on ", chromosome, "; no pairs were discarded")
+  fits <- rbindlist(fits)
+  stopifnot(nrow(fits) == length(expected_ids), !anyDuplicated(fits$CRE_pair),
+            setequal(fits$CRE_pair, expected_ids))
+  atomic_rds(list(signature = summary_signature, fits = fits), fit_summary_file)
+  fits
+}
+run_analysis <- function(analysis_name) {
+  chromosomes <- unique(annotations$chrom)
+  fits <- rbindlist(lapply(chromosomes, function(chr) {
+    male_only <- analysis_name == "noXCI" && chr == "chrX"
+    d <- if (male_only) copy(donor_male_x) else copy(donor_all[chrom == chr])
+    fit_chromosome(d, chr, male_only)
+  }))
+  out <- merge(annotations, fits, by = "CRE_pair", all.x = TRUE, sort = FALSE)
+  stopifnot(nrow(out) == nrow(annotations), !anyNA(out$fit_status),
+            !anyDuplicated(out$CRE_pair), setequal(out$CRE_pair, annotations$CRE_pair))
+  out[, chrX_rule := fifelse(analysis_name == "noXCI" & chrom == "chrX",
+                             "male samples only", "all samples")]
+  if (analysis_name == "noXCI")
+    out[chrom == "chrX" & fit_status == "no_coverage" &
+          !is.na(n_shared_reads_pooled) & n_shared_reads_pooled > 0,
+        fit_status := "no_coverage_noXCI"]
+  excluded_zero <- sum(out$fit_status %in% c("no_coverage", "no_coverage_noXCI"))
+  message(analysis_name, ": excluding ", excluded_zero, " zero-coverage pairs after cohort filtering")
+  out <- out[!fit_status %in% c("no_coverage", "no_coverage_noXCI")]
+  # One BH call after all chromosomes are combined. Failed fits are NA but
+  # count conservatively in the family of pairs with >=1 informative donor.
+  family_size <- sum(out$n_donors_informative >= 1L)
+  valid <- which(is.finite(out$p_adj_one_sided))
+  stopifnot(all(out$p_adj_one_sided[valid] >= 0 & out$p_adj_one_sided[valid] <= 1),
+            all(out$n_donors_informative[valid] >= 1L))
+  out[, fdr_adj := NA_real_]
+  if (length(valid)) out[valid, fdr_adj := adjust_bh(p_adj_one_sided, n = family_size)]
+  out[, `:=`(analysis = analysis_name, min_reads_per_donor = as.integer(params$min_reads_per_donor),
+    model = fifelse(n_donors_informative == 1L, "CRE2 ~ 1 + CRE1", "CRE2 ~ factor(donor) + CRE1"),
+    null_model = fifelse(n_donors_informative == 1L, "CRE2 ~ 1", "CRE2 ~ factor(donor)"),
+    fdr_scope = fdr_scope, bh_family_size = family_size, run_signature = summary_signature,
+    ci_level = 0.95, glm_maxit = 100L,
+    read_rule = "contain", fire_overlap_fraction = 0.5,
+    input_coverage_mode = "aligned_blocks_v1")]
+  # Rank all successfully tested pairs; CRE_pair is a deterministic final tie-break.
+  ranks <- out[is.finite(p_adj_one_sided) & !is.na(OR_adj), .(CRE_pair, fdr_adj, OR_adj)]
+  setorderv(ranks, c("fdr_adj", "OR_adj", "CRE_pair"), c(1L, -1L, 1L))
+  out[, adjusted_rank := match(CRE_pair, ranks$CRE_pair)]
+  setorder(out, chrom, CRE_pair)
+  out
+}
+summary_signature <- hash_object(list(inputs = input_md5,
+  min_reads_per_donor = params$min_reads_per_donor,
+  statistics_md5 = tools::md5sum(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r")),
+  functions = lapply(list(aggregate_donors, capture_fit, fit_pair, fit_chromosome, run_analysis), deparse),
+  R = R.version.string, logistf = as.character(packageVersion("logistf"))))
+fit_summary_dir <- file.path(output_base, "summary", summary_signature)
+dir.create(fit_summary_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Summary key:", summary_signature, "\n")
+```
+
+# Run A: all chromosomes and all donors
+
+```{r run-A}
+all_chr_results <- run_analysis("all_chr")
+```
+
+# Run B: exclude female chrX samples
+
+```{r run-B}
+noxci_results <- run_analysis("noXCI")
+```
+
+# Write outputs
+
+Genome-wide final tables use the requested paths under
+`coaccess/donor_adjusted/all_chr/` and `coaccess/donor_adjusted/noXCI/`.
+Smoke-test tables go under `coaccess/donor_adjusted/smoke_tests/chr21/` instead.
+Every new file is written to `.partial` in the destination directory, then
+renamed. An identical existing result is reused; a different existing result
+causes an error rather than an overwrite. After changing inputs/methods, retain
+the old results and choose a fresh `output_dir` before exporting the new run.
+
+```{r write-outputs}
+atomic_tsv <- function(d, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  if (file.exists(path)) {
+    old <- fread(path)
+    same <- identical(names(old), names(d)) && nrow(old) == nrow(d)
+    if (same) for (column in names(d)) {
+      a <- old[[column]]; b <- d[[column]]
+      if (all(is.na(a)) && all(is.na(b))) next
+      equal <- if (is.numeric(a) && is.numeric(b))
+        isTRUE(all.equal(a, b, tolerance = 1e-12, check.attributes = FALSE)) else
+        identical(as.character(a), as.character(b))
+      if (!equal) { same <- FALSE; break }
+    }
+    if (!same) stop("Existing output differs; choose a fresh output_dir: ", path)
+    return(invisible(path))
+  }
+  partial <- paste0(path, ".partial")
+  if (file.exists(partial)) stop("Incomplete output already exists: ", partial)
+  fwrite(d, partial, sep = "\t", na = "NA",
+         compress = if (grepl("\\.gz$", path)) "gzip" else "none")
+  if (!file.rename(partial, path)) stop("Atomic TSV rename failed: ", path)
+  invisible(path)
+}
+stopifnot(identical(unname(tools::md5sum(input_paths)), unname(input_md5)))
+result_sets <- list(all_chr = all_chr_results, noXCI = noxci_results)
+for (a in names(result_sets)) {
+  path <- file.path(output_dir, a, paste0("LCL_coaccess_pairs_donor_adjusted_", a, ".tsv.gz"))
+  atomic_tsv(result_sets[[a]], path)
+  cat(a, ":", nrow(result_sets[[a]]), "rows ->", path, "\n")
+}
+```
+
+# Summary
+
+The positive-association filter is `fdr_adj < 0.05 & OR_adj > 1 &
+co_access > expected_co_access_adj`. Pooled comparisons use the original pooled
+OR/FDR and all original pooled fibers, including female chrX; they are not a
+recomputed noXCI Fisher analysis. Adjusted counts use informative donors only.
+Separated pairs have finite Firth effects and score-test p-values; their counts
+and presence among the new top ten are shown explicitly. LRT statistics remain
+NA for score-tested rows; `score_stat`, `p_Rao`, and `test` identify that branch.
+
+```{r summary-tables}
+status_summary <- rbindlist(lapply(names(result_sets), function(a) {
+  result_sets[[a]][, .(analysis = a, n_pairs = .N), by = fit_status]
+}))
+test_summary <- rbindlist(lapply(names(result_sets), function(a) {
+  d <- result_sets[[a]]
+  data.table(analysis = a, fdr_scope = fdr_scope, n_pairs = nrow(d),
+    n_tested = sum(is.finite(d$p_adj_one_sided)),
+    n_fit_failed = sum(d$fit_status == "fit_failed"),
+    bh_family_size = unique(d$bh_family_size),
+    n_separation_positive = sum(d$separation == "positive"),
+    n_separation_negative = sum(d$separation == "negative"),
+    n_wald_ci_fallback = sum(d$ci_method == "wald_fallback", na.rm = TRUE))
+}))
+significance_summary <- rbindlist(lapply(names(result_sets), function(a) {
+  d <- copy(result_sets[[a]])
+  d[, adjusted_positive := !is.na(fdr_adj) & fdr_adj < 0.05 & !is.na(OR_adj) &
+      OR_adj > 1 & !is.na(expected_co_access_adj) & co_access > expected_co_access_adj]
+  d[, pooled_positive := !is.na(fdr_pooled) & fdr_pooled < 0.05 & OR_pooled > 1 &
+      co_access_pooled > expected_co_access_pooled]
+  rbindlist(lapply(c("all", "chrX"), function(region) {
+    z <- if (region == "chrX") d[chrom == "chrX"] else d
+    data.table(analysis = a, region = region, n_pairs = nrow(z),
+      adjusted_positive = sum(z$adjusted_positive), pooled_positive = sum(z$pooled_positive),
+      separated_significant = sum(z$adjusted_positive & z$separation != "none"),
+      separated_positive_significant = sum(z$adjusted_positive & z$separation == "positive"),
+      separated_negative_significant = sum(z$adjusted_positive & z$separation == "negative"),
+      overlap_positive = sum(z$adjusted_positive & z$pooled_positive))
+  }))
+}))
+top10 <- rbindlist(lapply(result_sets, function(d) d[!is.na(adjusted_rank) & adjusted_rank <= 10L]))
+setorder(top10, analysis, adjusted_rank)
+top10_genome_wide_adjusted <- rbindlist(lapply(names(result_sets), function(a) {
+  d <- merge(top10_genome_wide, result_sets[[a]], by = "CRE_pair", all.x = TRUE, sort = FALSE)
+  d[, analysis := a]
+  d[, comparison_status := fifelse(is.na(fit_status), "outside_chromosome_scope", "in_scope")]
+  setorder(d, pooled_rank)
+  d
+}), fill = TRUE)
+print(test_summary)
+print(status_summary)
+print(significance_summary)
+print(top10[, .(analysis, adjusted_rank, CRE_pair, chrom, gene_names, OR_adj,
+  OR_adj_ci_low, OR_adj_ci_high, fdr_adj, fit_status, or_method)])
+cat("Separated pairs among the new top ten:\n")
+print(top10[separation != "none", .(analysis, adjusted_rank, CRE_pair, fit_status,
+                                    OR_adj, OR_adj_ci_low, OR_adj_ci_high, fdr_adj)])
+cat("Original pooled top-ten rankings after donor adjustment:\n")
+print(top10_genome_wide_adjusted[, .(analysis, pooled_rank, CRE_pair, adjusted_rank,
+                            OR_adj, fdr_adj, fit_status, comparison_status)])
+summary_dir <- file.path(output_dir, "summary")
+for (entry in list(c("test_summary", "test_summary.tsv"), c("status_summary", "fit_status_counts.tsv"),
+                  c("significance_summary", "significance_comparison.tsv"),
+                  c("top10", "new_top10.tsv"), c("top10_genome_wide_adjusted", "old_pooled_top10_adjusted.tsv")))
+  atomic_tsv(get(entry[1]), file.path(summary_dir, entry[2]))
+```
+
+```{r summary-figures}
+atomic_pdf <- function(p, path) {
+  if (file.exists(path)) return(invisible(path))
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  partial <- paste0(path, ".partial")
+  if (file.exists(partial)) stop("Incomplete plot already exists: ", partial)
+  ggsave(partial, p, device = "pdf", width = 9, height = 6)
+  if (!file.rename(partial, path)) stop("Atomic PDF rename failed: ", path)
+}
+for (a in names(result_sets)) {
+  d <- result_sets[[a]]
+  plot_data <- d[is.finite(OR_pooled) & OR_pooled > 0 & is.finite(OR_adj) & OR_adj > 0]
+  p <- ggplot(plot_data, aes(OR_pooled, OR_adj, colour = or_method)) +
+    geom_point(size = 0.45, alpha = 0.25) + geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    scale_x_log10() + scale_y_log10() +
+    scale_colour_manual(values = c(mle = "#2166AC", firth = "#B2182B")) +
+    labs(x = "Original pooled odds ratio", y = "Donor-adjusted odds ratio", colour = "OR method",
+         title = paste(a, "- pooled versus donor-adjusted effects"),
+         subtitle = paste(fdr_scope, "|", nrow(plot_data), "pairs with finite positive ORs")) + theme_bw()
+  print(p)
+  atomic_pdf(p, file.path(output_dir, a, "plots", "pooled_vs_adjusted_OR.pdf"))
+  pvalues <- sort(d$p_adj_one_sided[is.finite(d$p_adj_one_sided)])
+  if (length(pvalues)) {
+    qq <- data.table(expected = -log10(ppoints(length(pvalues))),
+                     observed = -log10(pmax(pvalues, .Machine$double.xmin)))
+    q <- ggplot(qq, aes(expected, observed)) + geom_point(size = 0.5, alpha = 0.3) +
+      geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "#B2182B") +
+      labs(x = "Expected -log10(p) under uniform null", y = "Observed -log10(p)",
+           title = paste(a, "- one-sided p-value QQ plot"),
+           subtitle = paste(fdr_scope, "| LRT for non-separated; Rao score for separated pairs")) + theme_bw()
+    print(q)
+    atomic_pdf(q, file.path(output_dir, a, "plots", "pvalue_QQ.pdf"))
+  }
+}
+```

@@ -39,8 +39,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import fisher_exact
-from scipy.stats.contingency import odds_ratio as conditional_odds_ratio
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
+from count_and_test_pairs import count_pairs, test_counts, bh
 
 SAMPLES = ["LPS_0", "LPS_5", "LPS_10", "LPS_15"]
 CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
@@ -241,7 +241,6 @@ def main():
         # Score one chromosome at a time and keep only the counts. Holding the
         # incidence for every chromosome at once would mean ~9M (cCRE, read name)
         # string entries genome-wide; per chromosome it stays a few hundred thousand.
-        empty = set()
         counts = np.zeros((len(pairs), 4), dtype=np.int64)   # co_closed, CRE1, CRE2, co_access
         rows_by_chrom = pairs.groupby("chrom", sort=False).indices
         orphans = 0
@@ -255,19 +254,7 @@ def main():
                                                    args.fire_overlap_fraction)
             orphans += n_orph
             n_cre_seen += len(cov)
-            c1s = pairs["CRE1"].to_numpy()[idx]
-            c2s = pairs["CRE2"].to_numpy()[idx]
-            for k, i in enumerate(idx):
-                shared = cov.get(c1s[k], empty) & cov.get(c2s[k], empty)
-                if not shared:
-                    continue
-                a1 = acc.get(c1s[k], empty) & shared
-                a2 = acc.get(c2s[k], empty) & shared
-                both = len(a1 & a2)
-                counts[i] = (len(shared) - len(a1) - len(a2) + both,   # neither
-                             len(a1) - both,                            # first only
-                             len(a2) - both,                            # second only
-                             both)
+            counts[idx] = count_pairs(pairs.iloc[idx], cov, acc)
             del cov, acc
         print(f"{s}: incidence built for {n_cre_seen} cCREs "
               f"({orphans} element hits dropped as not covered under --read-rule {args.read_rule})",
@@ -280,16 +267,7 @@ def main():
         # matching fisher.test(contingency_table + pseudocount). Identical tables share
         # one test, so only unique tables are computed.
         pc = args.pseudocount
-        uniq, inv = np.unique(counts, axis=0, return_inverse=True)
-        pvals = np.empty(len(uniq))
-        fest = np.empty(len(uniq))
-        praw = np.empty(len(uniq))
-        for t, (ne, fi, se, bo) in enumerate(uniq):
-            tab = [[int(ne) + pc, int(se) + pc], [int(fi) + pc, int(bo) + pc]]
-            pvals[t] = fisher_exact(tab)[1]
-            fest[t] = conditional_odds_ratio(tab, kind="conditional").statistic
-            raw = [[int(ne), int(se)], [int(fi), int(bo)]]
-            praw[t] = fisher_exact(raw)[1]
+        tests = test_counts(counts, pc)
 
         df = pd.DataFrame({
             # --- Kevin's coaccess_stat_df columns, his names and order ---
@@ -305,8 +283,8 @@ def main():
             "co_closed": co_closed,
             "CRE1_access": cre1_access,
             "CRE2_access": cre2_access,
-            "fisher_estimate": fest[inv],
-            "pval": pvals[inv],
+            "fisher_estimate": tests.fisher_estimate.to_numpy(),
+            "pval": tests.pval.to_numpy(),
             "OR": ((co_access + pc) * (co_closed + pc)) /
                   ((cre1_access + pc) * (cre2_access + pc)),
             # --- added ---
@@ -322,7 +300,7 @@ def main():
             "cre1_end": meta.loc[pairs["CRE1"], "end"].to_numpy(),
             "cre2_start": meta.loc[pairs["CRE2"], "start"].to_numpy(),
             "cre2_end": meta.loc[pairs["CRE2"], "end"].to_numpy(),
-            "pval_raw": praw[inv],
+            "pval_raw": tests.pval_raw.to_numpy(),
             "or_haldane": ((co_access + 0.5) * (co_closed + 0.5)) /
                           ((cre1_access + 0.5) * (cre2_access + 0.5)),
             "zero_access_cre1": (co_access + cre1_access) == 0,
@@ -362,13 +340,7 @@ def main():
             columns=["gene_id", "gene_name", "transcript_type"])
         pairs_df = uniq_rows.merge(g, on="CRE_pair", how="left")
         for col, src in (("fdr", "pval"), ("fdr_raw", "pval_raw")):
-            p = pairs_df[src].to_numpy()
-            order = np.argsort(p)
-            q = np.minimum.accumulate(
-                (p[order] * len(p) / np.arange(1, len(p) + 1))[::-1])[::-1]
-            out = np.empty_like(q)
-            out[order] = np.minimum(q, 1)
-            pairs_df[col] = out
+            pairs_df[col] = bh(pairs_df[src].to_numpy())
         pairs_path = out_dir / f"{s}_coaccess_pairs.tsv.gz"
         pairs_df.to_csv(pairs_path, sep="\t", index=False)
 

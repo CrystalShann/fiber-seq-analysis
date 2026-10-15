@@ -36,6 +36,7 @@ suppressPackageStartupMessages({
   library(data.table); library(ggplot2); library(patchwork); library(dplyr)
 })
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/stats_testing_functions.r", local = TRUE)
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
 ```
 

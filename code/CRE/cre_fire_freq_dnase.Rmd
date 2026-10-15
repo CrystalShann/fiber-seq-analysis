@@ -1,0 +1,224 @@
+---
+title: "Per-read FIRE frequency at active cCREs, Low-DNase cCREs and no-DNase control regions"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+params:
+  test: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.path = file.path(tempdir(), "cre-access-figures/"))
+```
+
+Steps 1-2 (region files, per-read BEDs) are run by `cre_fire_freq_dnase.sh`
+(`regions`, then `sbatch --array=1-23 ... chrom`). This notebook runs Step 3
+(per-region counts for each chromosome), combines the chromosome tables, and
+runs Step 4 (summary). With `params$test = TRUE` it runs chr21 x the first
+sample into `test_chr21/` (after `bash cre_fire_freq_dnase.sh test`).
+
+```{r load_packages}
+suppressPackageStartupMessages({library(data.table); library(ggplot2)})
+
+out_root <- Sys.getenv("CRE_ACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/CRE_access")
+sample_sheet <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+bedtools <- "/project/spott/cshan/envs/bedtools/bin/bedtools"
+region_dir <- file.path(out_root, "regions")
+per_read <- file.path(out_root, "per_read")
+run_dir <- out_root
+sets <- c("active_cre", "low_dnase_cre", "no_dnase_cre_region")
+chroms <- c(paste0("chr", 1:22), "chrX")
+samples <- fread(sample_sheet)$sample_name
+if (params$test) {
+  run_dir <- file.path(out_root, "test_chr21"); chroms <- "chr21"; samples <- samples[1]
+}
+
+inputs <- CJ(s = samples, chrom = chroms, kind = c("reads", "fire"), sorted = FALSE)[
+  , file.path(per_read, s, sprintf("%s.%s.%s.bed.gz", s, chrom, kind))]
+if (!all(file.exists(inputs)))
+  stop("Missing per-read BEDs (run cre_fire_freq_dnase.sh chrom first), e.g. ", inputs[!file.exists(inputs)][1])
+```
+
+# Step 3: per-region counts
+
+n_reads = reads whose span covers the whole region; n_fire = those reads with
+>= 1 FIRE element overlapping the region; each read counted once per region.
+A chromosome is skipped if its `by_chrom/` tables are newer than the region
+files and its per-read BEDs (delete them to force a recount).
+
+```{r count_regions}
+# unique (region id, read name) pairs; -a is BED4, so the read name is column 8
+pairs <- function(regions, b, opt = "") {
+  x <- fread(cmd = sprintf("%s intersect -sorted %s -wa -wb -a %s -b %s | cut -f4,8", bedtools, opt, regions, b),
+             header = FALSE, sep = "\t", colClasses = "character")
+  if (!nrow(x)) return(data.table(id = character(), read = character()))
+  unique(setnames(x, c("id", "read")))
+}
+
+by_chrom_dir <- file.path(run_dir, "by_chrom")
+dir.create(by_chrom_dir, recursive = TRUE, showWarnings = FALSE)
+region_beds <- file.path(region_dir, paste0(sets, ".bed"))
+regions <- NULL
+tmp <- tempfile("cre-access."); dir.create(tmp)
+
+for (chrom in chroms) {
+  tables <- file.path(by_chrom_dir, sprintf("%s.%s.tsv", sets, chrom))
+  chrom_inputs <- c(region_beds, grep(sprintf("\\.%s\\.(reads|fire)\\.bed\\.gz$", chrom), inputs, value = TRUE))
+  if (all(file.exists(tables)) && min(file.mtime(tables)) > max(file.mtime(chrom_inputs))) next
+  if (is.null(regions)) regions <- setNames(lapply(region_beds, fread, header = FALSE, sep = "\t"), sets)
+
+  for (set in sets) {
+    bed4 <- file.path(tmp, paste0(set, ".bed4"))
+    reg <- regions[[set]][V1 == chrom]
+    fwrite(reg[, 1:4], bed4, sep = "\t", col.names = FALSE)
+    out <- data.table(chrom = reg$V1, start = reg$V2, end = reg$V3, id = reg$V4)
+    if (ncol(reg) >= 10) out[, class := reg$V10]
+    for (s in samples) {
+      f <- function(kind) file.path(per_read, s, sprintf("%s.%s.%s.bed.gz", s, chrom, kind))
+      span <- pairs(bed4, f("reads"), "-f 1.0")
+      fire <- span[pairs(bed4, f("fire")), on = .(id, read), nomatch = NULL]
+      nr <- paste0("n_reads_", s); nf <- paste0("n_fire_", s)
+      out[, (nr) := 0L][, (nf) := 0L]
+      out[span[, .N, by = id], on = "id", (nr) := i.N]
+      out[fire[, .N, by = id], on = "id", (nf) := i.N]
+    }
+    nr <- paste0("n_reads_", samples); nf <- paste0("n_fire_", samples)
+    out[, n_reads := as.integer(rowSums(.SD)), .SDcols = nr]
+    out[, n_fire := as.integer(rowSums(.SD)), .SDcols = nf]
+    out[, fire_freq := fifelse(n_reads > 0, n_fire / n_reads, NA_real_)]
+    setcolorder(out, c(intersect(c("chrom", "start", "end", "id", "class"), names(out)),
+                       "n_reads", "n_fire", "fire_freq", as.vector(rbind(nr, nf))))
+    bad <- sum(out$n_fire > out$n_reads) + sum(mapply(function(r, f) sum(out[[f]] > out[[r]]), nr, nf))
+    cat(sprintf("[%s] %-20s regions %7d | n_reads > 0: %7d | median n_reads %5.0f | n_fire > n_reads: %d\n",
+                chrom, set, nrow(out), sum(out$n_reads > 0), median(out$n_reads), bad))
+    fwrite(out, file.path(by_chrom_dir, sprintf("%s.%s.tsv", set, chrom)), sep = "\t", na = "NA", quote = FALSE)
+  }
+}
+unlink(tmp, recursive = TRUE)
+rm(regions)
+```
+
+# Combine chromosomes
+
+```{r combine}
+for (set in sets) {
+  tabs <- lapply(file.path(by_chrom_dir, sprintf("%s.%s.tsv", set, chroms)), fread)
+  if (length(unique(lapply(tabs, names))) != 1) stop(set, ": chromosome tables have different sample columns")
+  fwrite(rbindlist(tabs), file.path(run_dir, sprintf("fire_freq.%s.tsv", set)), sep = "\t", na = "NA", quote = FALSE)
+}
+rm(tabs)
+cat(sprintf("Combined %d chromosome(s) into %s/fire_freq.<set>.tsv\n", length(chroms), run_dir))
+```
+
+# Step 4: summary
+
+Summary of per-read FIRE frequency by region set (and by cCRE class within
+active_cre), ECDF by set, and between-sample correlation; written to
+`<run_dir>/summary/`.
+
+```{r load_tables}
+out_dir <- file.path(run_dir, "summary")
+dir.create(out_dir, showWarnings = FALSE)
+min_reads <- 10
+
+tabs <- setNames(lapply(sets, function(s) fread(file.path(run_dir, sprintf("fire_freq.%s.tsv", s)))), sets)
+samples <- sub("^n_reads_", "", grep("^n_reads_", names(tabs[[1]]), value = TRUE))
+cat(sprintf("Samples (%d): %s\n\n", length(samples), paste(samples, collapse = ", ")))
+
+for (s in sets) {
+  x <- tabs[[s]]
+  bad <- x[n_fire > n_reads, .N] +
+    sum(sapply(samples, function(k) sum(x[[paste0("n_fire_", k)]] > x[[paste0("n_reads_", k)]])))
+  cat(sprintf("%-20s n_fire > n_reads violations (pooled + per sample): %d\n", s, bad))
+}
+```
+
+## FIRE frequency by region set and cCRE class
+
+```{r summary_table}
+# median and fraction > 0.1 use regions with >= min_reads spanning reads; pooled uses every region
+stats <- function(n_reads, n_fire, fire_freq) {
+  ok <- n_reads >= min_reads
+  list(n_regions = length(n_reads), n_reads_ge10 = sum(ok), median_n_reads = as.numeric(median(n_reads)),
+       median_fire_freq = median(fire_freq[ok]), pooled_fire_freq = sum(n_fire) / sum(n_reads),
+       frac_fire_freq_gt_0.1 = mean(fire_freq[ok] > 0.1))
+}
+by_set <- rbindlist(lapply(sets, function(s)
+  tabs[[s]][, c(list(set = s, class = "all"), stats(n_reads, n_fire, fire_freq))]))
+by_class <- tabs$active_cre[, c(list(set = "active_cre"), stats(n_reads, n_fire, fire_freq)), by = class]
+summary_dt <- rbind(by_set, by_class[order(-n_regions)], use.names = TRUE)
+fwrite(summary_dt, file.path(out_dir, "fire_freq_summary.tsv"), sep = "\t")
+cat("\nFIRE frequency summary (median / frac > 0.1 over regions with n_reads >= 10):\n")
+print(summary_dt[, lapply(.SD, function(v) if (is.double(v)) signif(v, 3) else v)], row.names = FALSE)
+```
+
+## ECDF
+
+```{r ecdf, fig.width = 6.5, fig.height = 4.5}
+ecdf_dt <- rbindlist(lapply(sets, function(s) tabs[[s]][n_reads >= min_reads, .(set = s, fire_freq)]))
+n_ok <- ecdf_dt[, .N, by = set][match(sets, set), N]
+ecdf_dt[, set := factor(set, levels = sets,
+                        labels = sprintf("%s (n = %s)", sets, format(n_ok, big.mark = ",", trim = TRUE)))]
+p <- ggplot(ecdf_dt, aes(fire_freq, colour = set)) +
+  stat_ecdf(linewidth = 0.7) +
+  scale_colour_manual(values = c("#2a78d6", "#eb6834", "#1baf7a"), name = NULL) +
+  labs(x = "Per-read FIRE frequency (n_fire / n_reads)", y = "Fraction of regions",
+       title = "Per-read FIRE frequency by region set",
+       subtitle = sprintf("Regions with >= %d spanning reads, pooled over %d sample(s)", min_reads, length(samples))) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "inside", legend.position.inside = c(0.98, 0.04), legend.justification = c(1, 0))
+ggsave(file.path(out_dir, "fire_freq_ecdf.pdf"), p, width = 6.5, height = 4.5)
+p
+```
+
+## Histogram
+
+Same regions as the ECDF; y = fraction of the set's regions per bin, with its
+own y scale in each panel.
+
+```{r histogram, fig.width = 6.5, fig.height = 6}
+h <- ggplot(ecdf_dt, aes(fire_freq, fill = set)) +
+  geom_histogram(aes(y = after_stat(density * width)), binwidth = 0.02, boundary = 0,
+                 colour = "white", linewidth = 0.2) +
+  facet_wrap(~set, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("#2a78d6", "#eb6834", "#1baf7a"), guide = "none") +
+  labs(x = "Per-read FIRE frequency (n_fire / n_reads)", y = "Fraction of regions",
+       title = "Per-read FIRE frequency by region set",
+       subtitle = sprintf("Regions with >= %d spanning reads, pooled over %d sample(s)\nbin width 0.02; y scale differs per panel",
+                          min_reads, length(samples))) +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank(), strip.text = element_text(hjust = 0))
+ggsave(file.path(out_dir, "fire_freq_histogram.pdf"), h, width = 6.5, height = 6)
+h
+```
+
+## Between-sample correlation
+
+```{r sample_correlation}
+if (length(samples) > 1) {
+  sample_pairs <- CJ(a = samples, b = samples)[a < b]
+  cors <- rbindlist(lapply(sets, function(s) {
+    x <- tabs[[s]]
+    sample_pairs[, {
+      ra <- x[[paste0("n_reads_", a)]]; rb <- x[[paste0("n_reads_", b)]]
+      ok <- ra >= min_reads & rb >= min_reads
+      fa <- x[[paste0("n_fire_", a)]][ok] / ra[ok]
+      fb <- x[[paste0("n_fire_", b)]][ok] / rb[ok]
+      list(set = s, n_regions = sum(ok), pearson = suppressWarnings(cor(fa, fb)),
+           spearman = suppressWarnings(cor(fa, fb, method = "spearman")))
+    }, by = .(a, b)]
+  }))
+  fwrite(cors, file.path(out_dir, "fire_freq_sample_correlation.tsv"), sep = "\t")
+  cat(sprintf("\nBetween-sample correlation of fire_freq (regions with n_reads >= %d in both):\n", min_reads))
+  print(cors[, .(n_pairs = .N, median_n_regions = median(n_regions),
+                 pearson_median = median(pearson, na.rm = TRUE), pearson_min = min(pearson, na.rm = TRUE),
+                 pearson_max = max(pearson, na.rm = TRUE), spearman_median = median(spearman, na.rm = TRUE)),
+             by = set][, lapply(.SD, function(v) if (is.double(v)) signif(v, 3) else v)], row.names = FALSE)
+}
+cat(sprintf("\nWrote %s/{fire_freq_summary.tsv, fire_freq_ecdf.pdf, fire_freq_histogram.pdf%s}\n", out_dir,
+            if (length(samples) > 1) ", fire_freq_sample_correlation.tsv" else ""))
+```

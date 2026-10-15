@@ -1905,26 +1905,8 @@ coaccess_m6a_fraction <- function(m, sp, samples, blocks = NULL) {
 }
 
 
-# ---------------------------------------------------------------------------
-# The pair's 2x2 read off the fibers that cover both cCREs, with the Fisher
-# test of the co-accessibility tables (fisher.test(table + 1)).
-#
-# Inputs:
-#   labels - label_reads() result
-# Output:
-#   one-row data.frame both, cre1_only, cre2_only, neither, n_shared,
-#   fisher_or (conditional MLE), fisher_p
-# ---------------------------------------------------------------------------
-coaccess_2x2 <- function(labels) {
-  n <- table(factor(labels$config[!is.na(labels$config)], levels = CONFIG_LEVELS))
-  # rows CRE1 FALSE/TRUE, columns CRE2 FALSE/TRUE, as table(fire_region1, fire_region2)
-  tab <- matrix(c(n[["neither"]], n[["CRE2 only"]], n[["CRE1 only"]], n[["both accessible"]]),
-                2, byrow = TRUE)
-  ft <- stats::fisher.test(tab + 1)
-  data.frame(both = n[["both accessible"]], cre1_only = n[["CRE1 only"]],
-             cre2_only = n[["CRE2 only"]], neither = n[["neither"]], n_shared = sum(n),
-             fisher_or = unname(ft$estimate), fisher_p = ft$p.value)
-}
+# Statistical helpers (including coaccess_2x2) live in stats_testing_functions.r.
+
 
 
 # ---------------------------------------------------------------------------

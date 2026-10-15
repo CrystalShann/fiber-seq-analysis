@@ -176,7 +176,7 @@ has two), `cluster = "fire_configs"` hard-`stop()`s unless exactly two
 | `label_reads()` | `parsing_footprints_functions.r` | per-fiber configuration at the pair, under the same rules as the table |
 | `order_reads()` | `parsing_footprints_functions.r` | sort fibers by timepoint, then configuration, then position |
 | `coaccess_m6a_fraction()` | `parsing_footprints_functions.r` | per-position fraction of covering fibers methylated, by timepoint |
-| `coaccess_2x2()` | `parsing_footprints_functions.r` | the pair's 2×2 and `fisher.test(table + 1)` from the fibers covering both cCREs |
+| `coaccess_2x2()` | `stats_testing_functions.r` | the pair's 2×2 and two-sided Fisher test on `table + 1` from the fibers covering both cCREs |
 | `plot_coaccess_pair()` | `plotting_functions.r` | loads, labels and draws one pair: the four panels + configuration bars |
 | `coaccess_region_result()` | `plotting_functions.r` | adapt the retained, ordered pair reads for the shared region builder |
 | `configuration_proportion_inputs()` | `plotting_functions.r` | configuration proportions per timepoint |

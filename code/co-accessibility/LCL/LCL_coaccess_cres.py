@@ -19,6 +19,7 @@ pairs. Donor information is metadata only; there are no LCL timepoints.
 import argparse
 import gzip
 import os
+import sys
 import subprocess
 import tempfile
 from collections import defaultdict
@@ -26,8 +27,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import fisher_exact
-from scipy.stats.contingency import odds_ratio as conditional_odds_ratio
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
+from count_and_test_pairs import count_pairs, test_counts, summarize_coaccess_counts
 
 ROOT = Path(os.environ.get("LCL_COACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"))
 METATABLE = os.environ.get("LCL_SAMPLE_METATABLE", "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv")
@@ -251,63 +252,17 @@ def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, f
 # Observed co-access = 27, so observed/expected ≈ 1.7. The two cCREs are accessible together more often than chance.
 # OR = (27 + 1)(135 + 1) / ((45 + 1)(23 + 1)) = 28 × 136 / (46 × 24) ≈ 3.45
 
-def count_pairs(pairs, coverage, accessible):
-    counts = np.zeros((len(pairs), 4), dtype=np.int64)
-    empty = set()
-    # loop over the pairs, and pair.CRE1 and pair.CRE2 are CRE ids
-    for i, pair in enumerate(pairs.itertuples(index=False)):
-        # shared reads = reads covering both CREs
-        shared = coverage.get(pair.CRE1, empty) & coverage.get(pair.CRE2, empty)
-        # a = shared reads where CRE1 is acessible, b = shared reads where CRE2 is accessible
-        a = accessible.get(pair.CRE1, empty) & shared
-        b = accessible.get(pair.CRE2, empty) & shared
-        both = len(a & b)
-        # co_closed (neither accessible) is shared − |a| − |b| + both
-          # Adding both back is needed because reads in both a and b were subtracted twice
-        # CRE1_access (CRE1 only) is |a| − both
-        # CRE2_access (CRE2 only) is |b| − both
-        # co_access (both) is both
-        
-        counts[i] = len(shared) - len(a) - len(b) + both, len(a) - both, len(b) - both, both
-    return counts
+# Shared implementation: parsing_functions/count_and_test_pairs.py
 
 #################################################
 # BH correction
 #################################################
-def bh(p):
-    p = np.asarray(p, dtype=float)
-    if not len(p):
-        return p.copy()
-    # sort p values from smallest to largest
-    order = np.argsort(p)
-    # takes each sorted p-value and multiplies it by n / rank. The smallest p gets rank 1 and the largest gets rank n
-    # [::-1] largest p values come first
-    adjusted = np.minimum.accumulate((p[order] * len(p) / np.arange(1, len(p) + 1))[::-1])[::-1]
-    # running min: each value becomes the smallest value seen so fat 
-    out = np.empty(len(p)); out[order] = np.minimum(adjusted, 1)
-    return out
+# Shared implementation: parsing_functions/count_and_test_pairs.py
 
 #################################################
 # Fisher test on 2x2 table
 #################################################
-def test_counts(counts, pseudocount):
-    """Fisher test on all CRE pairs, add pseudocount after pooling all 31 samples."""
-    # only keep distinct read counts to run fisher on
-    unique, inverse = np.unique(counts, axis=0, return_inverse=True)
-    rows = []
-    for closed, first, second, both in unique:
-        # raw count
-        raw = np.array([[closed, second], [first, both]], dtype=np.int64)
-        # +1 to every count to avoid division by -
-        corrected = raw + pseudocount
-        # pval is the two-sided Fisher p-value on the +1 table
-        # pval_raw is the two-sided Fisher p-value on the raw table,
-        # fisher_estimate is the conditional maximum-likelihood odds ratio of the +1 table
-        rows.append((fisher_exact(corrected, alternative="two-sided").pvalue,
-                     conditional_odds_ratio(corrected, kind="conditional").statistic,
-                     fisher_exact(raw, alternative="two-sided").pvalue))
-    stats = np.array(rows, dtype=float)[inverse] if rows else np.empty((0, 3))
-    return pd.DataFrame(stats, columns=["pval", "fisher_estimate", "pval_raw"])
+# Shared implementation: parsing_functions/count_and_test_pairs.py
 
 #################################################
 # Parse options and validates inputs
@@ -419,22 +374,9 @@ def main():
     counts = pooled[keep]
     result = pairs.loc[keep].reset_index(drop=True)
     result = pd.concat([result, pd.DataFrame(counts, columns=CELLS), test_counts(counts, args.pseudocount)], axis=1)
-    result["n_shared_reads"] = counts.sum(axis=1)
-    result["n_contributing_samples"] = contributing_samples[keep]
-    result["co_inaccess"] = result.co_closed
-    pc = args.pseudocount
-    with np.errstate(divide="ignore", invalid="ignore"):
-        result["OR"] = ((result.co_access.astype(float) + pc) * (result.co_closed + pc)) / ((result.CRE1_access + pc) * (result.CRE2_access + pc))
-        result["or_haldane"] = ((result.co_access + 0.5) * (result.co_closed + 0.5)) / ((result.CRE1_access + 0.5) * (result.CRE2_access + 0.5))
-    a = (result.co_access + result.CRE1_access).astype(float)
-    b = result.co_access + result.CRE2_access
-    result["expected_co_access"] = a * b / result.n_shared_reads
-    result["observed_expected_ratio"] = result.co_access / result.expected_co_access.replace(0, np.nan)
-    result["excess_fraction"] = (result.co_access - result.expected_co_access) / result.n_shared_reads
-    result["zero_access_cre1"] = a == 0
-    result["zero_access_cre2"] = b == 0
-    result["fdr"] = bh(result.pval)
-    result["fdr_raw"] = bh(result.pval_raw)
+    result = summarize_coaccess_counts(result, args.pseudocount)
+    result.insert(result.columns.get_loc("n_shared_reads") + 1,
+                  "n_contributing_samples", contributing_samples[keep])
     result["dataset"] = "LCL"
     result["analysis_scope"] = args.chrom or "genome-wide"
     result["n_samples"] = len(samples)

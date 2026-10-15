@@ -1,0 +1,734 @@
+---
+title: "LCL top-10 co-accessibility: donor accessibility and pooled m6A proportions"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+params:
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  sample_sheet: "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+  fire_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+  code_root: "/project/spott/cshan/fiber-seq/code"
+  tabix: "/project/spott/cshan/envs/dimelo/bin/tabix"
+  n_permutations: 10000
+  seed: 1
+  make_plots: true
+---
+
+# Analysis overview
+
+This extends from the preivous co-acessibility analysis in `/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/LCL_co-access.Rmd`
+I preivously used Fisher exact to test if the CRE pairs are more often co-accessible than expected, but there is high donor heterogeneity,
+the CRE pairs accessible in one donor may not be accessible in another. This might be a problem because:
+
+  - mixing donor creates an assoication
+
+Permutation test shuffles CRE2 m6A proportions only within each sample. 
+Each shuffled dataset keeps every sample's own CRE1 and CRE2 distributions, so any correlation caused by sample-level differences is also 
+present in the null. The only thing the shuffle breaks is which CRE1 value sits on the same fiber as which CRE2 value
+
+
+
+The `pooled` analysis includes all 31 samples and the `noXCI` analysis uses the existing noXCI results and sex assignments: chrX uses male samples 
+only, and all other chromosomes use all 31 samples 
+
+Accessibility comes from `label_reads(read_rule = "contain",
+fire_overlap_fraction = 0.5)` applied to `load_region(span_source =
+"aligned_blocks")`. Only `shared == TRUE` fibers enter methylation summaries.
+Sample counts are read from `LCL_pair_sample_counts.tsv.gz`; donor bars and
+observed/expected summaries use those original counts, before methylation filtering.
+
+For each original cCRE, `assemble_region_m6a(full_span = TRUE, positions = NULL)`
+builds **one pooled read × position matrix** for the included samples. Its existing
+tabix reader keeps the longest overlapping alignment per read, removes sentinel
+blocks, and records binary m6A calls. The denominator is **the number of matrix
+columns**, i.e. positions with at least one observed m6A call among those pooled
+full-span reads. It is not a count of reference adenines or informative adenines.
+The column set is fixed before matching to Fisher fibers and is retained for all
+pooled, FIRE-state, and donor summaries; columns are not dropped after filtering.
+Full-span reads with zero calls remain zero rows.
+
+For each matched fiber, `prop1 = rowSums(CRE1_matrix) / ncol(CRE1_matrix)` and
+`prop2 = rowSums(CRE2_matrix) / ncol(CRE2_matrix)`. Main means and correlations
+use Fisher fibers present in **both** matrices. The per-fiber export also retains
+every Fisher fiber, with any available single-cCRE proportion and explicit
+exclusion reasons, so attrition can be inspected. Missing records are not zeros.
+BED cCRE starts are converted to 1-based starts only when calling the existing
+matrix API; the biological intervals are unchanged.
+
+# Setup and inputs
+
+```{r setup, include=FALSE}
+Sys.setenv(LC_ALL = "C")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                     fig.width = 13, fig.height = 10, cache = FALSE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(Matrix)
+})
+source(file.path(params$code_root, "parsing_functions", "parsing_footprints_functions.r"), local = TRUE)
+source(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r"), local = TRUE)
+source(file.path(params$code_root, "parsing_functions", "plotting_functions.r"), local = TRUE)
+options(scipen = 999)
+```
+
+```{r settings}
+coaccess_dir <- file.path(params$root, "coaccess")
+universe_dir <- file.path(params$root, "universe")
+analysis_sets <- c("pooled", "noXCI")
+stopifnot(params$n_permutations == 10000L)
+state_columns <- c("co_access", "CRE1_access", "CRE2_access", "co_closed")
+state_labels <- setNames(CONFIG_LEVELS, state_columns)
+read_rule <- "contain"
+fire_overlap_fraction <- 0.5
+
+# Save only final processed TSVs and PDFs, directly in the requested folders.
+out_dir <- file.path(params$root, "co-access_v2_perm_methy_prop")
+table_dir <- file.path(out_dir, "tables")
+plot_dir <- file.path(out_dir, "plots")
+for (d in c(table_dir, plot_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+if (length(list.files(table_dir)) || length(list.files(plot_dir)))
+  stop("Output folders already contain results; refusing to overwrite: ", out_dir)
+write_table <- function(x, name) {
+  path <- file.path(table_dir, name)
+  if (file.exists(path)) stop("Refusing to overwrite ", path)
+  fwrite(x, path, sep = "\t", na = "NA")
+  invisible(path)
+}
+final_plots <- list()
+queue_plot <- function(p, name, width = 13, height = 10) {
+  final_plots[[name]] <<- list(plot = p, width = width, height = height)
+}
+cat("Results directory:", out_dir, "\n")
+```
+
+```{r validate-inputs}
+sample_meta <- fread(params$sample_sheet)
+manifest <- fread(file.path(universe_dir, "sample_manifest.tsv"))
+run_manifest <- fread(file.path(coaccess_dir, "sample_manifest.tsv"))
+stopifnot(nrow(sample_meta) == 31L, nrow(manifest) == 31L,
+          nrow(run_manifest) == 31L,
+          !anyDuplicated(sample_meta$sample_name), !anyDuplicated(manifest$sample_name),
+          !anyDuplicated(run_manifest$sample_name),
+          setequal(sample_meta$sample_name, manifest$sample_name),
+          setequal(run_manifest$sample_name, manifest$sample_name))
+samples <- as.character(manifest$sample_name)
+sample_meta <- sample_meta[match(samples, sample_name)]
+sample_meta[, donor := as.character(cell_line)]
+run_manifest <- run_manifest[match(samples, sample_name)]
+stopifnot(identical(as.character(manifest$donor), sample_meta$donor))
+provenance_columns <- c("sample_name", "donor", "fire_dir", "cram_path",
+                        "elements_path", "spans_path")
+for (column in provenance_columns) {
+  if (!identical(as.character(run_manifest[[column]]), as.character(manifest[[column]])))
+    stop("Universe and completed-run manifests differ in ", column)
+}
+same_paths <- function(a, b)
+  identical(normalizePath(a, mustWork = TRUE), normalizePath(b, mustWork = TRUE))
+stopifnot(same_paths(manifest$fire_dir, file.path(params$fire_root, samples)),
+          same_paths(run_manifest$blocks_path,
+            file.path(params$root, samples, paste0(samples, ".aligned_blocks.bed.gz"))),
+          same_paths(run_manifest$elements_path,
+            file.path(params$fire_root, samples, "additional-outputs-v0.1", "fire-peaks",
+                      paste0(samples, "-v0.1-fire-elements.bed.gz"))),
+          file.exists(params$tabix))
+sample_table <- as.data.frame(manifest[, .(sample_name, fire_dir)])
+donors <- unique(sample_meta$donor)
+male_samples <- character()
+if ("noXCI" %in% analysis_sets) {
+  sex_noxci <- fread(file.path(coaccess_dir, "noXCI", "LCL_sample_sex_noXCI.tsv"))
+  stopifnot(nrow(sex_noxci) == 31L, !anyDuplicated(sex_noxci$sample_name),
+            setequal(sex_noxci$sample_name, samples),
+            all(sex_noxci$sex %in% c("male (XY)", "female (XX)")),
+            identical(as.character(sex_noxci$donor[match(samples, sex_noxci$sample_name)]),
+                      sample_meta$donor))
+  male_samples <- samples[samples %in% sex_noxci[sex == "male (XY)", sample_name]]
+  stopifnot(length(male_samples) > 0L)
+}
+```
+
+# Load the top-ten pairs
+
+Both top-ten sets are loaded from the tables saved by `LCL/LCL_co-access.Rmd`
+in `coaccess/`: `LCL_top10_pairs.tsv` (pooled) and `LCL_top10_pairs_noXCI.tsv`
+(noXCI). Their pair IDs and 1,000-bp aligned-block loading windows are used
+unchanged. m6A matrices always use the original cCRE boundaries. Saved Fisher
+columns are exported unchanged; no donor Fisher tests are added.
+
+```{r load-top-ten}
+top10_files <- c(pooled = file.path(coaccess_dir, "LCL_top10_pairs.tsv"),
+                 noXCI = file.path(coaccess_dir, "LCL_top10_pairs_noXCI.tsv"))
+selected_sets <- setNames(lapply(analysis_sets, function(a) {
+  chosen <- fread(top10_files[[a]])
+  chosen[, `:=`(analysis = a, pair_rank = seq_len(.N))]
+  chosen
+}), analysis_sets)
+selected <- rbindlist(selected_sets, fill = TRUE)
+selected[, .(analysis, pair_rank, pair_id, CRE_pair, gene_names)]
+```
+
+```{r original-sample-counts}
+# Stream the large file once, retaining only the selected pairs.
+read_selected_counts <- function(path, pair_ids) {
+  con <- gzfile(path, "rt")
+  on.exit(close(con))
+  header <- readLines(con, n = 1L)
+  out <- list()
+  repeat {
+    lines <- readLines(con, n = 100000L)
+    if (!length(lines)) break
+    ids <- substr(lines, 1L, regexpr("\t", lines, fixed = TRUE) - 1L)
+    lines <- lines[ids %in% pair_ids]
+    if (length(lines)) out[[length(out) + 1L]] <-
+      fread(text = paste(c(header, lines), collapse = "\n"), sep = "\t")
+  }
+  rbindlist(out)
+}
+counts_file <- file.path(coaccess_dir, "LCL_pair_sample_counts.tsv.gz")
+sample_counts <- read_selected_counts(counts_file, unique(selected$CRE_pair))
+stopifnot(!anyDuplicated(sample_counts[, .(CRE_pair, sample_name)]),
+          all(sample_counts$sample_name %in% samples),
+          all(sample_counts$donor == sample_meta$donor[match(sample_counts$sample_name, samples)]),
+          all(rowSums(as.matrix(sample_counts[, ..state_columns])) == sample_counts$n_shared_reads))
+pair_samples_for <- function(pair) {
+  if (pair$analysis == "noXCI" && pair$chrom == "chrX") male_samples else samples
+}
+counts_for <- function(pair) {
+  included <- pair_samples_for(pair)
+  z <- sample_counts[CRE_pair == pair$CRE_pair & sample_name %in% included]
+  stopifnot(nrow(z) == length(included), setequal(z$sample_name, included),
+            all(z$chrom == pair$chrom))
+  z <- copy(z[match(included, sample_name)])
+  suffix <- if (pair$analysis == "noXCI") "_noXCI" else ""
+  for (column in c(state_columns, "n_shared_reads"))
+    if (sum(z[[column]]) != pair[[paste0(column, suffix)]])
+      stop("Saved sample counts disagree with pooled Fisher table: ", pair$pair_id, " / ", column)
+  z[, `:=`(analysis = pair$analysis, pair_id = pair$pair_id, pair_rank = pair$pair_rank)]
+  z
+}
+selected_sample_counts <- rbindlist(lapply(seq_len(nrow(selected)), function(i) counts_for(selected[i])))
+```
+
+# Donor accessibility
+
+For each donor, observed co-accessibility is `co_access`; expected co-accessibility
+under independence is `(co_access + CRE1_access) * (co_access + CRE2_access) / N`,
+where `N` is the donor's total shared fibers. Fractions divide these counts by `N`.
+These descriptive values use unmodified counts without pseudocounts. A donor with
+zero shared fibers has undefined fractions and is labelled `n=0` without a bar.
+
+```{r donor-accessibility-summary}
+donor_accessibility <- selected_sample_counts[, lapply(.SD, sum),
+  by = .(analysis, pair_id, pair_rank, CRE_pair, donor),
+  .SDcols = c(state_columns, "n_shared_reads")]
+donor_accessibility[, `:=`(
+  observed_co_access = co_access,
+  expected_co_access = fifelse(n_shared_reads > 0,
+    expected_coaccess(co_closed, CRE1_access, CRE2_access, co_access), NA_real_))]
+donor_accessibility[, `:=`(
+  observed_fraction = fifelse(n_shared_reads > 0, co_access / n_shared_reads, NA_real_),
+  expected_fraction = fifelse(n_shared_reads > 0, expected_co_access / n_shared_reads, NA_real_),
+  observed_expected_ratio = fifelse(expected_co_access > 0, co_access / expected_co_access, NA_real_))]
+for (state in state_columns)
+  donor_accessibility[, (paste0(state, "_fraction")) :=
+    fifelse(n_shared_reads > 0, get(state) / n_shared_reads, NA_real_)]
+donor_states <- melt(donor_accessibility,
+  id.vars = c("analysis", "pair_id", "pair_rank", "CRE_pair", "donor", "n_shared_reads"),
+  measure.vars = state_columns, variable.name = "state", value.name = "n_fibers")
+donor_states[, `:=`(config = factor(state_labels[as.character(state)], levels = CONFIG_LEVELS),
+                    fraction = fifelse(n_shared_reads > 0, n_fibers / n_shared_reads, NA_real_))]
+```
+
+```{r donor-accessibility-bars, fig.height=12}
+if (isTRUE(params$make_plots)) for (a in analysis_sets) {
+  d <- copy(donor_states[analysis == a])
+  d[, donor := factor(donor, levels = donors)]
+  d[, pair_id := factor(pair_id, levels = selected_sets[[a]]$pair_id)]
+  totals <- unique(d[, .(pair_id, donor, n_shared_reads)])
+  totals[, lab := paste0("n=", n_shared_reads)]
+  p <- plot_stacked_proportion(d[n_shared_reads > 0], "donor", "config", CONFIG_COLS,
+    y = "fraction", position = "stack",
+    totals = list(data = totals, x = "donor", y = 1.03, label = "lab",
+                  style = list(size = 2.3, angle = 90, hjust = 0)),
+    scales = list(scale_y_continuous(labels = scales::label_percent(),
+                                    breaks = c(0, 0.5, 1), limits = c(0, 1.25)),
+                  scale_x_discrete(drop = FALSE)),
+    labels = list(x = NULL, y = "Fraction of shared fibers", title = paste(a, "- donor FIRE accessibility")),
+    legend = list(name = NULL, drop = FALSE),
+    theme = theme_fiberseq("bw", base_size = 10,
+      overrides = list(axis.text.x = element_text(angle = 60, hjust = 1),
+                       legend.position = "bottom"))) + facet_wrap(~pair_id, ncol = 2)
+  print(p)
+  queue_plot(p, paste0(a, "_donor_accessibility"), height = 12)
+}
+```
+
+# Matrix proportions and exclusion audit
+
+The additional metadata query below uses the same existing `read_ft_bed12()`
+reader and longest-alignment rule solely to explain exclusions. It does not call
+methylation or construct a second matrix. The matrix itself always comes from
+`assemble_region_m6a()`. Missing inputs and inconsistent identities stop the run.
+The existing parser also stops if a cCRE has fewer than three full-span reads or
+no observed m6A positions. Audits and matrix checks stay in memory; final fiber
+and exclusion tables report any filtering.
+
+```{r methylation-helpers}
+matrix_proportions <- function(pair, cre_number, fisher_fibers, included) {
+  region <- data.frame(region_id = paste0(pair$pair_id, "_CRE", cre_number),
+    chr = pair$chrom, start = pair[[paste0("cre", cre_number, "_start")]],
+    end = pair[[paste0("cre", cre_number, "_end")]])
+  region$analysis_start <- region$start + 1L
+  region$analysis_end <- region$end
+  st <- sample_table[match(included, sample_table$sample_name), , drop = FALSE]
+  paths <- file.path(st$fire_dir, "extracted_results", "m6a_by_chr",
+    paste0(st$sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
+  required <- c(paths, paste0(paths, ".tbi"))
+  if (!all(file.exists(required))) stop("Missing m6A input/index: ", paste(required[!file.exists(required)], collapse = ", "))
+  gr <- GenomicRanges::GRanges(region$chr, IRanges::IRanges(region$analysis_start, region$analysis_end))
+  # Record spans before full_span filtering, including overlapping zero-call reads.
+  audit_records <- rbindlist(lapply(seq_along(included), function(j) {
+    b <- read_ft_bed12(paths[j], region = gr, longest_alignment = TRUE)
+    if (!nrow(b)) return(data.table(sample_name = character(), original_RID = character(),
+                                   ft_start = integer(), ft_end = integer(), full_span = logical()))
+    data.table(sample_name = included[j], original_RID = as.character(b$RID),
+      ft_start = b$start, ft_end = b$end,
+      full_span = b$start <= region$start & b$end >= region$end)
+  }))
+  stopifnot(!anyDuplicated(audit_records[, .(sample_name, original_RID)]))
+  audit <- merge(fisher_fibers[, .(sample_name, original_RID, donor, state)],
+    audit_records, by = c("sample_name", "original_RID"), all.x = TRUE, sort = FALSE)
+  audit[, status := fifelse(is.na(full_span), "missing_ft_record",
+                            fifelse(full_span, "retained", "excluded_full_span"))]
+  audit[, `:=`(analysis = pair$analysis, pair_id = pair$pair_id,
+               CRE_pair = pair$CRE_pair, CRE = paste0("CRE", cre_number))]
+
+  assembled <- assemble_region_m6a(st, region, modality = "m6a",
+    full_span = TRUE, positions = NULL, matrix_dir = NULL, reuse = FALSE)
+  mat <- assembled$met_mat
+  meta <- as.data.table(assembled$rids_df)
+  positions <- as.integer(colnames(mat))
+  stopifnot(identical(rownames(mat), as.character(meta$RID)),
+            !anyDuplicated(meta[, .(sample_name, original_RID)]),
+            identical(meta$RID, paste(meta$sample_name, meta$original_RID, sep = "::")),
+            ncol(mat) > 0L, !anyNA(mat), all(mat@x %in% c(0, 1)),
+            !anyNA(positions), !anyDuplicated(positions),
+            identical(positions, sort(positions)),
+            all(positions >= region$analysis_start & positions <= region$analysis_end),
+            all(Matrix::colSums(mat) > 0),
+            all(meta$start <= region$analysis_start & meta$end >= region$analysis_end),
+            nrow(meta) == sum(audit_records$full_span))
+  expected_ids <- audit_records[full_span == TRUE, paste(sample_name, original_RID, sep = "::")]
+  stopifnot(setequal(meta$RID, expected_ids))
+
+  # Subset rows only: every sample/state/donor retains this exact column set.
+  rows <- match(paste(audit$sample_name, audit$original_RID, sep = "::"), meta$RID)
+  present <- !is.na(rows)
+  stopifnot(identical(present, audit$status == "retained"))
+  matched_mat <- mat[rows[present], , drop = FALSE]
+  stopifnot(identical(colnames(matched_mat), colnames(mat)))
+  audit[, `:=`(n_m6a_calls = NA_real_, proportion = NA_real_, n_positions = ncol(mat))]
+  audit[present, `:=`(n_m6a_calls = as.numeric(Matrix::rowSums(matched_mat)),
+                     proportion = as.numeric(Matrix::rowSums(matched_mat)) / ncol(mat))]
+  stopifnot(all(audit$proportion[present] >= 0 & audit$proportion[present] <= 1))
+
+  qc <- as.data.table(assembled$qc)
+  qc[, `:=`(analysis = pair$analysis, pair_id = pair$pair_id,
+            CRE = paste0("CRE", cre_number), n_positions = ncol(mat),
+            excluded_full_span_reads = overlapping_reads - full_span_reads)]
+  checks <- data.table(analysis = pair$analysis, pair_id = pair$pair_id,
+    CRE = paste0("CRE", cre_number), n_positions = ncol(mat),
+    n_matrix_reads = nrow(mat), n_shared_matrix_reads = nrow(matched_mat),
+    consistent_columns = identical(colnames(mat), colnames(matched_mat)),
+    binary_matrix = TRUE, positions_observed_in_pooled_matrix = TRUE)
+  list(fibers = audit, qc = qc, checks = checks)
+}
+```
+
+```{r calculate-all-fiber-proportions}
+fiber_results <- matrix_qc <- matrix_checks <- span_audits <- list()
+for (i in seq_len(nrow(selected))) {
+  pair <- selected[i]
+  included <- pair_samples_for(pair)
+  message("Analysing ", pair$analysis, " / ", pair$pair_id)
+  res <- load_region(list(chrom = pair$chrom, start = pair$region_start, end = pair$region_end),
+    included, params$root, params$fire_root, fire_ver = "v0.1",
+    tabix_bin = params$tabix, span_source = "aligned_blocks")
+  labels <- label_reads(res,
+    list(start = pair$cre1_start, end = pair$cre1_end),
+    list(start = pair$cre2_start, end = pair$cre2_end),
+    read_rule = read_rule, fire_overlap_fraction = fire_overlap_fraction)
+  identity <- res$spans[, .(key, sample_name, original_RID = as.character(RID))]
+  fibers <- merge(labels[shared == TRUE], identity,
+                  by = c("key", "sample_name"), all.x = TRUE, sort = FALSE)
+  stopifnot(!anyNA(fibers$original_RID),
+            !anyDuplicated(fibers[, .(sample_name, original_RID)]), all(fibers$shared))
+  fibers[, `:=`(donor = sample_meta$donor[match(sample_name, samples)],
+    state = fifelse(acc1 & acc2, "co_access", fifelse(acc1, "CRE1_access",
+                    fifelse(acc2, "CRE2_access", "co_closed"))))]
+  actual <- fibers[, .(co_access = sum(acc1 & acc2), CRE1_access = sum(acc1 & !acc2),
+    CRE2_access = sum(!acc1 & acc2), co_closed = sum(!acc1 & !acc2), n_shared_reads = .N),
+    by = sample_name]
+  original <- counts_for(pair)
+  for (column in c(state_columns, "n_shared_reads")) {
+    values <- actual[[column]][match(original$sample_name, actual$sample_name)]
+    values[is.na(values)] <- 0L
+    if (!identical(as.numeric(values), as.numeric(original[[column]])))
+      stop("Reloaded FIRE counts differ by sample for ", pair$pair_id, " / ", column)
+  }
+  m1 <- matrix_proportions(pair, 1L, fibers, included)
+  m2 <- matrix_proportions(pair, 2L, fibers, included)
+  for (j in 1:2) {
+    m <- if (j == 1L) m1 else m2
+    z <- m$fibers[, .(sample_name, original_RID, status, n_m6a_calls, proportion, n_positions)]
+    setnames(z, c("status", "n_m6a_calls", "proportion", "n_positions"),
+      c(paste0("CRE", j, "_status"), paste0("m6a_calls", j), paste0("prop", j), paste0("n_positions", j)))
+    fibers <- merge(fibers, z, by = c("sample_name", "original_RID"), all.x = TRUE, sort = FALSE)
+  }
+  fibers[, `:=`(analysis = pair$analysis, pair_id = pair$pair_id, pair_rank = pair$pair_rank,
+    CRE_pair = pair$CRE_pair, chrom = pair$chrom,
+    qualifying = CRE1_status == "retained" & CRE2_status == "retained" & is.finite(prop1) & is.finite(prop2))]
+  setorder(fibers, sample_name, original_RID)
+  fiber_results[[i]] <- fibers
+  matrix_qc[[i]] <- rbind(m1$qc, m2$qc)
+  matrix_checks[[i]] <- rbind(m1$checks, m2$checks)
+  span_audits[[i]] <- rbind(m1$fibers, m2$fibers)
+}
+per_fiber <- rbindlist(fiber_results)
+matrix_qc <- rbindlist(matrix_qc)
+matrix_checks <- rbindlist(matrix_checks)
+span_audit <- rbindlist(span_audits)
+exclusions <- per_fiber[, .(n_fisher_fibers = .N, n_qualifying = sum(qualifying),
+  n_excluded = sum(!qualifying),
+  n_CRE1_full_span_excluded = sum(CRE1_status == "excluded_full_span"),
+  n_CRE2_full_span_excluded = sum(CRE2_status == "excluded_full_span"),
+  n_either_full_span_excluded = sum(CRE1_status == "excluded_full_span" | CRE2_status == "excluded_full_span"),
+  n_CRE1_missing_ft_record = sum(CRE1_status == "missing_ft_record"),
+  n_CRE2_missing_ft_record = sum(CRE2_status == "missing_ft_record")),
+  by = .(analysis, pair_id, pair_rank, donor, sample_name)]
+pair_attrition <- exclusions[, lapply(.SD, sum), by = .(analysis, pair_id, pair_rank),
+  .SDcols = setdiff(names(exclusions), c("analysis", "pair_id", "pair_rank", "donor", "sample_name"))]
+print(pair_attrition)
+print(matrix_checks)
+print(matrix_qc[, .(overlapping_reads = sum(overlapping_reads),
+                    full_span_reads = sum(full_span_reads),
+                    excluded_full_span_reads = sum(excluded_full_span_reads)),
+                by = .(analysis, pair_id, CRE)])
+```
+
+# Pooled methylation means
+
+Every fiber has equal weight. The four-state and donor summaries partition the
+same qualifying fibers used for the pooled means and correlation, using the
+same CRE1 and CRE2 denominators. Empty donor/state groups have `n_fibers = 0`
+and `NA` means. Donor summaries are descriptive; no donor significance tests run.
+
+```{r methylation-summaries}
+# mean_props() and complete_summary() come from stats_testing_functions.r.
+qualifying <- per_fiber[qualifying == TRUE]
+pair_keys <- c("analysis", "pair_id", "pair_rank", "CRE_pair")
+pair_grid <- unique(selected[, ..pair_keys])
+pooled_means <- complete_summary(pair_grid, mean_props(qualifying, pair_keys), pair_keys)
+state_grid <- pair_grid[, .(state = state_columns), by = pair_keys]
+state_keys <- c(pair_keys, "state")
+state_means <- complete_summary(state_grid, mean_props(qualifying, state_keys), state_keys)
+donor_keys <- c(pair_keys, "donor")
+donor_grid <- unique(selected_sample_counts[, ..donor_keys])
+donor_means <- complete_summary(donor_grid, mean_props(qualifying, donor_keys), donor_keys)
+denominators <- unique(per_fiber[, .(analysis, pair_id, n_positions1, n_positions2)])
+stopifnot(nrow(denominators) == nrow(selected))
+pooled_means <- merge(pooled_means, denominators, by = c("analysis", "pair_id"))
+state_means <- merge(state_means, denominators, by = c("analysis", "pair_id"))
+donor_means <- merge(donor_means, denominators, by = c("analysis", "pair_id"))
+print(pooled_means[order(analysis, pair_rank)])
+```
+
+# Same-fiber correlation and sample-stratified permutations
+
+The primary statistic is Spearman correlation across all qualifying fibers in
+a pair. Each of 10,000 permutations shuffles CRE2 proportions **within the same
+sample**, while CRE1 proportions and sample identity remain fixed. Global
+midranks are computed once: permuting values also permutes their ranks, so the
+observed and permuted statistics are the same Spearman statistic, including ties.
+The empirical one-sided p-value for positive association is
+`(1 + sum(permuted_rho >= observed_rho)) / (10000 + 1)`.
+BH correction uses the ten primary tests within each selected analysis set.
+
+Sample differences can produce a positive pooled correlation and a nonzero
+permutation-null mean. As an additional statistic, global ranks are centered
+within sample and the residual ranks are correlated. This is a sample-adjusted
+rank correlation (equivalent to residualizing each global rank against sample
+indicators), not an average of per-donor tests. Its supplementary p-values use
+the same sample-stratified permutations, with a separate ten-test BH family.
+Constant proportions and lack of within-sample variation are explicitly flagged;
+undefined correlations remain `NA`. Singleton samples stay in the primary
+analysis but their values cannot shuffle. No fibers are downsampled for analysis
+or for the scatterplots. Inference is conditional on these accessibility-selected
+pairs and is not a genome-wide methylation significance claim.
+
+`permute_pooled_spearman()` is sourced from `stats_testing_functions.r`.
+
+```{r run-permutations}
+permutation_results <- permutation_nulls <- list()
+for (i in seq_len(nrow(selected))) {
+  pair <- selected[i]
+  d <- per_fiber[analysis == pair$analysis & pair_id == pair$pair_id & qualifying == TRUE]
+  # Seeds depend on analysis and rank, not on which sets run in this invocation.
+  pair_seed <- as.integer(params$seed + pair$pair_rank + if (pair$analysis == "noXCI") 1000L else 0L)
+  fit <- permute_pooled_spearman(d, n_permutations = params$n_permutations, seed = pair_seed)
+  s <- as.data.table(fit$statistics)
+  s[, `:=`(analysis = pair$analysis, pair_id = pair$pair_id,
+            pair_rank = pair$pair_rank, CRE_pair = pair$CRE_pair)]
+  n <- as.data.table(fit$null)
+  n[, `:=`(analysis = pair$analysis, pair_id = pair$pair_id, pair_rank = pair$pair_rank)]
+  permutation_results[[i]] <- s
+  permutation_nulls[[i]] <- n
+}
+permutation_statistics <- rbindlist(permutation_results)
+permutation_null <- rbindlist(permutation_nulls)
+permutation_statistics[, `:=`(bh_family_size = 10L,
+  p_positive_BH = adjust_bh(p_positive, n = 10L),
+  adjusted_p_positive_BH = adjust_bh(adjusted_p_positive, n = 10L)), by = analysis]
+permutation_statistics <- merge(permutation_statistics, pair_attrition,
+  by = c("analysis", "pair_id", "pair_rank"))
+permutation_statistics <- merge(permutation_statistics, denominators, by = c("analysis", "pair_id"))
+setorder(permutation_statistics, analysis, pair_rank)
+print(permutation_statistics[, .(analysis, pair_id, n_qualifying, spearman_rho,
+  p_positive, p_positive_BH, within_sample_adjusted_rho, adjusted_p_positive_BH,
+  null_mean, status)])
+```
+
+# Methylation figures
+
+Each scatterplot includes every qualifying fiber, coloured by its unchanged FIRE
+state. State means use the same fibers. The permutation panels show both the
+primary pooled statistic and the supplementary adjusted statistic; red lines
+mark observed values and labels show their respective BH-adjusted p-values.
+
+```{r scatterplots, fig.height=11}
+if (isTRUE(params$make_plots)) for (a in analysis_sets) {
+  d <- copy(qualifying[analysis == a])
+  d[, `:=`(pair_id = factor(pair_id, levels = selected_sets[[a]]$pair_id),
+            config = factor(state_labels[state], levels = CONFIG_LEVELS))]
+  s <- copy(permutation_statistics[analysis == a])
+  s[, pair_id := factor(pair_id, levels = selected_sets[[a]]$pair_id)]
+  s[, label := sprintf("n=%d | rho=%.3f\nadjusted rho=%.3f | BH p=%.3g",
+    n_qualifying, spearman_rho, within_sample_adjusted_rho, p_positive_BH)]
+  p <- ggplot(d, aes(prop1, prop2, colour = config)) +
+    geom_point(size = 0.8, alpha = 0.4) +
+    geom_text(data = s, aes(x = 0.01, y = 1, label = label), inherit.aes = FALSE,
+              hjust = 0, vjust = 1, size = 2.6) +
+    scale_colour_manual(values = CONFIG_COLS, drop = FALSE) +
+    scale_x_continuous(limits = c(0, 1)) + scale_y_continuous(limits = c(0, 1)) +
+    facet_wrap(~pair_id, ncol = 2, drop = FALSE) +
+    labs(x = "CRE1 m6A proportion", y = "CRE2 m6A proportion", colour = NULL,
+         title = paste(a, "- all qualifying same-fiber m6A proportions")) +
+    theme_fiberseq("bw", base_size = 10, overrides = list(legend.position = "bottom"))
+  print(p)
+  queue_plot(p, paste0(a, "_per_fiber_m6a_scatter"), height = 11)
+}
+```
+
+```{r permutation-null-plots, fig.height=15}
+if (isTRUE(params$make_plots)) for (a in analysis_sets) {
+  d <- melt(permutation_null[analysis == a],
+    id.vars = c("analysis", "pair_id", "pair_rank", "permutation"),
+    measure.vars = c("spearman_rho", "within_sample_adjusted_rho"),
+    variable.name = "statistic", value.name = "rho")
+  s <- permutation_statistics[analysis == a]
+  lines <- rbind(
+    s[, .(pair_id, statistic = "spearman_rho", observed = spearman_rho,
+           adjusted_p = p_positive_BH, status)],
+    s[, .(pair_id, statistic = "within_sample_adjusted_rho", observed = within_sample_adjusted_rho,
+           adjusted_p = adjusted_p_positive_BH, status = adjusted_status)])
+  for (z in list(d, lines)) {
+    z[, pair_id := factor(pair_id, levels = selected_sets[[a]]$pair_id)]
+    z[, statistic := factor(statistic, levels = c("spearman_rho", "within_sample_adjusted_rho"),
+      labels = c("Pooled Spearman", "Sample-adjusted rank correlation"))]
+  }
+  lines[, label := fifelse(is.finite(observed),
+    sprintf("observed %.3f | BH p %.3g", observed, adjusted_p), paste("Undefined:", status))]
+  p <- ggplot(d[is.finite(rho)], aes(rho)) +
+    geom_histogram(bins = 40, fill = "grey70", colour = "white", linewidth = 0.15) +
+    geom_vline(data = lines[is.finite(observed)], aes(xintercept = observed),
+               colour = "#B2182B", linewidth = 0.5) +
+    geom_text(data = lines, aes(x = -Inf, y = Inf, label = label), inherit.aes = FALSE,
+              hjust = -0.03, vjust = 1.2, size = 2.6) +
+    facet_grid(pair_id ~ statistic, scales = "free", drop = FALSE,
+      labeller = labeller(pair_id = function(x)
+        sub("_(chr[^_]+)_([0-9]+)_([0-9]+)$", "\n\\1:\\2-\\3", x))) +
+    labs(x = "Correlation after within-sample CRE2 shuffle", y = "Permutations",
+         title = paste(a, "- 10,000 sample-stratified permutations")) +
+    theme_fiberseq("bw", base_size = 10,
+      overrides = list(strip.text.y = element_text(angle = 0, size = 8)))
+  print(p)
+  queue_plot(p, paste0(a, "_permutation_null"), height = 15)
+}
+```
+
+```{r mean-proportions-by-fire-state, fig.height=11}
+if (isTRUE(params$make_plots)) for (a in analysis_sets) {
+  d <- melt(state_means[analysis == a],
+    id.vars = c("analysis", "pair_id", "pair_rank", "state", "n_fibers"),
+    measure.vars = c("mean_prop1", "mean_prop2"), variable.name = "CRE", value.name = "mean_proportion")
+  d[, `:=`(CRE = factor(CRE, levels = c("mean_prop1", "mean_prop2"), labels = c("CRE1", "CRE2")),
+    config = factor(state_labels[state], levels = CONFIG_LEVELS),
+    pair_id = factor(pair_id, levels = selected_sets[[a]]$pair_id))]
+  totals <- unique(d[, .(pair_id, config, n_fibers)])
+  p <- ggplot(d[is.finite(mean_proportion)], aes(config, mean_proportion, fill = CRE)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    geom_text(data = totals, aes(config, 1.03, label = paste0("n=", n_fibers)),
+              inherit.aes = FALSE, size = 2.6) +
+    scale_fill_manual(values = c(CRE1 = "#2166AC", CRE2 = "#B2182B")) +
+    scale_y_continuous(limits = c(0, 1.1), breaks = c(0, 0.5, 1)) +
+    scale_x_discrete(drop = FALSE) + facet_wrap(~pair_id, ncol = 2) +
+    labs(x = NULL, y = "Mean m6A proportion", fill = NULL,
+         title = paste(a, "- m6A means by FIRE accessibility state")) +
+    theme_fiberseq("bw", base_size = 10,
+      overrides = list(axis.text.x = element_text(angle = 25, hjust = 1), legend.position = "bottom"))
+  print(p)
+  queue_plot(p, paste0(a, "_fire_state_m6a_means"), height = 11)
+}
+```
+
+# Empirical permutation p-value diagnostics
+
+Kevin's `fiberQTL_utils.R` was inspected read-only. Its
+`test_AS_topic_prop_permute_genotype()` returns a model p-value for each shuffled
+dataset; `compute_empirical_pval()` then calculates
+`(1 + sum(null_p <= observed_p)) / (B + 1)`. Its methylation-QTL routines
+shuffle sample identities or genotype columns. Here the null instead breaks
+CRE1/CRE2 fiber pairing **within each sample**, and the empirical positive-tail
+p-value compares correlations using `>=`. These are different biological nulls;
+we retain the existing same-fiber test and its sample restrictions.
+
+The requested null diagnostics use **one nominal, one-sided Spearman p-value
+per shuffled dataset**, with the usual t approximation (`exact = FALSE` in
+`cor.test`, alternative `"greater"`). They are not 10,000 new empirical tests.
+For each pair the same number of finite fibers is used for every shuffle.
+Nominal p-values test zero pooled correlation; the sample-stratified null can
+have a nonzero pooled correlation because sample differences are preserved.
+Consequently, these histograms and QQ plots need not follow Uniform(0,1), even
+when the restricted permutation procedure is working correctly. They do not
+replace the empirical positive-tail p-values or their BH correction. Log-tail
+probabilities are retained for finite QQ coordinates when ordinary p-values
+underflow. Invalid or constant-correlation cases are omitted and counted in
+panel labels. No per-shuffle tables are saved.
+
+```{r shuffled-p-value-diagnostics, fig.height=13}
+# Equivalent to the asymptotic Spearman cor.test p-value, including tied ranks.
+# Shared implementation: stats_testing_functions.r.
+null_p_diagnostics <- merge(
+  permutation_null[, .(analysis, pair_id, pair_rank, permutation, spearman_rho)],
+  permutation_statistics[, .(analysis, pair_id, n_paired_finite_fibers)],
+  by = c("analysis", "pair_id"))
+null_p_diagnostics[, log_p := spearman_nominal_logp(spearman_rho, n_paired_finite_fibers)]
+null_p_diagnostics[, nominal_p := exp(log_p)]
+for (a in analysis_sets) {
+  d <- copy(null_p_diagnostics[analysis == a])
+  labels <- d[, .(label = paste0(pair_id[1], "\nvalid = ", sum(!is.na(log_p)),
+    "; unavailable = ", sum(is.na(log_p)))), by = .(pair_id, pair_rank)]
+  setorder(labels, pair_rank)
+  d[, panel := factor(pair_id, levels = labels$pair_id, labels = labels$label)]
+  valid_d <- d[!is.na(log_p)]
+  if (!nrow(valid_d)) next
+  p <- ggplot(valid_d, aes(nominal_p)) +
+    geom_histogram(breaks = seq(0, 1, by = 0.05), colour = "white", fill = "steelblue") +
+    facet_wrap(~ panel, ncol = 2, drop = FALSE) +
+    labs(x = "Permutation p-value (nominal Spearman, one-sided)", y = "Frequency",
+         title = paste(a, "- p-values from shuffled datasets"),
+         subtitle = "Within-sample shuffles preserve sample effects; uniformity is not guaranteed") +
+    theme_bw()
+  print(p)
+  queue_plot(p, paste0(a, "_shuffled_p_value_histograms"), height = 13)
+  setorder(valid_d, pair_rank, log_p, permutation)
+  valid_d[, expected := -log10((seq_len(.N) - 0.5) / .N), by = pair_id]
+  # Exact rho=1 has p=0; cap only its displayed height at the machine floor.
+  valid_d[, observed := -pmax(log_p, log(.Machine$double.xmin)) / log(10)]
+  p <- ggplot(valid_d, aes(expected, observed)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+    geom_point(size = 0.45, alpha = 0.35) +
+    facet_wrap(~ panel, ncol = 2, scales = "free", drop = FALSE) +
+    labs(x = "Expected -log10(p-value)", y = "Observed -log10(shuffled nominal p-value)",
+         title = paste(a, "- shuffled-dataset p-value QQ plots"),
+         subtitle = "All valid draws; displayed -log10(p) capped at machine precision") +
+    theme_bw()
+  print(p)
+  queue_plot(p, paste0(a, "_shuffled_p_value_qq"), height = 13)
+}
+```
+
+The QQ plot below uses the **unadjusted empirical p-value for each observed
+pair**, not BH q-values or individual shuffled correlations. Expected quantiles
+are `(rank - 0.5) / n`, as in the list-input branch of Kevin's
+`plots_test.R::qqplot.pvalue()`. All valid pairs are shown without thinning.
+The helper's vector-input branch includes a zero expected quantile, so this
+notebook constructs finite plotting positions explicitly without modifying or
+sourcing Kevin's files.
+
+With 10,000 permutations, the smallest possible empirical p-value is
+`1 / 10001`; zero exceedances give that value, not zero. If all ten pairs reach
+this limit, their QQ points have the same observed height. This does not resolve
+how much smaller their true tail probabilities might be.
+
+```{r empirical-p-value-qq, fig.height=6}
+for (a in analysis_sets) {
+  d <- copy(permutation_statistics[analysis == a & is.finite(p_positive),
+    .(pair_id, p_positive)])
+  if (!nrow(d)) next
+  stopifnot(all(d$p_positive > 0 & d$p_positive <= 1))
+  setorder(d, p_positive, pair_id)
+  d[, `:=`(expected = -log10((seq_len(.N) - 0.5) / .N),
+            observed = -log10(p_positive))]
+  p <- ggplot(d, aes(expected, observed)) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+    geom_point(size = 2) +
+    geom_text(aes(label = pair_id), vjust = -0.6, size = 3, check_overlap = TRUE) +
+    labs(x = "Expected -log10(p-value)", y = "Observed -log10(empirical p-value)",
+         title = paste(a, "- top-10 empirical permutation p-values"),
+         subtitle = paste(nrow(d), "valid pairs; selected-pair descriptive QQ plot")) +
+    theme_bw()
+  print(p)
+  queue_plot(p, paste0(a, "_empirical_permutation_p_qq"), width = 8, height = 6)
+}
+```
+
+
+# Final outputs
+
+Only final processed TSV tables and PDF figures are saved in `tables/` and
+`plots/` under `LCL_project/co-accessibility/co-access_v2_perm_methy_prop`.
+`per_fiber_m6a_proportions`
+contains every Fisher-eligible fiber, its sample/donor, FIRE state, matrix
+denominators, proportions, inclusion flag, and exclusion statuses. Pooled,
+FIRE-state, and donor means are separate TSVs. Final permutation statistics,
+unchanged top-ten Fisher statistics, donor accessibility summaries, and
+sample/pair exclusion summaries are also saved. Matrices, position lists,
+permutation draws, raw audits, manifests, and settings are not saved.
+Individual CRE1/CRE2 exclusion counts may overlap; `n_excluded` counts
+unique fibers excluded from the paired methylation analysis.
+
+```{r save-final-tables}
+for (name in names(final_plots)) {
+  p <- final_plots[[name]]
+  path <- file.path(plot_dir, paste0(name, ".pdf"))
+  if (file.exists(path)) stop("Refusing to overwrite ", path)
+  ggsave(path, p$plot, width = p$width, height = p$height, limitsize = FALSE)
+}
+for (a in analysis_sets)
+  write_table(selected_sets[[a]], paste0(a, "_top10_original_fisher_statistics.tsv"))
+write_table(per_fiber, "per_fiber_m6a_proportions.tsv")
+write_table(donor_accessibility, "donor_accessibility_observed_expected.tsv")
+write_table(pooled_means, "pooled_m6a_means.tsv")
+write_table(state_means, "fire_state_m6a_means.tsv")
+write_table(donor_means, "donor_m6a_means.tsv")
+write_table(exclusions, "m6a_exclusions_by_sample.tsv")
+write_table(pair_attrition, "m6a_exclusions_by_pair.tsv")
+write_table(permutation_statistics, "pooled_m6a_permutation_statistics.tsv")
+cat("Final PDFs:", plot_dir, "\nFinal TSVs:", table_dir, "\n")
+```

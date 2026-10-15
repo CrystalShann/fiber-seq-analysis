@@ -1151,7 +1151,8 @@ configuration_proportion_inputs <- function(labels, samples) {
 # TF footprints) with the pair shaded on every panel, plus configuration bars.
 # Macrophage: read spans, FiberHMM nucleosomes and size bins, one facet per
 # timepoint. LCL: primary read spans, ft nucleosomes, FiberHMM v2 TF footprints,
-# pooled / per-sample facets. Needs parsing_footprints_functions.r.
+# pooled / per-sample facets. Source parsing_footprints_functions.r and
+# stats_testing_functions.r before calling this wrapper.
 #
 # Inputs:
 #   pair        - one row with chrom, cre1_start, cre1_end, cre2_start, cre2_end
@@ -1204,6 +1205,8 @@ plot_coaccess_pair <- function(pair, samples, paths,
                                fire_overlap_fraction = 0) {
   if (!exists("load_region", mode = "function"))
     stop("source parsing_footprints_functions.r before plot_coaccess_pair()")
+  if (!exists("coaccess_2x2", mode = "function"))
+    stop("source stats_testing_functions.r before plot_coaccess_pair()")
   span_source <- match.arg(span_source)
   nuc_source <- match.arg(nuc_source)
   tf_source <- match.arg(tf_source)

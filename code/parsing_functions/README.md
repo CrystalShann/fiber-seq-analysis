@@ -4,7 +4,9 @@
 
 | File | Contents |
 |---|---|
-| `parsing_footprints_functions.r` | Readers for fibertools / FiberHMM BED files, and `assemble_region_m6a()`, which builds the read x position m6A (or CpG) matrix used for clustering; per-region extraction and loading for read-level region plots; fibers, display tracks and 2x2 tables for cCRE-pair co-accessibility |
+| `parsing_footprints_functions.r` | Readers for fibertools / FiberHMM BED files, methylation matrices, per-region extraction, fiber labels and display tracks |
+| `stats_testing_functions.r` | Shared R Fisher tests, BH adjustment, empirical permutation tests, Spearman diagnostics, donor-adjusted LRT/Rao tests and Firth effect estimation |
+| `count_and_test_pairs.py` | Shared Python pair counting, Fisher tests, BH adjustment and co-accessibility effect/expectation summaries |
 | `plotting_functions.r` | Shared colour palettes, ggplot theme, figure saving and plot builders (bar charts, interval tracks, profiles, stacked read-level region panels, read heatmaps); one-call region plots and cCRE-pair co-accessibility figures |
 | `extract_region_result_macrophage.sh` | Cuts one region for one macrophage timepoint into `<out_root>/<outname>/<sample>/parsed/` |
 | `extract_region_result_lcl.sh` | The same for one LCL sample, from tabix slices only |
@@ -18,11 +20,14 @@ functions read, and the output files they write.
 ```r
 library(dplyr); library(GenomicRanges); library(Rsamtools); library(Matrix)
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/parsing_footprints_functions.r")
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/stats_testing_functions.r")
 source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r")
 ```
 
-Source `parsing_footprints_functions.r` first: `plot_region_example()` and
-`plot_coaccess_pair()` in `plotting_functions.r`
+Source `parsing_footprints_functions.r` before `plot_region_example()` or
+`plot_coaccess_pair()`. The latter also needs `stats_testing_functions.r`.
+Load `data.table` for donor regression and grouped statistical summaries;
+separated donor fits additionally require `logistf`.
 
 `plot_group_profile(coordinates = "relative")` and `plot_read_heatmap()` also
 need helpers from `code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r`.
@@ -196,12 +201,44 @@ and TF footprint tracks are display only. Fibers are keyed `"<sample> <read name
 | `label_reads()` | Per-fiber configuration at the pair: accessible when one of its FIRE elements overlaps the cCRE by >= 1 bp; `read_rule = "any"` or `"contain"` | data.table `key, sample_name, shared, acc1, acc2, config` |
 | `order_reads()` | Raster order: sample, configuration, start | character vector of keys |
 | `coaccess_m6a_fraction()` | Unbinned m6A fraction per position and sample over covering fibers | data.table `pos, sample_name, frac` |
-| `coaccess_2x2()` | The pair's 2x2 from the fibers covering both cCREs, with `fisher.test(table + 1)` | one-row data.frame `both, cre1_only, cre2_only, neither, n_shared, fisher_or, fisher_p` |
 | `cre_class_from_id()` | cCRE class from a `CRE_ID` (`accession1.accession2.class`) | character |
 | `select_cre_pairs()` | Keeps the pairs whose classes match `cre_types` (NULL = any); `cre_match = "either"`, `"both"` or `"pair"` (with `cre_types2`); pairs are unordered | rows of the pair table |
 
 Caller: `co-accessibility/macrophage/coaccess_macrophage.Rmd` (through `plot_coaccess_pair()`
 and `select_cre_pairs()`).
+
+## Statistical helpers
+
+Define statistical implementations only in `stats_testing_functions.r` or
+`count_and_test_pairs.py`; notebooks and analysis scripts source/import them.
+Both files are safe to load without running an analysis or writing results.
+R and Python retain separate implementations and the existing output names.
+
+| R function | Purpose |
+|---|---|
+| `fisher_test_counts()` | Two-sided Fisher tests on four-column count tables, explicit pseudocount, optional raw p-values and conditional-MLE odds ratios |
+| `fisher_p_two_sided()` | Shared vectorized hypergeometric p-value engine used by `fisher_test_counts()` |
+| `coaccess_2x2()` | Adapts fiber labels to that test; returns `both, cre1_only, cre2_only, neither, n_shared, fisher_or, fisher_p` |
+| `adjust_bh()` | BH adjustment with an explicit family size and missing-result preservation |
+| `expected_coaccess()` | Expected joint accessibility from raw 2x2 margins |
+| `empirical_pvalue()` | Plus-one empirical p-value with explicit greater/less tail and tie inclusion |
+| `permute_pooled_spearman()` | Within-sample shuffles, pooled and sample-centered rank correlations, null draws and empirical p-values |
+| `spearman_nominal_logp()` | Approximate one-sided Spearman log-p-values for diagnostic plots |
+| `complete_separation_pvalue()` | Special-case exact rank-separation probability |
+| `aggregate_donors()`, `mean_props()`, `complete_summary()` | Grouped count/proportion summaries |
+| `capture_fit()`, `fit_pair()` | Donor-adjusted binomial LRT; separated pairs use Rao p-values and Firth OR/profile intervals |
+
+Python exposes `count_pairs()`, `test_counts()`, `bh()`, and
+`summarize_coaccess_counts()`. Both LCL Python entry points and the macrophage
+`03_coaccess_cres.py` import shared statistical helpers using a path relative to
+their own file, independent of the working directory. Macrophage BH adjustment
+remains per timepoint, after collapsing gene-anchored rows to distinct pairs.
+
+The caller defines the test family: genome-wide pairs, sex-specific pairs,
+ten selected methylation pairs, or informative-donor pairs. Do not pool these
+families when refactoring. Conditional-MLE OR, pseudocount cross-product OR,
+and donor-adjusted OR are distinct outputs. The v3 checkpoint signature includes
+the shared R file's digest so helper changes invalidate old fit checkpoints.
 
 ## `plotting_functions.r`
 
@@ -305,6 +342,10 @@ The LCL notebook contains separate chunks that call `load_region()`,
 `coaccess_region_result()`, `plot_region_panels()`,
 `configuration_proportion_inputs()`, and `plot_stacked_proportion()` to draw the
 figures. The macrophage notebook uses the `plot_coaccess_pair()` wrapper.
+The LCL pooled top-ten, noXCI top-ten and noXCI top-five figures all use the
+existing `plot_region_panels()` renderer. Their deterministic selection of
+window-spanning, co-accessible-first fibers is preserved; the wrapper's optional
+random per-facet downsampling is not substituted for that selection.
 Both notebooks explicitly pass `fire_overlap_fraction = 0.5` to their respective
 entry points: one FIRE element on that fiber must overlap at least 50% of the
 cCRE length. The shared helper default remains any positive overlap for

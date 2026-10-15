@@ -52,6 +52,7 @@ suppressPackageStartupMessages({
   library(dplyr)
 })
 source(file.path(params$code_root, "parsing_functions", "parsing_footprints_functions.r"), local = TRUE)
+source(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r"), local = TRUE)
 source(file.path(params$code_root, "parsing_functions", "plotting_functions.r"), local = TRUE)
 options(scipen = 999)
 ```
@@ -159,7 +160,7 @@ selected[, `:=`(
   region_start = pmax(0L, pmin(cre1_start, cre2_start) - as.integer(params$locus_flank_bp)),
   region_end = pmax(cre1_end, cre2_end) + as.integer(params$locus_flank_bp))]
 selected[, pair_id := sprintf("top%d_%s_%d_%d", seq_len(.N), chrom, region_start, region_end)]
-fwrite(selected, file.path(table_dir, "LCL_top10_pairs.tsv"), sep = "\t")
+fwrite(selected, file.path(coaccess_dir, "LCL_top10_pairs.tsv"), sep = "\t")
 cat(nrow(eligible), "pairs pass the positive-association criteria; selected",
     nrow(selected), "for plotting.\n")
 if (nrow(selected) < 10L)
@@ -262,7 +263,8 @@ ggsave(file.path(plot_dir, "LCL_coaccess_volcano.pdf"), volcano_plot,
 
 ### Load fibers and assign accessibility
 
-`load_region()`, `label_reads()`, and `coaccess_2x2()` come from `parsing_footprints_functions.r`
+`load_region()` and `label_reads()` come from `parsing_footprints_functions.r`;
+`coaccess_2x2()` comes from `stats_testing_functions.r`.
 
 For each of the ten selected pairs, this reloads the fibers from all 31 samples in that pair’s plotting window and get the fibers cover each cCRE and which are accessible. It then builds the 2×2 table
 
@@ -517,8 +519,7 @@ fwrite(sample_sex, file.path(table_dir, "LCL_xci_sample_sex.tsv"), sep = "\t")
 
 f_ratio <- sample_sex[sex == "female (XX)", oe_ratio]
 m_ratio <- sample_sex[sex == "male (XY)", oe_ratio]
-sep_p <- if (min(f_ratio) > max(m_ratio))
-  1 / choose(length(f_ratio) + length(m_ratio), length(f_ratio)) else NA_real_
+sep_p <- complete_separation_pvalue(f_ratio, m_ratio)
 cat(sprintf("%d female and %d male donors; median chrX/autosome O/E %.3f vs %.3f.\n",
             length(f_ratio), length(m_ratio), median(f_ratio), median(m_ratio)))
 cat(if (is.na(sep_p)) "The two groups overlap.\n" else
@@ -569,26 +570,7 @@ Output: `LCL_xci_sex_split_pairs.tsv.gz`
 # min # of reads spanning both CREs
 xci_min_split <- 50L
 
-# fisher test
-# m and n are the two row totals and k is the first column total.
-fisher_p_two_sided <- function(a, b, c, d) {
-  m <- a + b; n <- c + d; k <- a + c
-  out <- numeric(length(a))
-  for (idx in split(seq_along(a), paste(m, n, k, sep = "/"))) {
-    i <- idx[1L]
-    support <- max(0L, k[i] - n[i]):min(k[i], m[i])
-    dens <- dhyper(support, m[i], n[i], k[i])
-    
-    # Sorts the probabilities from smallest to largest and takes a running sum. A table’s two-sided p-value is the total probability of all tables no more likely than it
-    o <- order(dens)
-    ds <- dens[o]
-    grp <- cumsum(c(TRUE, diff(ds) > ds[-length(ds)] * 1e-7))
-    pv <- numeric(length(ds))
-    pv[o] <- as.numeric(tapply(cumsum(ds), grp, max))[grp]
-    out[idx] <- pmin(1, pv[match(a[idx], support)])
-  }
-  out
-}
+# Fisher testing is provided by stats_testing_functions.r.
 
 
 # summarize counts by pair and sex
@@ -628,8 +610,9 @@ keep <- depth[get("female (XX)") >= xci_min_split & get("male (XY)") >= xci_min_
 split_test <- split_counts[CRE_pair %in% keep]
 split_test[, `:=`(
   OR = ((co_closed + 1) * (co_access + 1)) / ((CRE1_access + 1) * (CRE2_access + 1)),
-  pval = fisher_p_two_sided(co_closed + 1, CRE2_access + 1, CRE1_access + 1, co_access + 1))]
-split_test[, fdr := p.adjust(pval, "BH"), by = sex]
+  pval = fisher_test_counts(cbind(co_closed, CRE1_access, CRE2_access, co_access),
+    pseudocount = 1L, estimate = FALSE, include_raw = FALSE)$pval)]
+split_test[, fdr := adjust_bh(pval), by = sex]
 split_test[, significant := fdr < fdr_cutoff & OR > 1 & obs > exp]
 fwrite(split_test, file.path(table_dir, "LCL_xci_sex_split_pairs.tsv.gz"), sep = "\t")
 
@@ -742,7 +725,7 @@ selected_noxci[, `:=`(
   region_end = pmax(cre1_end, cre2_end) + as.integer(params$locus_flank_bp))]
 selected_noxci[, pair_id := sprintf("noXCI_top%d_%s_%d_%d", seq_len(.N), chrom,
                                     region_start, region_end)]
-fwrite(selected_noxci, file.path(table_dir_noxci, "LCL_top10_pairs_noXCI.tsv"), sep = "\t")
+fwrite(selected_noxci, file.path(coaccess_dir, "LCL_top10_pairs_noXCI.tsv"), sep = "\t")
 cat(nrow(eligible_noxci), "pairs pass the positive-association criteria; selected",
     nrow(selected_noxci), "for plotting.\n")
 

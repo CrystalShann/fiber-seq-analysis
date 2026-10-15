@@ -16,7 +16,9 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from LCL_coaccess_cres import CELLS, ROOT, bh, test_counts
+from LCL_coaccess_cres import CELLS, ROOT
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
+from count_and_test_pairs import test_counts, summarize_coaccess_counts
 
 SUFFIX = "_noXCI"
 SEX_DEPTH_CUT = 0.9  # two X copies sit near 1, one copy near 0.5
@@ -113,19 +115,8 @@ def main():
     # statistics exactly as in LCL_coaccess_cres.main()
     cells = result[CELLS].to_numpy(dtype=np.int64)
     result = pd.concat([result, test_counts(cells, pc)], axis=1)
-    result["n_shared_reads"] = cells.sum(axis=1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        result["OR"] = ((result.co_access.astype(float) + pc) * (result.co_closed + pc)) / ((result.CRE1_access + pc) * (result.CRE2_access + pc))
-        result["or_haldane"] = ((result.co_access + 0.5) * (result.co_closed + 0.5)) / ((result.CRE1_access + 0.5) * (result.CRE2_access + 0.5))
-    a = (result.co_access + result.CRE1_access).astype(float)
-    b = result.co_access + result.CRE2_access
-    result["expected_co_access"] = a * b / result.n_shared_reads
-    result["observed_expected_ratio"] = result.co_access / result.expected_co_access.replace(0, np.nan)
-    result["excess_fraction"] = (result.co_access - result.expected_co_access) / result.n_shared_reads
-    result["zero_access_cre1"] = a == 0
-    result["zero_access_cre2"] = b == 0
-    result["fdr"] = bh(result.pval)
-    result["fdr_raw"] = bh(result.pval_raw)
+    result = summarize_coaccess_counts(result, pc)
+    result = result.drop(columns="co_inaccess")
 
     # outside chrX nothing was re-pooled, so everything except the BH family must match
     reference = pooled.set_index("CRE_pair").loc[result.CRE_pair]
