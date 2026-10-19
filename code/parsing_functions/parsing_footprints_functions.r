@@ -1905,6 +1905,90 @@ coaccess_m6a_fraction <- function(m, sp, samples, blocks = NULL) {
 }
 
 
+# ---------------------------------------------------------------------------
+# Per-fiber m6A proportion at one cCRE. One pooled full-span read x position
+# matrix is built for the given samples with assemble_region_m6a(full_span =
+# TRUE, positions = NULL), so its columns are the positions with at least one
+# m6A call on any of those reads; a fiber's proportion = its calls /
+# ncol(matrix). The same column set is used for every fiber. Every input fiber
+# is returned: fibers without a fibertools record, or whose longest alignment
+# does not span the cCRE, keep NA proportions and an explicit status.
+#
+# Inputs:
+#   sample_table - sample_name, fire_dir of the samples to pool
+#   region       - one row: region_id, chr, start (BED, 0-based), end
+#   fibers       - fibers to score: sample_name, original_RID (read name), plus
+#                  any columns to carry through (e.g. donor, state)
+# Output:
+#   list(fibers = the input rows + ft_start, ft_end, full_span, status
+#   ("retained", "excluded_full_span" or "missing_ft_record"), n_m6a_calls,
+#   proportion, n_positions; qc = assemble_region_m6a() per-sample read counts
+#   + n_positions, excluded_full_span_reads; checks = one row of matrix
+#   consistency counts). Stops on missing inputs or inconsistent read IDs
+# ---------------------------------------------------------------------------
+fiber_m6a_proportions <- function(sample_table, region, fibers) {
+  region$analysis_start <- region$start + 1L
+  region$analysis_end <- region$end
+  paths <- file.path(sample_table$fire_dir, "extracted_results", "m6a_by_chr",
+    paste0(sample_table$sample_name, ".ft_extracted_m6a.", region$chr, ".bed.gz"))
+  required <- c(paths, paste0(paths, ".tbi"))
+  if (!all(file.exists(required))) stop("Missing m6A input/index: ", paste(required[!file.exists(required)], collapse = ", "))
+  gr <- GenomicRanges::GRanges(region$chr, IRanges::IRanges(region$analysis_start, region$analysis_end))
+  # Record spans before full_span filtering, including overlapping zero-call reads.
+  audit_records <- data.table::rbindlist(lapply(seq_len(nrow(sample_table)), function(j) {
+    b <- read_ft_bed12(paths[j], region = gr, longest_alignment = TRUE)
+    if (!nrow(b)) return(data.table::data.table(sample_name = character(), original_RID = character(),
+                                               ft_start = integer(), ft_end = integer(), full_span = logical()))
+    data.table::data.table(sample_name = sample_table$sample_name[j], original_RID = as.character(b$RID),
+      ft_start = b$start, ft_end = b$end,
+      full_span = b$start <= region$start & b$end >= region$end)
+  }))
+  stopifnot(!anyDuplicated(audit_records[, .(sample_name, original_RID)]))
+  audit <- merge(data.table::as.data.table(fibers), audit_records,
+    by = c("sample_name", "original_RID"), all.x = TRUE, sort = FALSE)
+  audit[, status := data.table::fifelse(is.na(full_span), "missing_ft_record",
+                    data.table::fifelse(full_span, "retained", "excluded_full_span"))]
+
+  assembled <- assemble_region_m6a(sample_table, region, modality = "m6a",
+    full_span = TRUE, positions = NULL, matrix_dir = NULL, reuse = FALSE)
+  mat <- assembled$met_mat
+  meta <- data.table::as.data.table(assembled$rids_df)
+  positions <- as.integer(colnames(mat))
+  stopifnot(identical(rownames(mat), as.character(meta$RID)),
+            !anyDuplicated(meta[, .(sample_name, original_RID)]),
+            identical(meta$RID, paste(meta$sample_name, meta$original_RID, sep = "::")),
+            ncol(mat) > 0L, !anyNA(mat), all(mat@x %in% c(0, 1)),
+            !anyNA(positions), !anyDuplicated(positions),
+            identical(positions, sort(positions)),
+            all(positions >= region$analysis_start & positions <= region$analysis_end),
+            all(Matrix::colSums(mat) > 0),
+            all(meta$start <= region$analysis_start & meta$end >= region$analysis_end),
+            nrow(meta) == sum(audit_records$full_span))
+  expected_ids <- audit_records[full_span == TRUE, paste(sample_name, original_RID, sep = "::")]
+  stopifnot(setequal(meta$RID, expected_ids))
+
+  # Subset rows only: every sample/state/donor retains this exact column set.
+  rows <- match(paste(audit$sample_name, audit$original_RID, sep = "::"), meta$RID)
+  present <- !is.na(rows)
+  stopifnot(identical(present, audit$status == "retained"))
+  matched_mat <- mat[rows[present], , drop = FALSE]
+  stopifnot(identical(colnames(matched_mat), colnames(mat)))
+  audit[, `:=`(n_m6a_calls = NA_real_, proportion = NA_real_, n_positions = ncol(mat))]
+  audit[present, `:=`(n_m6a_calls = as.numeric(Matrix::rowSums(matched_mat)),
+                     proportion = as.numeric(Matrix::rowSums(matched_mat)) / ncol(mat))]
+  stopifnot(all(audit$proportion[present] >= 0 & audit$proportion[present] <= 1))
+
+  qc <- data.table::as.data.table(assembled$qc)
+  qc[, `:=`(n_positions = ncol(mat),
+            excluded_full_span_reads = overlapping_reads - full_span_reads)]
+  checks <- data.table::data.table(n_positions = ncol(mat),
+    n_matrix_reads = nrow(mat), n_shared_matrix_reads = nrow(matched_mat),
+    consistent_columns = identical(colnames(mat), colnames(matched_mat)),
+    binary_matrix = TRUE, positions_observed_in_pooled_matrix = TRUE)
+  list(fibers = audit, qc = qc, checks = checks)
+}
+
+
 # Statistical helpers (including coaccess_2x2) live in stats_testing_functions.r.
 
 

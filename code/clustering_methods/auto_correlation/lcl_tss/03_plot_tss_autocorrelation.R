@@ -12,8 +12,7 @@
 #'   06_paired_comparison.pdf     the PRIMARY statistic: paired per-gene peak height
 #'                                and lag, one line per matched pair
 #'
-#' Curves start at lag 25 bp: the lag-0 shoulder dominates any shared axis and carries
-#' no nucleosome information.
+
 
 suppressPackageStartupMessages({ library(data.table) })
 

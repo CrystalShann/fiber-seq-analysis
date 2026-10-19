@@ -14,61 +14,29 @@ params:
   chrom: null
 ---
 
-# Model and scope
+# Adjust for donor effect in co-accessibility analysis using logisitc regression
 
-The default runs every covered pair genome-wide, twice: **all_chr** uses
-all samples on every chromosome; **noXCI** uses male samples only on chrX and
-all samples elsewhere. Existing sex calls are required and never recomputed.
-Samples are first summed within the existing `donor` (cell-line) column.
-No CRAM, FIRE, or methylation track is read. The Python scripts and existing
-pooled results are read-only references.
+whether, within a donor, fibers where CRE1 is open are more likely to have CRE2 open?
 
-For each donor, two grouped-binomial rows represent all shared reads exactly:
+Samples are first summed within the existing `donor` 
+
+For each donor, two grouped-binomial rows represent all shared reads:
 
 | CRE1 status `x` | CRE2 open `y1` | CRE2 closed `y0` |
 |---|---|---|
 | 0 | `CRE2_access` | `co_closed` |
 | 1 | `co_access` | `CRE1_access` |
 
-Donors with fewer than `min_reads_per_donor` reads, constant CRE1 status, or
-constant CRE2 status are excluded separately for each pair. `n_donors_total`
-counts donors represented before this filter, including donors with zero reads;
-`n_donors_informative` counts retained donors. All reported adjusted cells and
-`n_shared_reads` refer only to retained donors. The original pooled cells and
-statistics are separately labelled.
-
-The full model adds `x` to donor-specific intercepts. Its likelihood-ratio test
-against the donor-only null has one degree of freedom. With one informative
-donor, these are `~ x` and `~ 1`. The positive-association p-value is `p_LRT / 2`
-when beta > 0 and `1 - p_LRT / 2` otherwise. No Wald p-value or pseudocount is
-used for non-separated pairs. Their confidence intervals are 95% likelihood-profile
-intervals; a failed profile falls back to a flagged Wald interval only.
-Separated pairs instead use a Rao score test and Firth odds ratios with penalized
-profile-likelihood intervals, as described below.
-
-BH is applied once after combining chromosomes, separately for the two analyses.
-Its family is all pairs with at least one informative donor, including separated
-pairs. Truly failed fits retain NA statistics but still count in this family
-(equivalent to a conservative p=1 placeholder for multiplicity only).
-Zero-coverage pairs are excluded, matching the original notebook; covered pairs
-with no informative donors remain as rows outside BH. Set `chrom: "chr21"`
-for a smoke test: its FDR is explicitly chromosome-scoped, and its outputs are
-isolated from genome-wide outputs. The original pooled FDR remains genome-wide
-even in this smoke-test comparison.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
                      cache = FALSE, fig.width = 9, fig.height = 6)
 suppressPackageStartupMessages({library(data.table); library(ggplot2)})
 source(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r"), local = TRUE)
-.libPaths(c(file.path(params$root, "coaccess", "donor_adjusted", "R_library"), .libPaths()))
-if (!requireNamespace("logistf", quietly = TRUE))
-  stop("Install logistf before running this notebook; no substitute estimator is used.")
-# Avoid data.table thread multiplication inside forked fitting workers.
 data.table::setDTthreads(1L)
 ```
 
-# Load inputs
+## Load inputs
 
 ```{r load-inputs}
 chrom_scope <- params$chrom
@@ -83,15 +51,15 @@ sex <- fread(input_paths[["sex"]])
 pooled <- fread(input_paths[["pooled"]])
 annotation_columns <- c("CRE_pair", "CRE1", "CRE2", "chrom", "cre1_start", "cre1_end",
   "cre2_start", "cre2_end", "dist", "CRE_pair_labels", "gene_ids", "gene_names", "n_genes")
-# Preserve the ORIGINAL genome-wide positive pooled top ten for the comparison.
+
 top10_genome_wide <- copy(pooled[!is.na(fdr) & fdr < 0.05 & !is.na(OR) & OR > 1 &
                           co_access > expected_co_access])
 setorderv(top10_genome_wide, c("fdr", "OR", "n_shared_reads", "CRE_pair"), c(1L, -1L, -1L, 1L))
 top10_genome_wide <- head(top10_genome_wide, 10L)[, .(CRE_pair, pooled_rank = seq_len(.N))]
 
-# Counts are already collapsed by sample: do not expand them into individual reads.
+
 counts <- fread(input_paths[["counts"]])
-# Match the original notebook: exclude pairs absent from pooled results.
+
 counts <- counts[CRE_pair %in% pooled$CRE_pair]
 ann <- pooled[, .(CRE_pair, OR_pooled = OR, fdr_pooled = fdr, n_shared_reads_pooled = n_shared_reads,
                    co_access_pooled = co_access, expected_co_access_pooled = expected_co_access)]
@@ -110,56 +78,51 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 cat(nrow(annotations), "pairs; FDR scope:", fdr_scope, "\n")
 ```
 
-# Aggregate by donor
+#### Aggregate by donor
 
-The noXCI sample filter is applied **before** donor aggregation. Donors excluded
-as uninformative are never pooled with other donors to rescue a fit.
+sums the four cell counts within each (CRE_pair, chrom, donor) group
+
+- donor_all uses every sample on every chr
+- donor_male_x keeps only chrX rows from samples with male
 
 ```{r aggregate-by-donor}
-# Shared implementation: stats_testing_functions.r.
+# tats_testing_functions.r.
 donor_all <- aggregate_donors(counts)
 male_samples <- sex[sex == "male (XY)", sample_name]
 stopifnot(length(male_samples) > 0L)
 donor_male_x <- aggregate_donors(counts[chrom == "chrX" & sample_name %in% male_samples])
 rm(counts)
-invisible(gc())
+
+print(head(donor_all))
+print(head(donor_male_x))
 ```
 
-# Fit function
+## Fit the regression model
 
-Separation is detected from cells before fitting. Positive separation means
-every informative donor has `CRE1_access == 0 | CRE2_access == 0`; negative
-separation means every informative donor has `co_access == 0 | co_closed == 0`.
-These pairs use `anova(null, full, test = "Rao")` for the p-value, with direction
-from the separation sign. Their effect is estimated by `logistf` using the same
-donor + x model and penalized profile-likelihood intervals for x only.
-Four binary rows per donor, weighted by the four cell counts, give the same
-likelihood and information as the individual reads; zero-weight rows are removed.
-Firth p-values are not used. See the
-[logistf reference](https://search.r-project.org/CRAN/refmans/logistf/help/logistf.html)
-for case weights and penalized profile intervals. Warnings and fallback reasons
-are recorded; Firth failures are never replaced by huge ordinary GLM effects.
+For every CRE pair, the model asks whether CRE2 being open on a fiber depends on CRE1 being open, after accounting for which donor the fiber came from.
 
-`fit_pair()` and `capture_fit()` are sourced from `stats_testing_functions.r`.
+Each read (fiber) covering both CREs has two binary outcomes: whether CRE1 is open (x) and whether CRE2 is open (y). The model is a logistic regression with CRE2 as the response:
+ **logit P(CRE2 open) = donor + beta x (x)**
 
-# Parallel fitting and summary
+  - donor is a separate intercept for each donor - donor’s baseline log-odds that CRE2 is open when CRE1 is closed
+  - beta is a coefficient shared across all donors. It is the change in log-odds of CRE2 being open when CRE1 is open, within a donor
+  - the reported odds ratio is OR_adj = exp(beta)
 
-Per-chromosome fit summaries live only under `coaccess/donor_adjusted/summary/`.
-Their key includes MD5
-digests of all three inputs, the minimum donor depth, fitting/aggregation code,
-R version, and `logistf` version. Each chromosome is an atomic checkpoint.
-An unchanged knit reads these checkpoints instead of refitting. The chr21 smoke
-summary is reusable in a later genome-wide run. Outside chrX the two analyses have
-identical data and reuse the same fits, but their BH corrections are separate.
-The number of cores does not change the summary key or statistical method.
+x is the CRE1 accessibility status of a fiber: a binary indicator
+
+  - x = 1 means CRE1 is open on that fiber
+  - x = 0 means CRE1 is closed on that fiber
+
 
 ```{r parallel-and-summary-functions}
+
 hash_object <- function(x) {
   tmp <- tempfile(fileext = ".rds")
   on.exit(unlink(tmp))
   saveRDS(x, tmp, version = 3)
   unname(tools::md5sum(tmp))
 }
+
 atomic_rds <- function(x, path) {
   partial <- paste0(path, ".partial")
   if (file.exists(path) || file.exists(partial))
@@ -167,6 +130,8 @@ atomic_rds <- function(x, path) {
   saveRDS(x, partial)
   if (!file.rename(partial, path)) stop("Atomic summary rename failed: ", path)
 }
+
+
 fit_chromosome <- function(d, chromosome, male_only = FALSE) {
   expected_ids <- sort(unique(d$CRE_pair), method = "radix")
   fit_summary_file <- file.path(fit_summary_dir, paste0(chromosome,
@@ -196,6 +161,8 @@ fit_chromosome <- function(d, chromosome, male_only = FALSE) {
   atomic_rds(list(signature = summary_signature, fits = fits), fit_summary_file)
   fits
 }
+
+
 run_analysis <- function(analysis_name) {
   chromosomes <- unique(annotations$chrom)
   fits <- rbindlist(lapply(chromosomes, function(chr) {
@@ -237,6 +204,8 @@ run_analysis <- function(analysis_name) {
   setorder(out, chrom, CRE_pair)
   out
 }
+
+
 summary_signature <- hash_object(list(inputs = input_md5,
   min_reads_per_donor = params$min_reads_per_donor,
   statistics_md5 = tools::md5sum(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r")),

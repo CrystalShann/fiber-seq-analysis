@@ -143,7 +143,8 @@ Read IDs are `<sample_name>::<read name>`; `rids_df$original_RID` keeps the read
 
 Callers: the Leiden workflows (`leiden_manhattan_cluster_regions()`, `run_lcl_clustering()`,
 `leiden_LCL.Rmd`, `marcophage_leiden_manhattan.Rmd`, `05_vis_fire_freq.Rmd`, `TF_enrichment.ipynb`),
-the Snakemake step `scripts/assemble_raw_reads.R`, the LCL autocorrelation input
+the Snakemake step `scripts/assemble_raw_reads.R`, `fiber_m6a_proportions()`
+(`co-accessibility/LCL/LCL_co-access_v2_perm_methy_prop.Rmd`), the LCL autocorrelation input
 (`code/haplotype_phasing/LCL_phased_m6a_input.r`, every base as columns) and the
 topic model (`assemble_region_met_data()` in `code/topic_model/topic_modelling_functions.r`,
 the only CpG caller).
@@ -201,6 +202,7 @@ and TF footprint tracks are display only. Fibers are keyed `"<sample> <read name
 | `label_reads()` | Per-fiber configuration at the pair: accessible when one of its FIRE elements overlaps the cCRE by >= 1 bp; `read_rule = "any"` or `"contain"` | data.table `key, sample_name, shared, acc1, acc2, config` |
 | `order_reads()` | Raster order: sample, configuration, start | character vector of keys |
 | `coaccess_m6a_fraction()` | Unbinned m6A fraction per position and sample over covering fibers | data.table `pos, sample_name, frac` |
+| `fiber_m6a_proportions()` | Per-fiber m6A proportion at one cCRE: calls / positions with at least one call in the pooled full-span `assemble_region_m6a()` matrix; every input fiber kept with an exclusion status | list `fibers, qc, checks` |
 | `cre_class_from_id()` | cCRE class from a `CRE_ID` (`accession1.accession2.class`) | character |
 | `select_cre_pairs()` | Keeps the pairs whose classes match `cre_types` (NULL = any); `cre_match = "either"`, `"both"` or `"pair"` (with `cre_types2`); pairs are unordered | rows of the pair table |
 
