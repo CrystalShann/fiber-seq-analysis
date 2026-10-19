@@ -1,0 +1,579 @@
+---
+title: "LCL single-TF frequency comparison"
+output: html_document
+params:
+  out: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/tf_co-occ"
+  min_fibers: 10
+  cores: 2
+  top_n: 5
+  run_frequencies: true
+  run_examples: true
+---
+
+```{r setup, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(patchwork)
+setDTthreads(1L)
+code <- '/project/spott/cshan/fiber-seq/code'
+out <- normalizePath(params$out, mustWork=TRUE)
+dest <- file.path(out, 'analysis/single_tf_adjusted')
+required <- c('cre_covariates.tsv.gz','motif_sample_counts.tsv.gz','motifs.tsv.gz','samples.tsv')
+missing <- required[!file.exists(file.path(out,required))]
+if(length(missing)) stop('Missing ',paste(missing,collapse=', '),
+  '. Run prepare for samples.tsv; FIMO for motifs.tsv.gz; count then combine for count/covariate tables.')
+stopifnot(params$min_fibers > 0, params$cores >= 1, params$top_n >= 0)
+dir.create(file.path(dest,'plots'),recursive=TRUE,showWarnings=FALSE)
+source(file.path(code,'parsing_functions/plotting_functions.r'))
+write_tsv <- function(x,name) fwrite(x,file.path(dest,name),sep='\t',na='NA')
+save_plot <- function(p,name,w=10,h=6) ggsave(file.path(dest,'plots',name),p,width=w,height=h,limitsize=FALSE)
+```
+
+This report is descriptive: there are no statistical tests, p-values, confidence
+intervals or multiple-testing corrections. `single_tf_adjusted` refers to the
+existing donor-adjusted co-accessibility labels, not adjustment of TF frequencies.
+For each motif, donor and set, bound frequency is total bound fibers divided by
+total informative fibers across motif-bearing CREs. Only donors with a nonzero
+denominator in both sets contribute to paired summaries. Zero denominators are
+missing, never zero frequencies. All eligible CREs contribute to motif presence.
+
+### Motif, read and footprint overlap criteria
+
+- A covered read must cover the **entire CRE in aligned blocks**, not just its
+  outer alignment span.
+- Accessibility requires **one same-fiber FIRE element overlapping at least 50%
+  of the CRE**, with the overlap counted only in aligned bases.
+- Binding requires an accessible read with a FiberHMM record and a **10–80 bp
+  footprint with per-block score >=50**. The footprint must lie completely inside
+  a same-fiber FIRE element, and one footprint must overlap **>=50% of the motif
+  instance's bases**. This is a fraction of motif length, not footprint length;
+  overlaps from separate footprints are not added together.
+- Any qualifying instance gives one bound observation per **CRE × motif × read**.
+  Missing FiberHMM records are excluded from the denominator; an observed record
+  without qualifying support is accessible-unbound. Motif presence simply means
+  at least one saved FIMO hit in that CRE, without a footprint requirement.
+- Example plots additionally require a read spanning the complete plotting
+  window. Window-centering support uses these full-span molecules in the initial
+  CRE-centered window, followed by rebuilding the final motif-centered window.
+
+```{r inputs, eval=params$run_frequencies}
+cre <- fread(file.path(out,'cre_covariates.tsv.gz'))
+stopifnot(all(c('CRE_ID','chrom','start','end','CRE_class','set_adjusted','n_accessible',
+  'n_informative','prop_act','length','motif_count') %in% names(cre)),!anyDuplicated(cre$CRE_ID))
+cre <- cre[set_adjusted %in% c('background','co-access') &
+  n_accessible>=params$min_fibers & n_informative>=params$min_fibers]
+cre[,set:=set_adjusted]
+stopifnot(nrow(cre)>0,all(is.finite(cre$prop_act)),all(cre$length>0),!anyNA(cre$CRE_class))
+write_tsv(cre,'eligible_cres.tsv.gz')
+write_tsv(cre[,.(n_CREs=.N,median_prop_act=median(prop_act),median_length=median(length),
+  median_motif_count=median(motif_count)),by=set],'set_balance.tsv')
+write_tsv(cre[,.N,by=.(CRE_class,set)],'set_balance_CRE_class.tsv')
+hits <- fread(file.path(out,'motifs.tsv.gz'),select=c('CRE_ID','motif_id','TF_label'))
+labels <- unique(hits[,.(motif_id,TF_label)])
+stopifnot(!anyDuplicated(labels$motif_id),!anyNA(labels$TF_label))
+instances <- unique(hits[,.(CRE_ID,motif_id)])
+ids <- sort(labels$motif_id)
+mc <- fread(file.path(out,'motif_sample_counts.tsv.gz'),
+  select=c('CRE_ID','motif_id','sample_name','donor','n_accessible','n_informative','n_bound'))
+samples <- fread(file.path(out,'samples.tsv'))
+stopifnot(nrow(samples)==31L,!anyDuplicated(samples$sample_name),
+  setequal(unique(mc$sample_name),samples$sample_name),
+  all(mc$donor == samples$donor[match(mc$sample_name,samples$sample_name)]),
+  !anyNA(mc),all(mc$n_bound>=0),all(mc$n_bound<=mc$n_informative),
+  all(mc$n_informative<=mc$n_accessible))
+mc <- merge(mc[CRE_ID %in% cre$CRE_ID],cre[,.(CRE_ID,set)],by='CRE_ID')
+donor_counts <- mc[,.(n_bound=sum(n_bound),n_informative=sum(n_informative),
+  n_CREs=uniqueN(CRE_ID),n_informative_CREs=uniqueN(CRE_ID[n_informative>0])),by=.(motif_id,donor,set)]
+donor_counts <- merge(CJ(motif_id=ids,donor=unique(samples$donor),set=c('background','co-access')),
+  donor_counts,by=c('motif_id','donor','set'),all.x=TRUE)
+for(nm in c('n_bound','n_informative','n_CREs','n_informative_CREs'))
+  set(donor_counts,which(is.na(donor_counts[[nm]])),nm,0)
+donor_counts[,frequency:=fifelse(n_informative>0,n_bound/n_informative,NA_real_)]
+write_tsv(donor_counts,'single_tf_donor_frequencies.tsv.gz')
+rm(mc,hits);invisible(gc())
+```
+
+```{r frequencies, eval=params$run_frequencies}
+frequency_summary <- function(id) {
+  d <- donor_counts[motif_id==id]
+  paired <- dcast(d,donor~set,value.var='frequency')
+  paired <- paired[is.finite(background) & is.finite(`co-access`)]
+  ans <- data.table(motif_id=id,status=if(nrow(paired)) 'ok' else 'no_paired_donors',
+    n_paired_donors=nrow(paired),
+    background_frequency=if(nrow(paired)) median(paired$background) else NA_real_,
+    coaccess_frequency=if(nrow(paired)) median(paired[['co-access']]) else NA_real_,
+    median_paired_difference=if(nrow(paired)) median(paired[['co-access']]-paired$background) else NA_real_)
+  # No pseudocount: zero/zero is undefined; positive/zero is infinite.
+  ratio <- paired[['co-access']]/paired$background
+  ans$median_paired_log2_ratio <- if(any(!is.na(ratio))) median(log2(ratio),na.rm=TRUE) else NA_real_
+  pr <- data.table(motif_id=id)
+  present <- instances[motif_id==id,CRE_ID]
+  for(g in c('background','co-access')) {
+    prefix <- if(g=='co-access') 'coaccess' else g
+    z <- d[set==g];n <- sum(z$n_informative)
+    ans[[paste0(prefix,'_n_bound')]] <- sum(z$n_bound)
+    ans[[paste0(prefix,'_n_informative')]] <- n
+    ans[[paste0(prefix,'_pooled_frequency')]] <- if(n>0) sum(z$n_bound)/n else NA_real_
+    c <- cre[set==g]
+    pr[[paste0(prefix,'_n_CREs')]] <- nrow(c)
+    pr[[paste0(prefix,'_n_with_motif')]] <- sum(c$CRE_ID %in% present)
+    pr[[paste0(prefix,'_fraction')]] <- if(nrow(c)) mean(c$CRE_ID %in% present) else NA_real_
+  }
+  pr[,difference:=coaccess_fraction-background_fraction]
+  list(occupancy=ans,presence=pr)
+}
+results <- parallel::mclapply(ids,frequency_summary,mc.cores=as.integer(params$cores))
+stopifnot(!any(vapply(results,inherits,logical(1),'try-error')))
+occupancy <- merge(rbindlist(lapply(results,`[[`,'occupancy')),labels,by='motif_id')
+presence <- merge(rbindlist(lapply(results,`[[`,'presence')),labels,by='motif_id')
+top <- occupancy[status=='ok' & median_paired_difference>0][order(-median_paired_difference,motif_id)]
+top <- head(top[!duplicated(TF_label)],params$top_n)
+write_tsv(occupancy,'single_tf_occupancy.tsv.gz')
+write_tsv(presence,'single_tf_presence.tsv.gz')
+write_tsv(top,'top5_motifs.tsv')
+saveRDS(list(params=params,occupancy=occupancy,presence=presence,top=top,session=sessionInfo()),
+  file.path(dest,'single_tf_results.rds'))
+knitr::kable(top)
+```
+
+```{r frequency-plots, eval=params$run_frequencies}
+p <- ggplot(occupancy[status=='ok'],aes(100*background_frequency,100*coaccess_frequency))+
+  geom_abline(slope=1,intercept=0,linetype=2,color='grey50')+geom_point(color='#bdbdbd',alpha=.6)+
+  geom_point(data=top,color='#d95f02')+
+  ggrepel::geom_text_repel(data=top,aes(label=TF_label),max.overlaps=Inf,size=3)+
+  coord_equal(xlim=c(0,100),ylim=c(0,100))+
+  labs(x='Background: median donor bound frequency (%)',y='Co-access: median donor bound frequency (%)',
+    title='Single-TF occupancy frequencies',caption='Descriptive comparison; no significance tests.')+theme_fiberseq()
+save_plot(p,'occupancy_frequency_comparison.pdf',8,7);print(p)
+d <- head(occupancy[status=='ok'][order(-median_paired_difference,motif_id)],25)
+d[,label:=paste0(TF_label,' (',motif_id,')')]
+d[,label:=factor(label,levels=rev(label))]
+p <- ggplot(d,aes(100*median_paired_difference,label))+
+  geom_segment(aes(x=0,xend=100*median_paired_difference,yend=label),color='#c7c7c7')+
+  geom_point(aes(color=motif_id %in% top$motif_id),size=3)+geom_vline(xintercept=0,linetype=2)+
+  scale_color_manual(values=c('FALSE'='#3274a1','TRUE'='#d95f02'),name='Top selected TF')+
+  labs(x='Median paired donor difference (percentage points)',y=NULL,title='Top 25 motifs by frequency difference')+theme_fiberseq()
+save_plot(p,'occupancy_frequency_lollipop.pdf',10,9);print(p)
+if(nrow(top)) {
+  d <- merge(donor_counts[motif_id %in% top$motif_id],top[,.(motif_id,TF_label)],by='motif_id')
+  d[,set:=factor(set,levels=c('background','co-access'))]
+  p <- ggplot(d,aes(set,100*frequency,group=donor))+geom_line(color='grey70',na.rm=TRUE)+
+    geom_point(aes(color=set),na.rm=TRUE)+facet_wrap(~TF_label)+
+    scale_color_manual(values=c(background='#3274a1','co-access'='#d95f02'))+
+    labs(x=NULL,y='Bound frequency (%)',color=NULL,title='Each line connects one donor')+theme_fiberseq()
+  save_plot(p,'top5_paired_donor_frequencies.pdf',12,7);print(p)
+}
+```
+
+```{r logos, eval=params$run_frequencies}
+# Scanner uses this path by default; retain its environment override if supplied.
+meme <- Sys.getenv('LCL_TF_MOTIFS','/project/spott/cshan/annotations/JASPAR2026_CORE_vertebrates_non-redundant_pfms_meme.txt')
+read_meme <- function(path,ids) {
+  lines <- readLines(path); starts <- grep('^MOTIF ',lines); result <- list()
+  for(i in starts) {
+    id <- strsplit(trimws(lines[i]),'\\s+')[[1]][2]
+    if(!id %in% ids) next
+    j <- which(seq_along(lines)>i & grepl('^letter-probability matrix:',lines))[1]
+    width <- as.integer(sub('.* w=\\s*([0-9]+).*','\\1',lines[j]))
+    mat <- as.matrix(read.table(text=paste(lines[j+seq_len(width)],collapse='\n')))
+    stopifnot(ncol(mat)==4,all(is.finite(mat)),all(mat>=0),all(abs(rowSums(mat)-1)<1e-3))
+    result[[id]] <- mat/rowSums(mat)
+  }
+  stopifnot(all(ids %in% names(result)));result
+}
+draw_information_logo <- function(mat,max_width) {
+  heights <- mat*pmax(0,2+rowSums(mat*log2(pmax(mat,.Machine$double.xmin))))
+  font <- systemfonts::match_fonts('sans',weight='bold')
+  glyph <- systemfonts::glyph_info(c('A','C','G','T'),path=font$path)
+  outlines <- systemfonts::glyph_outline(glyph$index,path=font$path,size=100)
+  pieces <- list()
+  for(i in seq_len(nrow(mat))) {
+    bottom <- 0
+    for(j in order(heights[i,])) {
+      h <- heights[i,j];if(h<1e-5) next
+      g <- as.data.table(outlines[outlines$glyph==j,])
+      g[,`:=`(x=i-.45+.9*(x-min(x))/diff(range(x)),
+        y=bottom+h*(y-min(y))/diff(range(y)),base=c('A','C','G','T')[j],letter=paste(i,j))]
+      pieces[[length(pieces)+1L]] <- g;bottom <- bottom+h
+    }
+  }
+  d <- rbindlist(pieces)
+  p <- ggplot()+scale_fill_manual(values=c(A='#2b8c4b',C='#2878b5',G='#e3a018',T='#d94b45'),guide='none')+
+    scale_x_continuous(limits=c(.5,max_width+.5))+scale_y_continuous(limits=c(0,2),breaks=c(0,2))+
+    labs(x=NULL,y='bits')+theme_fiberseq()+theme(axis.text.x=element_blank(),axis.ticks.x=element_blank())
+  if(nrow(d)) p <- p+geom_polygon(data=d,aes(x,y,group=letter,subgroup=contour,fill=base),rule='evenodd')
+  p
+}
+if(nrow(top)) {
+  matrices <- read_meme(meme,top$motif_id)
+  saveRDS(list(path=normalizePath(meme),md5=tools::md5sum(meme),matrices=matrices),file.path(dest,'logo_matrices.rds'))
+  h <- merge(top[,.(motif_id,TF_label,background_frequency,coaccess_frequency)],
+    presence[,.(motif_id,background_fraction,coaccess_fraction)],by='motif_id')
+  h <- h[match(top$motif_id,motif_id)]
+  h[,label:=paste0(TF_label,' (',motif_id,')')]
+  long <- melt(h,id.vars=c('motif_id','TF_label','label'),measure.vars=c('coaccess_fraction','background_fraction',
+    'background_frequency','coaccess_frequency'),variable.name='metric',value.name='value')
+  long[,`:=`(value=100*value,label=factor(label,levels=rev(h$label)))]
+  limits <- c(floor(min(long$value)),ceiling(max(long$value)))
+  if(diff(limits)==0) limits <- limits+c(-.5,.5)
+  heat <- ggplot(long,aes(metric,label,fill=value))+geom_tile()+
+    geom_text(aes(label=sprintf('%.1f%%',value),color=value>mean(limits)),size=3)+
+    scale_color_manual(values=c('FALSE'='#222222','TRUE'='white'),guide='none')+
+    scale_fill_distiller(palette='Blues',direction=1,limits=limits,name='%')+
+    scale_x_discrete(labels=c('Co-access\npresence','Background\npresence','Background\nbound','Co-access\nbound'),position='top')+
+    labs(x=NULL,y=NULL)+theme_fiberseq()+theme(axis.line=element_blank())
+  logos <- wrap_plots(lapply(top$motif_id,function(id) draw_information_logo(matrices[[id]],max(vapply(matrices,nrow,integer(1))))),ncol=1)
+  p <- (heat+logos)+plot_layout(widths=c(1.8,3))+plot_annotation(
+    title='Top TFs by frequency difference: motif presence and median donor bound frequency',
+    caption='Presence: all eligible CREs. Bound: medians across paired donors, conditional on motif-bearing, informative CREs.')
+  save_plot(p,'top5_heatmap_logos.pdf',15,max(4,nrow(top)*1.1));print(p)
+} else {
+  p <- ggplot()+annotate('text',x=0,y=0,label='No TFs have a positive median paired donor frequency difference')+theme_void()
+  save_plot(p,'top5_heatmap_logos.pdf');print(p)
+}
+```
+
+Assumptions and limitations: rankings use positive median within-donor differences,
+with ties broken by motif ID and one motif retained per TF label. No significance
+claim is made. Donors contribute equally to the median; within each donor, CREs
+are weighted by their informative fiber counts. Pooled frequencies are also
+reported. The two marginal medians need not differ by the median paired difference.
+The MEME path uses the FIMO wrapper default or `LCL_TF_MOTIFS`; historical scan
+overrides must be supplied again because scan command provenance was not retained.
+Residual confounding by accessibility, CRE class, length and motif copy number
+remains. Related motifs can move together. Background is limited to the tested
+pair universe, and shared CREs/pairs/fibers create dependence. Example regions
+are illustrations, not tests. Missing FiberHMM records never count as unbound.
+
+Example plotting conventions: deciles are calculated across all eligible CREs
+(duplicate quantile boundaries are collapsed). For each ranked TF, select the
+most informative unused co-access CRE whose decile has an unused background,
+then the most informative background in that decile; ties use CRE ID. CRE IDs
+are never reused. Windows use the notebook's 1-based inclusive midpoint +/-500 bp.
+Anchor support is counted among initial-window full-span molecules. All 31 LCLs
+enter assembly, with only samples contributing retained molecules sent to feature
+extraction. Accessible molecules missing FiberHMM records and molecules failing
+full CRE alignment are excluded from displayed states and recorded in the audit.
+The cluster-profile helper's internal `time` field carries motif state, not time.
+The cCRE track uses the same annotation BED as the notebook. The CRE track uses
+the smallest saved adjusted FDR among valid pairs passing the raw coverage filter;
+this is a pre-existing co-accessibility annotation, not a new TF significance test.
+
+## Example regions
+
+Run this section after the frequency outputs exist. `run_frequencies = FALSE`
+reuses those outputs; `run_examples = FALSE` skips read-level extraction and plots.
+Selection, motif centering, final-window rebuilding, and panels 3A–3E are all
+implemented here in R. The existing LCL shell extractor only slices indexed files.
+
+```{r example-functions, eval=params$run_examples, message=FALSE}
+# Descriptive top-TF examples; all analysis stages run directly in R.
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(ggplot2); library(Matrix)
+  library(GenomicRanges); library(Rsamtools); library(igraph)
+  library(ComplexHeatmap); library(cowplot); library(grid); library(patchwork)
+})
+setDTthreads(1L)
+code <- '/project/spott/cshan/fiber-seq/code'
+out <- normalizePath(params$out, mustWork=TRUE)
+dest <- file.path(out,'analysis/single_tf_adjusted')
+example_root <- file.path(dest,'example_regions')
+source(file.path(code,'parsing_functions/parsing_footprints_functions.r'))
+source(file.path(code,'clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r'))
+source(file.path(code,'parsing_functions/plotting_functions.r'))
+source(file.path(code,'clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r'))
+extract_script <- file.path(code,'parsing_functions/extract_region_result_lcl.sh')
+stopifnot(file.exists(extract_script))
+state_levels <- c('bound','accessible-unbound','inaccessible')
+state_colors <- c(bound='#d95f02','accessible-unbound'='#3274a1',inaccessible='#bdbdbd')
+
+# Import the same named Rmd chunks as the notebook, preserving their environments.
+reference_lines <- readLines(file.path(code,'fire_frequency/05_vis_fire_freq.Rmd'))
+reference_chunk <- function(name) {
+  a <- grep(paste0('^```\\{r[[:space:]]+',name,'([,[:space:]]|\\})'),reference_lines)
+  stopifnot(length(a)==1)
+  b <- which(seq_along(reference_lines)>a & grepl('^```[[:space:]]*$',reference_lines))[1]
+  paste(reference_lines[seq.int(a+1,b-1)],collapse='\n')
+}
+reference_style <- new.env(parent=globalenv())
+reference_style$input_dir <- dest
+reference_style$sample_names <- character()
+eval(parse(text=reference_chunk('top10_examples_setup')),reference_style)
+eval(parse(text=reference_chunk('top10_examples_functions')),reference_style)
+for(nm in c('example_theme_settings','window_breaks','example_title','stack_rows','molecule_tracks',
+            'interval_track_inputs','bar_width','bar_gap','molecule_xlim','plot_molecules','fp_cols'))
+  assign(nm,get(nm,reference_style),envir=globalenv())
+example_title <- function(ex) paste(ex$selection_TF,ex$set,paste0(ex$chrom,':',ex$start,'-',ex$end))
+example_dir <- function(ex) file.path(example_root,ex$example_id)
+example_figure_path <- function(ex,panel,description)
+  file.path(example_dir(ex),paste0(ex$example_id,'_',panel,'_',description,'.pdf'))
+
+# Tabix inputs and footprint rules mirror count(); all intervals here are BED half-open.
+slice_bed <- function(path,chrom,start,end) {
+  stopifnot(file.exists(path),file.exists(paste0(path,'.tbi')))
+  con <- TabixFile(path);open(con);on.exit(close(con))
+  if(!chrom %in% seqnamesTabix(con)) return(list())
+  strsplit(scanTabix(con,param=GRanges(chrom,IRanges(max(1L,start+1L),end)))[[1]],'\t',fixed=TRUE)
+}
+blocks <- function(f,footprint=FALSE) {
+  sizes <- as.numeric(strsplit(f[11],',',fixed=TRUE)[[1]])
+  offsets <- as.numeric(strsplit(f[12],',',fixed=TRUE)[[1]])
+  stopifnot(length(sizes)==as.integer(f[10]),length(offsets)==length(sizes))
+  keep <- rep(TRUE,length(sizes))
+  if(footprint) {
+    scores <- as.numeric(strsplit(f[13],',',fixed=TRUE)[[1]])
+    stopifnot(length(scores)==length(sizes))
+    keep <- sizes>=10 & sizes<=80 & scores>=50
+  }
+  data.frame(start=as.numeric(f[2])+offsets[keep],end=as.numeric(f[2])+offsets[keep]+sizes[keep])
+}
+overlap_length <- function(b,start,end) sum(pmax(0,pmin(b$end,end)-pmax(b$start,start)))
+classify_fibers <- function(ex,hits,samples) {
+  rows <- support <- footprints <- list()
+  for(i in seq_len(nrow(samples))) {
+    s <- samples[i,]
+    al <- slice_bed(s$blocks_path,ex$chrom,ex$start,ex$end)
+    fi <- slice_bed(s$elements_path,ex$chrom,ex$start,ex$end)
+    tf <- slice_bed(s$tf_path,ex$chrom,ex$start,ex$end)
+    fire <- split(fi,vapply(fi,`[`,character(1),4))
+    calls <- split(tf,vapply(tf,`[`,character(1),4))
+    for(f in al) {
+      rid <- f[4];b <- blocks(f)
+      if(overlap_length(b,ex$start,ex$end)!=ex$end-ex$start) next
+      fs <- fire[[rid]]
+      accessible <- any(vapply(fs,function(z) overlap_length(b,max(ex$start,as.numeric(z[2])),
+        min(ex$end,as.numeric(z[3]))) >= .5*(ex$end-ex$start),logical(1)))
+      observed <- length(calls[[rid]])>0
+      fp <- bind_rows(lapply(calls[[rid]],blocks,footprint=TRUE))
+      if(nrow(fp)) fp <- fp[vapply(seq_len(nrow(fp)),function(j)
+        any(vapply(fs,function(z) as.numeric(z[2])<=fp$start[j] && fp$end[j]<=as.numeric(z[3]),logical(1))),logical(1)),]
+      bound <- FALSE
+      qualified <- paste(s$sample_name,rid,sep='::')
+      if(accessible && observed && nrow(fp)) {
+        for(j in seq_len(nrow(hits))) {
+          yes <- pmin(fp$end,hits$end[j])-pmax(fp$start,hits$start[j])>=.5*(hits$end[j]-hits$start[j])
+          if(any(yes)) {
+            bound <- TRUE
+            support[[length(support)+1L]] <- data.table(instance_id=hits$instance_id[j],RID=qualified)
+          }
+        }
+      }
+      if(nrow(fp)) footprints[[length(footprints)+1L]] <- data.table(RID=qualified,start=fp$start,end=fp$end)
+      rows[[length(rows)+1L]] <- data.table(RID=qualified,sample_name=s$sample_name,
+        accessible=accessible,has_FiberHMM=observed,
+        motif_state=if(!accessible) 'inaccessible' else if(!observed) NA_character_ else if(bound) 'bound' else 'accessible-unbound')
+    }
+  }
+  r <- rbindlist(rows);stopifnot(!anyDuplicated(r$RID))
+  u <- if(length(support)) unique(rbindlist(support)) else data.table(instance_id=character(),RID=character())
+  list(states=r,support=u,footprints=rbindlist(footprints))
+}
+
+region_for <- function(ex) data.frame(chr=ex$chrom,start=ex$window_start-1L,end=ex$window_end,
+  analysis_start=ex$window_start,analysis_end=ex$window_end,width=ex$window_end-ex$window_start+1L,
+  region_id=ex$example_id,region_type='CRE',annotation=example_title(ex))
+assemble <- function(ex,samples) assemble_region_m6a(sample_table=lcl_region_samples(region_for(ex),samples),
+  region=region_for(ex),full_span=TRUE,reuse=FALSE)
+
+make_tracks <- function(ex,samples,result,classification) {
+  active <- samples[samples$sample_name %in% result$assignments$sample_name,,drop=FALSE]
+  paths <- extract_region_results(active$sample_name,
+    data.frame(chr=ex$chrom,start=ex$window_start,end=ex$window_end),ex$example_id,example_root,extract_script,
+    regenerate=TRUE)
+  tracks <- load_region_results(data.frame(chr=ex$chrom,start=ex$window_start,end=ex$window_end),
+    active$sample_name,paths,nucleosome_source='ft',fiberHMM_size_breaks=c(10,30,60,80),verbose=FALSE)
+  ids <- paste(tracks$rids_df$sample_name,tracks$rids_df$RID,sep='::')
+  for(nm in c('reads','rids_df','fire','fps','fps_infire','nucs')) {
+    if(is.null(tracks[[nm]]) || !nrow(tracks[[nm]])) next
+    tracks[[nm]]$RID <- factor(paste(tracks[[nm]]$sample_name,tracks[[nm]]$RID,sep='::'),levels=ids)
+  }
+  missing <- setdiff(result$assignments$RID,ids)
+  if(length(missing)) stop(length(missing),' clustered molecules lack plotting tracks in ',ex$example_id)
+  # Use exact same-fiber FIRE-element containment from the count rules, rather
+  # than relying on segmentation-derived FIRE polishing for displayed footprints.
+  if(nrow(tracks$fps)) {
+    fp <- as.data.table(tracks$fps)
+    elements <- list()
+    for(i in seq_len(nrow(active))) {
+      lines <- slice_bed(active$elements_path[i],ex$chrom,ex$window_start-1L,ex$window_end)
+      if(length(lines)) elements[[i]] <- rbindlist(lapply(lines,function(f)
+        data.table(RID=paste(active$sample_name[i],f[4],sep='::'),start=as.numeric(f[2]),end=as.numeric(f[3]))))
+    }
+    elements <- if(length(elements)) rbindlist(elements) else
+      data.table(RID=character(),start=numeric(),end=numeric())
+    contained <- vapply(seq_len(nrow(fp)),function(i) {
+      el <- elements[RID==as.character(fp$RID[i])]
+      any(el$start<=fp$start[i] & fp$end[i]<=el$end)
+    },logical(1))
+    tracks$fps_infire <- as.data.frame(fp[contained & !is.na(class)])
+  }
+  add_read_groups(tracks,setNames(as.character(result$assignments$motif_state),result$assignments$RID),
+    'motif_state',group_levels=state_levels,verbose=FALSE)
+}
+
+plot_tracks <- function(ex,zoom=FALSE) {
+  hits <- as.data.frame(motifs[CRE_ID==ex$CRE_ID & motif_id==ex$motif_id])
+  hits$start <- hits$start+1L;hits$label <- ex$selection_TF
+  window <- if(zoom) c(max(ex$window_start,ex$anchor_start-50),min(ex$window_end,ex$anchor_end+50)) else
+    c(ex$window_start,ex$window_end)
+  motif_plot <- plot_interval_track(hits,window,fill_col='score',row_col='label',geometry='segment',
+    color_scale=scale_colour_gradientn(colours=c('#ECDFFF','#AB7DFF','#3155FF'),limits=motif_score_limits,name='FIMO score'),
+    labels=list(x=NULL,y=NULL),theme=theme_fiberseq())
+  tested <- data.frame(start=ex$start+1L,end=ex$end,label=ex$set,value=-log10(max(ex$best_pair_fdr,.Machine$double.xmin)))
+  cre_plot <- plot_interval_track(tested,window,fill_col='value',row_col='label',geometry='segment',linewidth=2.5,
+    color_scale=scale_colour_gradient(low='#FEE5D9',high='#F43B2B',limits=cre_fdr_limits,name='-log10(pair FDR)'),
+    labels=list(x=NULL,y=NULL),theme=theme_fiberseq())
+  tr <- interval_track_inputs(ex)
+  tr <- tr[tr$class!='tested FIRE region',,drop=FALSE]
+  cc <- plot_interval_track(tr,window,fill_col='class',row_col='y',geometry='rect',clip_intervals=TRUE,
+    color_scale=scale_fill_manual(values=CCRE_COLORS,name='cCRE class'),
+    scales=list(y=scale_y_continuous(breaks=tr$y,labels=tr$label)),
+    labels=list(x=paste(ex$chrom,'position (bp)'),y=NULL),theme=theme_fiberseq())
+  list(motif=motif_plot,cre=cre_plot,ccre=cc)
+}
+plot_footprint_panels <- function(accessibility,molecules,ex,n_bars,n_groups,n_molecules,subtitle) {
+  tr <- plot_tracks(ex)
+  p <- wrap_plots(accessibility,tr$motif,tr$cre,tr$ccre,molecules,ncol=1,
+    heights=c(max(1,n_groups),.6,.5,.8,max(2,.025*n_molecules)))+
+    plot_annotation(title=example_title(ex),subtitle='LCLs pooled; groups and sidebars show motif state or Leiden cluster')
+  list(plot=p,height=5+max(1,n_groups)+max(2,.025*n_molecules))
+}
+# The shared cluster-profile helper calls its grouping field `time`. Only its
+# local plotting environment adapts that field; no reference file is modified.
+lcl_heatmap <- function(res,...) {
+  extra <- list(...)
+  a <- res$assignments
+  a <- a[order(a$cluster,a$start,a$RID),,drop=FALSE]
+  plot_read_heatmap(res,layout='genomic',sample_colors=state_colors,sample_label_column='motif_state',
+    main=example_title(res$example),use_raster=FALSE,draw=isTRUE(extra$draw),
+    heatmap_options=list(left_annotation=ComplexHeatmap::rowAnnotation(
+      cluster=a$cluster,motif_state=a$motif_state,
+      col=list(cluster=cluster_palette(levels(res$assignments$cluster)),motif_state=state_colors))))
+}
+cluster_profiles <- plot_tf_cluster_profiles
+profile_env <- new.env(parent=environment(cluster_profiles))
+profile_env$plot_read_heatmap <- lcl_heatmap
+environment(cluster_profiles) <- profile_env
+
+main <- function() {
+  needed <- c('cre_covariates.tsv.gz','motif_sample_counts.tsv.gz','motifs.tsv.gz','samples.tsv')
+  missing <- needed[!file.exists(file.path(out,needed))]
+  if(length(missing)) stop('Missing ',paste(missing,collapse=', '),'; run prepare -> FIMO -> count -> combine.')
+  if(!file.exists(file.path(dest,'top5_motifs.tsv'))) stop('Run the single_tf stage first.')
+  top <- fread(file.path(dest,'top5_motifs.tsv'))
+  dir.create(example_root,recursive=TRUE,showWarnings=FALSE)
+  if(!nrow(top)) {message('No positive-frequency TFs selected; no examples to plot.');return(invisible(NULL))}
+  cre <- fread(file.path(dest,'eligible_cres.tsv.gz'))
+  samples <- as.data.frame(fread(file.path(out,'samples.tsv')))
+  stopifnot(nrow(samples)==31L,!anyDuplicated(samples$sample_name))
+  motifs <<- fread(file.path(out,'motifs.tsv.gz'))[motif_id %in% top$motif_id]
+  breaks <- unique(quantile(cre$prop_act,seq(0,1,.1),names=FALSE))
+  cre[,decile:=if(length(breaks)>1) as.integer(cut(prop_act,breaks,include.lowest=TRUE)) else 1L]
+  selected <- list();used <- character();selection_status <- list()
+  for(i in seq_len(nrow(top))) {
+    id <- top$motif_id[i]
+    pool <- cre[CRE_ID %in% motifs[motif_id==id,CRE_ID] & !CRE_ID %in% used]
+    common <- intersect(pool[set=='co-access',decile],pool[set=='background',decile])
+    if(!length(common)) {
+      selection_status[[i]] <- data.table(motif_id=id,status='no_unused_decile_matched_pair');next
+    }
+    co <- pool[set=='co-access' & decile %in% common][order(-n_informative,CRE_ID)][1]
+    bg <- pool[set=='background' & decile==co$decile][order(-n_informative,CRE_ID)][1]
+    pair <- rbind(co,bg)
+    pair[,`:=`(motif_id=id,selection_TF=top$TF_label[i],rank=i)]
+    pair[,example_id:=paste(gsub('[^A-Za-z0-9_.-]','_',selection_TF),chrom,start,end,sep='_')]
+    selected[[i]] <- pair;used <- c(used,pair$CRE_ID)
+    selection_status[[i]] <- data.table(motif_id=id,status='selected')
+  }
+  fwrite(rbindlist(selection_status),file.path(example_root,'selection_status.tsv'),sep='\t')
+  examples <- rbindlist(selected)
+  if(!nrow(examples)) return(invisible(NULL))
+  # Best = smallest saved adjusted FDR among raw-coverage-passing valid pairs.
+  pairs <- fread(file.path(out,'pairs.tsv.gz'),select=c('CRE1','CRE2','set_adjusted','fdr_adj'))
+  pairs <- pairs[set_adjusted!='excluded' & is.finite(fdr_adj)]
+  best <- rbind(pairs[,.(CRE_ID=CRE1,fdr_adj)],pairs[,.(CRE_ID=CRE2,fdr_adj)])[,.(best_pair_fdr=min(fdr_adj)),by=CRE_ID]
+  examples <- merge(examples,best,by='CRE_ID',all.x=TRUE,sort=FALSE)
+  stopifnot(!anyNA(examples$best_pair_fdr))
+  setorder(examples,rank,set)
+  examples[,`:=`(window_start=as.integer(floor((start+1+end)/2))-500L,
+    window_end=as.integer(floor((start+1+end)/2))+500L)]
+  fwrite(examples,file.path(example_root,'selected_example_regions.tsv'),sep='\t')
+  ccre <- fread('/project/spott/cshan/annotations/GRCh38-cCREs.bed',header=FALSE)
+  reference_style$ccre <- data.frame(chr=ccre$V1,start=ccre$V2+1L,end=ccre$V3,
+    ccre_id=ccre$V4,ccre_class=ccre$V6)
+  motif_score_limits <<- range(motifs$score)
+  if(diff(motif_score_limits)==0) motif_score_limits <<- motif_score_limits+c(-.5,.5)
+  cre_fdr_limits <<- c(0,max(1,-log10(pmax(examples$best_pair_fdr,.Machine$double.xmin))))
+  for(i in seq_len(nrow(examples))) {
+    ex <- as.data.frame(examples[i]);dir.create(example_dir(ex),recursive=TRUE,showWarnings=FALSE)
+    message('Example ',i,'/',nrow(examples),': ',example_title(ex))
+    hits <- motifs[CRE_ID==ex$CRE_ID & motif_id==ex$motif_id]
+    classification <- classify_fibers(ex,hits,samples)
+    fwrite(classification$states,file.path(example_dir(ex),'fiber_states.tsv.gz'),sep='\t',na='NA')
+    # Select anchor using initial-window full-span, informative accessible molecules.
+    initial <- assemble(ex,samples)
+    support <- classification$support[RID %in% initial$rids_df$RID]
+    candidates <- merge(hits,support[,.(support=.N),by=instance_id],by='instance_id',all.x=TRUE)
+    candidates[is.na(support),support:=0L]
+    setorder(candidates,-support,-score,start,end,strand)
+    fwrite(candidates,file.path(example_dir(ex),'motif_center_candidates.tsv'),sep='\t')
+    if(candidates$support[1]<1) stop('No supported motif in initial window: ',ex$example_id)
+    anchor <- candidates[1];center <- as.integer(floor((anchor$start+1+anchor$end)/2))
+    ex$anchor_start <- anchor$start+1L;ex$anchor_end <- anchor$end
+    ex$window_start <- max(1L,center-500L);ex$window_end <- center+500L
+    dat <- assemble(ex,samples)
+    states <- classification$states
+    keep <- dat$rids_df$RID %in% states[!is.na(motif_state),RID]
+    metadata <- dat$rids_df[keep,,drop=FALSE];mat <- dat$met_mat[keep,,drop=FALSE]
+    if(nrow(mat)<3 || ncol(mat)<2) stop('Too few retained molecules/sites: ',ex$example_id)
+    result <- leiden_manhattan_cluster(mat,metadata,ex$window_start,ex$window_end,
+      window_size=0,k_neighbors=10,resolution=1,seed=1)
+    result$site_met_mat <- mat;result$region <- region_for(ex);result$example <- ex
+    result$assignments$motif_state <- factor(states$motif_state[match(result$assignments$RID,states$RID)],levels=state_levels)
+    result$assignments$time <- result$assignments$motif_state
+    result$assignments$original_RID <- metadata$original_RID[match(result$assignments$RID,metadata$RID)]
+    stopifnot(!anyNA(result$assignments$motif_state))
+    final_support <- classification$support[instance_id==anchor$instance_id & RID %in% result$assignments$RID]
+    fwrite(final_support,file.path(example_dir(ex),'anchor_final_support.tsv'),sep='\t')
+    if(!nrow(final_support)) stop('Anchor lost support after re-centering: ',ex$example_id)
+    tracks <- make_tracks(ex,samples,result,classification)
+    saveRDS(result,file.path(example_dir(ex),'pooled_leiden.rds'))
+    saveRDS(tracks,file.path(example_dir(ex),'retained_molecule_tracks.rds'))
+    fwrite(result$assignments,file.path(example_dir(ex),'molecule_assignments.tsv.gz'),sep='\t')
+    fwrite(ex,file.path(example_dir(ex),'final_window.tsv'),sep='\t')
+    a <- result$assignments
+    rows <- stack_rows(a[order(a$motif_state,a$start,a$RID),],'motif_state')
+    labels <- setNames(paste0(state_levels,' (n=',table(factor(a$motif_state,levels=state_levels)),')'),state_levels)
+    molecules <- plot_molecules(rows,molecule_tracks(tracks),ex,'motif_state',labels,
+      bar_cols='motif_state',bar_palette=state_colors,legend_extra=state_levels)
+    profile <- plot_group_profile(tracks$pileup,group_col='motif_state',style='area',y_col='smooth_frac',
+      facet_col='motif_state',fill_colors=state_colors,colors=state_colors,
+      window=c(ex$window_start,ex$window_end),labels=list(y='m6A fraction',x=NULL),theme=theme_fiberseq())
+    panel <- plot_footprint_panels(profile,molecules,ex,1,length(state_levels),nrow(a),'')
+    ggsave(example_figure_path(ex,'panel3A','motif_state_molecules'),panel$plot,width=10,height=panel$height,limitsize=FALSE)
+    ht <- grid::grid.grabExpr(lcl_heatmap(result,draw=TRUE),width=9,height=10)
+    ggsave(example_figure_path(ex,'panel3B','leiden_heatmap'),ht,width=9,height=10)
+    cluster_profiles(ex,reference_result=function(ex) result,show_reads=function(result) invisible(NULL),
+      example_dir=example_dir,example_figure_path=example_figure_path,plot_footprint_panels=plot_footprint_panels,
+      molecule_tracks=molecule_tracks,add_read_groups=add_read_groups,stack_rows=stack_rows,plot_molecules=plot_molecules,
+      time_cols=state_colors,time_levels=state_levels,example_theme_settings=example_theme_settings,
+      window_breaks=window_breaks,example_title=example_title)
+    graph <- plot_knn_graph(result,main=paste(example_title(ex),'by Leiden cluster'),seed=1)
+    ggsave(example_figure_path(ex,'panel3D','knn_by_cluster'),graph,width=9,height=7)
+    nodes <- graph$layers[[2]]$data
+    nodes$color_group <- a$motif_state[match(nodes$RID,a$RID)]
+    graph$layers[[2]]$data <- nodes
+    graph <- graph+scale_color_manual(values=state_colors,drop=FALSE)+
+      labs(title=paste(example_title(ex),'by motif state'),color='Motif state')
+    ggsave(example_figure_path(ex,'panel3D','knn_by_motif_state'),graph,width=9,height=7)
+    tr <- plot_tracks(ex,zoom=TRUE)
+    ggsave(example_figure_path(ex,'panel3E','motif_locations'),wrap_plots(tr,ncol=1)+
+      plot_annotation(title=example_title(ex)),width=10,height=5)
+  }
+  saveRDS(sessionInfo(),file.path(example_root,'R_sessionInfo.rds'))
+}
+```
+
+```{r example-regions, eval=params$run_examples}
+main()
+```

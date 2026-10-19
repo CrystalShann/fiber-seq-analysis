@@ -114,6 +114,16 @@ x is the CRE1 accessibility status of a fiber: a binary indicator
   - x = 0 means CRE1 is closed on that fiber
 
 
+| Pair type | Test used | Why |
+|---|---|---|
+| **No separation** (most pairs) | `LRT` | The full model has a finite maximum, so the likelihood ratio test is valid. |
+| **Separation** (positive or negative) | `Rao_score` | The full model has no finite maximum, so a test that doesn't need it is required. |
+
+
+  - Positive separation: every donor has CRE1_access == 0 or CRE2_access == 0
+  - Negative separation: every donor has co_access == 0 or co_closed == 0
+  - no separation: all cells have count
+
 ```{r parallel-and-summary-functions}
 # turns any R object into a unique code that changes whenever the object’s contents change
 # check if saved results still match the current settings
@@ -133,7 +143,9 @@ atomic_rds <- function(x, path) {
   if (!file.rename(partial, path)) stop("Atomic summary rename failed: ", path)
 }
 
-
+##########################################
+# fits the donor-adjusted logistic regression model on every CRE pair
+##########################################
 fit_chromosome <- function(d, chromosome, male_only = FALSE) {
   expected_ids <- sort(unique(d$CRE_pair), method = "radix")
   fit_summary_file <- file.path(fit_summary_dir, paste0(chromosome,

@@ -17,6 +17,21 @@ export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 stage=${1:-help}
 shift || true
 case "$stage" in
+  single_tf|single_tf_examples)
+    module load R/4.4.1
+    module load pandoc/2.17.1.1
+    Rscript - "$OUT" "$SCRIPT_DIR" "$stage" <<'RSCRIPT'
+args <- commandArgs(TRUE)
+dest <- file.path(args[1], 'analysis/single_tf_adjusted')
+dir.create(dest, recursive=TRUE, showWarnings=FALSE)
+rmarkdown::render(file.path(args[2], 'LCL_single_tf_enrichment.Rmd'),
+  output_dir=dest,
+  output_file=if(args[3]=='single_tf_examples') 'LCL_single_tf_examples.html' else 'LCL_single_tf_enrichment.html',
+  params=list(out=args[1], run_frequencies=args[3]=='single_tf', run_examples=TRUE,
+    cores=as.integer(Sys.getenv('SLURM_CPUS_PER_TASK','2'))),
+  envir=new.env(), quiet=TRUE)
+RSCRIPT
+    ;;
   prepare|combine)
     exec "$PYTHON" "$SCRIPT_DIR/LCL_tf_cooccupancy.py" "$stage" --root "$ROOT" --out "$OUT" "$@" ;;
   count)
@@ -59,5 +74,5 @@ RSCRIPT
     combine=$(sbatch --parsable --partition=caslake --qos=caslake --mem=48G --dependency="afterok:$counts" "$SCRIPT_DIR/LCL_tf_cooccupancy.sh" combine)
     analysis=$(sbatch --parsable --dependency="afterok:$combine" "$SCRIPT_DIR/LCL_tf_cooccupancy.sh" analyze)
     printf 'prepare=%s fimo=%s counts=%s combine=%s analysis=%s\n' "$prep" "$fimo" "$counts" "$combine" "$analysis" ;;
-  *) echo 'Usage: bash LCL_tf_cooccupancy.sh {prepare|count|combine|analyze|report|submit} [arguments]' >&2; exit 2 ;;
+  *) echo 'Usage: bash LCL_tf_cooccupancy.sh {prepare|count|combine|analyze|report|single_tf|single_tf_examples|submit} [arguments]' >&2; exit 2 ;;
 esac
