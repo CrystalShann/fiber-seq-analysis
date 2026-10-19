@@ -115,7 +115,8 @@ x is the CRE1 accessibility status of a fiber: a binary indicator
 
 
 ```{r parallel-and-summary-functions}
-
+# turns any R object into a unique code that changes whenever the object’s contents change
+# check if saved results still match the current settings
 hash_object <- function(x) {
   tmp <- tempfile(fileext = ".rds")
   on.exit(unlink(tmp))
@@ -123,6 +124,7 @@ hash_object <- function(x) {
   unname(tools::md5sum(tmp))
 }
 
+# saves only completed files
 atomic_rds <- function(x, path) {
   partial <- paste0(path, ".partial")
   if (file.exists(path) || file.exists(partial))

@@ -80,7 +80,7 @@ Leiden cluster.
 ```{r quintile-table}
 genes[, .(genes = .N, pi_min = signif(min(pi), 3), pi_median = signif(median(pi), 3),
           pi_max = signif(max(pi), 3), tpm_median = round(median(mean_tpm), 1),
-          reads_median = median(n_acf_valid),
+          reads_median = as.numeric(median(n_acf_valid)),
           m6a_fraction_median = round(median(mean_m6a_call_fraction), 4)),
       by = .(quintile = paste0("C", pi_quintile))][order(quintile)]
 ```
