@@ -85,9 +85,9 @@ min_dist_sel    <- 200
 min_shared_all  <- 15       # n_shared_reads floor in EVERY timepoint
 min_co_acc_late <- 5        # co_access floor at the last timepoint
 
-# the read rule the tables were computed under; the figure must match or the
-# fibers drawn and the 2x2 will disagree
-read_rule <- "any"
+# the read rule the tables must have been computed under (contain is the only rule
+# in 03_coaccess_cres.py and label_reads(); tables from the old any rule are rejected)
+read_rule <- "contain"
 fire_overlap_fraction <- 0.5  # fraction of cCRE covered by one same-read FIRE interval
 
 min_locus_sep <- 1e6     # keep the picks on different loci
@@ -268,7 +268,7 @@ plot_one <- function(r, width = 11, height = 16) {
   out <- plot_coaccess_pair(r, samples, paths,
     span_source = "read_spans", nuc_source = "fiberhmm", tf_source = "by_size",
     facet_by = "sample", colors = timepoint_palette(samples), cres = cre_uni,
-    flank = flank, read_rule = read_rule, fire_overlap_fraction = fire_overlap_fraction,
+    flank = flank, fire_overlap_fraction = fire_overlap_fraction,
     plot_name = paste0(r$gene_names, "  (", r$CRE_pair_labels, ")"),
     subtitle = sprintf("gap %d bp  |  OR(0/5/10/15)=%s  |  trend p=%.2g",
                        r$dist, r$or_series, r$p_trend),

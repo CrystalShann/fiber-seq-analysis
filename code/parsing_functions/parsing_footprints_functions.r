@@ -1790,22 +1790,20 @@ load_ft_tracks <- function(res, keys = NULL, ft_root, hmm_root = NULL, tabix_bin
 # Per-fiber configuration at a cCRE pair. A fiber is accessible at a cCRE
 # when ONE of its own FIRE elements overlaps at least fire_overlap_fraction
 # of the cCRE length. Separate elements are not summed and the overlap is not
-# reciprocal. Both this fraction and read_rule must match the statistics.
+# reciprocal. This fraction must match the statistics.
 #
 # Inputs:
 #   res        - load_region() result
 #   cre1, cre2 - list(start, end) in BED coordinates
-#   read_rule  - "any" (a fiber counts if it overlaps the cCRE at all, Kevin's
-#                rule) or "contain" (it must span the whole cCRE)
+#   a fiber covers a cCRE only if it spans the whole cCRE (aligned blocks when
+#   loaded, otherwise the read span); there is no any-overlap option
 #   fire_overlap_fraction - fraction of cCRE width covered by one FIRE element;
 #                0 preserves legacy >= 1 bp behavior; current notebooks use 0.5
 # Output:
 #   data.table key, sample_name, shared, acc1, acc2, config (factor with
 #   CONFIG_LEVELS; NA for fibers that do not cover both cCREs)
 # ---------------------------------------------------------------------------
-label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain"),
-                        fire_overlap_fraction = 0) {
-  read_rule <- match.arg(read_rule)
+label_reads <- function(res, cre1, cre2, fire_overlap_fraction = 0) {
   if (length(fire_overlap_fraction) != 1L || !is.finite(fire_overlap_fraction) ||
       fire_overlap_fraction < 0 || fire_overlap_fraction > 1)
     stop("fire_overlap_fraction must be one number in [0, 1]")
@@ -1814,15 +1812,14 @@ label_reads <- function(res, cre1, cre2, read_rule = c("any", "contain"),
   sp <- res$spans
   el <- res$elements
 
-  # which fibers cover the interval s-e under read_rule
+  # which fibers span the whole interval s-e
   covers <- function(s, e) {
     if (!is.null(res$blocks)) {
       b <- res$blocks[start < e & end > s]
       covered <- b[, .(bp = sum(pmin(end, e) - pmax(start, s))), by = key]
-      return(sp$key %in% covered[bp > 0 & (read_rule == "any" | bp >= e - s), key])
+      return(sp$key %in% covered[bp >= e - s, key])
     }
-    if (read_rule == "contain") sp$start <= s & sp$end >= e
-    else sp$start < e & sp$end > s
+    sp$start <= s & sp$end >= e
   }
   cov1 <- covers(cre1$start, cre1$end)
   cov2 <- covers(cre2$start, cre2$end)

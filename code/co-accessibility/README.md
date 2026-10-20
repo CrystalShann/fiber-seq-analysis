@@ -11,7 +11,7 @@ This analysis looks for ENCODE cCRE pairs that are accessible on the same fiber 
 3. Link cCREs to genes -> build TSS ± 10 kb windows around GENCODE v46 `Ensembl_canonical` TSSs and assign cCREs by overlap.
 4. Extract each sample's primary aligned blocks from the filtered FIRE CRAM -> BED12 files. Deletions and skipped regions are excluded from aligned coverage.
 5. Build candidate cCRE pairs -> both cCREs must share a gene window, with 500 < interval gap < 20,000 bp.
-6. Keep fibers whose aligned blocks fully cover both cCREs (`--read-rule contain`).
+6. Keep fibers whose aligned blocks fully cover both cCREs.
 7. Call accessibility at each cCRE -> one FIRE element on the same fiber must cover at least 50% of the cCRE. Only the part of that element overlapping the fiber's aligned blocks contributes; separate FIRE elements are not combined.
 8. Count four configurations for each pair: neither accessible, cCRE1 only, cCRE2 only, both accessible. Sum the raw counts across all 31 samples, keeping read identities separate by sample.
 9. Add one pseudocount to each cell, calculate Fisher's exact p-value and the odds ratio, and apply BH correction across unique pairs genome-wide. Raw-count p-values and their FDR are also saved.
@@ -69,7 +69,7 @@ span_job=$(sbatch --parsable LCL_read_spans.sh)
 
 # 3. Pool counts and calculate co-accessibility
 sbatch --dependency="afterok:${span_job}" LCL_run_coaccess.sh \
-    --read-rule contain --fire-overlap-fraction 0.5
+    --fire-overlap-fraction 0.5
 ```
 
 `LCL_run_coaccess.sh` runs [LCL_coaccess_cres.py](LCL/LCL_coaccess_cres.py). After it finishes, run the chunks in `LCL_co-access.Rmd` in order or knit the notebook.
@@ -183,7 +183,7 @@ Run this after `LCL_co-access.Rmd` has saved both top-ten tables. Run the chunks
 3. Link cCREs to genes -> build TSS ± 10 kb windows around canonical TSSs and assign cCREs by overlap.
 4. Extract primary read spans from each timepoint's filtered FIRE CRAM -> indexed BED files. Secondary and supplementary alignments are excluded.
 5. Build candidate cCRE pairs -> both cCREs must share a gene window, with 500 < interval gap < 20,000 bp.
-6. Keep fibers whose read spans overlap both cCREs (`--read-rule any`). Macrophage uses continuous read spans for coverage.
+6. Keep fibers whose read span covers the full length of both cCREs. Macrophage uses continuous read spans for coverage.
 7. Call accessibility at each cCRE -> one FIRE element on the same fiber must cover at least 50% of the cCRE. Separate FIRE elements are not combined.
 8. Count the four accessibility configurations separately at each timepoint. Add one pseudocount per cell, calculate Fisher's exact p-value and the odds ratio, and apply BH correction across unique pairs within each timepoint. Raw-count p-values and their FDR are also saved.
 9. Use [coaccess_macrophage.Rmd](macrophage/coaccess_macrophage.Rmd) to select pairs with a CA-CTCF partner and at least one protein-coding gene anchor. The notebook looks for weak coupling at baseline followed by an upward trend in the odds ratio, then draws up to five pairs across all four timepoints.
@@ -236,10 +236,10 @@ span_job=$(sbatch --parsable 02_read_spans.sh)
 
 # 3. Calculate co-accessibility separately at each timepoint
 sbatch --dependency="afterok:${span_job}" run_coaccess.sh \
-    --read-rule any --fire-overlap-fraction 0.5
+    --fire-overlap-fraction 0.5
 ```
 
-`run_coaccess.sh` runs [03_coaccess_cres.py](macrophage/03_coaccess_cres.py). After it finishes, run the chunks in `coaccess_macrophage.Rmd` in order or knit the notebook. Keep `read_rule` and `fire_overlap_fraction` in the notebook matched to the counting settings.
+`run_coaccess.sh` runs [03_coaccess_cres.py](macrophage/03_coaccess_cres.py). After it finishes, run the chunks in `coaccess_macrophage.Rmd` in order or knit the notebook. Keep `fire_overlap_fraction` in the notebook matched to the counting setting.
 
 ## Shared TSS annotation
 

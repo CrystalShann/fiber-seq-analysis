@@ -71,8 +71,8 @@ distance.
 
 Per timepoint, a fiber's state at a cCRE:
 
-- **covered** (denominator) — the fiber overlaps the cCRE (`--read-rule any`,
-  Kevin's rule) or spans it entirely (`--read-rule contain`). From the fiber spans
+- **covered** (denominator) — the fiber's span covers the whole cCRE (Kevin's
+  rule was any overlap; that option has been removed). From the fiber spans
   built in step 2 out of the `-filtered` FIRE CRAM.
 - **accessible** (numerator) — covered AND one of that fiber's **FIRE elements**
   covers at least 50% of the cCRE length. From
@@ -101,7 +101,7 @@ elem1 TRUE   CRE1_access      co_access
 - `pval_raw`, `or_haldane` — added. The `+1` pseudocount perturbs the null in an
   uncontrolled direction, so **use `pval_raw` for inference**.
 
-Flags: `--read-rule {any,contain}`, `--min-dist`, `--max-dist`, `--pseudocount`,
+Flags: `--min-dist`, `--max-dist`, `--pseudocount`,
 `--fire-overlap-fraction` (default 0.5), `--kevin-compat`, `--chrom` for a single-chromosome run.
 
 Outputs in `.../co-accessibility/coaccess/`:
@@ -214,7 +214,7 @@ Rscript -e 'rmarkdown::render("coaccess_macrophage.Rmd")'
 
 A single FIRE element on the same fiber must cover at least 50% of the cCRE length.
 This is `bedtools intersect -a cCREs -b FIRE_elements -f 0.5`, not reciprocal
-overlap and not a sum of separate FIRE elements. Read-span coverage remains
-`--read-rule any` by default. Both result tables record `fire_overlap_fraction`;
+overlap and not a sum of separate FIRE elements. A read covers a cCRE only if
+its span contains the whole cCRE. Both result tables record `fire_overlap_fraction`;
 the notebook rejects older tables without matching rule metadata. Recompute
 co-accessibility before plotting older results from the former 1 bp rule.

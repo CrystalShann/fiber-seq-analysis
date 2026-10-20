@@ -1,0 +1,281 @@
+---
+title: "Pausing-index example genes: m6A autocorrelation by allele"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: kable
+params:
+  out_dir: "/project/spott/cshan/fiber-seq/LCL_project/pausing/acf_tss_downstream_alleles"
+  lag_from: 25
+  lag_to: 1000
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({ library(data.table); library(Matrix); library(ggplot2) })
+PROJECT <- "/project/spott/cshan/fiber-seq"
+PARENT  <- file.path(PROJECT, "code/clustering_methods/auto_correlation")
+PYTHON  <- "/project/spott/cshan/envs/Jupyter-notebook/bin/python"
+if (!nzchar(Sys.getenv("RETICULATE_PYTHON"))) Sys.setenv(RETICULATE_PYTHON = PYTHON)
+library(reticulate)
+
+# shared read extraction, phasing and plotting helpers, unchanged
+source(file.path(PROJECT, "code/parsing_functions/parsing_footprints_functions.r"))
+source(file.path(PROJECT, "code/parsing_functions/plotting_functions.r"))
+source(file.path(PROJECT, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r"))
+source(file.path(PROJECT, "code/haplotype_phasing/LCL_phasing.r"))
+source(file.path(PROJECT, "code/haplotype_phasing/LCL_phased_m6a_input.r"))
+# parent ACF, summary and allele functions, unchanged
+source_python(file.path(PARENT, "03_compute_autocorrelations.py"))
+source_python(file.path(PARENT, "05_summarize_autocorrelations.py"))
+# report functions of 06_autocorrelation.Rmd. Embedded Python reads that Rmd in the locale
+# encoding and SLURM nodes only have the C locale, so extract them in a -X utf8 subprocess
+report_code <- system2(Sys.getenv("RETICULATE_PYTHON"), c("-X", "utf8", "-c", shQuote(sprintf(
+  "import sys; sys.path.insert(0, %s); import importlib; print(importlib.import_module(\"01_run_autocorrelation\").report_function_code())",
+  shQuote(PARENT, "sh")))), stdout = TRUE)
+stopifnot(is.null(attr(report_code, "status")))
+eval(parse(text = report_code))
+pd <- import("pandas", convert = FALSE)   # keep the region a pandas Series for annotate_alleles()
+
+out  <- params$out_dir
+for (d in c("tables", "plots")) dir.create(file.path(out, d), recursive = TRUE, showWarnings = FALSE)
+lags <- params$lag_from:params$lag_to
+```
+
+# Question
+
+`acf_example_genes.R` pooled every read of the 15 example genes and found that the three
+pausing / expression groups differ in their m6A autocorrelation from TSS +50 to +2500 bp.
+Here each gene's reads are split by allele at a heterozygous SNP, as in
+`06_autocorrelation.Rmd`, and the same figures and tests are repeated on the REF reads and
+on the ALT reads separately. If the group differences are a property of the genes, both
+allele read sets should show them.
+
+REF and ALT are defined by the reference genome, not by pausing: no allele-specific pausing
+is measured in these samples. The split therefore checks that the result replicates in two
+independent haplotype read sets per gene; it does not remove gene-level confounding.
+
+```{r inputs}
+FT_DIR  <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+PHASING <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+SAMPLES <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
+GROUPS  <- c("non-paused, high", "paused, high", "paused, moderate")
+ALLELES <- c("REF", "ALT")
+
+# the genes, groups and windows of the pooled run
+genes <- fread(file.path(PROJECT, "LCL_project/pausing/acf_tss_downstream/tables/genes.tsv"))
+stopifnot(nrow(genes) == 15L, setequal(genes$group, GROUPS),
+          genes[, all(ifelse(strand == "+", analysis_start - tss, tss - analysis_end) == 50L)],
+          genes[, all(analysis_end - analysis_start + 1L == 2451L)])
+
+# phased samples, with the VCF column of each sample's cell line
+samples <- as.data.frame(fread(SAMPLES)[with_genotype == "Yes"])
+samples$vcf_column <- vapply(seq_len(nrow(samples)), function(i)
+  lcl_vcf_sample_column(samples$phased_vcf_file[i], samples$cell_line[i]), integer(1))
+stopifnot(!anyNA(samples$vcf_column))
+```
+
+# Focal SNP per gene
+
+For each gene, the focal SNP is the biallelic SNV inside its window that is phased
+heterozygous (`0|1` or `1|0` with a phase set) in the most of the
+`r nrow(samples)` phased samples; ties go to the SNV nearest the TSS. Only those
+heterozygous samples contribute reads.
+
+```{r focal-snps}
+#' Phased heterozygous biallelic SNVs in one gene's window, one row per sample carrying one.
+window_het_snvs <- function(g) {
+  query <- GenomicRanges::GRanges(g$chrom, IRanges::IRanges(g$analysis_start, g$analysis_end))
+  rbindlist(lapply(seq_len(nrow(samples)), function(i) {
+    lines <- Rsamtools::scanTabix(Rsamtools::TabixFile(samples$phased_vcf_file[i]), param = query)[[1]]
+    rbindlist(lapply(strsplit(lines, "\t", fixed = TRUE), function(x) {
+      if (nchar(x[4]) != 1L || nchar(x[5]) != 1L) return(NULL)
+      keys   <- strsplit(x[9], ":", fixed = TRUE)[[1]]
+      values <- strsplit(x[samples$vcf_column[i]], ":", fixed = TRUE)[[1]]
+      gt <- values[match("GT", keys)]; ps <- values[match("PS", keys)]
+      if (!isTRUE(gt %in% c("0|1", "1|0")) || is.na(ps) || ps == ".") return(NULL)
+      data.table(pos = as.integer(x[2]), id = x[3], ref = x[4], alt = x[5],
+                 sample_name = samples$sample_name[i])
+    }))
+  }))
+}
+
+focal <- rbindlist(lapply(seq_len(nrow(genes)), function(i) {
+  g <- genes[i]
+  snvs <- window_het_snvs(g)[, .(n_het_samples = .N,
+                                 contributing_samples = paste(sample_name, collapse = ",")),
+                             by = .(pos, id, ref, alt)]
+  snvs[, tss_distance_bp := abs(pos - g$tss)]
+  setorder(snvs, -n_het_samples, tss_distance_bp)
+  data.table(gene_name = g$gene_name, group = g$group, n_snvs_in_window = nrow(snvs), snvs[1])
+}))
+focal[, focal_snp := ifelse(id == ".", paste0(genes$chrom, ":", pos), id)]
+fwrite(focal, file.path(out, "tables", "focal_snps.tsv"), sep = "\t")
+focal[, .(group, gene_name, focal_snp, pos, ref, alt, n_het_samples, tss_distance_bp, n_snvs_in_window)]
+```
+
+# Reads and autocorrelation by allele
+
+Reads come from `lcl_build_phased_m6a_input()`: full-span reads with at least one m6A call
+in the window from the heterozygous samples, kept only when their HiPhase haplotag and the
+sample's phased genotype at the focal SNP resolve the allele. The parent
+`annotate_alleles()` turns haplotag + genotype into REF / ALT, `autocorrelations()` gives
+the per-read ACF, and `summarize()` gives each allele's mean curve and 140-250 bp repeat
+peak, exactly as for the pooled genes.
+
+```{r allele-acf}
+per_gene <- lapply(seq_len(nrow(genes)), function(i) {
+  g <- genes[i]; f <- focal[i]
+  region <- data.frame(region_id = g$gene_name, chr = g$chrom, start = g$analysis_start - 1L,
+                       end = g$analysis_end, analysis_start = g$analysis_start,
+                       analysis_end = g$analysis_end, focal_pos = f$pos, focal_snp = f$focal_snp,
+                       ref = f$ref, alt = f$alt, contributing_samples = f$contributing_samples)
+  dat <- lcl_build_phased_m6a_input(region, samples, FT_DIR, PHASING)
+  reads <- annotate_alleles(dat$read_meta, pd$Series(as.list(region)), samples)
+  stopifnot(identical(rownames(dat$met_mat), reads$row_id))
+  dense <- as.matrix(dat$met_mat)
+  storage.mode(dense) <- "integer"
+  res   <- autocorrelations(dense)
+  valid <- as.logical(res[[2]])
+  records <- data.frame(region_id = g$gene_name, RID = reads$row_id[valid],
+                        sample_name = reads$sample_name[valid],
+                        m6a_call_fraction = rowMeans(dense)[valid],
+                        cluster = match(reads$allele_group[valid], ALLELES), status = "clustered")
+  s <- summarize(res[[1]][valid, , drop = FALSE], records)
+  stopifnot(identical(as.integer(s[[2]]$cluster), 1:2))
+  list(curves = as.data.table(s[[1]])[, allele := ALLELES[cluster]],
+       stats  = as.data.table(s[[2]])[, allele := ALLELES[cluster]],
+       samples = as.data.table(reads)[, .(n_reads = .N), by = .(sample_name, allele = allele_group)])
+})
+
+alleles <- rbindlist(lapply(seq_along(per_gene), function(i) {
+  st <- per_gene[[i]]$stats
+  data.table(gene_name = genes$gene_name[i], group = genes$group[i], allele = st$allele,
+             n_acf_valid = st$n_reads, mean_m6a_call_fraction = st$mean_m6a_call_fraction,
+             peak_lag_bp = as.numeric(st$positive_local_peak_140_250_bp), peak_acf = st$peak_acf)
+}))
+alleles <- merge(alleles, genes[, .(gene_name, pooled_peak_lag_bp = peak_lag_bp,
+                                    pooled_peak_acf = peak_acf)], by = "gene_name", sort = FALSE)
+curves <- rbindlist(lapply(seq_along(per_gene), function(i)
+  cbind(genes[i, .(group, gene_name)], per_gene[[i]]$curves[, .(allele, lag_bp, mean_acf, sem_acf, n_reads)])))
+fwrite(alleles, file.path(out, "tables", "genes_by_allele.tsv"), sep = "\t")
+fwrite(curves, file.path(out, "tables", "acf_per_gene_allele.tsv"), sep = "\t")
+fwrite(rbindlist(lapply(seq_along(per_gene), function(i)
+  cbind(gene_name = genes$gene_name[i], per_gene[[i]]$samples))),
+  file.path(out, "tables", "reads_by_sample_allele.tsv"), sep = "\t")
+
+dcast(alleles, group + gene_name + pooled_peak_lag_bp ~ allele,
+      value.var = c("n_acf_valid", "peak_lag_bp", "peak_acf", "mean_m6a_call_fraction"))[
+  order(match(group, GROUPS))]
+```
+
+```{r group-curves}
+#' Per-gene mean ACF of one allele, one row per gene in genes order.
+gene_matrix <- function(a)
+  do.call(rbind, lapply(per_gene, function(r) r$curves[allele == a]$mean_acf))
+
+# group mean curves, genes weighted equally, by the parent summarize()
+by_allele <- setNames(lapply(ALLELES, function(a) {
+  rec <- data.frame(region_id = paste("example_genes", a), RID = genes$gene_name, sample_name = "all",
+                    m6a_call_fraction = alleles[allele == a][match(genes$gene_name, gene_name),
+                                                             mean_m6a_call_fraction],
+                    cluster = match(genes$group, GROUPS), status = "clustered")
+  s <- summarize(gene_matrix(a), rec)
+  list(curves = as.data.table(s[[1]])[, `:=`(allele = a, group = GROUPS[cluster])],
+       peaks  = as.data.table(s[[2]])[, `:=`(allele = a, group = GROUPS[cluster])])
+}), ALLELES)
+fwrite(rbindlist(lapply(by_allele, `[[`, "curves")),
+       file.path(out, "tables", "acf_by_group_allele.tsv"), sep = "\t")
+
+rbindlist(lapply(by_allele, `[[`, "peaks"))[, .(allele, group, genes = n_reads,
+  peak_lag_bp = positive_local_peak_140_250_bp, peak_acf = signif(peak_acf, 3))]
+```
+
+# Figures
+
+The same two figures as the pooled run, drawn once from the REF reads and once from the
+ALT reads, written as PDFs to ``r file.path(out, "plots")``.
+
+## 1. Mean ACF per group
+
+```{r fig-group-mean, fig.width = 9, fig.height = 7}
+for (a in ALLELES) {
+  region_data <- list(
+    region = list(region_id = sprintf("TSS +50 to +2500 bp, %s reads at each gene's focal SNP, 5 genes per group, genes weighted equally", a),
+                  focal_snp = "groups", ref = "C1 non-paused high, C2 paused high",
+                  alt = "C3 paused moderate"),
+    tables = list(cluster_acf_summary = as.data.frame(by_allele[[a]]$curves)))
+  p <- plot_report_cluster_acf(region_data, lower = min(lags), upper = max(lags),
+                               title = sprintf("Mean ACF per group, %s allele; no smoothing", a))
+  save_figure(p, file.path(out, "plots", sprintf("01_group_mean_acf_%s.pdf", a)), width = 9, height = 7)
+  print(p)
+}
+```
+
+## 2. Per-gene mean ACF
+
+```{r fig-per-gene, fig.width = 9, fig.height = 8}
+for (a in ALLELES) {
+  d <- curves[allele == a & lag_bp %in% lags][, group := factor(group, levels = GROUPS)]
+  m <- by_allele[[a]]$curves[lag_bp %in% lags][, group := factor(group, levels = GROUPS)]
+  p <- ggplot(d, aes(lag_bp, mean_acf)) +
+    geom_hline(yintercept = 0, colour = "grey60", linewidth = .3) +
+    geom_line(aes(colour = gene_name), linewidth = .3) +
+    geom_line(data = m, colour = "black", linewidth = .6) +
+    facet_wrap(~ group, ncol = 1) +
+    labs(x = "Lag (bp)", y = "Mean ACF", colour = "Gene",
+         title = sprintf("Per-gene mean m6A ACF, %s allele, TSS +50 to +2500 bp; black = group mean; no smoothing", a)) +
+    theme_fiberseq("bw")
+  save_figure(p, file.path(out, "plots", sprintf("02_per_gene_acf_%s.pdf", a)), width = 9, height = 8)
+  print(p)
+}
+```
+
+# Tests
+
+The pooled run's tests, repeated within each allele, gene = unit: the squared difference of
+the two group mean curves summed over lags `r min(lags)`-`r max(lags)` with an exact
+permutation over all 252 splits of the 10 genes, and Wilcoxon rank-sum tests on per-gene
+peak height, peak lag and m6A call fraction.
+
+```{r tests}
+COMPARISONS <- list(GROUPS[1:2], GROUPS[2:3])
+profile_stat <- function(in_a, m)
+  sum((colMeans(m[in_a, , drop = FALSE]) - colMeans(m[!in_a, , drop = FALSE]))^2)
+
+tests <- rbindlist(lapply(ALLELES, function(a) {
+  m_all <- gene_matrix(a)[, lags + 1L, drop = FALSE]
+  tab   <- alleles[allele == a][match(genes$gene_name, gene_name)]
+  rbindlist(lapply(COMPARISONS, function(cmp) {
+    rows <- which(genes$group %in% cmp)
+    in_a <- genes$group[rows] == cmp[1]
+    m    <- m_all[rows, , drop = FALSE]
+    obs  <- profile_stat(in_a, m)
+    null <- apply(combn(length(rows), sum(in_a)), 2, function(k) profile_stat(seq_along(rows) %in% k, m))
+    wil  <- function(col) {
+      x <- tab[rows][[col]]
+      x_a <- x[in_a][is.finite(x[in_a])];  x_b <- x[!in_a][is.finite(x[!in_a])]
+      list(median_a = median(x_a), median_b = median(x_b),
+           p = if (length(x_a) >= 2 && length(x_b) >= 2) wilcox.test(x_a, x_b, exact = TRUE)$p.value else NA_real_)
+    }
+    rbind(data.table(allele = a, a = cmp[1], b = cmp[2],
+                     statistic = sprintf("profile SSD, lags %d-%d", min(lags), max(lags)),
+                     value_a = NA_real_, value_b = NA_real_, observed = obs,
+                     p_value = mean(null >= obs - 1e-12), n_permutations = length(null)),
+          rbindlist(lapply(c("peak_acf", "peak_lag_bp", "mean_m6a_call_fraction"), function(col) {
+            w <- wil(col)
+            data.table(allele = a, a = cmp[1], b = cmp[2], statistic = paste("median", col),
+                       value_a = w$median_a, value_b = w$median_b, observed = NA_real_,
+                       p_value = w$p, n_permutations = NA_integer_)
+          })))
+  }))
+}))
+fwrite(tests, file.path(out, "tables", "tests_by_allele.tsv"), sep = "\t")
+tests[, .(allele, a, b, statistic, value_a = signif(value_a, 3), value_b = signif(value_b, 3),
+          observed = signif(observed, 3), p_value = signif(p_value, 3))]
+```
+
+```{r session, echo=TRUE}
+sessionInfo()
+```

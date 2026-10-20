@@ -65,7 +65,6 @@ analysis_sets <- c("pooled", "noXCI")
 stopifnot(params$n_permutations == 10000L)
 state_columns <- c("co_access", "CRE1_access", "CRE2_access", "co_closed")
 state_labels <- setNames(CONFIG_LEVELS, state_columns)
-read_rule <- "contain"
 fire_overlap_fraction <- 0.5
 
 # output directories
@@ -312,7 +311,7 @@ for (i in seq_len(nrow(selected))) {
   labels <- label_reads(res,
     list(start = pair$cre1_start, end = pair$cre1_end),
     list(start = pair$cre2_start, end = pair$cre2_end),
-    read_rule = read_rule, fire_overlap_fraction = fire_overlap_fraction)
+    fire_overlap_fraction = fire_overlap_fraction)
   identity <- res$spans[, .(key, sample_name, original_RID = as.character(RID))]
   
   fibers <- merge(labels[shared == TRUE], identity,

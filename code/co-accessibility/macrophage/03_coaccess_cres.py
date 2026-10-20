@@ -6,7 +6,7 @@
                     CRE_ID = accession1.accession2.CRE_label
     gene window     TSS +/- 10 kb, pairs enumerated within a window
     pair distance   GenomicRanges gap distance, MIN_DIST < d < MAX_DIST (500 / 20000)
-    shared reads    reads overlapping BOTH cCREs -- see --read-rule
+    shared reads    reads whose span covers the FULL length of BOTH cCREs
     accessible      the read carries one FIRE element covering >= 50% of that cCRE
                     (fraction of cCRE length; not reciprocal or summed across FIREs)
     test            two-sided Fisher exact on the 2x2 + a pseudocount of 1 in every cell
@@ -113,7 +113,7 @@ def run_intersect(args_list, desc):
     return p.stdout
 
 
-def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, read_rule, tmpdir,
+def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, tmpdir,
                         fire_overlap_fraction=0.5):
     """{CRE_ID: set(read_id)} for covered and for accessible, on one chromosome."""
     cre_chr = tmpdir / f"cre.{chrom}.bed"
@@ -138,11 +138,9 @@ def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, read_rule, tmp
     if p.returncode != 0:
         sys.exit(f"ERROR: tabix on fire elements for {chrom} failed:\n{p.stderr[:2000]}")
 
-    # reads covering each cCRE. Kevin's rule is any overlap (subsetByOverlaps default
-    # minoverlap = 1L); --read-rule contain requires the read to span the whole cCRE.
-    cmd = [BEDTOOLS, "intersect", "-a", str(cre_chr), "-b", str(spans_chr), "-wa", "-wb"]
-    if read_rule == "contain":
-        cmd += ["-f", "1.0"]
+    # reads covering each cCRE: the read span must contain the whole cCRE (-f 1.0 of
+    # the cCRE). There is no any-overlap option.
+    cmd = [BEDTOOLS, "intersect", "-a", str(cre_chr), "-b", str(spans_chr), "-f", "1.0", "-wa", "-wb"]
     cov = defaultdict(set)
     for line in run_intersect(cmd, f"read intersect {chrom}").splitlines():
         f = line.split("\t")
@@ -158,7 +156,7 @@ def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, read_rule, tmp
         f = line.split("\t")
         acc[f[3]].add(f[8])          # CRE_ID, read name
 
-    # Under --read-rule contain a FIRE element can overlap the cCRE on a read that does
+    # A FIRE element can overlap the cCRE on a read that does
     # not span all of it, so accessibility is not automatically a subset of coverage.
     n_orphan = 0
     for c in list(acc):
@@ -184,9 +182,6 @@ def main():
                          "single-sample script uses 10000")
     ap.add_argument("--pseudocount", type=int, default=1,
                     help="added to every cell before the Fisher test, as Kevin does")
-    ap.add_argument("--read-rule", choices=["any", "contain"], default="any",
-                    help="'any' requires at least 1 bp of aligned-span overlap; "
-                         "'contain' requires the read to span the whole cCRE")
     ap.add_argument("--fire-overlap-fraction", type=float, default=0.5,
                     help="minimum fraction of the cCRE overlapped by ONE FIRE "
                          "element on the same read (default: 0.5)")
@@ -249,15 +244,14 @@ def main():
             idx = rows_by_chrom.get(chrom)
             if idx is None or len(idx) == 0:
                 continue
-            cov, acc, n_orph = incidence_for_chrom(chrom, cre_bed, spans, fe,
-                                                   args.read_rule, tmpdir,
+            cov, acc, n_orph = incidence_for_chrom(chrom, cre_bed, spans, fe, tmpdir,
                                                    args.fire_overlap_fraction)
             orphans += n_orph
             n_cre_seen += len(cov)
             counts[idx] = count_pairs(pairs.iloc[idx], cov, acc)
             del cov, acc
         print(f"{s}: incidence built for {n_cre_seen} cCREs "
-              f"({orphans} element hits dropped as not covered under --read-rule {args.read_rule})",
+              f"({orphans} element hits dropped: read does not span the whole cCRE)",
               flush=True)
 
         co_closed, cre1_access, cre2_access, co_access = counts.T
@@ -307,7 +301,7 @@ def main():
             "zero_access_cre2": (co_access + cre2_access) == 0,
             "cre1_in_tp_peaks": flags.loc[pairs["CRE1"], f"in_{s}_peaks"].to_numpy(),
             "cre2_in_tp_peaks": flags.loc[pairs["CRE2"], f"in_{s}_peaks"].to_numpy(),
-            "read_rule": args.read_rule,
+            "read_rule": "contain",
             "fire_overlap_fraction": args.fire_overlap_fraction,
             "min_dist": args.min_dist,
             "max_dist": args.max_dist,

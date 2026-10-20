@@ -148,7 +148,7 @@ def count(args):
             with tempfile.TemporaryDirectory(prefix='lcl_occupancy_') as tmp:
                 bed = Path(tmp)/'cres.bed'
                 cg[['chrom','start','end','CRE_ID','CRE_class']].to_csv(bed,sep='\t',index=False,header=False)
-                cov,acc,_ = incidence_for_chrom(chrom,bed,sample.blocks_path,sample.elements_path,'contain',.5,Path(tmp))
+                cov,acc,_ = incidence_for_chrom(chrom,bed,sample.blocks_path,sample.elements_path,.5,Path(tmp))
             wanted = set().union(*(cov[c] for c in cg.CRE_ID))
             fire_by_read=defaultdict(list)
             if chrom in fires.contigs:

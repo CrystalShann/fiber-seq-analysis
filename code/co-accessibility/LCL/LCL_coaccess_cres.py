@@ -4,7 +4,7 @@
 Adapted from macrophage/03_coaccess_cres.py. Candidate cCREs overlap the union
 of LCL FIRE peaks and share a canonical TSS +/-10 kb window. The interval gap
 must satisfy 500 < gap < 20000. Shared reads have aligned bases covering the
-FULL length of both cCREs (--read-rule contain): every base of each cCRE must
+FULL length of both cCREs: every base of each cCRE must
 fall inside the read's M/= /X blocks, so a read whose alignment gap or end lands
 inside either cCRE is not counted for that pair.
 A cCRE is accessible when ONE FIRE element on that same read covers >=50% of
@@ -171,7 +171,7 @@ def aligned_overlap(blocks, start, end):
 #################################################
 # get spanning reads, and accessible reads for every CRE
 #################################################
-def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, fire_fraction, tmpdir):
+def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, fire_fraction, tmpdir):
     """Intersect each FIRE with aligned blocks."""
     # pull only chrom out of the sample's aligned blocks file and its FIRE elements file
     spans = tmpdir / "spans.bed"
@@ -195,8 +195,8 @@ def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, read_rule, f
             blocks_by_read[rid] = aligned_blocks(fields[5:17])
         start, end = int(fields[1]), int(fields[2])
         overlap = aligned_overlap(blocks_by_read[rid], start, end)
-        # default rule for alignment: fully align both CREs
-        if overlap > 0 and (read_rule == "any" or overlap == end - start):
+        # the read's aligned blocks must cover every base of the CRE
+        if overlap == end - start:
           # if the read pass, write the read ID in CRE coverage
             coverage[fields[3]].add(rid)
             
@@ -282,7 +282,6 @@ def main():
     ap.add_argument("--sample-metatable", default=METATABLE)
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--prepare-manifest", action="store_true", help="Validate all31 source inputs and write universe/sample_manifest.tsv only")
-    ap.add_argument("--read-rule", choices=["any", "contain"], default="contain")
     ap.add_argument("--fire-overlap-fraction", type=float, default=0.5, help="Fraction of cCRE covered by ONE same-read FIRE element")
     ap.add_argument("--min-dist", type=int, default=500)
     ap.add_argument("--max-dist", type=int, default=20000)
@@ -353,7 +352,7 @@ def main():
             cre[cre.CRE_ID.isin(involved)].to_csv(cre_bed, sep="\t", index=False, header=False)
             for sample in samples.itertuples(index=False):
                 cov, acc, orphans = incidence_for_chrom(chrom, cre_bed, sample.blocks_path, sample.elements_path,
-                                                       args.read_rule, args.fire_overlap_fraction, temp)
+                                                       args.fire_overlap_fraction, temp)
                 cells = count_pairs(chrom_pairs, cov, acc)
                 pooled[idx] += cells
                 shared = cells.sum(axis=1)
@@ -381,7 +380,8 @@ def main():
     result["analysis_scope"] = args.chrom or "genome-wide"
     result["n_samples"] = len(samples)
     result["coverage_mode"] = COVERAGE_MODE
-    for field in ("read_rule", "fire_overlap_fraction", "min_dist", "max_dist", "pseudocount"):
+    result["read_rule"] = "contain"
+    for field in ("fire_overlap_fraction", "min_dist", "max_dist", "pseudocount"):
         result[field] = getattr(args, field)
     annotations = gene_map.groupby("CRE_pair", sort=False).agg(
         n_genes=("gene_id", "nunique"),

@@ -199,7 +199,7 @@ and TF footprint tracks are display only. Fibers are keyed `"<sample> <read name
 | `tabix_region()` | Tabix query of a BED region with the command line tool (1-based query) | data.table |
 | `load_region()` | Fiber spans and FIRE elements; `span_source = "aligned_blocks"` for LCL co-accessibility, `"read_spans"` for macrophage, or legacy `"fire_all"` for HP displays | list `region, samples, spans, elements, blocks`; aligned mode clips elements while preserving their IDs |
 | `load_ft_tracks()` | Adds the display tracks: `ft extract` m6A; nucleosomes (`nuc_source = "fiberhmm"` or `"ft"`); TF footprints (`tf_source = "by_size"`, `"recalled_tf"` or `"none"`) | the result with `m6a, nuc, size_fps` |
-| `label_reads()` | Per-fiber configuration at the pair: accessible when one of its FIRE elements overlaps the cCRE by >= 1 bp; `read_rule = "any"` or `"contain"` | data.table `key, sample_name, shared, acc1, acc2, config` |
+| `label_reads()` | Per-fiber configuration at the pair: accessible when one of its FIRE elements covers >= `fire_overlap_fraction` of the cCRE; a fiber covers a cCRE only if it spans the whole cCRE | data.table `key, sample_name, shared, acc1, acc2, config` |
 | `order_reads()` | Raster order: sample, configuration, start | character vector of keys |
 | `coaccess_m6a_fraction()` | Unbinned m6A fraction per position and sample over covering fibers | data.table `pos, sample_name, frac` |
 | `fiber_m6a_proportions()` | Per-fiber m6A proportion at one cCRE: calls / positions with at least one call in the pooled full-span `assemble_region_m6a()` matrix; every input fiber kept with an exclusion status | list `fibers, qc, checks` |

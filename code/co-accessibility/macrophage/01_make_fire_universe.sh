@@ -71,18 +71,21 @@ echo "  union: $(wc -l < "$peaks_union") merged peak intervals"
 
 
 ###########################
-# 2. cCREs overlapping a FIRE peak  ->  the element universe
+# 2. cCREs with >=50% inside a FIRE peak  ->  the element universe
 ###########################
-# subsetByOverlaps(CREs.gr, fire_peaks.gr) = any overlap >= 1 bp, keeping the cCRE
-# coordinates (never the peak's).  CRE_ID = accession1.accession2.CRE_label, exactly
+# A cCRE is kept if >=50% of its length lies inside one merged FIRE peak (-f is a
+# fraction of the cCRE, the -a feature), keeping the cCRE coordinates (never the
+# peak's). This replaces Kevin's subsetByOverlaps (any overlap >= 1 bp) so the
+# universe matches the per-read open call in 03_coaccess_cres.py, where one FIRE
+# element must cover >=50% of the cCRE.  CRE_ID = accession1.accession2.CRE_label, exactly
 # Kevin's paste0(accession1,".",accession2,".",CRE_label).
 #
 # Output BED5: chrom, start, end, CRE_ID, CRE_label
 
-echo "Selecting cCREs that overlap a FIRE peak..."
+echo "Selecting cCREs with >=50% of their length inside a FIRE peak..."
 awk -v re="$CHROM_RE" 'BEGIN{OFS="\t"} $1 ~ re {print $1,$2,$3,$4,$5,$6}' "$CRE_BED" \
     | LC_ALL=C sort -k1,1 -k2,2n -T "$SORT_TMP" \
-    | "$BEDTOOLS" intersect -a stdin -b "$peaks_union" -u \
+    | "$BEDTOOLS" intersect -a stdin -b "$peaks_union" -u -f 0.5 \
     | awk 'BEGIN{OFS="\t"} {print $1,$2,$3,$4"."$5"."$6,$6}' \
     | LC_ALL=C sort -k1,1 -k2,2n -T "$SORT_TMP" > "$cre_universe" || die "cCRE selection failed"
 n_cre=$(wc -l < "$cre_universe")
@@ -135,7 +138,8 @@ echo "  ${n_multi} genes carry more than one cCRE (these are the ones that yield
 ###########################
 # 5. Per-timepoint peak membership flags
 ###########################
-# Whether each universe cCRE overlaps THAT timepoint's own peaks. Carried through to
+# Whether >=50% of each universe cCRE lies inside one of THAT timepoint's own peaks
+# (same rule as the universe). Carried through to
 # the results so a per-timepoint-peak-restricted view stays available as a filter,
 # without changing the shared universe.
 
@@ -148,7 +152,7 @@ for s in "${SAMPLES[@]}"; do
     zcat "${FIRE_ROOT}/${s}/${s}-fire-v0.1-peaks.bed.gz" \
         | awk -v re="$CHROM_RE" 'BEGIN{OFS="\t"} $1 ~ /^#/ {next} $1 ~ re {print $1,$2,$3}' \
         | LC_ALL=C sort -k1,1 -k2,2n -T "$SORT_TMP" \
-        | "$BEDTOOLS" intersect -a "$cre_universe" -b stdin -c \
+        | "$BEDTOOLS" intersect -a "$cre_universe" -b stdin -c -f 0.5 \
         | awk '{print ($6 > 0) ? 1 : 0}' > "${tmpdir}/${s}"
 done
 {

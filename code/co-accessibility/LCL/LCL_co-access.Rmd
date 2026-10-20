@@ -64,7 +64,6 @@ universe_dir <- file.path(root, "universe")
 out_dir <- file.path(coaccess_dir, "all_chr")
 table_dir <- file.path(out_dir, "tables")
 plot_dir <- file.path(out_dir, "plots")
-read_rule <- "contain"
 fire_overlap_fraction <- 0.5
 fdr_cutoff <- 0.05
 paths <- list(root = root, fire_root = params$fire_root,
@@ -281,8 +280,7 @@ if (isTRUE(params$make_plots) && nrow(selected)) {
     res <- load_region(region, samples, paths$root, paths$fire_root,
       fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
       span_source = "aligned_blocks")
-    labels <- label_reads(res, cre1, cre2, read_rule = read_rule,
-      fire_overlap_fraction = fire_overlap_fraction)
+    labels <- label_reads(res, cre1, cre2, fire_overlap_fraction = fire_overlap_fraction)
     pair_data[[pair$pair_id]] <- list(pair = pair, region = region,
       cre1 = cre1, cre2 = cre2, res = res, labels = labels,
       counts = coaccess_2x2(labels))
@@ -813,8 +811,7 @@ if (isTRUE(params$make_plots) && nrow(selected_noxci)) {
     res <- load_region(region, pair_samples, paths$root, paths$fire_root,
       fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
       span_source = "aligned_blocks")
-    labels <- label_reads(res, cre1, cre2, read_rule = read_rule,
-      fire_overlap_fraction = fire_overlap_fraction)
+    labels <- label_reads(res, cre1, cre2, fire_overlap_fraction = fire_overlap_fraction)
     counts <- coaccess_2x2(labels)
 
     actual <- unlist(counts[1, c("neither", "cre1_only", "cre2_only", "both", "n_shared")],
@@ -975,8 +972,7 @@ if (isTRUE(params$make_plots) && nrow(top5_noxci)) {
     res <- load_region(region, pair_samples, paths$root, paths$fire_root,
       fire_ver = paths$fire_ver, tabix_bin = paths$tabix_bin,
       span_source = "aligned_blocks")
-    labels <- label_reads(res, cre1, cre2, read_rule = read_rule,
-      fire_overlap_fraction = fire_overlap_fraction)
+    labels <- label_reads(res, cre1, cre2, fire_overlap_fraction = fire_overlap_fraction)
     counts <- coaccess_2x2(labels)
 
     # window-spanning shared fibers, co-accessible first, capped at max_drawn

@@ -1171,7 +1171,6 @@ configuration_proportion_inputs <- function(labels, samples) {
 #   cre_track   - "tested": one row, tested pair red; "by_class": one row per class
 #   cre_track_types - cCRE classes drawn (NULL = all); the tested pair is always kept
 #   flank       - bp either side of the pair in the window
-#   read_rule   - see label_reads()
 #   plot_name   - title
 #   subtitle    - text appended to the window coordinates ("chr:start-end  |  ...")
 #   show_2x2    - add the 2x2 and Fisher OR of coaccess_2x2() to the subtitle
@@ -1197,7 +1196,7 @@ plot_coaccess_pair <- function(pair, samples, paths,
                                facet_by = c("sample", "pooled", "hp"),
                                colors = NULL, cres = NULL,
                                cre_track = c("tested", "by_class"), cre_track_types = NULL,
-                               flank = 1000, read_rule = "any",
+                               flank = 1000,
                                plot_name = NULL, subtitle = NULL, show_2x2 = TRUE,
                                heights = NULL, max_fibers_per_facet = NULL, seed = 1,
                                bar_by = c("facet", "sample"), pooled_bar = FALSE,
@@ -1225,8 +1224,7 @@ plot_coaccess_pair <- function(pair, samples, paths,
   res <- load_region(region, samples, paths$root, paths$fire_root,
                      fire_ver = if (is.null(paths$fire_ver)) "v0.1" else paths$fire_ver,
                      tabix_bin = paths$tabix_bin, span_source = span_source)
-  labs <- label_reads(res, cre1, cre2, read_rule = read_rule,
-                      fire_overlap_fraction = fire_overlap_fraction)
+  labs <- label_reads(res, cre1, cre2, fire_overlap_fraction = fire_overlap_fraction)
   # display tracks only for the fibers that can be drawn
   track_args <- list(res, keys = labs[!is.na(config), key], ft_root = paths$ft_root,
                      hmm_root = paths$hmm_root, tabix_bin = paths$tabix_bin,

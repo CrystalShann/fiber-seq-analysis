@@ -16,7 +16,6 @@
 # Usage:
 #   sbatch run_coaccess.sh
 #   sbatch run_coaccess.sh --max-dist 10000        # Kevin's single-sample range
-#   sbatch run_coaccess.sh --read-rule contain     # require fibers to span the cCRE
 #   sbatch run_coaccess.sh --fire-overlap-fraction 0.5  # fraction of cCRE covered by one FIRE
 #   sbatch run_coaccess.sh --kevin-compat          # drop zero-accessibility pairs
 

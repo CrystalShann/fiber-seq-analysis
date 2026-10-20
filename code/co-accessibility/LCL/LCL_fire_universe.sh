@@ -2,7 +2,7 @@
 # Genome-wide cCRE universe from FIRE peaks across all 31 LCL samples
 
 # 1. merge FIRE peaks from all 31 samples into one union
-# 2. keep only the CREs that overlap with the FIRE peaks union, and links each one to genes whose TSS is 
+# 2. keep only the CREs with >=50% of their length inside one FIRE peak union interval, and links each one to genes whose TSS is 
 # within 10 kb window of the CRE
 # 3. record which samples have a FIRE peak at each CRE
 
@@ -52,10 +52,12 @@ LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" "$tmpdir/peaks.bed" \
 
 # input: /project/spott/cshan/annotations/GRCh38-cCREs.bed
 
-# keep each CRE that overlaps the FIRE union by at least 1bp
+# keep each CRE with >=50% of its length inside one merged FIRE peak (-f is a fraction of the
+# cCRE, the -a feature). This matches the per-read open call in LCL_coaccess_cres.py, where one
+# FIRE element must cover >=50% of the cCRE.
 
 awk -v re="$CHROM_RE" 'BEGIN{OFS="\t"} $1 ~ re {print $1,$2,$3,$4,$5,$6}' "$CRE_BED" \
-    | "$BEDTOOLS" intersect -a stdin -b "$tmpdir/fire_peaks_union.bed" -u \
+    | "$BEDTOOLS" intersect -a stdin -b "$tmpdir/fire_peaks_union.bed" -u -f 0.5 \
     | awk 'BEGIN{OFS="\t"} {print $1,$2,$3,$4"."$5"."$6,$6}' \
     | LC_ALL=C sort -k1,1 -k2,2n -T "$tmpdir" > "$tmpdir/cre_universe.bed"
 
@@ -90,9 +92,10 @@ cut -f4 "$tmpdir/cre_universe.bed" > "$tmpdir/ids"
 flag_files=("$tmpdir/ids")
 printf 'CRE_ID' > "$tmpdir/flags_header"
 
-# for each sample, count how many of the sample's peak overlap each CRE and append the count
+# for each sample, flag CREs with >=50% of their length inside one of the sample's peaks (same rule
+# as the universe) and append the flag
 while IFS=$'\t' read -r sample_name cram_path peaks_path elements_path spans_path; do
-    "$BEDTOOLS" intersect -a "$tmpdir/cre_universe.bed" -b "$tmpdir/$sample_name.peaks.bed" -c \
+    "$BEDTOOLS" intersect -a "$tmpdir/cre_universe.bed" -b "$tmpdir/$sample_name.peaks.bed" -c -f 0.5 \
         | awk '{print ($6>0)?1:0}' > "$tmpdir/$sample_name.flags"
     flag_files+=("$tmpdir/$sample_name.flags")
     printf '\tin_%s_peaks' "$sample_name" >> "$tmpdir/flags_header"
