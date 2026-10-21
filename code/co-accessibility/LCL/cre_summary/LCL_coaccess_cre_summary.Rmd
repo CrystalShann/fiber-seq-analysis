@@ -22,6 +22,11 @@ a=$(sbatch --parsable --partition=caslake --qos=caslake --mem=48G --array=1-31%6
 sbatch --partition=caslake --qos=caslake --mem=48G --dependency=afterok:$a LCL_tf_cooccupancy.sh footprints_combine
 ```
 
+`/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/cre_summary/count_cre_footprints.R`
+
+- measures how often, and where, TF sized footprints occur inside each CRE
+- recurrent footprints a stretch of bases inside a CRE where at least 15% of the CRE’s informative fibers carry a footprint at the same place, with at least 5 fibers at its strongest base
+
 
 ```{r setup, message=FALSE}
 library(data.table)
@@ -77,17 +82,20 @@ head(print(cre))
 
 ## Do co-access CREs have more footprints?
 
-For each set and each CRE class within a set, tables report the number of CREs and
-the mean and median of five measures: footprints per informative fiber, footprints per informative
-fiber per 100 bp, percentage of CRE bases footprinted, recurrent footprint positions
-per CRE, and peak footprint frequency. Boxplots show the per-CRE distributions by set.
+Footprint density is the number of footprints per informative fiber divided by CRE length and multiplied by 100. The percentage of bases footprinted is averaged over informative fibers, using the union of footprint-covered bases within each fiber
 
-Footprint density is the number of footprints per informative fiber divided by CRE
-length and multiplied by 100. The percentage of bases footprinted is averaged over
-informative fibers, using the union of footprint-covered bases within each fiber.
-A recurrent position is a contiguous run of CRE bases footprinted on >= 15% of
-informative fibers, with >= 5 fibers at its peak. Peak footprint frequency is the
-maximum percentage of informative fibers footprinted at any base in the CRE.
+A recurrent position is a contiguous stretch of CRE bases footprinted on >= 15% of informative fibers, with >= 5 fibers at its peak. Peak footprint frequency is the maximum percentage of informative fibers footprinted at any base in the CRE
+
+
+1. Footprints per informative fiber: average number of footprints touching the CRE on each informative fiber. A footprint counts if it shares at least one base with the CRE
+
+2. Footprints per informative fiber per 100 bp: measures footprint density
+
+3. % of CRE bases footprinted. Of all the CRE bases on all informative fibers, this is the percentage covered by a footprint. If one fiber has two overlapping footprints, the shared bases count once. It shows how much of the element is protected on a typical open molecule: low values mean mostly bare, accessible DNA, and high values mean a densely bound element.
+
+3. Recurrent footprint positions per CRE: counts the stretches in the CRE where at least 15% of informative fibers have a footprint at the same bases, with at least 5 fibers at the strongest bas
+
+4. Peak footprint frequency (% of informative fibers): percentage of informative fibers footprinted at the CRE’s single most footprinted base
 
 ```{r footprints}
 metrics <- c(footprints_per_fiber='Footprints per informative fiber',
@@ -111,7 +119,7 @@ long[,metric:=factor(metrics[as.character(metric)],levels=metrics)]
 p <- ggplot(long,aes(set,value,fill=set))+geom_boxplot(outlier.size=.2,width=.6)+
   facet_wrap(~metric,scales='free_y',nrow=1)+scale_fill_manual(values=set_cols,guide='none')+
   labs(x=NULL,y=NULL,title='FiberHMM footprints per CRE',
-    caption='Eligible autosomal CREs; all FiberHMM footprints on open, informative fibers, pooled over samples.')+
+    caption='autosomal CREs')+
   theme_fiberseq()
 save_plot(p,'footprints_by_set.pdf',16,4.5);print(p)
 ```
@@ -119,8 +127,9 @@ save_plot(p,'footprints_by_set.pdf',16,4.5);print(p)
 ## Do co-access CREs differ in length?
 
 CRE length is `end - start` in base pairs. The table reports the count, mean, median,
-25th and 75th percentiles, minimum, and maximum for each set. Overlaid density
-histograms compare the length distributions using 10-bp bins.
+25th and 75th percentiles, minimum, and maximum for each set
+
+Overlaid density histograms compare the length distributions using 10-bp bins
 
 ```{r length}
 t2 <- cre[,.(n_CREs=.N,mean=mean(length),median=as.numeric(median(length)),q25=quantile(length,.25),
