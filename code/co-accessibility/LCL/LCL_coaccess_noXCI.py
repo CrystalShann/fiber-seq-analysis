@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from LCL_coaccess_cres import CELLS, ROOT
+from LCL_coaccess_cres import CELLS, ROOT, bh_min_shared
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
 from count_and_test_pairs import test_counts, summarize_coaccess_counts
 
@@ -27,7 +27,7 @@ FEMALE, MALE = "female (XX)", "male (XY)"
 KEYS = ["CRE_pair", "CRE1", "CRE2", "dist", "cre1_start", "cre1_end", "cre2_start", "cre2_end",
         "chrom", "CRE_pair_labels"]
 PARAMS = ["dataset", "coverage_mode", "read_rule", "fire_overlap_fraction", "min_dist", "max_dist",
-          "pseudocount"]
+          "pseudocount", "min_shared_reads"]
 GENES = ["n_genes", "gene_ids", "gene_names"]
 STATS = CELLS + ["pval", "fisher_estimate", "pval_raw", "n_shared_reads", "n_contributing_samples",
                  "n_samples", "OR", "or_haldane", "expected_co_access", "observed_expected_ratio",
@@ -115,7 +115,8 @@ def main():
     # statistics exactly as in LCL_coaccess_cres.main()
     cells = result[CELLS].to_numpy(dtype=np.int64)
     result = pd.concat([result, test_counts(cells, pc)], axis=1)
-    result = summarize_coaccess_counts(result, pc)
+    # BH only over pairs with >= 20 spanning fibers (chrX: male samples only)
+    result = bh_min_shared(summarize_coaccess_counts(result, pc))
     result = result.drop(columns="co_inaccess")
 
     # outside chrX nothing was re-pooled, so everything except the BH family must match

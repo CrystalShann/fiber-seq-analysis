@@ -263,6 +263,12 @@ the shared R file's digest so helper changes invalidate old fit checkpoints.
 | `configuration_proportion_inputs()` | Configuration proportions per bar | list `rows, totals` |
 | `plot_coaccess_pair()` | Read-level figure of one cCRE pair plus configuration bars, for either dataset (see below) | list `res, labels, counts, panels, bars, region, height` |
 | `plot_region_example()` | One-call region plot: `extract_region_results()` (when `script` is given), `load_region_results()`, optional `group` function, `plot_region_panels()` | list `res, plot, result_dirs` |
+| `MOLECULE_TRACK_COLORS` | Footprint classes and colours of the molecule panels (FIRE / linker, 130-160 bp nucleosome, TF footprint size classes) | named character vector |
+| `stack_rows()` | Plotting row of each molecule within its facet | the table with `y` |
+| `molecule_tracks()` | FIRE / linker segments, nucleosomes and FIRE-polished TF footprints of a `load_region_results()` result, one row per interval | data.frame `RID, start, end, class` |
+| `bar_width()`, `bar_gap()`, `molecule_xlim()` | Colour-bar sizes and x range of the molecule panels | numeric |
+| `plot_molecules()` | One row per molecule, facetted by a read grouping, with optional per-molecule colour bars (used by `TF_enrichment.ipynb` and `plot_tf_cluster_profiles()`) | ggplot |
+| `plot_tf_cluster_profiles()` | Per-cluster accessibility + molecule figure and its side-by-side with the read heatmap, for `TF_enrichment.ipynb` examples (panels 3C / 3BC) | invisible NULL; saves PDFs |
 
 ### `plot_coaccess_pair()`
 

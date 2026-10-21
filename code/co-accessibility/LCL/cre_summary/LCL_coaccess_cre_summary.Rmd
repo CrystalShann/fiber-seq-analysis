@@ -1,0 +1,161 @@
+---
+title: "LCL co-access vs background CREs: footprints, length, class"
+output: html_document
+params:
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  dest: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+---
+
+# Features of co-accessible CREs
+
+This analysis describes whether co-accessible CREs are longer and have higher footprint density than background CREs, and compares their CRE-class composition
+
+CREs come from `cre_summary/inputs/eligible_cres.tsv.gz` (eligible autosomal CREs with >= 10 open, informative fibers) and are split into co-access CREs (in >= 1 donor-adjusted co-access pair) and background CREs (the remaining eligible CREs)
+
+  - Each counted fiber must individually cover the entire CRE, have its own FIRE element covering >= 50% of the CRE after accounting for deletions --> all reads meet this criteria counts as denominator
+
+
+
+```bash
+cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/cre_summary
+a=$(sbatch --parsable --partition=caslake --qos=caslake --mem=48G --array=1-31%6 LCL_tf_cooccupancy.sh footprints)
+sbatch --partition=caslake --qos=caslake --mem=48G --dependency=afterok:$a LCL_tf_cooccupancy.sh footprints_combine
+```
+
+
+```{r setup, message=FALSE}
+library(data.table)
+library(ggplot2)
+setDTthreads(1L)
+root <- params$root
+dest <- params$dest
+out <- file.path(dest,'cre_summary')
+inputs <- file.path(out,'inputs')
+required <- c(file.path(root,'cre_footprint_summary.tsv.gz'),
+  file.path(inputs,'eligible_cres.tsv.gz'))
+missing <- required[!file.exists(required)]
+if(length(missing)) stop('Missing ',paste(missing,collapse=', '),
+  '. Restore eligible_cres.tsv.gz under cre_summary/inputs if missing; ',
+  'run the footprints jobs above if cre_footprint_summary.tsv.gz is missing.')
+for(d in c('tables','plots')) dir.create(file.path(out,d),recursive=TRUE,showWarnings=FALSE)
+source('/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r')
+write_tsv <- function(x,name) fwrite(x,file.path(out,'tables',name),sep='\t',na='NA')
+save_plot <- function(p,name,w=8,h=5) save_figure(p,file.path(out,'plots',name),width=w,height=h)
+set_cols <- c(background='#3274a1','co-access'='#d95f02')
+```
+
+
+Combine eligible CREs and footprints
+
+eligible CRE and footprint summary
+
+| Column | Meaning |
+|---|---|
+| `n_footprints` | Total qualifying footprint occurrences overlapping the CRE across informative fibers |
+| `footprint_bp` | Total footprint-covered bases within the CRE, summed across fibers; overlapping footprints on the same fiber count once per base |
+| `fibers_with_fp` | Number of informative fibers with at least one qualifying footprint overlapping the CRE |
+| `footprints_per_fiber` | `n_footprints / n_informative` |
+| `pct_bases_footprinted` | `100 × footprint_bp / (n_informative × CRE length)` |
+| `peak_pct` | Highest percentage of informative fibers footprinted at any single base in the CRE |
+| `n_positions` | Number of recurrent footprint positions in the CRE |
+
+
+```{r inputs}
+# load CRE and footprint summary
+cre <- fread(file.path(inputs,'eligible_cres.tsv.gz'),select=c('CRE_ID','chrom','start','end','CRE_class','set','n_informative'))
+fp <- fread(file.path(root,'cre_footprint_summary.tsv.gz'))
+cre <- merge(cre,fp[,.(CRE_ID,fp_informative=n_informative,n_footprints,footprint_bp,fibers_with_fp,
+  footprints_per_fiber,pct_bases_footprinted,peak_pct,n_positions)],by='CRE_ID',all.x=TRUE)
+
+stopifnot(!anyNA(cre$fp_informative),identical(cre$fp_informative,cre$n_informative))
+cre[,`:=`(length=end-start,set=factor(set,levels=c('co-access','background')),fp_informative=NULL)]
+cre[,footprints_per_fiber_per_100bp:=100*footprints_per_fiber/length]
+cre[,.N,by=set]
+
+head(print(cre))
+```
+
+## Do co-access CREs have more footprints?
+
+For each set and each CRE class within a set, tables report the number of CREs and
+the mean and median of five measures: footprints per informative fiber, footprints per informative
+fiber per 100 bp, percentage of CRE bases footprinted, recurrent footprint positions
+per CRE, and peak footprint frequency. Boxplots show the per-CRE distributions by set.
+
+Footprint density is the number of footprints per informative fiber divided by CRE
+length and multiplied by 100. The percentage of bases footprinted is averaged over
+informative fibers, using the union of footprint-covered bases within each fiber.
+A recurrent position is a contiguous run of CRE bases footprinted on >= 15% of
+informative fibers, with >= 5 fibers at its peak. Peak footprint frequency is the
+maximum percentage of informative fibers footprinted at any base in the CRE.
+
+```{r footprints}
+metrics <- c(footprints_per_fiber='Footprints per informative fiber',
+  footprints_per_fiber_per_100bp='Footprints per informative fiber per 100 bp',
+  pct_bases_footprinted='% of CRE bases footprinted',
+  n_positions='Recurrent footprint positions per CRE',peak_pct='Peak footprint frequency (% of informative fibers)')
+describe <- function(d,by_cols) {
+  ans <- d[,.(n_CREs=.N),by=by_cols]
+  
+  for(m in names(metrics)) ans <- merge(ans,d[,setNames(list(as.numeric(median(get(m))),mean(get(m))),
+    paste0(m,c('_median','_mean'))),by=by_cols],by=by_cols)
+  ans
+}
+t1 <- describe(cre,'set')
+t1_class <- describe(cre,c('CRE_class','set'))[order(CRE_class,set)]
+write_tsv(t1,'footprints_by_set.tsv');write_tsv(t1_class,'footprints_by_set_and_class.tsv')
+knitr::kable(t1,digits=2)
+knitr::kable(t1_class,digits=2)
+long <- melt(cre[,c(list(set=set),lapply(.SD,as.numeric)),.SDcols=names(metrics)],id.vars='set',variable.name='metric')
+long[,metric:=factor(metrics[as.character(metric)],levels=metrics)]
+p <- ggplot(long,aes(set,value,fill=set))+geom_boxplot(outlier.size=.2,width=.6)+
+  facet_wrap(~metric,scales='free_y',nrow=1)+scale_fill_manual(values=set_cols,guide='none')+
+  labs(x=NULL,y=NULL,title='FiberHMM footprints per CRE',
+    caption='Eligible autosomal CREs; all FiberHMM footprints on open, informative fibers, pooled over samples.')+
+  theme_fiberseq()
+save_plot(p,'footprints_by_set.pdf',16,4.5);print(p)
+```
+
+## Do co-access CREs differ in length?
+
+CRE length is `end - start` in base pairs. The table reports the count, mean, median,
+25th and 75th percentiles, minimum, and maximum for each set. Overlaid density
+histograms compare the length distributions using 10-bp bins.
+
+```{r length}
+t2 <- cre[,.(n_CREs=.N,mean=mean(length),median=as.numeric(median(length)),q25=quantile(length,.25),
+  q75=quantile(length,.75),min=min(length),max=max(length)),by=set]
+write_tsv(t2,'length_by_set.tsv')
+knitr::kable(t2,digits=1)
+p <- ggplot(cre,aes(length,after_stat(density),fill=set))+
+  geom_histogram(binwidth=10,position='identity',alpha=.5,boundary=0)+
+  scale_fill_manual(values=set_cols,name=NULL)+
+  labs(x='CRE length (bp)',y='Density',title='CRE length')+theme_fiberseq()
+save_plot(p,'length_by_set.pdf',7,4.5);print(p)
+```
+
+## Which CRE classes tend to be co-access?
+
+The table reports co-access and background counts for each CRE class, the percentage
+of each class that is co-access, and each class's percentage of the two sets. The bar
+plot shows class composition within each set, ordered by the percentage of each
+class that is co-access.
+
+```{r class}
+t3 <- dcast(cre[,.N,by=.(CRE_class,set)],CRE_class~set,value.var='N',fill=0)
+setnames(t3,c('co-access','background'),c('n_coaccess','n_background'))
+t3[,`:=`(pct_of_class_coaccess=100*n_coaccess/(n_coaccess+n_background),
+  pct_of_coaccess_set=100*n_coaccess/sum(n_coaccess),pct_of_background_set=100*n_background/sum(n_background))]
+setorder(t3,-pct_of_class_coaccess)
+write_tsv(t3,'class_by_set.tsv')
+knitr::kable(t3,digits=1)
+d <- melt(t3[,.(CRE_class,`co-access`=pct_of_coaccess_set,background=pct_of_background_set)],
+  id.vars='CRE_class',variable.name='set',value.name='pct')
+d[,CRE_class:=factor(CRE_class,levels=t3$CRE_class)]
+p <- ggplot(d,aes(CRE_class,pct,fill=set))+geom_col(position='dodge',width=.7)+
+  scale_fill_manual(values=set_cols,name=NULL)+
+  labs(x=NULL,y='% of CREs in the set',title='CRE class composition',
+    caption='Classes ordered by % of the class that is co-access.')+theme_fiberseq()
+save_plot(p,'class_by_set.pdf',8,4.5);print(p)
+```
+

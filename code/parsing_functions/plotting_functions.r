@@ -1407,15 +1407,160 @@ plot_region_example <- function(region, sample_names, out_root, outname, script 
 
 
 # ---------------------------------------------------------------------------
+# Molecule panels: one row per molecule with its FIRE / linker segments,
+# nucleosomes and FIRE-polished TF footprints drawn as rectangles, facetted by a
+# read grouping, with optional colour bars left of the window (moved from
+# 05_vis_fire_freq.Rmd; used by TF_enrichment.ipynb and
+# plot_tf_cluster_profiles()). `ex` is one example row with chrom, start, end
+# (tested region) and window_start, window_end.
+# ---------------------------------------------------------------------------
+
+# Footprint classes of molecule_tracks(), in drawing order, with their colours
+MOLECULE_TRACK_COLORS <- c("linker (non-FIRE MSP)"  = "darkgray",
+                           "FIRE element"           = "#FF8C00",
+                           "nucleosome 130-160 bp"  = "darkblue",
+                           "TF footprint 10-30 bp"  = "purple",
+                           "TF footprint 30-60 bp"  = "magenta",
+                           "TF footprint 60-80 bp"  = "#41c4e1")
+
+# ---------------------------------------------------------------------------
+# Plotting row of each molecule within its facet, in the current row order.
+#
+# Inputs:
+#   df        - one row per molecule
+#   group_col - facet column
+# Output:
+#   df with y = 1, 2, ... within each value of group_col
+# ---------------------------------------------------------------------------
+stack_rows <- function(df, group_col) {
+  df$y <- as.integer(ave(seq_len(nrow(df)), df[[group_col]], FUN = seq_along))
+  df
+}
+
+# ---------------------------------------------------------------------------
+# FIRE / linker segmentation, nucleosomes and FIRE-polished TF footprints of a
+# load_region_results() result, one row per interval.
+#
+# Inputs:
+#   res          - load_region_results() result (fire, nucs, fps_infire)
+#   track_colors - named colours; the names are the class levels
+# Output:
+#   data.frame RID, start, end, class (factor), TF footprints last so they are
+#   drawn on top
+# ---------------------------------------------------------------------------
+molecule_tracks <- function(res, track_colors = MOLECULE_TRACK_COLORS) {
+  as_track <- function(df, class) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    data.frame(RID = as.character(df$RID), start = df$start, end = df$end, class = class)
+  }
+  fire <- res$fire[res$fire$class %in% c("FIRE", "linker"), , drop = FALSE]
+  fps  <- res$fps_infire[!is.na(res$fps_infire$class), , drop = FALSE]
+  tr <- dplyr::bind_rows(
+    as_track(fire, ifelse(fire$class == "FIRE", "FIRE element", "linker (non-FIRE MSP)")),
+    as_track(res$nucs, "nucleosome 130-160 bp"),
+    as_track(fps, paste("TF footprint", fps$class)))
+  tr$class <- factor(tr$class, levels = names(track_colors))
+  tr[order(tr$class), , drop = FALSE]      # TF footprints drawn last, on top
+}
+
+# ---------------------------------------------------------------------------
+# x range of the molecule panels: the window plus room for n_bars colour bars
+# of width bar_width() separated by bar_gap().
+#
+# Inputs:
+#   ex     - example row (window_start, window_end)
+#   n_bars - number of colour bars left of the window
+# Output:
+#   bar_width(), bar_gap(): bp; molecule_xlim(): c(left, window_end)
+# ---------------------------------------------------------------------------
+bar_width <- function(ex) 0.022 * (ex$window_end - ex$window_start)
+bar_gap   <- function(ex) 0.006 * (ex$window_end - ex$window_start)
+molecule_xlim <- function(ex, n_bars) {
+  c(ex$window_start - n_bars * (bar_width(ex) + bar_gap(ex)) - bar_gap(ex), ex$window_end)
+}
+
+# ---------------------------------------------------------------------------
+# One row per molecule, facetted by `facet_col`, with a colour bar per
+# molecule left of the window for each column in `bar_cols`; dashed lines mark
+# the tested region.
+#
+# Inputs:
+#   rows            - one row per molecule: RID, y (stack_rows()), facet_col
+#                     and the bar_cols
+#   tracks          - molecule_tracks() result
+#   ex              - example row (chrom, start, end, window_start, window_end)
+#   facet_col       - facet column of rows
+#   facet_labels    - named facet strip labels
+#   bar_cols        - columns of rows drawn as colour bars
+#   bar_palette     - colours of the bar values
+#   legend_extra    - bar values to list in the legend after the track classes
+#   title, subtitle - plot labels
+#   track_colors    - colours of the track classes
+#   breaks          - x axis breaks; NULL = pretty() breaks inside the window
+#   theme_overrides - theme_fiberseq() overrides
+# Output:
+#   ggplot
+# ---------------------------------------------------------------------------
+plot_molecules <- function(rows, tracks, ex, facet_col, facet_labels,
+                           bar_cols = character(), bar_palette = NULL, legend_extra = NULL,
+                           title = NULL, subtitle = NULL, track_colors = MOLECULE_TRACK_COLORS,
+                           breaks = NULL, theme_overrides = list()) {
+  bw   <- bar_width(ex)
+  gap  <- bar_gap(ex)
+  xlim <- molecule_xlim(ex, length(bar_cols))
+  if (is.null(breaks)) {
+    breaks <- pretty(c(ex$window_start, ex$window_end), n = 5)
+    breaks <- breaks[breaks >= ex$window_start & breaks <= ex$window_end]
+  }
+
+  rows$facet <- rows[[facet_col]]
+  tr <- dplyr::inner_join(tracks, rows[, c("RID", "facet", "y")], by = "RID")
+  tr$start <- pmax(tr$start, ex$window_start)
+  tr$end   <- pmin(tr$end, ex$window_end)
+  tr <- tr[tr$end > tr$start, , drop = FALSE]
+
+  bars <- dplyr::bind_rows(lapply(seq_along(bar_cols), function(i) {
+    xmax <- ex$window_start - gap - (i - 1) * (bw + gap)
+    data.frame(facet = rows$facet, y = rows$y, xmin = xmax - bw, xmax = xmax,
+               fill = as.character(rows[[bar_cols[i]]]))
+  }))
+
+  p <- ggplot() +
+    geom_segment(data = rows, aes(x = ex$window_start, xend = ex$window_end, y = y, yend = y),
+                 colour = "grey80", linewidth = 0.15) +
+    geom_rect(data = tr, aes(xmin = start, xmax = end, ymin = y - 0.45, ymax = y + 0.45,
+                             fill = class))
+  if (nrow(bars) > 0)
+    p <- p + geom_rect(data = bars, aes(xmin = xmin, xmax = xmax, ymin = y - 0.5,
+                                        ymax = y + 0.5, fill = fill))
+  p +
+    geom_vline(xintercept = c(ex$start, ex$end), linetype = "dashed", linewidth = 0.3) +
+    facet_grid(facet ~ ., scales = "free_y", space = "free_y",
+               labeller = as_labeller(facet_labels)) +
+    # clusters are named by the facets, so only classes and extra keys are listed
+    scale_fill_manual(values = c(track_colors, bar_palette),
+                      breaks = c(names(track_colors), legend_extra), name = NULL) +
+    scale_x_continuous(breaks = breaks, labels = scales::comma) +
+    scale_y_reverse(expand = expansion(add = 0.6)) +
+    coord_cartesian(xlim = xlim, expand = FALSE) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    labs(x = paste(ex$chrom, "position (bp)"), y = NULL, title = title, subtitle = subtitle) +
+    theme_fiberseq("classic", base_size = 9, overrides = theme_overrides) +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          axis.line.y = element_blank(), panel.spacing.y = unit(1.5, "mm"),
+          plot.margin = margin(5.5, 5.5, 5.5, 20))
+}
+
+
+# ---------------------------------------------------------------------------
 # Per-cluster accessibility, molecule and heatmap figures for one set of TF
 # footprint example regions (panel3C / panel3BC). For each example: an
 # accessibility profile + molecule panel per Leiden cluster, saved alone,
 # then combined side-by-side with the pooled read heatmap from
 # plot_read_heatmap(layout = "fire"), saved combined. Uses cluster_palette(),
 # plot_group_profile(), theme_fiberseq() and plot_read_heatmap() from this
-# file; the remaining collaborators are supplied by the caller because they
-# come from the calling pipeline (an extracted 05_vis_fire_freq.Rmd chunk and
-# its own R-stage preamble), not from this file.
+# file; the remaining collaborators are supplied by the caller (TF_enrichment.ipynb
+# passes its own R-stage helpers and this file's molecule panel functions).
 #
 # Inputs:
 #   examples              - one row per example region (selection_TF, start,
@@ -1430,8 +1575,9 @@ plot_region_example <- function(region, sample_names, out_root, outname, script 
 #                           n_groups, n_molecules, subtitle) combining an
 #                           accessibility profile with a molecule panel
 #   molecule_tracks, add_read_groups, stack_rows, plot_molecules -
-#                           parsing_footprints_functions.r helpers for
 #                           per-read track data and the molecule panel
+#                           (add_read_groups() from parsing_footprints_functions.r,
+#                           the others from this file)
 #   time_cols, time_levels - timepoint colours and factor levels
 #   example_theme_settings - theme_fiberseq() overrides shared across panels
 #   window_breaks         - function(ex) -> x axis breaks for ex's window
@@ -1462,7 +1608,8 @@ plot_tf_cluster_profiles <- function(examples, reference_result, show_reads, exa
     lab_C2 <- setNames(sprintf("%s\nn = %d", names(n_C2), as.integer(n_C2)), names(n_C2))
     pC2_mol <- plot_molecules(rows_C2, tracks, ex, "cluster", lab_C2,
                               bar_cols = c("cluster", "time"),
-                              bar_palette = c(cl_cols, time_cols), legend_extra = time_levels)
+                              bar_palette = c(cl_cols, time_cols), legend_extra = time_levels,
+                              breaks = window_breaks(ex), theme_overrides = example_theme_settings)
     pC2_accessibility <- local({
       .profile_args <- list(pileup = res_cl$pileup,
     ex = ex,

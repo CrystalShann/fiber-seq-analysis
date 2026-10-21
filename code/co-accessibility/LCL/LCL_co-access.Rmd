@@ -34,6 +34,7 @@ This analysis looks for co-accessibility CREs in pooled 31 sample LCL data
 7. Identify which reads are accessible at each CRE -> a CRE is accessible if it 50% overlaps with a FIRE element, and restrict this to the aligned blocks
 8. Build 2x2 table for fisher test on reads fully spanning both CREs: neither, CRE1 only, CRE2 only, both, and sum the counts across all samples
 9. Fisher test + 1 pseudocount on row counts from 2x2 table, and calculate OR
+10. Coverage filter: a pair is tested (BH correction, FDR) only if at least 20 fibers span both CREs, summed across samples (chrX in the female-chrX-removed section: male samples only); pairs below this keep their p-value but have FDR = NA
 
 
 # Setup
@@ -125,7 +126,7 @@ Read Co-accessible CRE pairs
 ```{r read-genome-wide-pair-results}
 pairs_file <- file.path(coaccess_dir, "LCL_coaccess_pairs.tsv.gz")
 pairs_dt <- fread(pairs_file)
-cat(nrow(pairs_dt), "unique tested pairs loaded.\n")
+cat(nrow(pairs_dt), "unique pairs loaded;", sum(!is.na(pairs_dt$fdr)), "tested (>= 20 spanning fibers).\n")
 
 head(pairs_dt)
 ```

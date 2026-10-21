@@ -1,0 +1,244 @@
+---
+title: "Haplotype and allele skew of LCL cCREs and co-accessible pairs"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+---
+
+# Are co-accessible pairs driven by haplotype differences?
+
+A pooled 2x2 table mixes the two haplotypes of every sample. When both cCREs are more open on
+the same haplotype the odds ratio is inflated; when they are open on opposite haplotypes it is
+deflated. Haplotype-selective chromatin accessibility (HSCA) comes from imprinting, cis variants
+(HSCA-withVar) and clonal somatic epimutations (HSCA-noVar) (Vollger et al., Cell 2026).
+
+The test is the paper's: two-sided Fisher on accessible vs not accessible fibers per haplotype,
+BH, FDR <= 0.05, at least 10 reads per haplotype. Applied to a pair, "accessible" becomes "both
+cCREs open" on reads that span both cCREs.
+
+| Unit | Within sample, H1 vs H2 | Within sample, REF vs ALT | Across samples, REF vs ALT |
+|---|---|---|---|
+| cCRE | `LCL_hsca_cre_status` | `LCL_hsca_cre_allele_by_sample` | `LCL_hsca_cre_allele` |
+| pair | `LCL_hsca_pair_status` | `LCL_hsca_pair_allele_by_sample` | `LCL_hsca_pair_allele` |
+
+- `LCL_hsca_cre_status`: FIRE's own per-peak hap1 vs hap2 test (`<sample>-fire-v0.1-hap-differences.bed.gz`)
+  intersected with the paired cCREs; status hap1 / hap2 / conflict / ns; a missing row = untested.
+- H1/H2 are each sample's HiPhase tags: they are only compared within one sample and one phase
+  block (pairs use the reads of their majority block).
+- REF/ALT is read from each read's base at one het SNV per cCRE (the SNV het in the most samples),
+  so the direction means the same thing in every sample and can be pooled. A sample is pooled at
+  an SNV only if its reads show both alleles there: AL20, AL27, AL28 and AL54 (and partly AL61,
+  AL38) carry another person's genotypes, and 57-68% of their "het" sites show only one allele
+  (0-10% in the other samples).
+- A skew that follows the allele across samples is genetic; a within-sample skew without a
+  consistent allele (or without a het SNV) is an imprinting or epimutation candidate.
+
+Run the tables (about an hour on 8 CPUs), then knit:
+
+```bash
+cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca
+sbatch LCL_run_hsca.sh   # -> LCL_project/co-accessibility/hsca/outputs/
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      cache = FALSE, fig.width = 10, fig.height = 9)
+source("/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca/fire_plots.R")
+```
+
+```{r settings}
+hsca_dir = file.path(params$root, "hsca")
+outputs_dir = file.path(hsca_dir, "outputs")
+tables_dir = file.path(hsca_dir, "tables")
+plots_dir = file.path(hsca_dir, "plots")
+dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+fdr_cut = 0.05
+hap_status = c("hap1", "hap2")
+```
+
+```{r load-tables}
+read_output = function(name) fread(file.path(outputs_dir, paste0(name, ".tsv.gz")))
+cre_status = read_output("LCL_hsca_cre_status")
+pair_status = read_output("LCL_hsca_pair_status")
+cre_allele_by_sample = read_output("LCL_hsca_cre_allele_by_sample")
+pair_allele_by_sample = read_output("LCL_hsca_pair_allele_by_sample")
+cre_allele = read_output("LCL_hsca_cre_allele")
+pair_allele = read_output("LCL_hsca_pair_allele")
+
+# cCRE coordinates and pooled co-accessibility tables
+cres = fread(file.path(params$root, "universe", "cre_universe.bed"),
+             col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
+pooled = fread(file.path(params$root, "coaccess", "LCL_coaccess_pairs.tsv.gz"))
+pooled_noxci = fread(file.path(params$root, "coaccess", "noXCI", "LCL_coaccess_pairs_noXCI.tsv.gz"))
+
+# imprinted cCREs (Akbari DMR overlap, as fire-figures Fire-peak-df.R)
+cres[, imprinted := flag_imprinted(cres)]
+imprinted_cres = cres[imprinted == TRUE, CRE_ID]
+```
+
+## Tested and skewed per sample
+
+A missing sample has no tested rows in that table (no FIRE haplotype test, or no unit with at
+least 10 reads per haplotype / allele).
+
+```{r sample-tallies}
+tally = function(dt, name) {
+  dt[, .(tested = .N, skewed = sum(status != "ns")), by = sample_name][
+    , setnames(.SD, c("tested", "skewed"), paste0(name, c("_tested", "_skewed")))]
+}
+sample_tallies = Reduce(function(a, b) merge(a, b, by = "sample_name", all = TRUE), list(
+  tally(cre_status, "cre_hap"),
+  cre_status[, .(cre_hap_conflict = sum(status == "conflict")), by = sample_name],
+  tally(pair_status, "pair_hap"),
+  tally(cre_allele_by_sample, "cre_allele"),
+  tally(pair_allele_by_sample, "pair_allele")))
+for (j in setdiff(names(sample_tallies), "sample_name")) set(sample_tallies, which(is.na(sample_tallies[[j]])), j, 0L)
+fwrite(sample_tallies, file.path(tables_dir, "LCL_hsca_sample_tallies.tsv"), sep = "\t")
+knitr::kable(sample_tallies)
+
+pooled_tallies = data.table(
+  table = c("LCL_hsca_cre_allele", "LCL_hsca_pair_allele"),
+  with_variant = c(nrow(cre_allele), nrow(pair_allele)),
+  tested = c(sum(!is.na(cre_allele$p_value)), sum(!is.na(pair_allele$p_value))),
+  fdr_lt_0.05 = c(sum(cre_allele$fdr < fdr_cut, na.rm = TRUE), sum(pair_allele$fdr < fdr_cut, na.rm = TRUE)))
+knitr::kable(pooled_tallies)
+```
+
+## Haplotype and allele skew plots (paper figures)
+
+hap1-vs-hap2 accessibility and the volcano from fire-figures `hap-diffs.Rmd`, one panel per
+sample. Blue dashed line: p = 0.05; red dashed line: the largest p-value with BH p <= 0.05 in
+that sample; red crosses: imprinted (Akbari DMR) cCREs.
+
+```{r skew-plots}
+pair_imprinted = function(dt) dt$CRE1 %in% imprinted_cres | dt$CRE2 %in% imprinted_cres
+cre_status[, imprinted := CRE_ID %in% imprinted_cres]
+pair_status[, imprinted := pair_imprinted(pair_status)]
+cre_allele_by_sample[, imprinted := CRE_ID %in% imprinted_cres]
+pair_allele_by_sample[, imprinted := pair_imprinted(pair_allele_by_sample)]
+cre_allele[, imprinted := CRE_ID %in% imprinted_cres]
+pair_allele[, imprinted := pair_imprinted(pair_allele)]
+
+hap_labels = c("hap1 accessibility", "hap2 accessibility", "Difference between hap1 and hap2 accessibility")
+pair_hap_labels = c("hap1 both-open fraction", "hap2 both-open fraction", "Difference between hap1 and hap2 both-open fraction")
+allele_labels = c("REF accessibility", "ALT accessibility", "Difference between ALT and REF accessibility")
+pair_allele_labels = c("REF both-open fraction", "ALT both-open fraction", "Difference between ALT and REF both-open fraction")
+panels = list(
+  list("LCL_hsca_cre_status", cre_status, "hap1_frac_acc", "hap2_frac_acc", hap_labels, "p_adjust", "sample_name"),
+  list("LCL_hsca_pair_status", pair_status, "hap1_frac_acc", "hap2_frac_acc", pair_hap_labels, "p_adjust", "sample_name"),
+  list("LCL_hsca_cre_allele_by_sample", cre_allele_by_sample, "ref_frac_open", "alt_frac_open", allele_labels, "p_adjust", "sample_name"),
+  list("LCL_hsca_pair_allele_by_sample", pair_allele_by_sample, "ref_frac_open", "alt_frac_open", pair_allele_labels, "p_adjust", "sample_name"),
+  list("LCL_hsca_cre_allele", cre_allele[!is.na(p_value)], "ref_frac_open", "alt_frac_open", allele_labels, "fdr", NULL),
+  list("LCL_hsca_pair_allele", pair_allele[!is.na(p_value)], "ref_frac_open", "alt_frac_open", pair_allele_labels, "fdr", NULL))
+for (panel in panels) {
+  name = panel[[1]]; dt = panel[[2]]; labels = panel[[5]]; facet = panel[[7]]
+  if (!nrow(dt)) next
+  size = if (is.null(facet)) c(4, 3.5) else c(10, 9)
+  p1 = plot_hap1_vs_hap2(dt, panel[[3]], panel[[4]], labels[1], labels[2], facet = facet)
+  p2 = plot_hap_volcano(dt, labels[3], p_adjust = panel[[6]], facet = facet)
+  save_pdf(p1, file.path(plots_dir, paste0(name, "_hap1_vs_hap2.pdf")), width = size[1], height = size[2])
+  save_pdf(p2, file.path(plots_dir, paste0(name, "_volcano.pdf")), width = size[1], height = size[2])
+  print(p1); print(p2)
+}
+```
+
+## Are pooled co-accessible pairs haplotype- or allele-skewed?
+
+Pooled positives are `fdr < 0.05 & OR > 1 & co_access > expected_co_access` in the pooled table
+(all chromosomes) and the noXCI table; only autosomal pairs can be tested here. Each test compares
+the skewed fraction of positives with the skewed fraction of the other tested pairs.
+
+```{r pooled-positive-enrichment}
+positives = list(
+  all_chr = pooled[fdr < fdr_cut & OR > 1 & co_access > expected_co_access, CRE_pair],
+  noXCI = pooled_noxci[fdr_noXCI < fdr_cut & OR_noXCI > 1 & co_access_noXCI > expected_co_access_noXCI, CRE_pair])
+
+# per pair: tested / skewed by haplotype (within sample) and by allele (within sample or pooled)
+pair_flags = merge(
+  pair_status[, .(hap_skewed = any(status != "ns")), by = CRE_pair],
+  rbind(pair_allele_by_sample[, .(CRE_pair, skewed = status != "ns")],
+        pair_allele[!is.na(p_value), .(CRE_pair, skewed = fdr < fdr_cut)])[, .(allele_skewed = any(skewed)), by = CRE_pair],
+  by = "CRE_pair", all = TRUE)
+
+enrichment = rbindlist(lapply(names(positives), function(set) {
+  rbindlist(lapply(c("hap_skewed", "allele_skewed"), function(test) {
+    d = pair_flags[!is.na(get(test)), .(positive = CRE_pair %in% positives[[set]], skewed = get(test))]
+    ft = fisher.test(table(factor(d$positive, c(TRUE, FALSE)), factor(d$skewed, c(TRUE, FALSE))))
+    data.table(positive_set = set, test = test, n_tested = nrow(d), n_positive_tested = sum(d$positive),
+               n_skewed = sum(d$skewed), n_positive_skewed = sum(d$positive & d$skewed),
+               frac_skewed_positive = mean(d$skewed[d$positive]), frac_skewed_other = mean(d$skewed[!d$positive]),
+               odds_ratio = unname(ft$estimate), p_value = ft$p.value)
+  }))
+}))
+fwrite(enrichment, file.path(tables_dir, "LCL_hsca_pooled_positive_enrichment.tsv"), sep = "\t")
+knitr::kable(enrichment, digits = 4)
+```
+
+## Haplotype-skewed pairs: are both cCREs selective on the same haplotype?
+
+For each pair skewed within a sample, the FIRE hap1/hap2 status of CRE1 and CRE2 in the same
+sample. Directions are compared only when both cCREs lie inside one HiPhase block of that sample
+(`cres_same_block`). "same haplotype" is the case that inflates a pooled odds ratio and "opposite
+haplotypes" the case that deflates it.
+
+```{r skewed-pair-directions}
+cre_calls = cre_status[, .(sample_name, CRE_ID, status)]
+skewed_pairs = pair_status[status != "ns"]
+skewed_pairs = merge(skewed_pairs, setnames(copy(cre_calls), c("CRE_ID", "status"), c("CRE1", "cre1_status")),
+                     by = c("sample_name", "CRE1"), all.x = TRUE)
+skewed_pairs = merge(skewed_pairs, setnames(copy(cre_calls), c("CRE_ID", "status"), c("CRE2", "cre2_status")),
+                     by = c("sample_name", "CRE2"), all.x = TRUE)
+skewed_pairs[, category := fcase(
+  !cres_same_block, "not comparable (different blocks)",
+  cre1_status %in% "conflict" | cre2_status %in% "conflict", "conflict",
+  cre1_status %in% hap_status & cre2_status %in% hap_status & cre1_status == cre2_status, "same haplotype",
+  cre1_status %in% hap_status & cre2_status %in% hap_status, "opposite haplotypes",
+  cre1_status %in% hap_status | cre2_status %in% hap_status, "one cCRE only",
+  cre1_status %in% "ns" & cre2_status %in% "ns", "neither (both ns)",
+  default = "untested")]
+skewed_pairs[, `:=`(pooled_positive = CRE_pair %in% positives$all_chr, noXCI_positive = CRE_pair %in% positives$noXCI)]
+direction_summary = skewed_pairs[, .(n = .N, n_pooled_positive = sum(pooled_positive),
+                                     n_noXCI_positive = sum(noXCI_positive)), by = category][order(-n)]
+fwrite(direction_summary, file.path(tables_dir, "LCL_hsca_skewed_pair_directions.tsv"), sep = "\t")
+fwrite(skewed_pairs[order(sample_name, p_adjust)], file.path(tables_dir, "LCL_hsca_skewed_pairs.tsv.gz"), sep = "\t")
+knitr::kable(direction_summary)
+```
+
+## cCREs with haplotype-selective accessibility: genetic, imprinted or epimutation?
+
+Every cCRE that is hap1, hap2 or conflict in at least one sample, classified by the pooled REF/ALT
+test at its het SNV:
+
+- imprinted: overlaps an Akbari DMR (REF/ALT pooling cannot detect parent-of-origin effects)
+- allele-associated (genetic): pooled REF vs ALT fdr < 0.05
+- no allele association (epimutation candidate): het SNV tested, pooled fdr >= 0.05
+- allele not testable: het SNV without reads on both alleles
+- no het SNV (noVar): no het SNV inside the cCRE in any of the 27 phased samples
+
+```{r hsca-cre-classes}
+hsca_cres = cre_status[status %in% c(hap_status, "conflict"), .(n_hsca_samples = uniqueN(sample_name),
+                                                              hsca_samples = paste(sort(unique(sample_name)), collapse = ";")), by = CRE_ID]
+hsca_cres = merge(hsca_cres, cre_allele[, .(CRE_ID, variant_id, n_het_samples, diff, p_value, fdr,
+                                             n_samples_alt_higher, n_samples_ref_higher, n_samples_both_alleles)],
+                  by = "CRE_ID", all.x = TRUE)
+hsca_cres[, class := fcase(
+  CRE_ID %in% imprinted_cres, "imprinted",
+  is.na(variant_id), "no het SNV (noVar)",
+  is.na(fdr), "allele not testable",
+  fdr < fdr_cut, "allele-associated (genetic)",
+  default = "no allele association (epimutation candidate)")]
+class_summary = hsca_cres[, .(n_cres = .N, median_hsca_samples = median(n_hsca_samples)), by = class][order(-n_cres)]
+fwrite(hsca_cres[order(class, fdr)], file.path(tables_dir, "LCL_hsca_cre_classes.tsv"), sep = "\t")
+fwrite(class_summary, file.path(tables_dir, "LCL_hsca_cre_class_summary.tsv"), sep = "\t")
+knitr::kable(class_summary)
+```
+
+```{r session-information}
+sessionInfo()
+```

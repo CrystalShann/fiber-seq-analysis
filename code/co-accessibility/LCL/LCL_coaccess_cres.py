@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Genome-wide pooled co-accessibility across all 31 LCL samples.
 
-Adapted from macrophage/03_coaccess_cres.py. Candidate cCREs overlap the union
-of LCL FIRE peaks and share a canonical TSS +/-10 kb window. The interval gap
+Adapted from macrophage/03_coaccess_cres.py. Candidate cCREs have >=50% of
+their length inside ONE merged LCL FIRE peak and share a canonical TSS +/-10 kb window. The interval gap
 must satisfy 500 < gap < 20000. Shared reads have aligned bases covering the
 FULL length of both cCREs: every base of each cCRE must
 fall inside the read's M/= /X blocks, so a read whose alignment gap or end lands
@@ -13,7 +13,8 @@ contribute coverage or accessibility; separate FIRE elements are not combined.
 
 Sum raw 2x2 cells across samples before testing. Preserve macrophage two-sided
 Fisher tests on both table+1 and raw counts; apply BH once across unique pooled
-pairs. Donor information is metadata only; there are no LCL timepoints.
+pairs with >= 20 fibers spanning both cCREs (others keep p-values, FDR is NA).
+Donor information is metadata only; there are no LCL timepoints.
 """
 
 import argparse
@@ -28,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
-from count_and_test_pairs import count_pairs, test_counts, summarize_coaccess_counts
+from count_and_test_pairs import bh, count_pairs, test_counts, summarize_coaccess_counts
 
 ROOT = Path(os.environ.get("LCL_COACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"))
 METATABLE = os.environ.get("LCL_SAMPLE_METATABLE", "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv")
@@ -37,6 +38,18 @@ TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
 CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
 CELLS = ["co_closed", "CRE1_access", "CRE2_access", "co_access"]
 COVERAGE_MODE = "aligned_blocks_v1"
+# coverage filter: only pairs with >= 20 fibers spanning both cCREs enter the BH family
+MIN_SHARED_READS = 20
+
+
+def bh_min_shared(result):
+    # pairs below MIN_SHARED_READS keep their p-values, but fdr / fdr_raw are NA
+    tested = result.n_shared_reads >= MIN_SHARED_READS
+    for p, q in (("pval", "fdr"), ("pval_raw", "fdr_raw")):
+        result[q] = np.nan
+        result.loc[tested, q] = bh(result.loc[tested, p])
+    result["min_shared_reads"] = MIN_SHARED_READS
+    return result
 
 #################################################
 # build sample meta table
@@ -182,7 +195,7 @@ def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, fire_fractio
     # maps cCRE ID to read ID
     coverage = defaultdict(set)
     blocks_by_read = {}
-    # which read covers the CRE by at least 1bp
+    # which read covers every base of the CRE (bedtools pulls reads touching the CRE by >=1bp, then the check below keeps only full coverage)
     #################################################
     # find every read that has outer span overlaps a cCRE, holds CRE and read side by side
     # -wa -wb prints both the cCRE record and the read record on one line
@@ -200,7 +213,7 @@ def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, fire_fractio
           # if the read pass, write the read ID in CRE coverage
             coverage[fields[3]].add(rid)
             
-    # For the reads that cover CRE by at least 1bp, on which read is each CRE accessible?
+    # For the reads that cover every base of the CRE, on which read is each CRE accessible (one FIRE element covers >=50% of the CRE)?
     #################################################
     # accessible = FIRE element overlap with 50% of the CRE length
     
@@ -373,7 +386,7 @@ def main():
     counts = pooled[keep]
     result = pairs.loc[keep].reset_index(drop=True)
     result = pd.concat([result, pd.DataFrame(counts, columns=CELLS), test_counts(counts, args.pseudocount)], axis=1)
-    result = summarize_coaccess_counts(result, args.pseudocount)
+    result = bh_min_shared(summarize_coaccess_counts(result, args.pseudocount))
     result.insert(result.columns.get_loc("n_shared_reads") + 1,
                   "n_contributing_samples", contributing_samples[keep])
     result["dataset"] = "LCL"

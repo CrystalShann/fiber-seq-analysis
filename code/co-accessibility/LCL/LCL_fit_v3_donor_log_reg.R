@@ -6,6 +6,8 @@ params <- list(
   root = "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility",
   code_root = "/project/spott/cshan/fiber-seq/code",
   min_reads_per_donor = 2L,
+  # coverage filter: pairs need >= 20 fibers spanning both CREs to be tested
+  min_shared_reads = 20L,
   cores = as.integer(args[1]),
   chrom = if (length(args) >= 2L) args[2] else NULL)
 
@@ -104,7 +106,8 @@ fit_chromosome <- function(d, chromosome, male_only = FALSE) {
   # loop over # of pairs on each chr, and takes one row per donor with four counts
   # (co_closed, CRE1_access, CRE2_access, co_access)
   fits <- parallel::mclapply(seq_len(nrow(groups)), function(i) {
-    fit_pair(d[seq.int(groups$first[i], groups$last[i])], params$min_reads_per_donor)
+    fit_pair(d[seq.int(groups$first[i], groups$last[i])], params$min_reads_per_donor,
+             params$min_shared_reads)
   }, mc.cores = cores, mc.preschedule = TRUE, mc.set.seed = FALSE)
   if (any(vapply(fits, inherits, logical(1), what = "try-error")) ||
       any(vapply(fits, is.null, logical(1))))
@@ -141,15 +144,19 @@ run_analysis <- function(analysis_name) {
   excluded_zero <- sum(out$fit_status %in% c("no_coverage", "no_coverage_noXCI"))
   message(analysis_name, ": excluding ", excluded_zero, " zero-coverage pairs after cohort filtering")
   out <- out[!fit_status %in% c("no_coverage", "no_coverage_noXCI")]
-  # count the number of pairs
-  family_size <- sum(out$n_donors_informative >= 1L)
+  # count the number of pairs: BH family = pairs that pass the coverage filter, have an
+  # informative donor and are not separated (separated and low-coverage pairs are not tested)
+  tested <- out$n_donors_informative >= 1L &
+    !out$fit_status %in% c("low_coverage", "separation_positive", "separation_negative")
+  family_size <- sum(tested)
   valid <- which(is.finite(out$p_adj_one_sided))
   stopifnot(all(out$p_adj_one_sided[valid] >= 0 & out$p_adj_one_sided[valid] <= 1),
-            all(out$n_donors_informative[valid] >= 1L))
+            all(tested[valid]))
   out[, fdr_adj := NA_real_]
   if (length(valid)) out[valid, fdr_adj := adjust_bh(p_adj_one_sided, n = family_size)]
   # add metadata + full and null model formulas for each pair
   out[, `:=`(analysis = analysis_name, min_reads_per_donor = as.integer(params$min_reads_per_donor),
+    min_shared_reads = as.integer(params$min_shared_reads),
     model = fifelse(n_donors_informative == 1L, "CRE2 ~ 1 + CRE1", "CRE2 ~ factor(donor) + CRE1"),
     null_model = fifelse(n_donors_informative == 1L, "CRE2 ~ 1", "CRE2 ~ factor(donor)"),
     fdr_scope = fdr_scope, bh_family_size = family_size, run_signature = summary_signature,
@@ -166,10 +173,10 @@ run_analysis <- function(analysis_name) {
 
 # save the result
 summary_signature <- hash_object(list(inputs = input_md5,
-  min_reads_per_donor = params$min_reads_per_donor,
+  min_reads_per_donor = params$min_reads_per_donor, min_shared_reads = params$min_shared_reads,
   statistics_md5 = tools::md5sum(file.path(params$code_root, "parsing_functions", "stats_testing_functions.r")),
   functions = lapply(list(aggregate_donors, capture_fit, fit_pair, fit_chromosome, run_analysis), deparse),
-  R = R.version.string, logistf = as.character(packageVersion("logistf"))))
+  R = R.version.string))
 fit_summary_dir <- file.path(output_base, "summary", summary_signature)
 dir.create(fit_summary_dir, recursive = TRUE, showWarnings = FALSE)
 

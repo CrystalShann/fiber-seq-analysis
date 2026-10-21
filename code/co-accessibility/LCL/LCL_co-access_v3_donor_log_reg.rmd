@@ -74,44 +74,30 @@ x is the CRE1 accessibility status of a fiber: a binary indicator
   - x = 0 means CRE1 is closed on that fiber
 
 
-| Pair type | Test used | Why |
-|---|---|---|
-| **No separation** (most pairs) | `LRT` | The full model has a finite maximum, so the likelihood ratio test is valid. |
-| **Separation** (positive or negative) | `Rao_score` | The full model has no finite maximum, so a test that doesn't need it is required. |
+**Coverage filter**: a pair is tested only if at least 20 fibers span both CREs (summed over all samples in the analysis; chrX in `noXCI` counts male samples only). The pooled Fisher test and `noXCI` use the same rule for their BH family.
 
+**Separated pairs are removed** (not tested, no OR, no p-value)
 
   - Positive separation: every donor has CRE1_access == 0 or CRE2_access == 0
   - Negative separation: every donor has co_access == 0 or co_closed == 0
-  - no separation: all cells have count
-  
+  - with separation the full model has no finite maximum (beta goes to infinity), so there is no MLE and no LRT
+
 Null model: CRE2 depends only on donor (no CRE1 effect, β = 0).
 Full model: CRE2 depends on donor and CRE1 (β is estimated).
 
 Each model has a likelihood
 
-**LTR (likelihood ratio test)**
+**LRT (likelihood ratio test)**
 fit both null and full model, then compare how good is each one
-1. find the max for the null model 
+1. find the max for the null model
 2. find the max for the full model
 3. how much bigger is the max for full model
 
-**RAO score test**
-only fit the null model, then check the slop of max when beta = 0
+`fit_pair()` in `stats_testing_functions.r`: anova(null, full, test = "LRT")
 
-Look at the slope
-1. if the curve is rising steeply toward larger beta, then beta = 0 is far from the max, so it is a poor fit 
-2. if the curve is nearly flat, then beta = 0 is already near the max and there is no evidence of association
+  - MLE (maximum likelihood estimate) is the ordinary logistic-regression estimate of the odds ratio, and select beta that best fits the data
+  - BH family = pairs that pass the coverage filter, have at least one informative donor and are not separated
 
-`fit_pair()` in `stats_testing_functions.r`
-
-1. no separation: anova(null, full, test = "LRT")
-
-    - MLE (maximum likelihood estimate) is the ordinary logistic-regression estimate of the odds ratio, and select beta that best fits the data
-    
-2. Separation: anova(null, full, test = "Rao")
-
-  - Firth is a penalized version that pulls the estimate back to a finite value when separation would otherwise push it to infinity
-  
 
 ## Load the fitted results
 
@@ -156,10 +142,10 @@ significance_summary <- rbindlist(lapply(names(result_sets), function(a) {
   rbindlist(lapply(c("all", "chrX"), function(region) {
     z <- if (region == "chrX") d[chrom == "chrX"] else d
     data.table(analysis = a, region = region, n_pairs = nrow(z),
+      low_coverage_removed = sum(z$fit_status == "low_coverage"),
+      separated_removed = sum(z$fit_status %in% c("separation_positive", "separation_negative")),
+      n_tested = sum(is.finite(z$p_adj_one_sided)),
       adjusted_positive = sum(z$adjusted_positive), pooled_positive = sum(z$pooled_positive),
-      separated_significant = sum(z$adjusted_positive & z$separation != "none"),
-      separated_positive_significant = sum(z$adjusted_positive & z$separation == "positive"),
-      separated_negative_significant = sum(z$adjusted_positive & z$separation == "negative"),
       overlap_positive = sum(z$adjusted_positive & z$pooled_positive))
   }))
 }))
@@ -177,9 +163,6 @@ top10_genome_wide_adjusted <- rbindlist(lapply(names(result_sets), function(a) {
 print(significance_summary)
 print(top10[, .(analysis, adjusted_rank, CRE_pair, chrom, gene_names, OR_adj,
   OR_adj_ci_low, OR_adj_ci_high, fdr_adj, fit_status, or_method)])
-cat("Separated pairs among the new top ten:\n")
-print(top10[separation != "none", .(analysis, adjusted_rank, CRE_pair, fit_status,
-                                    OR_adj, OR_adj_ci_low, OR_adj_ci_high, fdr_adj)])
 cat("Original pooled top-ten rankings after donor adjustment:\n")
 print(top10_genome_wide_adjusted[, .(analysis, pooled_rank, CRE_pair, adjusted_rank,
                             OR_adj, fdr_adj, fit_status, comparison_status)])
@@ -198,11 +181,10 @@ for (entry in list(c("significance_summary", "significance_comparison.tsv"),
 for (a in names(result_sets)) {
   d <- result_sets[[a]]
   plot_data <- d[is.finite(OR_pooled) & OR_pooled > 0 & is.finite(OR_adj) & OR_adj > 0]
-  p <- ggplot(plot_data, aes(OR_pooled, OR_adj, colour = or_method)) +
-    geom_point(size = 0.45, alpha = 0.25) + geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  p <- ggplot(plot_data, aes(OR_pooled, OR_adj)) +
+    geom_point(size = 0.45, alpha = 0.25, colour = "#2166AC") + geom_abline(slope = 1, intercept = 0, linetype = 2) +
     scale_x_log10() + scale_y_log10() +
-    scale_colour_manual(values = c(mle = "#2166AC", firth = "#B2182B")) +
-    labs(x = "Original pooled odds ratio", y = "Donor-adjusted odds ratio", colour = "OR method",
+    labs(x = "Original pooled odds ratio", y = "Donor-adjusted odds ratio (MLE)",
          title = paste(a, "- pooled versus donor-adjusted effects"),
          subtitle = paste(fdr_scope, "|", nrow(plot_data), "pairs with finite positive ORs")) + theme_bw()
   print(p)
@@ -216,7 +198,7 @@ for (a in names(result_sets)) {
       geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "#B2182B") +
       labs(x = "Expected -log10(p) under uniform null", y = "Observed -log10(p)",
            title = paste(a, "- one-sided p-value QQ plot"),
-           subtitle = paste(fdr_scope, "| LRT for non-separated; Rao score for separated pairs")) + theme_bw()
+           subtitle = paste(fdr_scope, "| LRT; separated and < 20-fiber pairs not tested")) + theme_bw()
     print(q)
     ggsave(file.path(output_dir, a, "plots", "pvalue_QQ.pdf"), q,
            width = 9, height = 6, create.dir = TRUE)

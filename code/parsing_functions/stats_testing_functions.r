@@ -1,7 +1,7 @@
 # Shared statistical calculations for co-accessibility analyses.
 # Source this file explicitly before testing or calling plot_coaccess_pair().
-# data.table is required for donor regression and grouped summaries; logistf
-# is required only for separated donor fits. No analysis runs when sourced.
+# data.table is required for donor regression and grouped summaries.
+# No analysis runs when sourced.
 
 # BH families are caller-defined. Failed fits may count in n without being
 # assigned a p-value; outputs retain NA in the original positions.
@@ -261,7 +261,8 @@ complete_summary <- function(grid, summary, by_columns) {
   z
 }
 
-# Donor-adjusted binomial LRT / separated-data Rao test with Firth effects.
+# Donor-adjusted binomial LRT with MLE effects. Pairs with fewer than min_shared_reads
+# fibers spanning both cCREs, or with separation (no finite MLE), are not tested.
 capture_fit <- function(expr) {
   warnings <- character()
   error <- NULL
@@ -272,7 +273,7 @@ capture_fit <- function(expr) {
   list(value = value, error = error, warnings = unique(warnings))
 }
 
-fit_pair <- function(d, min_reads = 2L) {
+fit_pair <- function(d, min_reads = 2L, min_shared_reads = 20L) {
   cells <- c("co_closed", "CRE1_access", "CRE2_access", "co_access")
   n <- d$co_closed + d$CRE1_access + d$CRE2_access + d$co_access
   x_open <- d$CRE1_access + d$co_access
@@ -294,17 +295,25 @@ fit_pair <- function(d, min_reads = 2L) {
     observed_expected_ratio_adj = if (expected > 0) sums[["co_access"]] / expected else NA_real_,
     beta = NA_real_, OR_adj = NA_real_, OR_adj_ci_low = NA_real_, OR_adj_ci_high = NA_real_,
     ci_method = NA_character_, or_method = NA_character_, test = NA_character_,
-    lrt_stat = NA_real_, score_stat = NA_real_, test_df = NA_integer_,
-    p_LRT = NA_real_, p_Rao = NA_real_, p_adj_one_sided = NA_real_,
+    lrt_stat = NA_real_, test_df = NA_integer_,
+    p_LRT = NA_real_, p_adj_one_sided = NA_real_,
     fit_status = if (sum(n) == 0) "no_coverage" else "no_informative_donors",
     separation = "none", fit_warning = "", fit_error = "", ci_warning = "")
   if (!nrow(z)) return(result)
   separation_direction <- if (all(z$CRE1_access == 0 | z$CRE2_access == 0)) "positive" else
     if (all(z$co_access == 0 | z$co_closed == 0)) "negative" else "none"
-  separated <- separation_direction != "none"
-  result[, `:=`(separation = separation_direction,
-                 or_method = if (separated) "firth" else "mle",
-                 test = if (separated) "Rao_score" else "LRT")]
+  result[, separation := separation_direction]
+  # coverage filter: at least min_shared_reads fibers span both cCREs (all donors, before the donor filter)
+  if (sum(n) < min_shared_reads) {
+    result[, fit_status := "low_coverage"]
+    return(result)
+  }
+  # separation: the MLE of the CRE1 effect is infinite, so the pair is removed (not tested)
+  if (separation_direction != "none") {
+    result[, fit_status := paste0("separation_", separation_direction)]
+    return(result)
+  }
+  result[, `:=`(or_method = "mle", test = "LRT")]
   fail <- function(reason) {
     result[, `:=`(fit_status = "fit_failed", fit_error = reason)]
     result
@@ -324,49 +333,18 @@ fit_pair <- function(d, min_reads = 2L) {
     return(fail(paste(c(null_fit$error, full_fit$error), collapse = " | ")))
   null <- null_fit$value
   full <- full_fit$value
-  # Rao uses the converged NULL residuals/weights and FULL design matrix;
-  # it does not require a finite full-model MLE. No separated GLM effect is reported.
-  if (!isTRUE(null$converged) || (!separated && !isTRUE(full$converged)))
+  if (!isTRUE(null$converged) || !isTRUE(full$converged))
     return(fail("GLM did not converge"))
   if (full$rank - null$rank != 1L) return(fail("Full/null model rank difference is not one"))
-  comparison <- capture_fit(anova(null, full, test = if (separated) "Rao" else "LRT"))
+  comparison <- capture_fit(anova(null, full, test = "LRT"))
   if (!is.null(comparison$error)) return(fail(comparison$error))
   tab <- comparison$value
   p_column <- grep("^Pr\\(", names(tab), value = TRUE)
-  statistic <- if (separated) tab$Rao[2] else tab$Deviance[2]
+  statistic <- tab$Deviance[2]
   if (length(p_column) != 1L || !is.finite(tab[[p_column]][2]) ||
       !is.finite(statistic) || statistic < 0 || tab$Df[2] != 1L)
-    return(fail("Invalid likelihood-ratio or Rao test"))
+    return(fail("Invalid likelihood-ratio test"))
   p_two_sided <- tab[[p_column]][2]
-  if (separated) {
-    weighted <- data.frame(donor = factor(rep(z$donor, each = 4L)),
-      x = rep(c(0, 0, 1, 1), nrow(z)), y = rep(c(0, 1, 0, 1), nrow(z)),
-      frequency = as.vector(rbind(z$co_closed, z$CRE2_access, z$CRE1_access, z$co_access)))
-    weighted <- weighted[weighted$frequency > 0, , drop = FALSE]
-    firth_formula <- if (nrow(z) == 1L) y ~ x else y ~ factor(donor) + x
-    x_index <- match("x", colnames(model.matrix(firth_formula, weighted)))
-    firth <- capture_fit(logistf::logistf(firth_formula, data = weighted, weights = frequency,
-      firth = TRUE, pl = TRUE, plconf = x_index, alpha = 0.05,
-      control = logistf::logistf.control(maxit = 100L),
-      plcontrol = logistf::logistpl.control(maxit = 100L)))
-    result[, fit_warning := paste(c(fit_warning, firth$warnings), collapse = " | ")]
-    if (!is.null(firth$error)) return(fail(paste("Firth:", firth$error)))
-    f <- firth$value
-    beta_firth <- unname(f$coefficients["x"])
-    limits <- c(f$ci.lower["x"], f$ci.upper["x"])
-    if (f$iter[["full"]] >= 100L || any(f$pl.iter[x_index, 1:2] >= 100L) ||
-        !is.finite(beta_firth) || anyNA(limits) ||
-        limits[1] > beta_firth || limits[2] < beta_firth ||
-        f$method.ci[x_index] != "Profile Likelihood")
-      return(fail("Firth fit or penalized profile interval did not converge"))
-    result[, `:=`(beta = beta_firth, OR_adj = exp(beta_firth),
-      OR_adj_ci_low = exp(limits[1]), OR_adj_ci_high = exp(limits[2]),
-      ci_method = "firth_penalized_profile", score_stat = statistic, test_df = 1L,
-      p_Rao = p_two_sided,
-      p_adj_one_sided = if (separation_direction == "positive") p_two_sided / 2 else 1 - p_two_sided / 2,
-      fit_status = paste0("separation_", separation_direction))]
-    return(result)
-  }
   beta_hat <- unname(coef(full)["x"])
   if (!is.finite(beta_hat)) return(fail("Coefficient x is not estimable"))
   profile <- capture_fit(stats::confint(full, parm = "x", level = 0.95, test = "LRT"))
