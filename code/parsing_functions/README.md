@@ -87,7 +87,7 @@ raster of the co-accessibility figures) and, sliced into `parsed/`, by
 | FIRE peaks | 29 (v0.1) | `<FIRE root>/<sample>/<sample>-fire-v0.1-peaks.bed.gz` | sliced to `parsed/fire_peaks.bed` by both scripts, read by `read_fire_peaks_region()` |
 | `fire_all` (`ft fire --extract --all`) | 11 (`FIRE_BED_COLS`): per-read segments coloured nucleosome (169,169,169), linker (147,112,219) or FIRE, with the HP tag | LCL only: `/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results/<sample>/extracted_results/<sample>.fire_all.bed.gz` | `load_region(span_source = "fire_all")`; sliced to `parsed/fire.bed` by `extract_region_result_lcl.sh` |
 | read spans | one primary alignment per row | macrophage only: `/project/spott/cshan/fiber-seq/macrophage_project/co-accessibility/<sample>/<sample>.read_spans.bed.gz` (`co-accessibility/macrophage/02_read_spans.sh`) | `load_region(span_source = "read_spans")` |
-| aligned blocks | primary BED12, split at CIGAR D/N; no sentinels | LCL: `LCL_project/co-accessibility/<sample>/<sample>.aligned_blocks.bed.gz` | `load_region(span_source = "aligned_blocks")` |
+| aligned blocks | primary BED12, split at CIGAR D/N; no sentinels | LCL: `LCL_project/co-accessibility/CRE_co-accessibility_FIRE/<sample>/<sample>.aligned_blocks.bed.gz` | `load_region(span_source = "aligned_blocks")` |
 
 `<FIRE root>` is `/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE`
 (macrophage) or `/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results` (LCL).
@@ -144,7 +144,7 @@ Read IDs are `<sample_name>::<read name>`; `rids_df$original_RID` keeps the read
 Callers: the Leiden workflows (`leiden_manhattan_cluster_regions()`, `run_lcl_clustering()`,
 `leiden_LCL.Rmd`, `marcophage_leiden_manhattan.Rmd`, `05_vis_fire_freq.Rmd`, `TF_enrichment.ipynb`),
 the Snakemake step `scripts/assemble_raw_reads.R`, `fiber_m6a_proportions()`
-(`co-accessibility/LCL/LCL_co-access_v2_perm_methy_prop.Rmd`), the LCL autocorrelation input
+(`co-accessibility/LCL/CRE_co-accessibility_FIRE/LCL_co-access_v2_perm_methy_prop.Rmd`), the LCL autocorrelation input
 (`code/haplotype_phasing/LCL_phased_m6a_input.r`, every base as columns) and the
 topic model (`assemble_region_met_data()` in `code/topic_model/topic_modelling_functions.r`,
 the only CpG caller).
@@ -343,8 +343,8 @@ with its own stamp `extraction_complete.json` (region, sample and the script's
 modification time).
 
 
-The pooled all31 LCL notebook is `code/co-accessibility/LCL/LCL_co-access.Rmd`.
-Its aligned blocks are produced by `code/co-accessibility/LCL/LCL_read_spans.sh`.
+The pooled all31 LCL notebook is `code/co-accessibility/LCL/CRE_co-accessibility_FIRE/LCL_co-access.Rmd`.
+Its aligned blocks are produced by `code/co-accessibility/LCL/CRE_co-accessibility_FIRE/LCL_read_spans.sh`.
 The LCL notebook contains separate chunks that call `load_region()`,
 `label_reads()`, `coaccess_2x2()`, and `load_ft_tracks()` directly, then use
 `coaccess_region_result()`, `plot_region_panels()`,

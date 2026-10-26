@@ -21,4 +21,4 @@ Rscript -e '
 args <- commandArgs(trailingOnly = TRUE)
 tmp <- tempfile("render_"); dir.create(tmp)
 rmarkdown::render(args[1], output_dir = args[2], intermediates_dir = tmp, envir = new.env(), quiet = TRUE)
-' "/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/$1" /project/spott/cshan/fiber-seq/docs
+' "/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/CRE_co-accessibility_FIRE/$1" /project/spott/cshan/fiber-seq/docs

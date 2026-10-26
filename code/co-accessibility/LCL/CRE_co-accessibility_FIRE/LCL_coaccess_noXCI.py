@@ -17,7 +17,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from LCL_coaccess_cres import CELLS, ROOT, bh_min_shared
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "parsing_functions"))
 from count_and_test_pairs import test_counts, summarize_coaccess_counts
 
 SUFFIX = "_noXCI"

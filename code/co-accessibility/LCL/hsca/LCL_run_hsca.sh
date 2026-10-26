@@ -15,7 +15,7 @@
 #   sbatch LCL_run_hsca.sh --chrom chr21 --out-dir <dir>     # smoke test
 # 1. LCL_hsca_intersect.py: FIRE hap-differences peaks x paired cCREs -> LCL_hsca_cre_status.tsv.gz
 # 2. LCL_hsca_run.py: H1/H2 and REF/ALT counts and tests -> the other five tables
-# Needs coaccess/LCL_coaccess_pairs.tsv.gz and LCL_pair_sample_counts.tsv.gz from LCL_run_coaccess.sh.
+# Needs CRE_co-accessibility_FIRE/coaccess/LCL_coaccess_pairs.tsv.gz and LCL_pair_sample_counts.tsv.gz from ../CRE_co-accessibility_FIRE/LCL_run_coaccess.sh.
 set -euo pipefail
 cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca
 PYTHON=/project/spott/cshan/envs/Jupyter-notebook/bin/python3

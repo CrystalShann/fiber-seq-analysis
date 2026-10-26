@@ -33,7 +33,7 @@ def main():
     ap.add_argument("--sample-metatable", default=METATABLE)
     ap.add_argument("--out-dir", type=Path)
     args = ap.parse_args()
-    out_dir = args.out_dir or args.root / "hsca" / "outputs"
+    out_dir = args.out_dir or args.root.parent / "hsca" / "outputs"
 
     # 1. cCREs tested in at least one pooled pair
     pairs = pd.read_csv(args.root / "coaccess" / "LCL_coaccess_pairs.tsv.gz", sep="\t", usecols=["CRE1", "CRE2"])

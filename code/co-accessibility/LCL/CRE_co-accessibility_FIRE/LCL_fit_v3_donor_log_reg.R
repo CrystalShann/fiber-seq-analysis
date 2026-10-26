@@ -3,7 +3,7 @@
 # Submitted by LCL_run_v3_donor_log_reg.sh:  Rscript LCL_fit_v3_donor_log_reg.R <cores> [chrom]
 args <- commandArgs(trailingOnly = TRUE)
 params <- list(
-  root = "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility",
+  root = "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE",
   code_root = "/project/spott/cshan/fiber-seq/code",
   min_reads_per_donor = 2L,
   # coverage filter: pairs need >= 20 fibers spanning both CREs to be tested

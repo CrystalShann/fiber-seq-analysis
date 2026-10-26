@@ -1,9 +1,4 @@
-"""Functions for haplotype- and allele-selective accessibility at LCL cCREs and cCRE pairs.
-
-No analysis runs on import; LCL_hsca_intersect.py and LCL_hsca_run.py call these.
-The read rule (full aligned cover of a cCRE; one FIRE element covering >=50% of it)
-is imported unchanged from ../LCL_coaccess_cres.py so the counts match the pooled tables.
-"""
+"""Functions for haplotype- and allele-selective accessibility at LCL cCREs and cCRE pairs."""
 
 import subprocess
 import sys
@@ -16,7 +11,7 @@ import pandas as pd
 import pysam
 from scipy.stats import fisher_exact
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "CRE_co-accessibility_FIRE"))
 from LCL_coaccess_cres import BEDTOOLS, CELLS, CHROMS, ROOT, incidence_for_chrom, sample_manifest
 from count_and_test_pairs import bh, count_pairs
 

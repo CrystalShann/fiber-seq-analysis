@@ -2,7 +2,7 @@
 title: "LCL co-access vs background CREs: footprints, length, class"
 output: html_document
 params:
-  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"
   dest: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
 ---
 
@@ -10,22 +10,21 @@ params:
 
 This analysis describes whether co-accessible CREs are longer and have higher footprint density than background CREs, and compares their CRE-class composition
 
-CREs come from `cre_summary/inputs/eligible_cres.tsv.gz` (eligible autosomal CREs with >= 10 open, informative fibers) and are split into co-access CREs (in >= 1 donor-adjusted co-access pair) and background CREs (the remaining eligible CREs)
+CREs come from `CRE_co-accessibility_FIRE/eligible_cres.tsv.gz` (eligible autosomal CREs with >= 10 open, informative fibers) and are split into co-access CREs (in >= 1 donor-adjusted co-access pair) and background CREs (the remaining eligible CREs)
 
-  - Each counted fiber must individually cover the entire CRE, have its own FIRE element covering >= 50% of the CRE after accounting for deletions --> all reads meet this criteria counts as denominator
+The denominator (`n_covered`) includes all fibers whose aligned blocks cover the entire CRE and that have a FiberHMM record on the chromosome, whether open or closed. Fibers without a FiberHMM record are excluded. The numerator retains the original open-fiber filter (one FIRE element covering >= 50% of the CRE after deletions), with footprints restricted to FIRE elements. Closed fibers contribute zero. CRE eligibility still uses >= 10 open, informative fibers.
 
 
 
 ```bash
 cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/cre_summary
 a=$(sbatch --parsable --partition=caslake --qos=caslake --mem=48G --array=1-31%6 LCL_tf_cooccupancy.sh footprints)
-sbatch --partition=caslake --qos=caslake --mem=48G --dependency=afterok:$a LCL_tf_cooccupancy.sh footprints_combine
+sbatch --partition=caslake --qos=caslake --mem=48G --dependency=afterok:$a LCL_tf_cooccupancy.sh footprints_combine_render
 ```
 
 `/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/cre_summary/count_cre_footprints.R`
 
-- measures how often, and where, TF sized footprints occur inside each CRE
-- recurrent footprints a stretch of bases inside a CRE where at least 15% of the CRE’s informative fibers carry a footprint at the same place, with at least 5 fibers at its strongest base
+- measures footprint counts and footprint-covered bases inside each CRE
 
 
 ```{r setup, message=FALSE}
@@ -35,12 +34,11 @@ setDTthreads(1L)
 root <- params$root
 dest <- params$dest
 out <- file.path(dest,'cre_summary')
-inputs <- file.path(out,'inputs')
-required <- c(file.path(root,'cre_footprint_summary.tsv.gz'),
-  file.path(inputs,'eligible_cres.tsv.gz'))
+required <- c(file.path(out,'cre_footprint_summary.tsv.gz'),
+  file.path(root,'eligible_cres.tsv.gz'))
 missing <- required[!file.exists(required)]
 if(length(missing)) stop('Missing ',paste(missing,collapse=', '),
-  '. Restore eligible_cres.tsv.gz under cre_summary/inputs if missing; ',
+  '. Restore eligible_cres.tsv.gz under CRE_co-accessibility_FIRE if missing; ',
   'run the footprints jobs above if cre_footprint_summary.tsv.gz is missing.')
 for(d in c('tables','plots')) dir.create(file.path(out,d),recursive=TRUE,showWarnings=FALSE)
 source('/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r')
@@ -56,23 +54,25 @@ eligible CRE and footprint summary
 
 | Column | Meaning |
 |---|---|
+| `n_covered` | Fully covering fibers with a FiberHMM record on the chromosome, open or closed |
 | `n_footprints` | Total qualifying footprint occurrences overlapping the CRE across informative fibers |
 | `footprint_bp` | Total footprint-covered bases within the CRE, summed across fibers; overlapping footprints on the same fiber count once per base |
 | `fibers_with_fp` | Number of informative fibers with at least one qualifying footprint overlapping the CRE |
-| `footprints_per_fiber` | `n_footprints / n_informative` |
-| `pct_bases_footprinted` | `100 × footprint_bp / (n_informative × CRE length)` |
-| `peak_pct` | Highest percentage of informative fibers footprinted at any single base in the CRE |
-| `n_positions` | Number of recurrent footprint positions in the CRE |
+| `footprints_per_fiber` | `n_footprints / n_covered` |
+| `pct_bases_footprinted` | `100 × footprint_bp / (n_covered × CRE length)` |
 
 
 ```{r inputs}
 # load CRE and footprint summary
-cre <- fread(file.path(inputs,'eligible_cres.tsv.gz'),select=c('CRE_ID','chrom','start','end','CRE_class','set','n_informative'))
-fp <- fread(file.path(root,'cre_footprint_summary.tsv.gz'))
-cre <- merge(cre,fp[,.(CRE_ID,fp_informative=n_informative,n_footprints,footprint_bp,fibers_with_fp,
-  footprints_per_fiber,pct_bases_footprinted,peak_pct,n_positions)],by='CRE_ID',all.x=TRUE)
+cre <- fread(file.path(root,'eligible_cres.tsv.gz'),select=c('CRE_ID','chrom','start','end','CRE_class','set','n_informative'))
+fp <- fread(file.path(out,'cre_footprint_summary.tsv.gz'))
+cre <- merge(cre,fp[,.(CRE_ID,fp_informative=n_informative,n_covered,n_footprints,footprint_bp,fibers_with_fp,
+  footprints_per_fiber,pct_bases_footprinted)],by='CRE_ID',all.x=TRUE)
 
-stopifnot(!anyNA(cre$fp_informative),identical(cre$fp_informative,cre$n_informative))
+stopifnot(!anyNA(cre$fp_informative),identical(cre$fp_informative,cre$n_informative),
+  !anyNA(cre$n_covered),all(cre$n_covered>=cre$n_informative),
+  isTRUE(all.equal(cre$footprints_per_fiber,cre$n_footprints/cre$n_covered)),
+  isTRUE(all.equal(cre$pct_bases_footprinted,100*cre$footprint_bp/(cre$n_covered*(cre$end-cre$start)))))
 cre[,`:=`(length=end-start,set=factor(set,levels=c('co-access','background')),fp_informative=NULL)]
 cre[,footprints_per_fiber_per_100bp:=100*footprints_per_fiber/length]
 cre[,.N,by=set]
@@ -82,26 +82,22 @@ head(print(cre))
 
 ## Do co-access CREs have more footprints?
 
-Footprint density is the number of footprints per informative fiber divided by CRE length and multiplied by 100. The percentage of bases footprinted is averaged over informative fibers, using the union of footprint-covered bases within each fiber
-
-A recurrent position is a contiguous stretch of CRE bases footprinted on >= 15% of informative fibers, with >= 5 fibers at its peak. Peak footprint frequency is the maximum percentage of informative fibers footprinted at any base in the CRE
+Footprint density is the number of footprints per covered fiber divided by CRE length and multiplied by 100. The percentage of bases footprinted is averaged over covered fibers, using the union of footprint-covered bases within each fiber
 
 
-1. Footprints per informative fiber: average number of footprints touching the CRE on each informative fiber. A footprint counts if it shares at least one base with the CRE
 
-2. Footprints per informative fiber per 100 bp: measures footprint density
+1. Footprints per covered fiber: average number of footprints touching the CRE on each covered fiber. A footprint counts if it shares at least one base with the CRE
 
-3. % of CRE bases footprinted. Of all the CRE bases on all informative fibers, this is the percentage covered by a footprint. If one fiber has two overlapping footprints, the shared bases count once. It shows how much of the element is protected on a typical open molecule: low values mean mostly bare, accessible DNA, and high values mean a densely bound element.
+2. Footprints per covered fiber per 100 bp: measures footprint density
 
-3. Recurrent footprint positions per CRE: counts the stretches in the CRE where at least 15% of informative fibers have a footprint at the same bases, with at least 5 fibers at the strongest bas
+3. % of CRE bases footprinted. Of all the CRE bases on all covered fibers, this is the percentage covered by a footprint. If one fiber has two overlapping footprints, the shared bases count once. It shows how much of the element is protected on a typical covering molecule, with closed fibers contributing zero.
 
-4. Peak footprint frequency (% of informative fibers): percentage of informative fibers footprinted at the CRE’s single most footprinted base
+
 
 ```{r footprints}
-metrics <- c(footprints_per_fiber='Footprints per informative fiber',
-  footprints_per_fiber_per_100bp='Footprints per informative fiber per 100 bp',
-  pct_bases_footprinted='% of CRE bases footprinted',
-  n_positions='Recurrent footprint positions per CRE',peak_pct='Peak footprint frequency (% of informative fibers)')
+metrics <- c(footprints_per_fiber='Footprints per covered fiber',
+  footprints_per_fiber_per_100bp='Footprints per covered fiber per 100 bp',
+  pct_bases_footprinted='% of CRE bases footprinted')
 describe <- function(d,by_cols) {
   ans <- d[,.(n_CREs=.N),by=by_cols]
   
@@ -121,7 +117,7 @@ p <- ggplot(long,aes(set,value,fill=set))+geom_boxplot(outlier.size=.2,width=.6)
   labs(x=NULL,y=NULL,title='FiberHMM footprints per CRE',
     caption='autosomal CREs')+
   theme_fiberseq()
-save_plot(p,'footprints_by_set.pdf',16,4.5);print(p)
+save_plot(p,'footprints_by_set.pdf',11,4.5);print(p)
 ```
 
 ## Do co-access CREs differ in length?

@@ -15,7 +15,7 @@ This analysis looks for ENCODE cCRE pairs that are accessible on the same fiber 
 7. Call accessibility at each cCRE -> one FIRE element on the same fiber must cover at least 50% of the cCRE. Only the part of that element overlapping the fiber's aligned blocks contributes; separate FIRE elements are not combined.
 8. Count four configurations for each pair: neither accessible, cCRE1 only, cCRE2 only, both accessible. Sum the raw counts across all 31 samples, keeping read identities separate by sample.
 9. Add one pseudocount to each cell, calculate Fisher's exact p-value and the odds ratio, and apply BH correction across unique pairs genome-wide. Raw-count p-values and their FDR are also saved.
-10. Use [LCL_co-access.Rmd](LCL/LCL_co-access.Rmd) to select up to ten pairs with FDR < 0.05, OR > 1, and observed co-accessibility above the expectation under independence, then draw the single-fiber figures.
+10. Use [LCL_co-access.Rmd](LCL/CRE_co-accessibility_FIRE/LCL_co-access.Rmd) to select up to ten pairs with FDR < 0.05, OR > 1, and observed co-accessibility above the expectation under independence, then draw the single-fiber figures.
 
 ### Input
 
@@ -38,7 +38,7 @@ The notebook also reads display tracks from each sample's `extracted_results/` a
 
 ### Output
 
-Output root: `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/`.
+Output root: `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/`.
 
 | Step | Output relative to the output root | Contents |
 |---|---|---|
@@ -58,7 +58,7 @@ Output root: `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/`.
 Run the universe script first, then submit the aligned-block array. The counting job waits for all 31 array tasks to finish successfully.
 
 ```bash
-cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL
+cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/CRE_co-accessibility_FIRE
 mkdir -p /project/spott/cshan/fiber-seq/results/logs
 
 # 1. Build the cCRE universe and sample manifest
@@ -72,13 +72,13 @@ sbatch --dependency="afterok:${span_job}" LCL_run_coaccess.sh \
     --fire-overlap-fraction 0.5
 ```
 
-`LCL_run_coaccess.sh` runs [LCL_coaccess_cres.py](LCL/LCL_coaccess_cres.py). After it finishes, run the chunks in `LCL_co-access.Rmd` in order or knit the notebook.
+`LCL_run_coaccess.sh` runs [LCL_coaccess_cres.py](LCL/CRE_co-accessibility_FIRE/LCL_coaccess_cres.py). After it finishes, run the chunks in `LCL_co-access.Rmd` in order or knit the notebook.
 
 To change the output root or sample metadata, set `LCL_COACCESS_ROOT` or `LCL_SAMPLE_METATABLE` before running the shell scripts. Use the same settings for all stages and update the notebook parameters to match. The manifest must contain 31 unique samples.
 
 ### m6A permutation test on the top ten pairs
 
-[LCL_co-access_v2_perm_methy_prop.Rmd](LCL/LCL_co-access_v2_perm_methy_prop.Rmd) extends the analysis in `LCL_co-access.Rmd`. I used Fisher's exact test to test whether cCRE pairs are co-accessible more often than expected, but there is high donor heterogeneity: a pair accessible in one donor may not be accessible in another, and mixing donors can create an association on its own.
+[LCL_co-access_v2_perm_methy_prop.Rmd](LCL/CRE_co-accessibility_FIRE/LCL_co-access_v2_perm_methy_prop.Rmd) extends the analysis in `LCL_co-access.Rmd`. I used Fisher's exact test to test whether cCRE pairs are co-accessible more often than expected, but there is high donor heterogeneity: a pair accessible in one donor may not be accessible in another, and mixing donors can create an association on its own.
 
 This notebook asks a within-sample question instead: within a sample, does a fiber with more m6A at CRE1 also have more m6A at CRE2? It uses continuous m6A proportions rather than a binary open/closed call, and the permutation test shuffles only within each sample.
 
@@ -136,7 +136,7 @@ Notes
 
 #### Input
 
-The `coaccess/`, `universe/` and `<sample>/` paths are under the LCL output root `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/`.
+The `coaccess/`, `universe/` and `<sample>/` paths are under the LCL output root `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/`.
 
 | Input | Used for |
 |---|---|
@@ -153,7 +153,7 @@ The `coaccess/`, `universe/` and `<sample>/` paths are under the LCL output root
 
 #### Output
 
-Output root: `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/co-access_v2_perm_methy_prop/`. Files already on disk are kept and only missing files are written, so delete a file to regenerate it. `<set>` is `pooled` or `noXCI`.
+Output root: `/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/co-access_v2_perm_methy_prop/`. Files already on disk are kept and only missing files are written, so delete a file to regenerate it. `<set>` is `pooled` or `noXCI`.
 
 | Output relative to the output root | Contents |
 |---|---|

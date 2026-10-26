@@ -17,7 +17,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 
 if [[ ! -f "$SCRIPT_DIR/LCL_coaccess_cres.py" ]]; then
-    SCRIPT_DIR=/project/spott/cshan/fiber-seq/code/co-accessibility/LCL
+    SCRIPT_DIR=/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/CRE_co-accessibility_FIRE
 fi
 PYTHON=/project/spott/cshan/envs/Jupyter-notebook/bin/python3
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1

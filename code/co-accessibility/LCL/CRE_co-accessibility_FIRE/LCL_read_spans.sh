@@ -15,7 +15,7 @@
 # output: <sample>.aligned_blocks.bed.gz
 
 set -euo pipefail
-OUT_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-accessibility}
+OUT_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE}
 INPUTS="$OUT_ROOT/universe/sample_inputs.tsv"
 REF=/project/spott/reference/human/GRCh38.p14/hg38.fa
 SAMTOOLS=/project/spott/cshan/envs/dimelo/bin/samtools

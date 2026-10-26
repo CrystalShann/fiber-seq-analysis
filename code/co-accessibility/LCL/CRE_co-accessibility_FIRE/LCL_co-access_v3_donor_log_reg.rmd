@@ -7,7 +7,7 @@ output:
     toc_float: true
     code_folding: hide
 params:
-  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"
   chrom: null
 ---
 
@@ -36,7 +36,7 @@ suppressPackageStartupMessages({library(data.table); library(ggplot2)})
 `LCL_run_v3_donor_log_reg.sh` runs `LCL_fit_v3_donor_log_reg.R`
 
 ```bash
-cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL
+cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/CRE_co-accessibility_FIRE
 
 # genome-wide -> coaccess/donor_adjusted/all_chr/ and coaccess/donor_adjusted/noXCI/
 sbatch LCL_run_v3_donor_log_reg.sh

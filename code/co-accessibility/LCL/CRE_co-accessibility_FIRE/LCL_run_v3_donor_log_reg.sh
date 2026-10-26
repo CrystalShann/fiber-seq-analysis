@@ -18,5 +18,5 @@
 # a rerun with the same R, inputs and code reuses them instead of refitting.
 set -euo pipefail
 /software/R-4.4.1-el8-x86_64/bin/Rscript \
-  /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/LCL_fit_v3_donor_log_reg.R \
+  /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/CRE_co-accessibility_FIRE/LCL_fit_v3_donor_log_reg.R \
   "$SLURM_CPUS_PER_TASK" "$@"

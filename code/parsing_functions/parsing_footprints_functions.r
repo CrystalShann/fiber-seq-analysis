@@ -1482,7 +1482,7 @@ add_haplotype_groups <- function(res, group_col = "haplotype",
 # cCRE-pair co-accessibility: fibers, FIRE elements and display tracks
 #
 # Shared by code/co-accessibility/macrophage/coaccess_macrophage.Rmd and
-# code/co-accessibility/LCL/LCL_co-access.Rmd. Every path is an argument. The
+# code/co-accessibility/LCL/CRE_co-accessibility_FIRE/LCL_co-access.Rmd. Every path is an argument. The
 # accessibility call is always the FIRE elements; m6A, nucleosome and TF
 # footprint tracks are display only. Figures: plot_coaccess_pair() in
 # plotting_functions.r.

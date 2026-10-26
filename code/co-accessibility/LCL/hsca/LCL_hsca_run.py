@@ -152,7 +152,7 @@ def main():
     ap.add_argument("--chrom", choices=AUTOSOMES, help="Smoke test: this chromosome only (BH within it)")
     ap.add_argument("--workers", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)))
     args = ap.parse_args()
-    out_dir = args.out_dir or args.root / "hsca" / "outputs"
+    out_dir = args.out_dir or args.root.parent / "hsca" / "outputs"
     chroms = [args.chrom] if args.chrom else AUTOSOMES
 
     samples = phased_samples(args.sample_metatable, args.root)

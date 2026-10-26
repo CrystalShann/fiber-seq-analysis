@@ -12,7 +12,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON=/project/spott/cshan/envs/Jupyter-notebook/bin/python3
 BEDTOOLS=/project/spott/cshan/envs/bedtools/bin/bedtools
 BGZIP=/project/spott/cshan/envs/dimelo/bin/bgzip
-OUT_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-accessibility}
+OUT_ROOT=${LCL_COACCESS_ROOT:-/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE}
 CRE_BED=/project/spott/cshan/annotations/GRCh38-cCREs.bed
 TSS_BED=/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
 WINDOW=10000
@@ -21,7 +21,7 @@ WINDOW=10000
 CHROM_RE='^chr([1-9]|1[0-9]|2[0-2]|X|Y)$'
 
 # check if the samples' FIRE CRAM, FIRE peak and element files exist, and writes the sample input file
-[[ -s "$CRE_BED" && -s "$TSS_BED" ]] || { echo "Missing annotations; see ../make_gencode_v46_all_tss.sh" >&2; exit 1; }
+[[ -s "$CRE_BED" && -s "$TSS_BED" ]] || { echo "Missing annotations; see ../../make_gencode_v46_all_tss.sh" >&2; exit 1; }
 "$PYTHON" "$SCRIPT_DIR/LCL_coaccess_cres.py" --root "$OUT_ROOT" --prepare-manifest
 uni="$OUT_ROOT/universe"
 tmpdir=$(mktemp -d "${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/lcl-universe.XXXXXX")

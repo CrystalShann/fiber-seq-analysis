@@ -8,7 +8,7 @@ output:
     code_folding: hide
     self_contained: true
 params:
-  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"
   sample_sheet: "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
   fire_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
   code_root: "/project/spott/cshan/fiber-seq/code"
@@ -20,7 +20,7 @@ params:
 
 # Analysis overview
 
-This extends from the preivous co-acessibility analysis in `/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/LCL_co-access.Rmd`
+This extends from the preivous co-acessibility analysis in `/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/CRE_co-accessibility_FIRE/LCL_co-access.Rmd`
 I preivously used Fisher exact to test if the CRE pairs are more often co-accessible than expected, but there is high donor heterogeneity,
 the CRE pairs accessible in one donor may not be accessible in another. This might be a problem because:
 
@@ -139,7 +139,7 @@ if ("noXCI" %in% analysis_sets) {
 
 ## Load the top ten co-accessible pairs (ranked by FDR)
 
-Both top-ten sets are loaded from the tables saved by `LCL/LCL_co-access.Rmd` in `coaccess/`: 
+Both top-ten sets are loaded from the tables saved by `LCL/CRE_co-accessibility_FIRE/LCL_co-access.Rmd` in `coaccess/`: 
 
   - `LCL_top10_pairs.tsv` (pooled) and `LCL_top10_pairs_noXCI.tsv` (female chrx removed)
 

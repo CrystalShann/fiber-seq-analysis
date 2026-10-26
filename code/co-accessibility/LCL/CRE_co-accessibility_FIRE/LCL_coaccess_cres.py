@@ -28,10 +28,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "parsing_functions"))
 from count_and_test_pairs import bh, count_pairs, test_counts, summarize_coaccess_counts
 
-ROOT = Path(os.environ.get("LCL_COACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"))
+ROOT = Path(os.environ.get("LCL_COACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"))
 METATABLE = os.environ.get("LCL_SAMPLE_METATABLE", "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv")
 BEDTOOLS = "/project/spott/cshan/envs/bedtools/bin/bedtools"
 TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
@@ -88,9 +88,9 @@ def require_files(paths):
 #################################################
 # a pair must share a gene's TSS window and should be 500-20,000 bp distance
 
-# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/universe/cre_universe.bed -> 
+# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/universe/cre_universe.bed -> 
   # this the the overlap ENCODE cCREs /project/spott/cshan/annotations/GRCh38-cCREs.bedand merged FIRE peaks across all 31 samples 
-  # /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/universe/fire_peaks_union.bed
+  # /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/universe/fire_peaks_union.bed
   
   
 # TSS: /project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed
@@ -150,7 +150,7 @@ def command_lines(command):
 #################################################
 # Convert bed12 to bed3
 #################################################
-# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/<sample>/<sample>.aligned_blocks.bed.gz
+# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/<sample>/<sample>.aligned_blocks.bed.gz
 def aligned_blocks(fields):
     """Decode BED12 (without zeros at the end and beginning) from bamtobed -bed12 -splitD to a list of genomic coordinates"""
     # read the read's outer start and end, and the number of blocks from bed12

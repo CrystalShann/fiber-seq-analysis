@@ -8,7 +8,7 @@ output:
     code_folding: hide
     self_contained: true
 params:
-  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"
   sample_sheet: "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
   fire_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
   tf_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model"
@@ -80,7 +80,7 @@ read sample metadata:
 `/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv`
 
 sample manifest - containing the file path to FIRE CRAM, element and peaks:
-`/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/universe/sample_manifest.tsv`
+`/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/universe/sample_manifest.tsv`
 
 ```{r validate-all-31-samples}
 sample_meta <- fread(params$sample_sheet)

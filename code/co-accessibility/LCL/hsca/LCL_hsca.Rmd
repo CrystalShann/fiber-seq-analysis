@@ -7,19 +7,33 @@ output:
     toc_float: true
     code_folding: hide
 params:
-  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility"
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"
+  code_root: "/project/spott/cshan/fiber-seq/code"
+  fire_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+  tf_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model"
+  tabix: "/project/spott/cshan/envs/dimelo/bin/tabix"
+  phasing_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+  make_molecule_plots: true
+  locus_flank_bp: 1000
+  leiden_k_neighbors: 10
+  leiden_resolution: 1
+  leiden_seed: 1
+  acf_python: "/project/spott/cshan/envs/Jupyter-notebook/bin/python"
+  acf_n_pcs: 50
+  acf_neighbors: 10
+  acf_resolution: 0.4
+  acf_seed: 0
+  acf_plot_max_lag: 500
 ---
 
-# Are co-accessible pairs driven by haplotype differences?
+# Are co-accessible pairs driven by haplotype differences (Hapolotype Specific Chromatin Accessibility - HSCA)?
 
 A pooled 2x2 table mixes the two haplotypes of every sample. When both cCREs are more open on
 the same haplotype the odds ratio is inflated; when they are open on opposite haplotypes it is
-deflated. Haplotype-selective chromatin accessibility (HSCA) comes from imprinting, cis variants
-(HSCA-withVar) and clonal somatic epimutations (HSCA-noVar) (Vollger et al., Cell 2026).
+deflate
+- Haplotype-selective chromatin accessibility (HSCA) can come from imprinting, cis variants (HSCA-withVar) and clonal somatic epimutations (HSCA-noVar) (Vollger et al., Cell 2026).
 
-The test is the paper's: two-sided Fisher on accessible vs not accessible fibers per haplotype,
-BH, FDR <= 0.05, at least 10 reads per haplotype. Applied to a pair, "accessible" becomes "both
-cCREs open" on reads that span both cCREs.
+The test is the paper's: two-sided Fisher on accessible vs not accessible fibers per haplotype, BH, FDR <= 0.05, at least 10 reads per haplotype. Applied to a pair, "accessible" becomes "both cCREs open" on reads that span both cCREs
 
 | Unit | Within sample, H1 vs H2 | Within sample, REF vs ALT | Across samples, REF vs ALT |
 |---|---|---|---|
@@ -28,36 +42,53 @@ cCREs open" on reads that span both cCREs.
 
 - `LCL_hsca_cre_status`: FIRE's own per-peak hap1 vs hap2 test (`<sample>-fire-v0.1-hap-differences.bed.gz`)
   intersected with the paired cCREs; status hap1 / hap2 / conflict / ns; a missing row = untested.
+  
 - H1/H2 are each sample's HiPhase tags: they are only compared within one sample and one phase
   block (pairs use the reads of their majority block).
-- REF/ALT is read from each read's base at one het SNV per cCRE (the SNV het in the most samples),
-  so the direction means the same thing in every sample and can be pooled. A sample is pooled at
-  an SNV only if its reads show both alleles there: AL20, AL27, AL28 and AL54 (and partly AL61,
-  AL38) carry another person's genotypes, and 57-68% of their "het" sites show only one allele
-  (0-10% in the other samples).
-- A skew that follows the allele across samples is genetic; a within-sample skew without a
-  consistent allele (or without a het SNV) is an imprinting or epimutation candidate.
 
-Run the tables (about an hour on 8 CPUs), then knit:
+- A skew that follows the allele across samples is genetic; a within-sample skew without a
+  consistent allele (or without a het SNV) is an imprinting or epimutation candidate
+
+
 
 ```bash
 cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca
 sbatch LCL_run_hsca.sh   # -> LCL_project/co-accessibility/hsca/outputs/
 ```
 
+the imprinted differentially mwthylated regions (DMRs), is used as known imprinted regions from - Akbari V, Garant J-M, O’Neill K, Pandoh P, Moore R, Marra MA, Hirst M, Jones SJM (2022). “Genome-wide detection of imprinted differentially methylated regions using nanopore sequencing.” eLife 11:e77898.
+
+
+the analysis was done on 27 phased samples: /project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_27samples.csv
+
+
+
+1. Identify skewed CRE pairs
+  - at least 10 reads in each group (hap1 vs hap2 within a sample, ref vs alt after pooling all samples)
+  
+  - A two-sided Fisher exact test compares the fraction of reads that are open between the two groups. For H1 vs H2 on a cCRE, “open” means the cCRE is accessible. For a pair, “open” means both cCREs are open on the same read.
+    - For REF vs ALT, the reads are split by the base at the chosen het SNV.
+    - BH correction is applied within each sample.
+    - The unit is skewed if the adjusted p-value is ≤ 0.05
+    - The sign of diff (group 1 open fraction minus group 2 open fraction) sets the label: hap1 or hap2 for the haplotype tests. alt or ref for the allele tests.
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
                       cache = FALSE, fig.width = 10, fig.height = 9)
 source("/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca/fire_plots.R")
+source(file.path(params$code_root, "co-accessibility/LCL/hsca/hap_sele_access_plots.r"),
+       local = TRUE)
 ```
 
 ```{r settings}
-hsca_dir = file.path(params$root, "hsca")
+hsca_dir = file.path(dirname(params$root), "hsca")
 outputs_dir = file.path(hsca_dir, "outputs")
 tables_dir = file.path(hsca_dir, "tables")
 plots_dir = file.path(hsca_dir, "plots")
+examples_dir = file.path(hsca_dir, "CRE_pairs_examples")
 dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
 dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(examples_dir, showWarnings = FALSE, recursive = TRUE)
 fdr_cut = 0.05
 hap_status = c("hap1", "hap2")
 ```
@@ -77,21 +108,20 @@ cres = fread(file.path(params$root, "universe", "cre_universe.bed"),
 pooled = fread(file.path(params$root, "coaccess", "LCL_coaccess_pairs.tsv.gz"))
 pooled_noxci = fread(file.path(params$root, "coaccess", "noXCI", "LCL_coaccess_pairs_noXCI.tsv.gz"))
 
-# imprinted cCREs (Akbari DMR overlap, as fire-figures Fire-peak-df.R)
+# imprinted cCREs 
 cres[, imprinted := flag_imprinted(cres)]
 imprinted_cres = cres[imprinted == TRUE, CRE_ID]
+
 ```
 
 ## Tested and skewed per sample
-
-A missing sample has no tested rows in that table (no FIRE haplotype test, or no unit with at
-least 10 reads per haplotype / allele).
 
 ```{r sample-tallies}
 tally = function(dt, name) {
   dt[, .(tested = .N, skewed = sum(status != "ns")), by = sample_name][
     , setnames(.SD, c("tested", "skewed"), paste0(name, c("_tested", "_skewed")))]
 }
+
 sample_tallies = Reduce(function(a, b) merge(a, b, by = "sample_name", all = TRUE), list(
   tally(cre_status, "cre_hap"),
   cre_status[, .(cre_hap_conflict = sum(status == "conflict")), by = sample_name],
@@ -112,12 +142,10 @@ knitr::kable(pooled_tallies)
 
 ## Haplotype and allele skew plots (paper figures)
 
-hap1-vs-hap2 accessibility and the volcano from fire-figures `hap-diffs.Rmd`, one panel per
-sample. Blue dashed line: p = 0.05; red dashed line: the largest p-value with BH p <= 0.05 in
+hap1-vs-hap2 accessibility and the volcano, one panel per sample. Blue dashed line: p = 0.05; red dashed line: the largest p-value with BH p <= 0.05 in
 that sample; red crosses: imprinted (Akbari DMR) cCREs.
 
 ```{r skew-plots}
-pair_imprinted = function(dt) dt$CRE1 %in% imprinted_cres | dt$CRE2 %in% imprinted_cres
 cre_status[, imprinted := CRE_ID %in% imprinted_cres]
 pair_status[, imprinted := pair_imprinted(pair_status)]
 cre_allele_by_sample[, imprinted := CRE_ID %in% imprinted_cres]
@@ -150,9 +178,8 @@ for (panel in panels) {
 
 ## Are pooled co-accessible pairs haplotype- or allele-skewed?
 
-Pooled positives are `fdr < 0.05 & OR > 1 & co_access > expected_co_access` in the pooled table
-(all chromosomes) and the noXCI table; only autosomal pairs can be tested here. Each test compares
-the skewed fraction of positives with the skewed fraction of the other tested pairs.
+Pooled positives are `fdr < 0.05 & OR > 1 & co_access > expected_co_access` in the pooled table (all chromosomes) and the noXCI table; only autosomal pairs can be tested here
+Each test compares the skewed fraction of positives with the skewed fraction of the other tested pairs.
 
 ```{r pooled-positive-enrichment}
 positives = list(
@@ -178,6 +205,397 @@ enrichment = rbindlist(lapply(names(positives), function(set) {
 }))
 fwrite(enrichment, file.path(tables_dir, "LCL_hsca_pooled_positive_enrichment.tsv"), sep = "\t")
 knitr::kable(enrichment, digits = 4)
+```
+
+## Co-accessible pairs with pooled allele selectivity, ranked by p-value
+
+These lists use the **pooled REF/ALT pair test**, not the within-sample H1/H2 test.
+Co-accessibility still requires pooled co-accessibility FDR < 0.05, OR > 1, and observed
+both-open counts above expectation. Within that set, raw allele p < 0.05 identifies
+**exploratory candidates**; allele BH FDR < 0.05 identifies the corrected discoveries.
+The allele BH values are retained from the original test across all tested autosomal pairs;
+they are **not recalculated after selecting co-accessible pairs**. Every list is sorted by
+raw allele p-value, with CRE_pair breaking ties. Coordinates are BED (0-based, end-exclusive).
+The `difference_pp` column is ALT minus REF both-open fraction, in percentage points.
+
+```{r ranked-allele-pairs}
+pair_annotation = pooled[, .(CRE_pair, chrom, cre1_start, cre1_end, cre2_start, cre2_end,
+  gene_names, CRE_pair_labels, coaccess_OR = OR, coaccess_fdr = fdr,
+  coaccess_p_value = pval, n_shared_reads, co_access, expected_co_access)]
+stopifnot(!anyDuplicated(pair_annotation$CRE_pair), !anyDuplicated(pair_allele$CRE_pair))
+ranked_pair_alleles = merge(copy(pair_allele[!is.na(p_value)]), pair_annotation,
+  by = "CRE_pair", all.x = TRUE, sort = FALSE)
+stopifnot(!anyNA(ranked_pair_alleles$chrom))
+setnames(ranked_pair_alleles, c("p_value", "fdr"), c("allele_p_value", "allele_bh_fdr"))
+ranked_pair_alleles[, `:=`(
+  coaccessible = CRE_pair %in% positives$all_chr,
+  allele_nominal = allele_p_value < fdr_cut,
+  allele_bh_significant = allele_bh_fdr < fdr_cut,
+  ref_n = ref_open + ref_closed,
+  alt_n = alt_open + alt_closed,
+  difference_percentage_points = 100 * diff)]
+setorder(ranked_pair_alleles, allele_p_value, CRE_pair)
+rank_pair_list = function(d) {
+  d = copy(d)
+  d[, rank := seq_len(.N)]
+  setcolorder(d, c("rank", setdiff(names(d), "rank")))
+  d[]
+}
+coaccessible_allele_nominal = rank_pair_list(ranked_pair_alleles[coaccessible & allele_nominal])
+coaccessible_allele_bh = rank_pair_list(ranked_pair_alleles[coaccessible & allele_bh_significant])
+all_pair_allele_bh = rank_pair_list(ranked_pair_alleles[allele_bh_significant == TRUE])
+fwrite(coaccessible_allele_nominal,
+  file.path(tables_dir, "LCL_hsca_coaccessible_pair_allele_nominal_ranked.tsv"), sep = "\t")
+fwrite(coaccessible_allele_bh,
+  file.path(tables_dir, "LCL_hsca_coaccessible_pair_allele_BH_ranked.tsv"), sep = "\t")
+fwrite(all_pair_allele_bh,
+  file.path(tables_dir, "LCL_hsca_all_pair_allele_BH_ranked.tsv"), sep = "\t")
+knitr::kable(data.table(
+  group = c("Co-accessible pairs with an allele test", "Raw allele p < 0.05 (exploratory)",
+            "Allele BH FDR < 0.05 among co-accessible pairs", "Allele BH FDR < 0.05 among all pairs"),
+  n_pairs = c(sum(ranked_pair_alleles$coaccessible), nrow(coaccessible_allele_nominal),
+              nrow(coaccessible_allele_bh), nrow(all_pair_allele_bh))))
+
+# Show every passing pair; scientific notation keeps small p-values visible.
+show_ranked_pairs = function(d) {
+  knitr::kable(d[, .(rank, CRE_pair, gene_names,
+    CRE1_interval = paste0(chrom, ":", cre1_start, "-", cre1_end),
+    CRE2_interval = paste0(chrom, ":", cre2_start, "-", cre2_end), variant_id,
+    REF_both_open = paste0(ref_open, "/", ref_n),
+    ALT_both_open = paste0(alt_open, "/", alt_n),
+    difference_pp = round(difference_percentage_points, 2),
+    allele_p = formatC(allele_p_value, format = "e", digits = 3),
+    allele_BH_FDR = formatC(allele_bh_fdr, format = "e", digits = 3),
+    coaccess_FDR = formatC(coaccess_fdr, format = "e", digits = 3),
+    coaccessible, n_samples_both_alleles)])
+}
+```
+
+### All nominal candidates among significant co-accessible pairs
+
+```{r nominal-coaccessible-pairs}
+show_ranked_pairs(coaccessible_allele_nominal)
+```
+
+### BH-significant allele-selective co-accessible pairs
+
+```{r bh-coaccessible-pairs}
+show_ranked_pairs(coaccessible_allele_bh)
+```
+
+### All BH-significant allele-selective pairs, including pairs without significant co-accessibility
+
+The `coaccessible` column distinguishes the overlap from allele-selective pairs that do not
+pass the original co-accessibility criteria.
+
+```{r bh-all-pairs}
+show_ranked_pairs(all_pair_allele_bh)
+```
+
+## Reusable CRE-pair plotting
+
+`plot_cre_pair(cre_pair)` prepares the reads and writes the plots for one pair:
+phased molecule tracks, phased configuration bars, the unclustered phased-molecule heatmap, the
+Manhattan/Leiden heatmap, cluster m6A profiles, neighbor graphs and allele composition,
+plus autocorrelation heatmaps, profiles, and clustering. Only PDFs are written to the
+example folders; read labels, phasing audits, assignments, and profiles remain in the
+returned R object.
+The input can be a full `CRE_pair` string from the ranked table or a vector of two full
+CRE IDs. Coordinates and the focal SNP come from the pooled and allele-test tables.
+The pair must have an allele-test SNV and enough fully spanning, phaseable molecules
+for the existing phasing filter (at least three reads and both SNP alleles).
+
+Output filenames default to both CRE accessions, so pairs near the same gene remain
+separate. `label` sets the gene label for titles and folders (by default, gene symbols
+from the pair annotation); `output_prefix` optionally chooses a filename stem.
+`region_description` adds positional context, for example `"upstream of PTGER4"`.
+Future plot titles include this description and the full plotted window's hg38 coordinates
+(1-based, inclusive). If no description is supplied, a neutral gene-locus label is used;
+upstream/downstream relationships are not inferred from proximity alone.
+Each pair gets a directory named with its gene label and both CRE accessions under `CRE_pairs_examples/`,
+containing only its PDFs. `output_dir` overrides the parent directory. The function returns the
+plot objects, underlying data, output directory, and PDF paths.
+It preserves the original full-span filters, yellow CRE bands, SNP markers, REF/ALT
+legends, and clustering settings. It does not change the allele tests or BH values.
+
+For another pair, after running the notebook setup and function definitions:
+
+```r
+cxcr4_id = coaccessible_allele_nominal[rank == 14L, CRE_pair]
+cxcr4_plots = plot_cre_pair(cxcr4_id, label = "CXCR4")
+cxcr4_plots$files
+# For several selected pairs, call the same function once per pair:
+# lapply(selected_pair_ids, plot_cre_pair)
+```
+
+```{r pair-plot-dependencies, include=FALSE}
+for (script in c("parsing_footprints_functions.r", "stats_testing_functions.r", "plotting_functions.r"))
+  source(file.path(params$code_root, "parsing_functions", script), local = TRUE)
+for (script in c("clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r",
+                 "clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
+                 "haplotype_phasing/LCL_phasing.r", "haplotype_phasing/LCL_phased_m6a_input.r"))
+  source(file.path(params$code_root, script), local = TRUE)
+```
+
+
+## SLFN5: single-molecule view of both cCREs
+
+
+```{r slfn5-pair-example, include=FALSE}
+slfn5 = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  slfn5 = plot_cre_pair(
+    c("EH38D5005816.EH38E3219251.PLS", "EH38D6268395.EH38E4160235.pELS"),
+    label = "SLFN5", output_prefix = "LCL_hsca_SLFN5")
+}
+```
+
+```{r slfn5-retained-counts, echo=FALSE}
+if (!is.null(slfn5)) knitr::kable(slfn5$read_labels[, .(molecules = .N,
+  samples = uniqueN(sample_name)), by = allele_group])
+```
+
+```{r slfn5-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(slfn5)) 6 else slfn5$phased_plot$height}
+if (!is.null(slfn5)) print(slfn5$phased_plot$panels$combined)
+```
+
+```{r slfn5-configuration-figure, echo=FALSE, fig.width=12, fig.height=6}
+if (!is.null(slfn5)) print(slfn5$phased_plot$bars)
+```
+
+## SLFN5: phased-molecule m6A heatmaps and Manhattan/Leiden clustering
+
+
+```{r slfn5-clustering-summary, echo=FALSE}
+if (!is.null(slfn5)) knitr::kable(as.data.table(slfn5$phased_molecules$assignments)[,
+  .(molecules = .N, samples = uniqueN(sample_name), in_phased_plot = sum(in_phased_plot),
+    zero_m6a_molecules = sum(n_m6a_calls == 0)), by = cluster][order(cluster)])
+```
+
+```{r slfn5-phased-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(slfn5)) 8 else slfn5$heatmap_height}
+if (!is.null(slfn5)) draw_pair_m6a_heatmap(slfn5$heatmap_unclustered)
+```
+
+```{r slfn5-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(slfn5)) 8 else slfn5$heatmap_height}
+if (!is.null(slfn5)) draw_pair_m6a_heatmap(slfn5$heatmap_leiden)
+```
+
+```{r slfn5-leiden-profile-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(slfn5)) 6 else 1.3 * (slfn5$phased_molecules$n_clusters + 1) + 1}
+if (!is.null(slfn5)) print(slfn5$profile_plot)
+```
+
+```{r slfn5-leiden-graph-figure, echo=FALSE, fig.width=10, fig.height=8}
+if (!is.null(slfn5)) print(slfn5$graph_plot)
+```
+
+## TNFAIP3 and FAS: additional CRE-pair examples
+
+These are raw-p candidates (ranks 83 and 61), not BH-significant allele tests.
+The same function and read filters generate all PDFs for each pair, in separate
+pair directories under `CRE_pairs_examples/`. The phased tracks and clustered heatmaps
+are also displayed here; configuration bars, profiles, and neighbor graphs are in the PDFs.
+
+```{r additional-pair-examples, include=FALSE}
+tnfaip3 = fas = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  tnfaip3 = plot_cre_pair(
+    c("EH38D5796985.EH38E3735644.dELS", "EH38D3906538.EH38E2507553.dELS"),
+    label = "TNFAIP3", output_prefix = "LCL_hsca_TNFAIP3")
+  fas = plot_cre_pair(
+    c("EH38D2372847.EH38E1486833.pELS", "EH38D4537003.EH38E2915259.PLS"),
+    label = "FAS", output_prefix = "LCL_hsca_FAS")
+}
+```
+
+```{r example-pair-summary, echo=FALSE}
+if (isTRUE(params$make_molecule_plots)) {
+  example_results = list(SLFN5 = slfn5, TNFAIP3 = tnfaip3, FAS = fas)
+  example_summary = rbindlist(lapply(names(example_results), function(gene) {
+    x = example_results[[gene]]
+    data.table(gene = gene, CRE_pair = x$pair_id,
+      phased_track_molecules = nrow(x$read_labels),
+      phased_heatmap_molecules = nrow(x$phased_molecules$assignments),
+      input_full_window_molecules = x$phased_molecules$params$n_input_full_window,
+      unassigned_excluded = x$phased_molecules$params$n_unassigned_excluded,
+      samples = uniqueN(x$phased_molecules$assignments$sample_name),
+      Leiden_clusters = x$phased_molecules$n_clusters,
+      REF_molecules = sum(x$phased_molecules$assignments$allele_group == paste0("REF-", x$region$ref)),
+      ALT_molecules = sum(x$phased_molecules$assignments$allele_group == paste0("ALT-", x$region$alt)),
+      ACF_clusters = x$autocorrelation$result$n_clusters,
+      ACF_molecules = nrow(x$autocorrelation$result$assignments), output_dir = x$output_dir)
+  }))
+  knitr::kable(example_summary[, !"output_dir"])
+}
+```
+
+```{r tnfaip3-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(tnfaip3)) 6 else tnfaip3$phased_plot$height}
+if (!is.null(tnfaip3)) print(tnfaip3$phased_plot$panels$combined)
+```
+
+```{r tnfaip3-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(tnfaip3)) 8 else tnfaip3$heatmap_height}
+if (!is.null(tnfaip3)) draw_pair_m6a_heatmap(tnfaip3$heatmap_leiden)
+```
+
+```{r fas-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(fas)) 6 else fas$phased_plot$height}
+if (!is.null(fas)) print(fas$phased_plot$panels$combined)
+```
+
+```{r fas-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(fas)) 8 else fas$heatmap_height}
+if (!is.null(fas)) draw_pair_m6a_heatmap(fas$heatmap_leiden)
+```
+
+## PTGER4 and WDFY4: upstream CRE-pair examples
+
+Rank 19 is the pair upstream of PTGER4, and rank 30 is upstream of WDFY4 in the
+nominal-p ranked list. These are positional labels, not evidence that either pair
+regulates the named gene. Both pairs are upstream of the plus-strand canonical TSS
+in `/project/spott/cshan/annotations/gencodev46_Ensembl_canonical_TSS.bed`:
+PTGER4 at chr5:40,679,915 and WDFY4 at chr10:48,684,873 (hg38, 1-based).
+The titles give the plotted windows, including the flanks. Only these new examples
+need to be executed to add their PDFs; existing example PDFs need not be regenerated.
+
+```{r upstream-pair-examples, include=FALSE}
+ptger4 = wdfy4 = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  ptger4 = plot_cre_pair(
+    c("EH38D3696628.EH38E2368242.dELS", "EH38D5644181.EH38E3633999.pELS"),
+    label = "PTGER4", output_prefix = "LCL_hsca_PTGER4",
+    region_description = "upstream of PTGER4")
+  wdfy4 = plot_cre_pair(
+    c("EH38D6178319.EH38E4008375.dELS", "EH38D6178323.EH38E4008379.PLS"),
+    label = "WDFY4", output_prefix = "LCL_hsca_WDFY4",
+    region_description = "upstream of WDFY4")
+}
+```
+
+```{r upstream-pair-summary, echo=FALSE}
+if (!is.null(ptger4) && !is.null(wdfy4)) {
+  knitr::kable(rbindlist(lapply(list(ptger4, wdfy4), function(x) data.table(
+    gene = x$region$gene_label, description = x$region$region_description,
+    chromosome = x$region$chr, window_start = x$region$analysis_start,
+    window_end = x$region$analysis_end, phased_track_molecules = nrow(x$read_labels),
+    phased_heatmap_molecules = nrow(x$phased_molecules$assignments),
+    Manhattan_clusters = x$phased_molecules$n_clusters,
+    ACF_clusters = x$autocorrelation$result$n_clusters))))
+}
+```
+
+```{r ptger4-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(ptger4)) 6 else ptger4$phased_plot$height}
+if (!is.null(ptger4)) print(ptger4$phased_plot$panels$combined)
+```
+
+```{r ptger4-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(ptger4)) 8 else ptger4$heatmap_height}
+if (!is.null(ptger4)) draw_pair_m6a_heatmap(ptger4$heatmap_leiden)
+```
+
+```{r wdfy4-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(wdfy4)) 6 else wdfy4$phased_plot$height}
+if (!is.null(wdfy4)) print(wdfy4$phased_plot$panels$combined)
+```
+
+```{r wdfy4-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(wdfy4)) 8 else wdfy4$heatmap_height}
+if (!is.null(wdfy4)) draw_pair_m6a_heatmap(wdfy4$heatmap_leiden)
+```
+
+## Gene, domain and CTCF context of the CRE-pair examples
+
+One PDF per pair in `CRE_domain_CTCF_anno/`. The top block is the locus context: canonical
+GENCODE v46 transcripts, Rao et al. 2014 GM12878 HiCCUPS loops and Arrowhead domains, lifted
+hg19 -> hg38 by `rao2014_GM12878/liftover_to_hg38.sh`. Loops are arcs between anchor midpoints:
+loops with an anchor in the pair window are red and labelled, with CTCF motif arrows at their
+anchors. Domains are triangles. The yellow band is the pair window (pair +/- `locus_flank_bp`),
+which the bottom block shows at base resolution. That block has transcript structure, loop
+anchors, motifs and domain edges in the window, the cCREs, per-base m6A by genotype group
+(fraction of the group's molecules with a call; no smoothing) and every molecule's m6A.
+
+Genotypes come from each sample's reads at the focal SNV: the base each primary read carries,
+the rule of the pooled allele test. They do not come from the VCFs, so homozygous donors, the four
+samples without a VCF and the samples carrying another person's VCF genotypes are all labelled
+from their own reads. A sample needs at least 5 informative reads. It is het when the minor
+allele has at least 2 reads and at least 15% of them, and otherwise homozygous for the majority
+allele. Het donors' molecules are split by their own base. Molecules are the full-window primary
+alignments that cover both cCREs, from all 31 samples: the molecule-track read rule without its
+phasing requirement. The pooled 2x2 is reproduced as a check. There is no clustering. These
+figures do not change the allele tests or BH values.
+
+```{r domain-ctcf-data, include=FALSE}
+if (isTRUE(params$make_molecule_plots)) {
+  gene_models = load_canonical_gene_models("/project/spott/cshan/annotations/gencode.v46.annotation.gtf.gz")
+  rao_hg38 = load_rao_hg38("/project/spott/cshan/annotations/LCL_public_data/rao2014_GM12878/hg38")
+}
+```
+
+```{r domain-ctcf-examples, include=FALSE}
+domain_ctcf = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  domain_ctcf = list(
+    SLFN5 = plot_cre_pair_domain_ctcf(
+      c("EH38D5005816.EH38E3219251.PLS", "EH38D6268395.EH38E4160235.pELS"), "SLFN5"),
+    TNFAIP3 = plot_cre_pair_domain_ctcf(
+      c("EH38D5796985.EH38E3735644.dELS", "EH38D3906538.EH38E2507553.dELS"), "TNFAIP3"),
+    FAS = plot_cre_pair_domain_ctcf(
+      c("EH38D2372847.EH38E1486833.pELS", "EH38D4537003.EH38E2915259.PLS"), "FAS"),
+    PTGER4 = plot_cre_pair_domain_ctcf(
+      c("EH38D3696628.EH38E2368242.dELS", "EH38D5644181.EH38E3633999.pELS"), "PTGER4",
+      region_description = "upstream of PTGER4"),
+    WDFY4 = plot_cre_pair_domain_ctcf(
+      c("EH38D6178319.EH38E4008375.dELS", "EH38D6178323.EH38E4008379.PLS"), "WDFY4",
+      region_description = "upstream of WDFY4"))
+}
+```
+
+```{r domain-ctcf-group-sizes, echo=FALSE}
+if (!is.null(domain_ctcf)) knitr::kable(rbindlist(lapply(names(domain_ctcf), function(gene)
+  domain_ctcf[[gene]]$group_sizes[, .(gene, focal_snv = domain_ctcf[[gene]]$allele$variant_id,
+    group = cluster, molecules, samples, donors)])))
+```
+
+```{r domain-ctcf-genotypes, echo=FALSE}
+# per sample and pair: genotype call (REF/ALT reads at the focal SNV)
+if (!is.null(domain_ctcf)) knitr::kable(dcast(rbindlist(lapply(names(domain_ctcf), function(gene)
+  domain_ctcf[[gene]]$genotypes[, .(gene, sample = sub("_.*$", "", sample_name),
+    call = sprintf("%s (%d/%d)", genotype, n_ref, n_alt))])), sample ~ gene, value.var = "call"))
+```
+
+## Allele annotations and autocorrelation of the CRE-pair examples
+
+
+```{r slfn5-allele-clustering-figure, echo=FALSE, fig.width=12, fig.height=8}
+if (!is.null(slfn5)) print(slfn5$autocorrelation$allele_graph)
+```
+
+```{r slfn5-acf-heatmap-figure, echo=FALSE, fig.width=14, fig.height=10}
+if (!is.null(slfn5)) ComplexHeatmap::draw(slfn5$autocorrelation$heatmap,
+  heatmap_legend_side = "right", annotation_legend_side = "right")
+```
+
+```{r slfn5-acf-profile-figure, echo=FALSE, fig.width=12, fig.height=8}
+if (!is.null(slfn5)) print(slfn5$autocorrelation$profile_plot)
+```
+
+```{r tnfaip3-allele-clustering-figure, echo=FALSE, fig.width=12, fig.height=8}
+if (!is.null(tnfaip3)) print(tnfaip3$autocorrelation$allele_graph)
+```
+
+```{r tnfaip3-acf-heatmap-figure, echo=FALSE, fig.width=14, fig.height=10}
+if (!is.null(tnfaip3)) ComplexHeatmap::draw(tnfaip3$autocorrelation$heatmap,
+  heatmap_legend_side = "right", annotation_legend_side = "right")
+```
+
+```{r tnfaip3-acf-profile-figure, echo=FALSE, fig.width=12, fig.height=8}
+if (!is.null(tnfaip3)) print(tnfaip3$autocorrelation$profile_plot)
+```
+
+```{r fas-allele-clustering-figure, echo=FALSE, fig.width=12, fig.height=8}
+if (!is.null(fas)) print(fas$autocorrelation$allele_graph)
+```
+
+```{r fas-acf-heatmap-figure, echo=FALSE, fig.width=14, fig.height=10}
+if (!is.null(fas)) ComplexHeatmap::draw(fas$autocorrelation$heatmap,
+  heatmap_legend_side = "right", annotation_legend_side = "right")
+```
+
+```{r fas-acf-profile-figure, echo=FALSE, fig.width=12, fig.height=8}
+if (!is.null(fas)) print(fas$autocorrelation$profile_plot)
 ```
 
 ## Haplotype-skewed pairs: are both cCREs selective on the same haplotype?

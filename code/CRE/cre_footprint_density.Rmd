@@ -1,0 +1,125 @@
+---
+title: "FIRE frequency and FiberHMM footprint density at active and Low-DNase cCREs"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.path = file.path(tempdir(), "cre-density-figures/"))
+```
+
+Inputs, all pooled over the 31 LCL samples (chr1-22, X, Y):
+
+- `fire_freq.<set>.tsv` from `cre_fire_freq_dnase.Rmd`
+- `footprints/cre_footprint_summary.tsv.gz` from `bash cre_footprint_density.sh footprints`
+  (`cre_summary/count_cre_footprints.R`)
+
+Both use the same denominator, `n_covered`: fibers with one aligned block covering
+the whole cCRE (no deletion inside it) and a FiberHMM v2 record on the chromosome,
+open or closed.
+
+- FIRE frequency = fibers with >= 1 FIRE element overlapping the cCRE / `n_covered`
+- Footprints per covered fiber = 10-80 bp FiberHMM footprints inside a FIRE element
+  of an open fiber (FIRE element covering >= 50% of the cCRE) that touch the cCRE /
+  `n_covered`; closed fibers count 0
+- Footprints per covered fiber per 100 bp = the above x 100 / cCRE length
+- % of cCRE bases footprinted = footprinted cCRE bases (per fiber, overlaps counted
+  once) / (`n_covered` x cCRE length)
+
+cCREs with >= 10 covered fibers are summarised; outputs go to `footprints/summary/`.
+
+```{r load}
+suppressPackageStartupMessages({library(data.table); library(ggplot2)})
+
+out_root <- Sys.getenv("CRE_ACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/CRE_access")
+fp_dir <- file.path(out_root, "footprints")
+out_dir <- file.path(fp_dir, "summary")
+dir.create(out_dir, showWarnings = FALSE)
+sets <- c("active_cre", "low_dnase_cre")
+min_covered <- 10
+
+cre <- fread(file.path(fp_dir, "cres.tsv.gz"))
+fp <- fread(file.path(fp_dir, "cre_footprint_summary.tsv.gz"),
+            select = c("CRE_ID", "width", "n_covered", "n_footprints", "footprints_per_fiber", "pct_bases_footprinted"))
+ff <- rbindlist(lapply(sets, function(s)
+  fread(file.path(out_root, sprintf("fire_freq.%s.tsv", s)), select = c("id", "n_reads", "n_fire"))))
+setnames(ff, "id", "CRE_ID")
+
+for (name in c("cre", "fp", "ff")) {
+  ids <- get(name)$CRE_ID
+  if (anyNA(ids) || anyDuplicated(ids))
+    stop(name, ": missing or duplicate CRE_ID values; each input must have one row per cCRE.")
+}
+coverage <- rbindlist(lapply(c("fp", "ff"), function(name) {
+  ids <- get(name)$CRE_ID
+  data.table(input = name, missing = sum(!cre$CRE_ID %in% ids),
+             unexpected = sum(!ids %in% cre$CRE_ID))
+}))
+if (any(coverage$missing > 0L | coverage$unexpected > 0L)) {
+  print(coverage)
+  stop("Input CRE IDs do not match cres.tsv.gz. If ff is incomplete, wait for ",
+       "run_cre_fire_counts.sh to finish rebuilding both fire_freq tables, then rerun ",
+       "this entire load chunk to refresh cre, fp, and ff. No regions were dropped.")
+}
+d <- merge(merge(cre, fp, by = "CRE_ID"), ff, by = "CRE_ID")
+stopifnot(nrow(d) == nrow(cre), nrow(d) == nrow(fp), nrow(d) == nrow(ff),
+          identical(as.integer(d$n_reads), as.integer(d$n_covered)))
+d[, `:=`(fire_freq = n_fire / n_covered, fp_per_100bp = 100 * footprints_per_fiber / width)]
+cat(sprintf("cCREs: %d | n_reads == n_covered for all | >= %d covered fibers: %d\n",
+            nrow(d), min_covered, d[n_covered >= min_covered, .N]))
+```
+
+```{r summary_table}
+metrics <- c(fire_freq = "FIRE frequency",
+             footprints_per_fiber = "Footprints per covered fiber",
+             fp_per_100bp = "Footprints per covered fiber per 100 bp",
+             pct_bases_footprinted = "% of cCRE bases footprinted")
+classes <- c("PLS", "pELS", "dELS", "CA-H3K4me3", "CA-CTCF", "CA-TF", "CA-only")
+groups <- c("Low-DNase", "active (all)", classes)
+
+ok <- d[n_covered >= min_covered]
+dd <- rbind(ok[set == "low_dnase_cre"][, group := "Low-DNase"],
+            ok[set == "active_cre"][, group := "active (all)"],
+            ok[set == "active_cre"][, group := class])
+dd[, group := factor(group, levels = groups)]
+long <- melt(dd, id.vars = c("group", "set"), measure.vars = names(metrics), variable.name = "metric")
+long[, metric := factor(metrics[as.character(metric)], levels = metrics)]
+
+tab <- long[, .(n_cCREs = .N, median = median(value), mean = mean(value)), by = .(group, metric)][order(metric, group)]
+tab_wide <- dcast(tab, group + n_cCREs ~ metric, value.var = c("median", "mean"))
+fwrite(tab_wide, file.path(out_dir, "fire_footprint_density_summary.tsv"), sep = "\t")
+print(tab[, .(group, metric, n_cCREs, median = signif(median, 3), mean = signif(mean, 3))], row.names = FALSE)
+```
+
+## Boxplots
+
+Boxes are the 25th-75th percentiles with the median; whiskers reach the most extreme
+cCRE within 1.5 x IQR (cCREs beyond them are not drawn); x = mean.
+
+```{r boxplots, fig.width = 13, fig.height = 4.8}
+bx <- long[, {
+  q <- quantile(value, c(.25, .5, .75), names = FALSE); iqr <- q[3] - q[1]
+  .(lower = q[1], middle = q[2], upper = q[3],
+    ymin = min(value[value >= q[1] - 1.5 * iqr]), ymax = max(value[value <= q[3] + 1.5 * iqr]),
+    mean = mean(value))
+}, by = .(group, set, metric)]
+p <- ggplot(bx, aes(group, fill = set)) +
+  geom_boxplot(aes(ymin = ymin, lower = lower, middle = middle, upper = upper, ymax = ymax),
+               stat = "identity", width = 0.65, linewidth = 0.3) +
+  geom_point(aes(y = mean), shape = 4, size = 1.6) +
+  facet_wrap(~metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c(active_cre = "#2a78d6", low_dnase_cre = "#eb6834"), name = NULL) +
+  labs(x = NULL, y = NULL, title = "FIRE frequency and FiberHMM footprint density per cCRE",
+       subtitle = sprintf("cCREs with >= %d covered fibers (no deletion in the cCRE, FiberHMM record), pooled over 31 samples",
+                          min_covered)) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_blank(),
+        legend.position = "bottom")
+ggsave(file.path(out_dir, "fire_footprint_density_boxplots.pdf"), p, width = 13, height = 4.8)
+p
+```
