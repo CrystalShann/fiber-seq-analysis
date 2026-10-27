@@ -62,9 +62,7 @@ coverage <- rbindlist(lapply(c("fp", "ff"), function(name) {
 }))
 if (any(coverage$missing > 0L | coverage$unexpected > 0L)) {
   print(coverage)
-  stop("Input CRE IDs do not match cres.tsv.gz. If ff is incomplete, wait for ",
-       "run_cre_fire_counts.sh to finish rebuilding both fire_freq tables, then rerun ",
-       "this entire load chunk to refresh cre, fp, and ff. No regions were dropped.")
+  stop("Input CRE IDs do not match cres.tsv.gz.")
 }
 d <- merge(merge(cre, fp, by = "CRE_ID"), ff, by = "CRE_ID")
 stopifnot(nrow(d) == nrow(cre), nrow(d) == nrow(fp), nrow(d) == nrow(ff),
@@ -115,7 +113,7 @@ p <- ggplot(bx, aes(group, fill = set)) +
   facet_wrap(~metric, scales = "free_y", nrow = 1) +
   scale_fill_manual(values = c(active_cre = "#2a78d6", low_dnase_cre = "#eb6834"), name = NULL) +
   labs(x = NULL, y = NULL, title = "FIRE frequency and FiberHMM footprint density per cCRE",
-       subtitle = sprintf("cCREs with >= %d covered fibers (no deletion in the cCRE, FiberHMM record), pooled over 31 samples",
+       subtitle = sprintf("cCREs with >= %d covered fibers, pooled over 31 samples",
                           min_covered)) +
   theme_classic(base_size = 11) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.background = element_blank(),

@@ -1,11 +1,180 @@
-# Plotting functions and supporting helpers for LCL_hsca.Rmd.
-# Sourced into the report environment; shared plotting/parsing dependencies
-# are loaded by the report before these functions are called.
-# Report data, params, and output directories are supplied by that environment.
+# Plotting functions for the LCL REF/ALT allele skew report (LCL_hsca.Rmd)
+#
+# Taken from the code of Vollger et al., Cell 2026 (Somatic epimutations cap genetic determinism
+# in the human diploid chromatin epigenome):
+#   fire-figures  https://github.com/mrvollger/fire-figures @ 01e9345dd15ef9e203b8f7e816b441e3627995f8
+#     Rscripts/utils.R          FONT_SIZE, my_grid, reverselog_trans, scientific_10
+#     Rscripts/hap-diffs.Rmd    REF/ALT hex plot adapted from the haplotype plot and volcano (wrapped in functions below)
+#   FIRE  workflow/scripts/hap-diffs.R  (same two plots; the test the per-peak table comes from)
 
-pair_imprinted = function(dt) dt$CRE1 %in% imprinted_cres | dt$CRE2 %in% imprinted_cres
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(scales)
+  library(cowplot)
+  library(ggpubr)
+  library(ggrepel)
+  library(glue)
+})
 
-# phased-pair-plot-function
+FONT_SIZE=6
+#################################################
+# set the shared plot theme
+#################################################
+# Return a minimal grid theme using the report font size.
+my_grid = function(...){
+    theme_minimal_grid(font_size=FONT_SIZE, ...)
+}
+
+#################################################
+# transform p-values for volcano plots
+#################################################
+# Map p-values to minus log(base) and provide the inverse and axis breaks.
+reverselog_trans <- function(base = exp(1)) {
+    trans <- function(x) -log(x, base)
+    inv <- function(x) base^(-x)
+    trans_new(paste0("reverselog-", format(base)), trans, inv,
+              log_breaks(base = base),
+              domain = c(1e-100, Inf))
+}
+
+#################################################
+# format scientific axis labels
+#################################################
+# Convert numeric tick values to plotmath powers of ten, including a special label for one.
+scientific_10 <- function(x) {
+    is_one = as.numeric(x) == 1
+    text = gsub("e", " %*% 10^", scales::scientific_format()(x))
+    #print(text)
+    text = str_remove(text, "^1 %\\*% ") # remove leading one
+    #print(text)
+    text[is_one] = "10^0"
+    rtn = parse(text=text)
+    rtn
+}
+
+# REF-vs-ALT accessibility, one hexbin panel per sample
+#################################################
+# compare accessibility between REF and ALT
+#################################################
+# Plot hexagonal read-fraction densities with correlation and the identity line.
+# Optionally split the plot into one panel per sample.
+plot_ref_vs_alt = function(tdf, x, y, x_label, y_label, facet = "sample_name"){
+    p = tdf %>%
+        ggplot(aes(x=.data[[x]], y=.data[[y]])) +
+        stat_cor(size=2) +
+        geom_hex(bins=75) +
+        geom_abline(aes(intercept=0, slope=1), linetype="dashed")+
+        scale_fill_distiller("", palette = "Spectral", trans="log10") +
+        scale_x_continuous(x_label, labels=percent) +  # edit: was "Paternal accessibility"
+        scale_y_continuous(y_label, labels=percent) +  # edit: was "Maternal accessibility"
+        #annotation_logticks(sides="lb") +
+        my_grid()
+    if (!is.null(facet)) p = p + facet_wrap(vars(.data[[facet]]))  # edit: was ~autosome
+    p
+}
+
+# volcano of the accessibility difference against the Fisher p-value; dashed lines at p = 0.05
+# (blue) and at the largest p-value with an adjusted p <= 0.05 (red)
+#################################################
+# plot accessibility differences against Fisher p-values
+#################################################
+# Show density, nominal significance, and the largest raw p-value passing BH in each panel.
+# Accept either per-sample adjusted p-values or the pooled FDR column.
+plot_allele_volcano = function(tdf, x_label, p_adjust = "p_adjust", facet = "sample_name", p_threshold = 0.05){
+    tdf = as.data.table(tdf)[!is.na(p_value)]
+    tdf$p_adjust = tdf[[p_adjust]]
+    tdf$facet = if (is.null(facet)) "all" else tdf[[facet]]
+    # edit: one cor_p_threshold per facet instead of one per table
+    thresholds = tdf[, .(cor_p_threshold = if (any(p_adjust <= p_threshold)) max(p_value[p_adjust <= p_threshold]) else NA_real_), by = facet]
+    y_lim = ceiling(max(max(-log10(tdf$p_value)), max(-log10(tdf$p_adjust))))
+    y_by = 1
+    if(y_lim > 10){
+        y_by = 2
+    }
+    # counts: nominal-only at the blue line, adjusted-significant at the red line
+    labels = tdf[p_value < 0.05, .(count = .N), by = .(facet, adjusted = p_adjust <= p_threshold)] %>%
+        merge(thresholds, by = "facet") %>%
+        mutate(y = ifelse(adjusted, cor_p_threshold, p_threshold)) %>%
+        filter(!is.na(y))
+    n=comma(nrow(tdf))
+    p = tdf %>%
+        ggplot(aes(x=diff, y=p_value)) +
+        geom_hex(bins=100) + scale_fill_distiller("", palette = "Spectral", trans="log10") +
+        geom_hline(aes(yintercept=(p_threshold)), linetype="dashed", color="darkblue")+
+        geom_hline(data = thresholds %>% filter(!is.na(cor_p_threshold)),
+                   aes(yintercept=(cor_p_threshold)), linetype="dashed", color="darkred")+
+        scale_x_continuous(x_label, labels=percent) +  # edit: was "Difference between paternal and maternal accessibility"
+        scale_y_continuous(
+            glue("p-value   (n = {n})"),
+            #labels=comma,
+            breaks=10**(-seq(0, y_lim, y_by)),
+            minor_breaks=10**(-seq(0, y_lim, 0.1)),
+            trans=reverselog_trans(10),
+            labels=scientific_10,
+        ) +
+        geom_text_repel(
+            data = labels,
+            aes(
+                label = paste0("n = ", comma(count)),
+                x=0.750,
+                y=y,
+            ),
+            direction="y",
+            force=2,
+            nudge_y=0.01,
+            size=2.5,
+        )+
+        my_grid()
+    if (!is.null(facet)) p = p + facet_wrap(~facet)  # edit: was ~autosome
+    p
+}
+
+# PDF only (fire-figures my_ggsave also writes tmp.<ext> into the working directory)
+#################################################
+# save a ggplot as PDF
+#################################################
+# Write the requested plot with a transparent background and report the output path.
+save_pdf = function(p, file, ...){
+    ggsave(file, p, bg='transparent', ...)
+    message(file)
+}
+
+
+#################################################
+# load the 27 phased samples for molecule plots
+#################################################
+# Read donor and phasing paths directly from the phased CSV, then derive the
+# per-sample file paths required by the shared molecule readers.
+# Reject another cohort rather than silently including unphased samples.
+hsca_sample_manifest = function(config) {
+  canonical_path = "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_phased_27samples.csv"
+  path = if (is.null(config$sample_metatable)) canonical_path else config$sample_metatable
+  samples = fread(path, colClasses = "character", na.strings = "")
+  required = c("sample_name", "cell_line", "fire_dir", "phasing_dir", "phased_vcf_file")
+  if (!all(required %in% names(samples)) || nrow(samples) != 27L ||
+      anyDuplicated(samples$sample_name) || anyNA(samples[, ..required]))
+    stop("HSCA requires exactly 27 unique phased samples with complete paths.")
+  canonical = fread(canonical_path, colClasses = "character")
+  if (!setequal(samples$sample_name, canonical$sample_name))
+    stop("HSCA sample names must match the canonical 27 phased samples.")
+  canonical = canonical[match(samples$sample_name, sample_name)]
+  if (!identical(as.data.frame(samples[, ..required]), as.data.frame(canonical[, ..required])))
+    stop("HSCA donor and phasing paths must match the phased sheet.")
+  samples[, `:=`(donor = cell_line,
+    cram_path = file.path(fire_dir, paste0(sample_name, "-fire-v0.1-filtered.cram")),
+    peaks_path = file.path(fire_dir, paste0(sample_name, "-fire-v0.1-peaks.bed.gz")),
+    elements_path = file.path(fire_dir, "additional-outputs-v0.1/fire-peaks", paste0(sample_name, "-v0.1-fire-elements.bed.gz")),
+    spans_path = file.path(config$root, sample_name, paste0(sample_name, ".read_spans.bed.gz")),
+    blocks_path = file.path(config$root, sample_name, paste0(sample_name, ".aligned_blocks.bed.gz")))]
+  samples
+}
+
+#################################################
+# draw aligned molecule and footprint tracks
+#################################################
+# Use the same molecule order for m6A and footprints, with SNP allele and sample labels.
+# Add cCRE bands and the focal SNP, returning the component panels and their combined height.
 plot_phased_pair_tracks = function(result, records, pair, group_colors = NULL,
     sample_colors = NULL, cre_colors = NULL, highlight_color = "#FFFF00",
     highlight_alpha = .22, title = NULL, min_read_height = 3.5, row_height = .035,
@@ -84,12 +253,20 @@ plot_phased_pair_tracks = function(result, records, pair, group_colors = NULL,
     height = 1.1 + 2 * read_height)
 }
 
-# pair-allele-acf-functions
+#################################################
+# assign consistent REF and ALT colors
+#################################################
+# Return named colors using the region-specific reference and alternative bases.
 pair_allele_colors = function(region) {
   setNames(c('#FDBE85', '#9ECAE1'),
     c(paste0('REF-', region$ref), paste0('ALT-', region$alt)))
 }
 
+#################################################
+# attach phased focal-SNP alleles to molecules
+#################################################
+# Match the phasing audit by sample and original read ID.
+# Assign REF/ALT only for phased heterozygous genotypes; retain exclusion reasons for other reads.
 annotate_pair_alleles = function(result, audit) {
   a = result$assignments
   audit = as.data.frame(audit)
@@ -113,6 +290,11 @@ annotate_pair_alleles = function(result, audit) {
 }
 
 # Filter before computing either distance matrix or graph. The audit retains exclusions.
+#################################################
+# cluster allele-assigned molecules by m6A pattern
+#################################################
+# Exclude unassigned molecules before Manhattan distances and Leiden clustering.
+# Preserve allele metadata and record the number of excluded molecules.
 cluster_phased_pair = function(input, audit, config) {
   input = annotate_pair_alleles(input, audit)
   keep = input$assignments$allele_assigned
@@ -136,6 +318,11 @@ cluster_phased_pair = function(input, audit, config) {
   result
 }
 
+#################################################
+# build heatmap row annotations
+#################################################
+# Create sample and focal-allele color bars, optionally including the cluster assignment.
+# Require every plotted molecule to have a recognized REF/ALT label.
 pair_read_annotations = function(assignments, region, include_cluster = TRUE) {
   stopifnot(all(as.character(assignments$allele_group) %in% names(pair_allele_colors(region))))
   samples = sample_palette(assignments$sample_name)
@@ -152,22 +339,10 @@ pair_read_annotations = function(assignments, region, include_cluster = TRUE) {
     annotation_legend_param = list(allele = list(title = 'Focal SNP allele')))
 }
 
-plot_pair_allele_graph = function(result, main = NULL) {
-  # Reuse the shared graph layout. Its color_by='allele' branch requires every
-  # read to have an rsID-based allele label, so adapt only the point colors here.
-  p = plot_knn_graph(result, main = main)
-  point = which(vapply(p$layers, function(layer) inherits(layer$geom, 'GeomPoint'), logical(1)))
-  stopifnot(length(point) == 1L)
-  nodes = p$layers[[point]]$data
-  nodes$color_group = result$assignments$allele_group[match(nodes$RID, result$assignments$RID)]
-  p$layers[[point]]$data = nodes
-  colors = pair_allele_colors(result$region)
-  counts = table(factor(nodes$color_group, levels = names(colors)))
-  suppressMessages(p + scale_color_manual(values = colors, breaks = names(colors),
-    labels = paste0(names(colors), ' (n=', as.integer(counts), ')'), drop = FALSE) +
-    labs(color = 'Focal SNP allele'))
-}
-
+#################################################
+# summarize allele composition within clusters
+#################################################
+# Count REF/ALT molecules per cluster and return the counts and a stacked fraction plot.
 pair_cluster_alleles = function(result, title) {
   counts = as.data.table(as.data.frame(table(cluster = result$assignments$cluster,
     allele = result$assignments$allele_group)))
@@ -181,170 +356,13 @@ pair_cluster_alleles = function(result, title) {
   list(counts = counts, plot = p)
 }
 
-pair_autocorrelation = function(result, config) {
-  # Call the existing ACF calculation and PCA/correlation-neighbor Leiden code
-  # directly, with REF/ALT-assigned full-window molecules and no allele features.
-  work = tempfile('pair_acf_')
-  dir.create(work)
-  on.exit(unlink(work, recursive = TRUE), add = TRUE)
-  a = result$assignments
-  stopifnot(all(a$allele_assigned), !anyNA(a$allele_group),
-    !any(a$allele_group == 'Unassigned'))
-  region = result$region
-  binary = matrix(0L, nrow(a), region$width, dimnames = list(a$RID, NULL))
-  binary[, as.integer(colnames(result$site_met_mat)) - region$analysis_start + 1L] =
-    as.matrix(result$site_met_mat[a$RID, , drop = FALSE])
-  fwrite(as.data.table(binary), file.path(work, 'binary.tsv'), sep = '\t', col.names = FALSE)
-  runner = r"---(
-import importlib.util, json, sys
-from pathlib import Path
-import numpy as np
-import pandas as pd
-source, work = map(Path, sys.argv[1:3])
-def load(name, filename):
-    spec = importlib.util.spec_from_file_location(name, source / filename)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-compute = load('pair_acf_compute', '03_compute_autocorrelations.py')
-cluster = load('pair_acf_cluster', '04_cluster_autocorrelations.py')
-binary = np.loadtxt(work / 'binary.tsv', delimiter='\t', ndmin=2)
-profiles, valid = compute.autocorrelations(binary)
-labels, status, embedding, info, edges = cluster.cluster_profiles(
-    profiles, valid, n_pcs=int(sys.argv[3]), n_neighbors=int(sys.argv[4]),
-    resolution=float(sys.argv[5]), seed=int(sys.argv[6]))
-np.savetxt(work / 'acf.tsv', profiles, delimiter='\t', fmt='%.17g')
-pd.DataFrame(dict(row_index=np.arange(len(labels)), cluster=labels, status=status,
-                  valid=valid, umap1=embedding[:,0], umap2=embedding[:,1])).to_csv(
-    work / 'assignments.tsv', sep='\t', index=False)
-pd.DataFrame(edges, columns=['source_index','target_index','weight']).to_csv(
-    work / 'edges.tsv', sep='\t', index=False)
-with open(work / 'parameters.json', 'w') as f:
-    json.dump(info, f)
-)---"
-  script = file.path(work, 'run.py')
-  writeLines(runner, script)
-  args = c(script, file.path(config$code_root, 'clustering_methods/auto_correlation'), work,
-    config$acf_n_pcs, config$acf_neighbors, config$acf_resolution, config$acf_seed)
-  log = file.path(work, 'run.log')
-  status = system2(config$acf_python, vapply(as.character(args), shQuote, character(1)),
-    stdout = log, stderr = log, env = c('OMP_NUM_THREADS=1', 'OPENBLAS_NUM_THREADS=1',
-      'MKL_NUM_THREADS=1', 'NUMBA_NUM_THREADS=1', 'PYTHONDONTWRITEBYTECODE=1',
-      paste0('NUMBA_CACHE_DIR=', file.path(work, 'numba')),
-      paste0('MPLCONFIGDIR=', file.path(work, 'matplotlib'))))
-  if (status != 0L) stop('Autocorrelation failed:\n', paste(readLines(log), collapse = '\n'))
-  meta = fread(file.path(work, 'assignments.tsv'), colClasses = list(character = c('cluster','status')))
-  stopifnot(identical(meta$row_index, seq_len(nrow(a)) - 1L))
-  profiles = as.matrix(fread(file.path(work, 'acf.tsv'), header = FALSE, na.strings = 'nan'))
-  rownames(profiles) = a$RID
-  colnames(profiles) = as.character(seq_len(ncol(profiles)) - 1L)
-  stopifnot(nrow(profiles) == nrow(a), ncol(profiles) == region$width,
-    all(abs(profiles[meta$valid, 1] - 1) < 1e-10))
-  a$m6a_cluster = a$cluster
-  a$acf_status = meta$status
-  a$acf_valid = meta$valid
-  a$umap1 = meta$umap1
-  a$umap2 = meta$umap2
-  selected = which(meta$status == 'clustered')
-  if (!length(selected)) stop('No ACF profiles could be clustered; see the input read variability.')
-  cluster = rep(NA_character_, nrow(a))
-  cluster[selected] = as.character(relabel_clusters_by_size(setNames(meta$cluster[selected], a$RID[selected])))
-  a$cluster = factor(cluster, levels = paste0('cluster', seq_len(length(unique(cluster[selected])))))
-  edges = fread(file.path(work, 'edges.tsv'))
-  edges[, `:=`(from = a$RID[source_index + 1L], to = a$RID[target_index + 1L])]
-  graph = igraph::graph_from_data_frame(as.data.frame(edges[, .(from, to, weight)]),
-    directed = FALSE, vertices = a$RID[selected])
-  settings = jsonlite::fromJSON(file.path(work, 'parameters.json'))
-  settings$k_eff = settings$actual_neighbors
-  settings$read_filter = result$params$read_filter
-  settings$n_input_full_window = result$params$n_input_full_window
-  settings$n_unassigned_excluded = result$params$n_unassigned_excluded
-  settings$lag_min = 0L
-  settings$lag_max = region$width - 1L
-  list(region = region, assignments = a[selected, , drop = FALSE], all_assignments = a,
-    acf = profiles[selected, , drop = FALSE], all_acf = profiles,
-    site_met_mat = result$site_met_mat[a$RID[selected], , drop = FALSE],
-    graph = graph, n_clusters = nlevels(droplevels(a$cluster)), params = settings)
-}
-
-pair_acf_heatmap = function(result) {
-  a = result$assignments
-  ordering = order(a$cluster, a$start, a$RID)
-  display = result$acf[a$RID[ordering], -1, drop = FALSE]
-  limit = max(as.numeric(stats::quantile(abs(display), .99)), .01)
-  ticks = unique(round(seq(1, ncol(display), length.out = min(6L, ncol(display)))))
-  ComplexHeatmap::Heatmap(display, name = 'ACF',
-    col = circlize::colorRamp2(c(-limit, 0, limit), c('#2166ac', 'white', '#b2182b')),
-    cluster_rows = FALSE, cluster_columns = FALSE, cluster_row_slices = FALSE,
-    row_split = a$cluster[ordering], row_title_rot = 0, row_title_gp = grid::gpar(fontsize = 8),
-    show_row_names = FALSE, show_column_names = FALSE,
-    use_raster = TRUE, raster_quality = 2, raster_resize_mat = FALSE, raster_by_magick = FALSE,
-    left_annotation = pair_read_annotations(a[ordering, , drop = FALSE], result$region),
-    column_title = paste0(result$region$annotation, ' | autocorrelation + Leiden | ', nrow(a), ' phased molecules\n',
-      'All nonzero lags shown; REF/ALT labels are annotations only'),
-    column_title_gp = grid::gpar(fontsize = 10),
-    bottom_annotation = ComplexHeatmap::HeatmapAnnotation(lag_bp = ComplexHeatmap::anno_mark(
-      at = ticks, labels = as.character(ticks), which = 'column', side = 'bottom')))
-}
-
-pair_acf_profiles = function(result, max_lag = 500L) {
-  a = result$all_assignments
-  lag = seq_len(min(max_lag, ncol(result$all_acf) - 1L))
-  summarize = function(group, selection, panel) {
-    selection = selection & a$acf_valid
-    if (!any(selection)) return(NULL)
-    data.table(panel = panel, group = group, lag_bp = lag,
-      mean_acf = colMeans(result$all_acf[selection, lag + 1L, drop = FALSE]), n_reads = sum(selection))
-  }
-  values = rbindlist(c(
-    lapply(levels(a$allele_group), function(x) summarize(x, a$allele_group == x, 'Focal SNP allele')),
-    lapply(levels(a$cluster), function(x) summarize(x, !is.na(a$cluster) & a$cluster == x, 'ACF cluster'))))
-  colors = c(pair_allele_colors(result$region), cluster_id_palette(levels(a$cluster)))
-  p = ggplot(values, aes(lag_bp, mean_acf, color = group)) + geom_line(linewidth = .6) +
-    facet_grid(panel ~ .) + scale_color_manual(values = colors) +
-    cowplot::theme_cowplot(font_size = 10) +
-    labs(title = paste0(result$region$annotation, ' | mean per-molecule autocorrelation'),
-      subtitle = paste0('Display: lags 1-', max(lag), ' bp; clustering uses all lags. Zero-variance reads excluded.'),
-      x = 'Lag (bp)', y = 'Mean ACF', color = 'Group')
-  list(values = values, plot = p)
-}
-
-write_pair_allele_acf_plots = function(result, pair, config, output_dir, output_prefix) {
-  path = function(suffix, extension = '.pdf') file.path(output_dir, paste0(output_prefix, '_', suffix, extension))
-  allele_graph = plot_pair_allele_graph(result,
-    paste0(result$region$annotation, ' | Manhattan graph colored by focal SNP allele'))
-  allele_composition = pair_cluster_alleles(result,
-    paste0(result$region$annotation, ' | allele composition of m6A Leiden clusters'))
-  acf = pair_autocorrelation(result, config)
-  acf_heatmap = pair_acf_heatmap(acf)
-  acf_m6a_heatmap = pair_m6a_heatmap(acf, pair, cluster_label = 'Autocorrelation + Leiden clusters')
-  acf_profiles = pair_acf_profiles(acf, config$acf_plot_max_lag)
-  acf_graph = plot_knn_graph(acf, main = paste0(result$region$annotation, ' | ACF PCA/correlation graph; Leiden clusters'))
-  acf_allele_graph = plot_pair_allele_graph(acf,
-    paste0(result$region$annotation, ' | ACF PCA/correlation graph; focal SNP allele'))
-  acf_composition = pair_cluster_alleles(acf,
-    paste0(result$region$annotation, ' | allele composition of ACF Leiden clusters'))
-  plots = list(manhattan_leiden_graph_by_allele = allele_graph,
-    leiden_allele_composition = allele_composition$plot,
-    autocorrelation_profiles = acf_profiles$plot,
-    autocorrelation_graph = acf_graph,
-    autocorrelation_graph_by_allele = acf_allele_graph,
-    autocorrelation_allele_composition = acf_composition$plot)
-  for (name in names(plots)) ggsave(path(name), plots[[name]], width = 12, height = 8)
-  heatmap_height = max(8, .012 * nrow(acf$assignments) + 3)
-  save_figure(acf_heatmap, path('autocorrelation_heatmap'), width = 14, height = heatmap_height,
-    draw = function(x) ComplexHeatmap::draw(x, heatmap_legend_side = 'right', annotation_legend_side = 'right'))
-  save_figure(acf_m6a_heatmap, path('m6a_heatmap_autocorrelation'), width = 14,
-    height = heatmap_height, draw = draw_pair_m6a_heatmap)
-  suffixes = c(names(plots), 'autocorrelation_heatmap', 'm6a_heatmap_autocorrelation')
-  list(result = acf, heatmap = acf_heatmap, m6a_heatmap = acf_m6a_heatmap,
-    profile_plot = acf_profiles$plot, allele_graph = allele_graph,
-    allele_composition = allele_composition, plots = plots,
-    files = setNames(vapply(suffixes, path, character(1)), suffixes))
-}
-
 # pair-m6a-heatmap-functions
 # Reusable wrapper with a top track aggregated over the displayed phased molecules.
+#################################################
+# build a base-resolution m6A heatmap
+#################################################
+# Order full-window molecules by cluster or allele and add sample/allele row annotations.
+# Include aggregate m6A and CRE annotations while retaining the original base coordinates.
 pair_m6a_heatmap = function(result, pair, split_by_cluster = TRUE,
     cluster_label = "Manhattan + Leiden clusters") {
   region = result$region
@@ -393,6 +411,10 @@ pair_m6a_heatmap = function(result, pair, split_by_cluster = TRUE,
     snp_x = (region$focal_pos - region$analysis_start + .5) / region$width)
 }
 
+#################################################
+# render and annotate a CRE-pair heatmap
+#################################################
+# Draw the ComplexHeatmap object and decorate its slices with the CRE bands and focal SNP.
 draw_pair_m6a_heatmap = function(x) {
   grid::grid.newpage()
   h = ComplexHeatmap::draw(x$heatmap, newpage = FALSE,
@@ -412,7 +434,12 @@ draw_pair_m6a_heatmap = function(x) {
   invisible(h)
 }
 
-# cre-pair-plot-function
+#################################################
+# generate phased molecule figures for one CRE pair
+#################################################
+# Resolve the pair and focal SNP, load only the 27 phased samples, and check pooled counts.
+# Keep full-window allele-assigned molecules for tracks and Manhattan/Leiden clustering.
+# Write PDFs and return the plot objects, read audits, clustering results, and output paths.
 plot_cre_pair = function(cre_pair, label = NULL, output_prefix = NULL,
     pooled_pairs = pooled, allele_pairs = pair_allele, config = params,
     output_dir = examples_dir, region_description = NULL) {
@@ -447,7 +474,7 @@ plot_cre_pair = function(cre_pair, label = NULL, output_prefix = NULL,
   folder_label = gsub("[^A-Za-z0-9_.-]+", "_", folder_label)
   output_dir = file.path(output_dir, paste0(folder_label, "_", paste(short_ids, collapse = "__")))
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-  molecule_manifest = fread(file.path(config$root, "universe", "sample_manifest.tsv"))
+  molecule_manifest = hsca_sample_manifest(config)
   stopifnot(!anyDuplicated(molecule_manifest$sample_name))
   snp = strsplit(pair_allele_row$variant_id, ":", fixed = TRUE)[[1]]
   if (length(snp) != 4L || snp[1] != pair$chrom ||
@@ -581,27 +608,31 @@ plot_cre_pair = function(cre_pair, label = NULL, output_prefix = NULL,
     theme(legend.position = "none") +
     labs(title = paste0(pair_region$annotation, " | aggregate and Leiden-cluster m6A profiles"),
       x = paste0(pair_region$chr, " position (1-based)"), y = "Fraction of group molecules with m6A")
-  pair_knn_plot = plot_knn_graph(pair_clustered)
+  pair_allele_composition = pair_cluster_alleles(pair_clustered,
+    paste0(pair_region$annotation, " | allele composition of m6A Leiden clusters"))
   ggsave(file.path(output_dir, paste0(output_prefix, "_leiden_m6a_profiles.pdf")), pair_profile_plot,
     width = 12, height = 1.3 * (length(groups) + 1) + 1)
-  ggsave(file.path(output_dir, paste0(output_prefix, "_manhattan_leiden_graph.pdf")), pair_knn_plot,
-    width = 10, height = 8)
-  acf_plots = write_pair_allele_acf_plots(pair_clustered, pair, config, output_dir, output_prefix)
+  ggsave(file.path(output_dir, paste0(output_prefix, "_leiden_allele_composition.pdf")),
+    pair_allele_composition$plot, width = 12, height = 8)
   pdf_suffixes = c("molecule_tracks", "configurations", "m6a_heatmap_phased",
-    "m6a_heatmap_leiden", "leiden_m6a_profiles", "manhattan_leiden_graph")
+    "m6a_heatmap_leiden", "leiden_m6a_profiles", "leiden_allele_composition")
   files = setNames(file.path(output_dir, paste0(output_prefix, "_", pdf_suffixes, ".pdf")), pdf_suffixes)
-  stopifnot(all(file.exists(c(files, acf_plots$files))))
+  stopifnot(all(file.exists(files)))
   invisible(list(pair_id = pair_id, pair = pair, allele = pair_allele_row, region = pair_region,
     phased = pair_result, read_labels = pair_labels, sample_counts = pair_contributions,
     phasing_audit = audit, records = records, phased_plot = pair_plot,
     phased_molecules = pair_clustered, heatmap_unclustered = pair_heatmap_unclustered, heatmap_leiden = pair_heatmap_leiden,
     heatmap_height = pair_heatmap_height, cluster_profiles = pair_cluster_profiles,
-    profile_plot = pair_profile_plot, graph_plot = pair_knn_plot,
-    autocorrelation = acf_plots, output_dir = output_dir, files = c(files, acf_plots$files)))
+    profile_plot = pair_profile_plot, allele_composition = pair_allele_composition,
+    output_dir = output_dir, files = files))
 }
 
-# domain-ctcf-functions
 # Exon rows (BED coordinates) of each protein-coding and lncRNA gene's Ensembl_canonical transcript.
+#################################################
+# load canonical transcript exons
+#################################################
+# Extract protein-coding and lncRNA Ensembl_canonical exons from GENCODE.
+# Convert to BED coordinates and retain gene, transcript, and strand annotations.
 load_canonical_gene_models = function(gtf) {
   awk = '$3 == "exon" && $9 ~ /Ensembl_canonical/ && $9 ~ /gene_type "(protein_coding|lncRNA)"/ {print $1, $4 - 1, $5, $7, $9}'
   exons = fread(cmd = paste("zcat", shQuote(gtf), "| awk -F'\\t' -v OFS='\\t'", shQuote(awk)),
@@ -615,6 +646,11 @@ load_canonical_gene_models = function(gtf) {
 # Rao et al. 2014 GM12878 HiCCUPS loops and Arrowhead domains lifted to hg38
 # (rao2014_GM12878/liftover_to_hg38.sh). loopN = row N of the lifted loop list. Rao's motif
 # columns are 1-based starts (sequence = hg38[motif_x1 - 1, motif_x2 - 1)); stored here as BED.
+#################################################
+# load lifted GM12878 loop and domain annotations
+#################################################
+# Read hg38 HiCCUPS loops, CTCF motifs, and Arrowhead domains.
+# Validate unique loop/motif keys and attach motif information to loop anchors.
 load_rao_hg38 = function(dir) {
   read = function(name) fread(file.path(dir, paste0("GSE63525_GM12878_primary+replicate_", name, ".hg38.txt.gz")))
   key = c("chr1", "x1", "x2", "y1", "y2")
@@ -638,6 +674,10 @@ load_rao_hg38 = function(dir) {
 }
 
 # Shared look of the browser tracks: no y axis; each track sets its own x range.
+#################################################
+# set the gene and chromatin-context theme
+#################################################
+# Return a compact cowplot theme shared by the domain/CTCF figure tracks.
 domain_ctcf_theme = function() cowplot::theme_cowplot(font_size = 9) +
   theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank(),
     axis.title.y = element_text(angle = 0, vjust = .5, size = 8), plot.margin = margin(2, 5, 2, 5))
@@ -646,6 +686,11 @@ domain_ctcf_theme = function() cowplot::theme_cowplot(font_size = 9) +
 # line with strand chevrons, exon boxes, gene name. With region, x is SNP-relative bp
 # (plot_positions()); otherwise genomic Mb. A zoom window without transcripts names the nearest
 # protein-coding TSS. Returns list(plot, rows).
+#################################################
+# draw canonical gene structures in a genomic window
+#################################################
+# Select overlapping transcripts and draw exons, introns, and strand arrows.
+# Use genomic Mb or SNP-relative coordinates and return the plot plus its row count.
 plot_gene_track = function(models, win_chrom, win_start, win_end, xlim, region = NULL, focus = NULL) {
   to_x = function(pos) if (is.null(region)) pos / 1e6 else plot_positions(pos, region)
   tx = models[chrom == win_chrom, .(start = min(start), end = max(end)),
@@ -700,6 +745,11 @@ plot_gene_track = function(models, win_chrom, win_start, win_end, xlim, region =
 # Context tracks over chrom:[start, end): HiCCUPS loops with both anchors in view as arcs between
 # anchor midpoints (loops with an anchor in focus coloured and labelled), anchors and CTCF motif
 # arrows at the base; Arrowhead domains as triangles with edge ticks.
+#################################################
+# draw broad chromatin loop and domain context
+#################################################
+# Display overlapping loops and domains around the pair window.
+# Highlight relevant anchors and mark the zoomed CRE-pair interval.
 plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
   xlim = c(win_start, win_end) / 1e6
   band = annotate("rect", xmin = (focus[1] + 1) / 1e6, xmax = focus[2] / 1e6, ymin = -Inf, ymax = Inf,
@@ -753,6 +803,11 @@ plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
 # Zoom track over the pair window: loop anchors overlapping it (clipped, one row per anchor interval,
 # labelled with every loop using it), CTCF motif arrows and domain edges; SNP-relative x.
 # Returns list(plot, rows).
+#################################################
+# draw local loop anchors and CTCF motifs
+#################################################
+# Place loop anchors, motif directions, and domain edges in focal-SNP-relative coordinates.
+# Return the local annotation plot and row count for layout.
 plot_rao_zoom = function(rao, region, xlim) {
   s = region$start
   e = region$end
@@ -800,6 +855,12 @@ plot_rao_zoom = function(rao, region, xlim) {
 # are labelled too. A sample needs >= 5 allele-informative reads; it is het when the minor allele
 # has >= 2 reads and >= 15% of them (a lone discordant HiFi read, or 2 of 48, is an error, not a
 # het), else homozygous for the majority allele.
+#################################################
+# call focal-SNP genotypes from read bases
+#################################################
+# Read REF/ALT bases from each phased-cohort sample CRAM through the Python pileup helper.
+# Require five informative reads; call heterozygous with at least two minor reads and 15% support.
+# Return per-sample genotype calls and per-read allele assignments.
 pair_genotype_calls = function(region, manifest, python, hsca_functions) {
   work = tempfile("pair_genotypes_")
   dir.create(work)
@@ -838,9 +899,15 @@ pd.DataFrame(rows, columns=["sample_name", "read_name", "allele"]).to_csv(out, s
 
 # One PDF per pair: context (genes, HiCCUPS loops with CTCF motifs, Arrowhead domains) over the pair
 # window (genes, Rao features, cCREs, per-base m6A by genotype group, m6A molecules). Reads: the
-# full-span molecules of all samples that are full-window primary alignments covering both cCREs
+# full-span molecules of the 27 phased samples that are primary alignments covering both cCREs
 # (plot_cre_pair()'s molecule-track universe without its phasing requirement). Groups: hom-REF
 # donors, het donors' REF-base and ALT-base reads, hom-ALT donors. No clustering.
+#################################################
+# combine locus context with genotype-grouped molecules
+#################################################
+# Load only the 27 phased samples and verify their pooled co-accessibility counts.
+# Group full-window primary molecules by read-derived genotype and allele, without clustering.
+# Combine gene, loop, domain, motif, cCRE, and m6A tracks into a PDF and return its data.
 plot_cre_pair_domain_ctcf = function(cre_pair, label, region_description = NULL,
     context_flank_bp = 250000, output_dir = file.path(hsca_dir, "CRE_domain_CTCF_anno"),
     config = params, models = gene_models, rao = rao_hg38,
@@ -865,7 +932,7 @@ plot_cre_pair_domain_ctcf = function(cre_pair, label, region_description = NULL,
     format(region$analysis_start, big.mark = ","), "-", format(region$analysis_end, big.mark = ","), " (hg38)")
 
   # reads, with the pooled 2x2 reproduced as a check of the read rule
-  manifest = fread(file.path(config$root, "universe", "sample_manifest.tsv"))
+  manifest = hsca_sample_manifest(config)
   window = list(chrom = region$chr, start = region$start, end = region$end)
   spans = load_region(window, manifest$sample_name, config$root, config$fire_root,
     tabix_bin = config$tabix, span_source = "aligned_blocks")

@@ -1,9 +1,8 @@
-"""Functions for haplotype- and allele-selective accessibility at LCL cCREs and cCRE pairs."""
+"""Functions for allele-selective accessibility at LCL cCREs and cCRE pairs."""
 
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -12,36 +11,23 @@ import pysam
 from scipy.stats import fisher_exact
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "CRE_co-accessibility_FIRE"))
-from LCL_coaccess_cres import BEDTOOLS, CELLS, CHROMS, ROOT, incidence_for_chrom, sample_manifest
+from LCL_coaccess_cres import BEDTOOLS, CELLS, CHROMS, ROOT, incidence_for_chrom
 from count_and_test_pairs import bh, count_pairs
 
 BCFTOOLS = "/project/spott/cshan/envs/bedtools/bin/bcftools"
 PHASED_METATABLE = "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_phased_27samples.csv"
 AUTOSOMES = [c for c in CHROMS if c not in ("chrX", "chrY")]
 FDR = 0.05
-MIN_READS = 10  # per haplotype or allele, as in the paper's haplotype-selective peak test
+MIN_READS = 10  # REF and ALT reads per donor/unit, before testing or pooling
 CRAM_FIELDS = [b"required_fields=0x23F"]  # QNAME FLAG RNAME POS MAPQ CIGAR SEQ; skips QUAL and aux tags
 
 #################################################
-# FIRE haplotype-selective peaks -> cCRE status
+# find overlaps in 2 bed files
 #################################################
-
-# <sample>-fire-v0.1-hap-differences.bed.gz: one row per peak that passed FIRE's per-haplotype
-# coverage filter, with FIRE's two-sided Fisher test of hap1 vs hap2 accessibility
-HAP_DIFF_COLS = ["#chrom", "peak_start", "peak_end", "coverage_H1", "coverage_H2",
-                 "hap1_frac_acc", "hap2_frac_acc", "p_value", "p_adjust", "diff"]
-REPRESENTATIVE = ["p_value", "p_adjust", "diff", "hap1_frac_acc", "hap2_frac_acc", "coverage_H1", "coverage_H2"]
-
-
-def read_hap_differences(path):
-    """FIRE peaks tested for haplotype selectivity; empty if the file is missing or empty (unphased)."""
-    path = Path(path)
-    if not path.is_file() or path.stat().st_size == 0:
-        return pd.DataFrame(columns=["chrom"] + HAP_DIFF_COLS[1:])
-    peaks = pd.read_csv(path, sep="\t", usecols=HAP_DIFF_COLS)
-    return peaks.rename(columns={"#chrom": "chrom"})
-
-
+# Find every overlapping pair of intervals in two DataFrames using BED coordinates.
+# The first three columns must be chromosome, 0-based start, and exclusive end.
+# Return both rows with a_/b_ column prefixes; values parsed from bedtools are strings.
+# Temporary BED files are deleted automatically, and a failed bedtools command raises an error.
 def bedtools_overlaps(a, b):
     """bedtools intersect -wa -wb of two BED-like frames (first 3 columns = chrom, start, end)."""
     with tempfile.TemporaryDirectory(prefix="hsca-") as tmp:
@@ -56,38 +42,16 @@ def bedtools_overlaps(a, b):
     rows = [line.split("\t") for line in out.rstrip("\n").split("\n")]
     return pd.DataFrame(rows, columns=cols)
 
-
-def cre_status(cres, peaks):
-    """One row per cCRE overlapping >=1 haplotype-tested peak.
-
-    status: conflict = significant peaks favour both haplotypes; hap1/hap2 = all significant peaks
-    favour one haplotype; ns = none significant. The representative peak is the one with the
-    smallest p_adjust (ties: smallest peak_start); its values are copied even for ns cCREs.
-    """
-    if peaks.empty:
-        return pd.DataFrame()
-    peaks = peaks.reset_index(drop=True)
-    hits = bedtools_overlaps(cres[["chrom", "start", "end", "CRE_ID"]],
-                             peaks[["chrom", "peak_start", "peak_end"]].assign(peak=peaks.index))
-    if hits.empty:
-        return pd.DataFrame()
-    hits = pd.DataFrame({"CRE_ID": hits.a_CRE_ID, "peak": hits.b_peak.astype(int)})
-    hits = hits.join(peaks, on="peak")
-    significant = hits.p_adjust <= FDR
-    hits["hap1_hit"] = significant & (hits["diff"] > 0)
-    hits["hap2_hit"] = significant & (hits["diff"] < 0)
-    grouped = hits.groupby("CRE_ID", sort=False)
-    out = pd.DataFrame({"n_hap_peaks": grouped.size(),
-                        "n_hsca_peaks": grouped.p_adjust.apply(lambda p: int((p <= FDR).sum())),
-                        "hap1": grouped.hap1_hit.any(), "hap2": grouped.hap2_hit.any()})
-    out["status"] = np.select([out.hap1 & out.hap2, out.hap1, out.hap2], ["conflict", "hap1", "hap2"], "ns")
-    representative = hits.sort_values(["CRE_ID", "p_adjust", "peak_start"]).drop_duplicates("CRE_ID").set_index("CRE_ID")
-    out = out.join(representative[REPRESENTATIVE]).reset_index()
-    return out[["CRE_ID", "status", "n_hap_peaks", "n_hsca_peaks"] + REPRESENTATIVE]
-
 #################################################
 # heterozygous SNVs inside cCREs and the variant used per cCRE / pair
 #################################################
+
+# find the heterozygous SNVs of one sample that sit inside cCRE -> read genotype from VCF with bcftools, 
+# then uses bedtools to link each SNV to its CRE
+
+# Extract this donor’s PASS, heterozygous, biallelic SNVs from the multi-sample VCF.
+# Subset the donor before testing heterozygosity so another donor’s genotype cannot qualify a site.
+# Intersect the SNVs with cCREs and return one row per variant/cCRE overlap.
 
 def het_snvs(vcf, cell_line, cres):
     """PASS heterozygous biallelic SNVs of one sample that fall inside a cCRE.
@@ -98,20 +62,25 @@ def het_snvs(vcf, cell_line, cres):
     with tempfile.TemporaryDirectory(prefix="hsca-") as tmp:
         regions = Path(tmp) / "cres.bed"  # .bed suffix: bcftools reads it as 0-based
         cres[["chrom", "start", "end"]].to_csv(regions, sep="\t", header=False, index=False)
+        # subset = keep regions inside the CRE, and the sample's genotype column, keep only sites has pass filter
         subset = subprocess.Popen([BCFTOOLS, "view", "-R", str(regions), "-s", cell_line, "-f", "PASS", "-Ou", vcf],
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # het (from subset piple) = keep sites where the remaining sample is heterozygous, keep SNPs and ref vs alt allele
         het = subprocess.Popen([BCFTOOLS, "view", "-i", 'GT="HET"', "-v", "snps", "-m2", "-M2", "-Ou"],
                                stdin=subset.stdout, stdout=subprocess.PIPE)
         subset.stdout.close()
+        # print chrom, pos, ref, alt, one line per site
         query = subprocess.run([BCFTOOLS, "query", "-f", "%CHROM\t%POS\t%REF\t%ALT\n"],
                                stdin=het.stdout, capture_output=True, text=True, check=True)
         het.stdout.close()
         if het.wait() or subset.wait():
             raise RuntimeError(f"bcftools failed on {vcf}")
     rows = [line.split("\t") for line in query.stdout.splitlines()]
+    # Converts pos to an integer and builds variant_id as chrom:pos:ref:alt
     snvs = pd.DataFrame(rows, columns=["chrom", "pos", "ref", "alt"]).drop_duplicates()
     if snvs.empty:
         return pd.DataFrame(columns=["CRE_ID", "variant_id", "chrom", "pos", "ref", "alt"])
+      
     snvs["pos"] = snvs.pos.astype(int)
     snvs["variant_id"] = snvs.chrom + ":" + snvs.pos.astype(str) + ":" + snvs.ref + ":" + snvs.alt
     hits = bedtools_overlaps(snvs.assign(start=snvs.pos - 1)[["chrom", "start", "pos", "variant_id"]],
@@ -119,7 +88,14 @@ def het_snvs(vcf, cell_line, cres):
     hits = pd.DataFrame({"variant_id": hits.a_variant_id, "CRE_ID": hits.b_CRE_ID})
     return hits.merge(snvs, on="variant_id")[["CRE_ID", "variant_id", "chrom", "pos", "ref", "alt"]]
 
+#################################################
+# picks one anchor SNV per cCRE, the het SNV shared by the most samples
+#################################################
 
+# Choose one common anchor SNP per cCRE for REF/ALT comparisons across samples.
+# Rank by number of heterozygous samples, then distance to the cCRE centre, then variant ID.
+# Retain the supporting sample count and semicolon-separated sample names for later filtering.
+# cCREs with no candidate heterozygous SNP do not appear in the result.
 def choose_cre_variants(het, cres):
     """Per cCRE, the het SNV shared by the most samples; ties go to the SNV nearest the cCRE centre."""
     counts = het.groupby(["CRE_ID", "variant_id", "chrom", "pos", "ref", "alt"], sort=False).sample_name.agg(
@@ -130,6 +106,14 @@ def choose_cre_variants(het, cres):
                                 ascending=[True, False, True, True])
     return counts.drop_duplicates("CRE_ID").reset_index(drop=True)
 
+#################################################
+# picks one anchor SNV for each cCRE pair, taken from whichever of the two cCREs has the better anchor
+#################################################
+
+# Choose one anchor SNP for each cCRE pair from the selected SNPs of its two members.
+# Prefer the SNP heterozygous in more samples, then closer to its own cCRE centre;
+# a remaining tie selects CRE1. variant_cre records which member supplied the SNP.
+# A pair can qualify with a SNP in just one member; pairs with neither are omitted.
 
 def choose_pair_variants(pairs, cre_variants):
     """Per pair, the same rule over the het SNVs of CRE1 and CRE2: the better of the two cCRE
@@ -144,21 +128,13 @@ def choose_pair_variants(pairs, cre_variants):
     return both.drop_duplicates("CRE_pair").reset_index(drop=True)
 
 #################################################
-# per-read haplotype tags and alleles
+# records which allele (REF or ALT) each read carries at each anchor SNP
 #################################################
 
-def load_haplotags(phasing_dir):
-    """HiPhase read-level-phasing.tsv -> {chrom: {read_name: (phase_block_id, haplotag)}}.
-
-    Keyed by (chrom, read_name) because chimeric reads appear once per chromosome; a read with
-    conflicting tags on one chromosome counts as unphased.
-    """
-    tags = pd.read_csv(Path(phasing_dir) / "read-level-phasing.tsv", sep="\t",
-                       usecols=["chrom", "phase_block_id", "read_name", "haplotag"])
-    tags = tags[tags.haplotag.isin([1, 2])].drop_duplicates()
-    tags = tags[~tags.duplicated(["chrom", "read_name"], keep=False)]
-    return {chrom: dict(zip(g.read_name, zip(g.phase_block_id, g.haplotag))) for chrom, g in tags.groupby("chrom")}
-
+# Read the actual base at each selected SNP from primary CRAM alignments.
+# Return a nested variant-ID/read-name lookup of ref or alt; no HiPhase tag is required.
+# Convert 1-based SNP positions to pileup coordinates, exclude deletions/reference skips
+# Labels it "ref" if it equals the VCF REF base, "alt" if it equals the ALT base, and drops the read if it matches neither
 
 def read_alleles(cram, chrom, variants):
     """{variant_id: {read_name: "ref" | "alt"}} from the base each primary read carries.
@@ -183,34 +159,22 @@ def read_alleles(cram, chrom, variants):
             calls[v.variant_id] = reads
     return calls
 
-#################################################
-# counts
-#################################################
+######################################
+# counts, for each unit, how many REF and ALT reads are open vs closed
+######################################
 
-def block_local_hap_counts(pairs, coverage, accessible, tags):
-    """Both-open counts per haplotype on the shared reads of each pair's majority phase block.
 
-    H1/H2 are only consistent within one HiPhase block, so phased reads from other blocks are
-    dropped (n_other_block_reads). hap*_acc = both cCREs open, hap*_nacc = not both open.
-    """
-    rows, empty = [], set()
-    for pair in pairs.itertuples(index=False):
-        shared = coverage.get(pair.CRE1, empty) & coverage.get(pair.CRE2, empty)
-        phased = [(r, tags[r]) for r in shared if r in tags]
-        if not phased:
-            continue
-        blocks = Counter(ps for _, (ps, _) in phased)
-        block = min(blocks, key=lambda b: (-blocks[b], b))
-        both = accessible.get(pair.CRE1, empty) & accessible.get(pair.CRE2, empty)
-        n, acc = [0, 0], [0, 0]
-        for r, (ps, hp) in phased:
-            if ps == block:
-                n[hp - 1] += 1
-                acc[hp - 1] += r in both
-        rows.append((pair.CRE_pair, block, len(phased) - n[0] - n[1], acc[0], n[0] - acc[0], acc[1], n[1] - acc[1]))
-    return pd.DataFrame(rows, columns=["CRE_pair", "phase_block", "n_other_block_reads",
-                                       "hap1_acc", "hap1_nacc", "hap2_acc", "hap2_nacc"])
+# CRE level:	One cCRE +	 CRE_ID	+ reads covering that cCRE	reads on which it is FIRE-accessible
+# Pair level:	One cCRE pair	+ CRE_pair +	reads spanning both cCREs	reads on which both cCREs are accessible
 
+# Build the REF/ALT by open/closed 2x2 counts for each supplied cCRE or cCRE pair
+
+
+# Output:
+# unit	CRE_ID or CRE_pair.
+# variant_id	The anchor SNV used to split the reads.
+# ref_open, ref_closed	REF-carrying reads that are open / not open
+# alt_open, alt_closed	ALT-carrying reads that are open / not open
 
 def allele_counts(units, calls):
     """ref_open, ref_closed, alt_open, alt_closed per unit.
@@ -231,32 +195,15 @@ def allele_counts(units, calls):
     return pd.DataFrame(rows, columns=["unit", "variant_id", "ref_open", "ref_closed", "alt_open", "alt_closed"])
 
 #################################################
-# phase blocks
+# Fisher test + BH
 #################################################
 
-def load_blocks(phasing_dir):
-    """HiPhase blocks.tsv: 1-based first/last phased variant of each block."""
-    blocks = pd.read_csv(Path(phasing_dir) / "blocks.tsv", sep="\t", usecols=["phase_block_id", "chrom", "start", "end"])
-    return {chrom: g.sort_values("start") for chrom, g in blocks.drop_duplicates().groupby("chrom")}
-
-
-def same_block(chrom, span_start, span_end, blocks):
-    """True where the 0-based span [span_start, span_end) lies inside one HiPhase block."""
-    g = blocks.get(chrom)
-    if g is None:
-        return np.zeros(len(span_start), dtype=bool)
-    starts, ends = g.start.to_numpy(), g.end.to_numpy()
-    i = np.searchsorted(starts, np.asarray(span_start) + 1, side="right") - 1
-    return (i >= 0) & (ends[np.clip(i, 0, None)] >= np.asarray(span_end))
-
-#################################################
-# tests
-#################################################
+# 1. REF vs ALT within each donor, for a cCRE or a pair: allele_counts() supplies the cells.
+# 2. REF vs ALT pooled across donors: pooled_alleles() sums the eligible donor cells.
+# Both analyses require >= MIN_READS REF and ALT reads per donor/unit before testing or pooling.
 
 def fisher_bh(table, cols, group=None, testable=None):
-    """Two-sided Fisher on [[c0, c1], [c2, c3]] plus BH within each group (as FIRE hap-diffs.R).
-
-    Identical tables are tested once. Rows outside `testable` get NaN and are left out of BH.
+    """Two-sided Fisher on [[c0, c1], [c2, c3]] plus BH within each group
     """
     counts = table[cols].to_numpy(dtype=np.int64)
     unique, inverse = np.unique(counts, axis=0, return_inverse=True)
@@ -265,30 +212,54 @@ def fisher_bh(table, cols, group=None, testable=None):
     if testable is not None:
         table.loc[~np.asarray(testable), "p_value"] = np.nan
 
+
     def adjust(s):
         out = pd.Series(np.nan, index=s.index)
         ok = s.notna()
         out[ok] = bh(s[ok])
         return out
     table["p_adjust"] = table.p_value.groupby(table[group] if group else np.zeros(len(table))).transform(adjust)
+  
     return table
 
+#################################################
+# lable fisher test result
+#################################################
+
+# Positive means group 1 is more open
+# not significant results get ns
 
 def call_status(diff, p_adjust, positive, negative):
     """positive/negative label by the sign of diff when p_adjust <= FDR, otherwise ns."""
     return np.where(p_adjust <= FDR, np.where(diff > 0, positive, negative), "ns")
 
 #################################################
-# samples
+# build the manifest directly from the 27 phased samples
 #################################################
 
-def phased_samples(sample_metatable, root):
-    """The 31-sample manifest (paths, donor, phasing_dir, phased_vcf_file) restricted to the phased sheet."""
-    manifest = sample_manifest(sample_metatable, root)
-    phased = pd.read_csv(PHASED_METATABLE, dtype=str, keep_default_na=False)
-    samples = manifest[manifest.sample_name.isin(phased.sample_name)].reset_index(drop=True)
-    check = samples.merge(phased, on="sample_name", suffixes=("", "_phased"))
-    if len(samples) != len(phased) or any(check[c].ne(check[c + "_phased"]).any()
-                                          for c in ("cell_line", "fire_dir", "phasing_dir", "phased_vcf_file")):
-        raise ValueError("The phased sheet must match the 31-sample manifest")
+# 1. Read the phased sheet, requiring exactly 27 distinct, nonempty sample identifiers
+# 2. Reject another cohort or mismatched donor/phasing paths instead of silently dropping samples
+# 3. Derive the FIRE and upstream per-sample paths used by the counting 
+
+def phased_samples(sample_metatable=PHASED_METATABLE, root=ROOT):
+    """Validated 27-sample HSCA manifest; independent of the 31-sample manifest loader."""
+    samples = pd.read_csv(sample_metatable, dtype=str, keep_default_na=False)
+    required = ["sample_name", "cell_line", "fire_dir", "phasing_dir", "phased_vcf_file"]
+    if not set(required).issubset(samples.columns):
+        raise ValueError(f"Phased sample CSV requires {required}")
+    if len(samples) != 27 or samples.sample_name.nunique() != 27 or samples[required].eq("").any().any():
+        raise ValueError("HSCA requires exactly 27 unique phased samples with complete paths")
+    canonical = pd.read_csv(PHASED_METATABLE, dtype=str, keep_default_na=False)
+    if set(samples.sample_name) != set(canonical.sample_name):
+        raise ValueError("HSCA sample names must match the canonical 27 phased samples")
+    expected = canonical.set_index("sample_name").loc[samples.sample_name, required[1:]]
+    if not np.array_equal(samples[required[1:]].to_numpy(), expected.to_numpy()):
+        raise ValueError("HSCA donor and phasing paths must match the phased sheet")
+    root = Path(root)
+    samples["donor"] = samples.cell_line
+    samples["cram_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-filtered.cram") for r in samples.itertuples()]
+    samples["peaks_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-peaks.bed.gz") for r in samples.itertuples()]
+    samples["elements_path"] = [str(Path(r.fire_dir) / "additional-outputs-v0.1/fire-peaks" / f"{r.sample_name}-v0.1-fire-elements.bed.gz") for r in samples.itertuples()]
+    samples["spans_path"] = [str(root / s / f"{s}.read_spans.bed.gz") for s in samples.sample_name]
+    samples["blocks_path"] = [str(root / s / f"{s}.aligned_blocks.bed.gz") for s in samples.sample_name]
     return samples

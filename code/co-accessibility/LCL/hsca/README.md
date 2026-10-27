@@ -17,7 +17,7 @@
    done
    ```
 
-3. Submit the full HSCA run. The wrapper runs `LCL_hsca_intersect.py` followed by `LCL_hsca_run.py` and writes the six tables under `LCL_project/co-accessibility/hsca/outputs/`.
+3. Submit the full HSCA run. The wrapper runs `LCL_hsca_pool.py` and `LCL_hsca_run.py`. It writes the four REF/ALT test tables plus the 27-sample pooled/noXCI comparisons and cohort/sex manifests under `LCL_project/co-accessibility/hsca/outputs/`.
 
    ```bash
    hsca_job=$(sbatch --parsable code/co-accessibility/LCL/hsca/LCL_run_hsca.sh)
@@ -31,7 +31,7 @@
    tail -n 30 "results/logs/LCL_hsca_${hsca_job}.err"
    ```
 
-5. In an R session on a compute node, render the report after the HSCA job completes. This includes the molecule, clustering, ACF, and domain/CTCF figures. The notebook sources `fire_plots.R` and `hap_sele_access_plots.r` automatically.
+5. In an R session on a compute node, render the report after the HSCA job completes. This includes the molecule, clustering, ACF, and domain/CTCF figures. The notebook sources `hap_sele_access_plots.r` automatically. All tests and molecule figures use `LCL_sample_metatable_merged_phased_27samples.csv`; the 31-sample upstream data supply coordinates and per-sample counts only. Re-run the wrapper and render all figures after this cohort change; existing PDFs are not updated by editing the scripts.
 
    ```r
    rmarkdown::render(
@@ -42,3 +42,8 @@
    ```
 
 6. Open `/project/spott/cshan/fiber-seq/docs/LCL_hsca.html`.
+
+REF/ALT tests use the same coverage threshold throughout: at least 10 REF reads and
+10 ALT reads per donor and cCRE/pair. Pooled tests sum only donor/unit rows meeting
+that threshold. H1/H2 tests and FIRE haplotype-peak intersections are no longer run.
+Phasing remains available for assigning REF/ALT labels in molecule figures.

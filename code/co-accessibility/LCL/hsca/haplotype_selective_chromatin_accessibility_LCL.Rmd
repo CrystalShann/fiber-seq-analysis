@@ -1,0 +1,704 @@
+---
+title: "REF/ALT allele skew of LCL cCREs and co-accessible pairs"
+author: "Crystal Shan"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  root: "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"
+  code_root: "/project/spott/cshan/fiber-seq/code"
+  fire_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results"
+  tf_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model"
+  tabix: "/project/spott/cshan/envs/dimelo/bin/tabix"
+  sample_metatable: "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_phased_27samples.csv"
+  phasing_root: "/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples"
+  make_molecule_plots: true
+  locus_flank_bp: 1000
+  leiden_k_neighbors: 10
+  leiden_resolution: 1
+  leiden_seed: 1
+---
+
+# REF/ALT accessibility of LCL cCREs and co-accessible pairs
+
+Single-cCRE tests compare that element's accessibility between REF and ALT reads. Pair tests compare the fraction of spanning reads with both cCREs open between REF and ALT. A pair difference can arise from one element's accessibility difference; it does not by itself establish a difference in coordination between the elements.
+
+All four REF/ALT tests use a two-sided Fisher exact test and BH correction. A donor contributes to a cCRE/pair test only when it has **at least 10 REF reads and 10 ALT reads** at the chosen heterozygous SNP (open plus closed reads). The same donor-level rule applies before pooling. Within-donor BH is applied separately for cCREs and pairs; pooled BH is applied across units separately for cCREs and pairs. Positive `diff = ALT fraction - REF fraction` favors ALT. `n_samples_both_alleles` counts donors passing the 10-reads-per-allele rule.
+
+| Unit | Within donor, REF vs ALT         | Across donors, REF vs ALT |
+|------|----------------------------------|---------------------------|
+| cCRE | `LCL_hsca_cre_allele_by_sample`  | `LCL_hsca_cre_allele`     |
+| pair | `LCL_hsca_pair_allele_by_sample` | `LCL_hsca_pair_allele`    |
+
+## HSCA test on CRE and CRE pairs
+
+use a 2x2 table with REF and ALT. For a single cCRE, the columns are accessible and not accessible. For a pair, the columns are
+both cCREs open and not both open, either one open or neither open
+
+- Each donor must have at least 10 reads of each allele for the unit being tested
+
+| Test | Question and null hypothesis | Interpretation of a significant result |
+|---|---|---|
+| Single cCRE, within donor | Is this cCRE more accessible on REF or ALT reads in this donor? Null: the accessible fraction is equal between alleles. | Accessibility of this element is associated with the focal allele in this donor. |
+| cCRE pair, within donor | Are both cCREs open together more often on REF or ALT reads in this donor? Null: the both-open fraction is equal between alleles among reads covering both elements. | Joint accessibility differs between alleles in this donor |
+| Single cCRE, pooled across donors | Is this cCRE's accessible fraction different between REF and ALT after summing eligible donor counts? Null: the pooled accessible fractions are equal. | There is an aggregate allele-associated accessibility difference at this element. |
+| cCRE pair, pooled across donors | Is the both-open fraction different between REF and ALT after summing eligible donor counts? Null: the pooled both-open fractions are equal. | There is an aggregate allele-associated difference in joint accessibility of this pair. |
+
+Within-donor tests receive BH correction across tested cCREs or pairs separately in each donor. Pooled tests receive BH correction across tested cCREs or pairs separately
+
+
+
+``` bash
+cd /project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca
+sbatch LCL_run_hsca.sh
+```
+
+VCF file: `/project/spott/1_Shared_projects/LCL_Fiber_seq/preprocess_final_merged_samples/AL6_bc2162_19093/AL6_bc2162_19093.5mC.6mA.aligned.phased.vcf.gz`
+
+| Column                        | Meaning                                                                 |
+|-------------------------------|-------------------------------------------------------------------------|
+| `#CHROM`                      | Chromosome, such as `chr1`.                                             |
+| `POS`                         | **1-based** genomic position, unlike a BED start coordinate.            |
+| `ID`                          | Variant identifier, such as an rsID; `.` means missing.                 |
+| `REF`                         | Reference allele.                                                       |
+| `ALT`                         | Alternative allele(s); multiple alternatives are comma-separated.       |
+| `QUAL`                        | Variant-level Phred-scaled quality; `.` means unavailable.              |
+| `FILTER`                      | Variant filtering result. `PASS` means it passed the applied filters.   |
+| `INFO`                        | Semicolon-separated variant annotations, such as `AF=0.0168067`.        |
+| `FORMAT`                      | Colon-separated names defining the fields in each sample’s cell.        |
+| `NA19093`, other sample names | That sample’s genotype and any additional fields specified by `FORMAT`. |
+
+| `GT`   | Interpretation                                           |
+|--------|----------------------------------------------------------|
+| `0/0`  | Homozygous REF.                                          |
+| `0/1`  | Heterozygous, unphased.                                  |
+| `0\|1` | Phased: first haplotype carries REF, second carries ALT. |
+| `1\|0` | Phased: first haplotype carries ALT, second carries REF. |
+| `1/1`  | Homozygous first ALT.                                    |
+| `./.`  | Missing genotype.                                        |
+
+**ONLY ONE SNP PER CRE IS KEPT**, which is the het SNV shared by the most samples **SNP in CRE pair** prefer the SNP heterozygous in more samples, then closer to its own cCRE centre
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      cache = FALSE, fig.width = 10, fig.height = 9)
+source(file.path(params$code_root, "co-accessibility/LCL/hsca/hap_sele_access_plots.r"),
+       local = TRUE)
+```
+
+```{r settings}
+hsca_dir = file.path(dirname(params$root), "hsca")
+outputs_dir = file.path(hsca_dir, "outputs")
+tables_dir = file.path(hsca_dir, "tables")
+plots_dir = file.path(hsca_dir, "plots")
+examples_dir = file.path(hsca_dir, "CRE_pairs_examples")
+dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(examples_dir, showWarnings = FALSE, recursive = TRUE)
+fdr_cut = 0.05
+```
+
+```{r load-tables}
+# Check every required result before loading any of them.
+required_outputs = c("LCL_hsca_cre_allele_by_sample", "LCL_hsca_pair_allele_by_sample",
+  "LCL_hsca_cre_allele", "LCL_hsca_pair_allele",
+  "LCL_hsca_coaccess_pairs", "LCL_hsca_coaccess_pairs_noXCI")
+output_paths = file.path(outputs_dir, paste0(required_outputs, ".tsv.gz"))
+missing = required_outputs[!file.exists(output_paths) | file.access(output_paths, 4L) != 0L]
+if (length(missing)) {
+  pooling_only = all(missing %in% c("LCL_hsca_coaccess_pairs", "LCL_hsca_coaccess_pairs_noXCI"))
+  instruction = if (pooling_only) paste0(
+    "Generate the 27-sample pooled comparisons on a compute node with:\n",
+    "/project/spott/cshan/envs/Jupyter-notebook/bin/python3 ",
+    shQuote(file.path(params$code_root, "co-accessibility/LCL/hsca/LCL_hsca_pool.py")),
+    " --root ", shQuote(params$root), " --out-dir ", shQuote(outputs_dir),
+    " --sample-metatable ", shQuote(params$sample_metatable)) else paste0(
+    "Run LCL_run_hsca.sh to generate the allele and pooled result tables.")
+  stop("Missing or unreadable HSCA outputs in ", outputs_dir, ":\n",
+    paste(paste0(missing, ".tsv.gz"), collapse = "\n"), "\n\n", instruction,
+    "\nWait for the job to finish, then rerun this chunk.", call. = FALSE)
+}
+read_output = function(name) fread(file.path(outputs_dir, paste0(name, ".tsv.gz")))
+cre_allele_by_sample = read_output("LCL_hsca_cre_allele_by_sample")
+pair_allele_by_sample = read_output("LCL_hsca_pair_allele_by_sample")
+cre_allele = read_output("LCL_hsca_cre_allele")
+pair_allele = read_output("LCL_hsca_pair_allele")
+
+# cCRE coordinates and pooled co-accessibility tables
+cres = fread(file.path(params$root, "universe", "cre_universe.bed"),
+             col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))
+pooled = read_output("LCL_hsca_coaccess_pairs")
+pooled_noxci = read_output("LCL_hsca_coaccess_pairs_noXCI")
+
+# Fail if stale tables contain samples outside the phased cohort.
+phased_manifest = hsca_sample_manifest(params)
+for (dt in list(cre_allele_by_sample, pair_allele_by_sample))
+  stopifnot(all(dt$sample_name %in% phased_manifest$sample_name))
+stopifnot(all(pooled$n_samples == 27L),
+  all(pooled_noxci[chrom != "chrX", n_samples_noXCI] == 27L))
+
+
+```
+
+## CRE and CRE pair allele specific chromatin accessibility
+
+| R object | File | Contents |
+|---|---|---|
+| `cre_allele_by_sample` | `LCL_hsca_cre_allele_by_sample.tsv.gz` | One row per tested cCRE per donor |
+| `pair_allele_by_sample` | `LCL_hsca_pair_allele_by_sample.tsv.gz` | One row per tested cCRE pair per donor |
+| `cre_allele` | `LCL_hsca_cre_allele.tsv.gz` | Pooled REF/ALT results for each cCRE with a selected SNP |
+| `pair_allele` | `LCL_hsca_pair_allele.tsv.gz` | Pooled REF/ALT results for each pair with a selected SNP |
+
+```{r sample-tallies}
+tally = function(dt, name) {
+  dt[, .(tested = .N, skewed = sum(status != "ns")), by = sample_name][
+    , setnames(.SD, c("tested", "skewed"), paste0(name, c("_tested", "_skewed")))]
+}
+
+sample_tallies = Reduce(function(a, b) merge(a, b, by = "sample_name", all = TRUE), list(
+  tally(cre_allele_by_sample, "cre_allele"),
+  tally(pair_allele_by_sample, "pair_allele")))
+for (j in setdiff(names(sample_tallies), "sample_name")) set(sample_tallies, which(is.na(sample_tallies[[j]])), j, 0L)
+fwrite(sample_tallies, file.path(tables_dir, "LCL_hsca_sample_tallies.tsv"), sep = "\t")
+knitr::kable(sample_tallies)
+
+pooled_tallies = data.table(
+  table = c("LCL_hsca_cre_allele", "LCL_hsca_pair_allele"),
+  with_variant = c(nrow(cre_allele), nrow(pair_allele)),
+  tested = c(sum(!is.na(cre_allele$p_value)), sum(!is.na(pair_allele$p_value))),
+  fdr_lt_0.05 = c(sum(cre_allele$fdr < fdr_cut, na.rm = TRUE), sum(pair_allele$fdr < fdr_cut, na.rm = TRUE)))
+knitr::kable(pooled_tallies)
+```
+
+### volcano and scatter plots for REF/ALT allele skew  
+
+REF-vs-ALT accessibility and the volcano, one panel per sample. Blue dashed line: p = 0.05; red dashed line: the largest p-value with BH p \<= 0.05 in that sample
+
+**scatter plots**
+
+REF/ALT accessibility scatterplot
+- X-axis: fraction of REF reads that are open.
+- Y-axis: fraction of ALT reads that are open.
+- For a single cCRE, “open” means that element is accessible.
+- For a pair, “open” means both elements are accessible on the same read
+
+| Position | Interpretation |
+|---|---|
+| Near `y = x` | Similar accessibility for REF and ALT |
+| Above the diagonal | ALT has higher accessibility |
+| Below the diagonal | REF has higher accessibility |
+
+**volcano plots**
+X-axis: ALT open fraction − REF open fraction.
+Y-axis: -log2(p), higher means smaller p-value
+Blue dashed line: nominal p = 0.05.
+Red dashed line: the largest raw p-value passing BH-adjusted p ≤0.05 
+
+Far from zero: a substantial accessibility difference.
+High on the plot: strong statistical evidence
+
+X-axis: ALT accessibility − REF accessibility. Right favors ALT; left favors REF; zero means equal accessibility.
+
+| Line | Meaning |
+|---|---|
+| **Blue dashed** | Raw p = 0.05. Observations above it are nominally significant. |
+| **Red dashed** | The largest raw p-value passing BH-adjusted p ≤0.05 in that panel. Observations at or above it pass the corrected threshold. |
+
+Outputs:
+
+| file | What it shows |
+|---|---|
+| `cre_allele_by_sample_ref_vs_alt.pdf` | Single-cCRE REF versus ALT accessibility, one panel per donor |
+| `cre_allele_by_sample_volcano.pdf` | Single-cCRE allele differences and significance, per donor |
+| `pair_allele_by_sample_ref_vs_alt.pdf` | Pair REF versus ALT **both-open fractions**, one panel per donor |
+| `pair_allele_by_sample_volcano.pdf` | Pair allele differences and significance, per donor |
+| `cre_allele_ref_vs_alt.pdf` | Single-cCRE REF versus ALT accessibility pooled across donors |
+| `cre_allele_volcano.pdf` | Pooled single-cCRE allele differences and significance |
+| `pair_allele_ref_vs_alt.pdf` | Pair REF versus ALT both-open fractions pooled across donors |
+| `pair_allele_volcano.pdf` | Pooled pair allele differences and significance |
+
+cCRE-level analysis: For each cCRE, compare its accessibility between REF and ALT reads. Each observation in the plot represents one cCRE.
+Pair-level analysis: For each pair of cCREs, compare how often both are open on the same read between REF and ALT reads. Each observation represents one pair
+
+
+```{r skew-plots}
+
+allele_labels = c("REF accessibility", "ALT accessibility", "Difference between ALT and REF accessibility")
+pair_allele_labels = c("REF both-open fraction", "ALT both-open fraction", "Difference between ALT and REF both-open fraction")
+panels = list(
+  list("LCL_hsca_cre_allele_by_sample", cre_allele_by_sample, "ref_frac_open", "alt_frac_open", allele_labels, "p_adjust", "sample_name"),
+  list("LCL_hsca_pair_allele_by_sample", pair_allele_by_sample, "ref_frac_open", "alt_frac_open", pair_allele_labels, "p_adjust", "sample_name"),
+  list("LCL_hsca_cre_allele", cre_allele[!is.na(p_value)], "ref_frac_open", "alt_frac_open", allele_labels, "fdr", NULL),
+  list("LCL_hsca_pair_allele", pair_allele[!is.na(p_value)], "ref_frac_open", "alt_frac_open", pair_allele_labels, "fdr", NULL))
+for (panel in panels) {
+  name = panel[[1]]; dt = panel[[2]]; labels = panel[[5]]; facet = panel[[7]]
+  if (!nrow(dt)) next
+  size = if (is.null(facet)) c(4, 3.5) else c(10, 9)
+  p1 = plot_ref_vs_alt(dt, panel[[3]], panel[[4]], labels[1], labels[2], facet = facet)
+  p2 = plot_allele_volcano(dt, labels[3], p_adjust = panel[[6]], facet = facet)
+  save_pdf(p1, file.path(plots_dir, paste0(name, "_ref_vs_alt.pdf")), width = size[1], height = size[2])
+  save_pdf(p2, file.path(plots_dir, paste0(name, "_volcano.pdf")), width = size[1], height = size[2])
+  print(p1); print(p2)
+}
+```
+
+#### Are pooled co-accessible pairs allele-skewed?
+
+Pooled positives are `fdr < 0.05 & OR > 1 & co_access > expected_co_access` in the pooled table (all chromosomes) and the noXCI table; only autosomal pairs can be tested here Each test compares the skewed fraction of positives with the skewed fraction of the other tested pairs.
+
+```{r pooled-positive-enrichment}
+positives = list(
+  all_chr = pooled[fdr < fdr_cut & OR > 1 & co_access > expected_co_access, CRE_pair],
+  noXCI = pooled_noxci[fdr_noXCI < fdr_cut & OR_noXCI > 1 & co_access_noXCI > expected_co_access_noXCI, CRE_pair])
+
+# A pair is allele-skewed if a within-donor or pooled REF/ALT test is significant.
+pair_flags = rbind(
+  pair_allele_by_sample[, .(CRE_pair, skewed = status != "ns")],
+  pair_allele[!is.na(p_value), .(CRE_pair, skewed = fdr < fdr_cut)]
+)[, .(allele_skewed = any(skewed)), by = CRE_pair]
+
+enrichment = rbindlist(lapply(names(positives), function(set) {
+  rbindlist(lapply("allele_skewed", function(test) {
+    d = pair_flags[!is.na(get(test)), .(positive = CRE_pair %in% positives[[set]], skewed = get(test))]
+    ft = fisher.test(table(factor(d$positive, c(TRUE, FALSE)), factor(d$skewed, c(TRUE, FALSE))))
+    data.table(positive_set = set, test = test, n_tested = nrow(d), n_positive_tested = sum(d$positive),
+               n_skewed = sum(d$skewed), n_positive_skewed = sum(d$positive & d$skewed),
+               frac_skewed_positive = mean(d$skewed[d$positive]), frac_skewed_other = mean(d$skewed[!d$positive]),
+               odds_ratio = unname(ft$estimate), p_value = ft$p.value)
+  }))
+}))
+fwrite(enrichment, file.path(tables_dir, "LCL_hsca_pooled_positive_enrichment.tsv"), sep = "\t")
+knitr::kable(enrichment, digits = 4)
+```
+
+#### Co-accessible pairs with pooled allele selectivity, ranked by p-value
+
+These lists use the **pooled REF/ALT pair test**. Co-accessibility still requires pooled co-accessibility FDR \< 0.05, OR \> 1, and observed both-open counts above expectation. Within that set, raw allele p \< 0.05 identifies **exploratory candidates**; allele BH FDR \< 0.05 identifies the corrected discoveries. The allele BH values are retained from the original test across all tested autosomal pairs; they are **not recalculated after selecting co-accessible pairs**. Every list is sorted by raw allele p-value, with CRE_pair breaking ties. Coordinates are BED (0-based, end-exclusive). The `difference_pp` column is ALT minus REF both-open fraction, in percentage points.
+
+```{r ranked-allele-pairs}
+pair_annotation = pooled[, .(CRE_pair, chrom, cre1_start, cre1_end, cre2_start, cre2_end,
+  gene_names, CRE_pair_labels, coaccess_OR = OR, coaccess_fdr = fdr,
+  coaccess_p_value = pval, n_shared_reads, co_access, expected_co_access)]
+stopifnot(!anyDuplicated(pair_annotation$CRE_pair), !anyDuplicated(pair_allele$CRE_pair))
+ranked_pair_alleles = merge(copy(pair_allele[!is.na(p_value)]), pair_annotation,
+  by = "CRE_pair", all.x = TRUE, sort = FALSE)
+stopifnot(!anyNA(ranked_pair_alleles$chrom))
+setnames(ranked_pair_alleles, c("p_value", "fdr"), c("allele_p_value", "allele_bh_fdr"))
+ranked_pair_alleles[, `:=`(
+  coaccessible = CRE_pair %in% positives$all_chr,
+  allele_nominal = allele_p_value < fdr_cut,
+  allele_bh_significant = allele_bh_fdr < fdr_cut,
+  ref_n = ref_open + ref_closed,
+  alt_n = alt_open + alt_closed,
+  difference_percentage_points = 100 * diff)]
+setorder(ranked_pair_alleles, allele_p_value, CRE_pair)
+rank_pair_list = function(d) {
+  d = copy(d)
+  d[, rank := seq_len(.N)]
+  setcolorder(d, c("rank", setdiff(names(d), "rank")))
+  d[]
+}
+coaccessible_allele_nominal = rank_pair_list(ranked_pair_alleles[coaccessible & allele_nominal])
+coaccessible_allele_bh = rank_pair_list(ranked_pair_alleles[coaccessible & allele_bh_significant])
+all_pair_allele_bh = rank_pair_list(ranked_pair_alleles[allele_bh_significant == TRUE])
+fwrite(coaccessible_allele_nominal,
+  file.path(tables_dir, "LCL_hsca_coaccessible_pair_allele_nominal_ranked.tsv"), sep = "\t")
+fwrite(coaccessible_allele_bh,
+  file.path(tables_dir, "LCL_hsca_coaccessible_pair_allele_BH_ranked.tsv"), sep = "\t")
+fwrite(all_pair_allele_bh,
+  file.path(tables_dir, "LCL_hsca_all_pair_allele_BH_ranked.tsv"), sep = "\t")
+knitr::kable(data.table(
+  group = c("Co-accessible pairs with an allele test", "Raw allele p < 0.05 (exploratory)",
+            "Allele BH FDR < 0.05 among co-accessible pairs", "Allele BH FDR < 0.05 among all pairs"),
+  n_pairs = c(sum(ranked_pair_alleles$coaccessible), nrow(coaccessible_allele_nominal),
+              nrow(coaccessible_allele_bh), nrow(all_pair_allele_bh))))
+
+
+show_ranked_pairs = function(d) {
+  knitr::kable(d[, .(rank, CRE_pair, gene_names,
+    CRE1_interval = paste0(chrom, ":", cre1_start, "-", cre1_end),
+    CRE2_interval = paste0(chrom, ":", cre2_start, "-", cre2_end), variant_id,
+    REF_both_open = paste0(ref_open, "/", ref_n),
+    ALT_both_open = paste0(alt_open, "/", alt_n),
+    difference_pp = round(difference_percentage_points, 2),
+    allele_p = formatC(allele_p_value, format = "e", digits = 3),
+    allele_BH_FDR = formatC(allele_bh_fdr, format = "e", digits = 3),
+    coaccess_FDR = formatC(coaccess_fdr, format = "e", digits = 3),
+    coaccessible, n_samples_both_alleles)])
+}
+```
+
+
+**BH-significant allele-selective co-accessible pairs**
+
+```{r bh-coaccessible-pairs}
+show_ranked_pairs(coaccessible_allele_bh)
+```
+
+```{r pair-plot-dependencies, include=FALSE}
+for (script in c("parsing_footprints_functions.r", "stats_testing_functions.r", "plotting_functions.r"))
+  source(file.path(params$code_root, "parsing_functions", script), local = TRUE)
+for (script in c("clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r",
+                 "clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r",
+                 "haplotype_phasing/LCL_phasing.r", "haplotype_phasing/LCL_phased_m6a_input.r"))
+  source(file.path(params$code_root, script), local = TRUE)
+```
+
+# significantly allele-skewed cCREs that belong to significant co-accessible pairs
+
+Which allele-skewed cCREs participate in at least one significantly positively co-accessible pair?
+
+CLASP1 was selected from significantly positively co-accessible pairs
+with an individually allele-skewed cCRE (pooled cCRE BH FDR < 0.05, October 27 allele results)
+whose focal SNV is a significant GTEx v8 LCL cis-eQTL
+(`/project/spott/cshan/annotations/LCL_public_data/GTEx_Analysis_v8_eQTL/`).
+
+This selection does not require the pair's REF/ALT test to be significant. The pair's
+selected focal SNP is used for the molecule figures; here it is the same SNV as the
+individual-cCRE test. The CLASP1 label is the GTEx eQTL gene, not a proven target.
+
+| Locus | Individually skewed cCRE | Partner cCRE | Focal SNV | GTEx LCL eQTL |
+|---|---|---|---|---|
+| CLASP1 | `EH38E2029449.dELS` | `EH38E3368841.dELS` | chr2:121599032 C>T | CLASP1, ALT slope -0.51, p = 2.6e-6 |
+
+## CLASP1: single-molecule view of both cCREs
+
+```{r clasp1-pair-example, include=FALSE}
+clasp1 = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  clasp1 = plot_cre_pair(
+    c("EH38D3172088.EH38E2029449.dELS", "EH38D5230574.EH38E3368841.dELS"),
+    label = "CLASP1", output_prefix = "LCL_hsca_CLASP1")
+}
+```
+
+```{r clasp1-retained-counts, echo=FALSE}
+if (!is.null(clasp1)) knitr::kable(clasp1$read_labels[, .(molecules = .N,
+  samples = uniqueN(sample_name)), by = allele_group])
+```
+
+```{r clasp1-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(clasp1)) 6 else clasp1$phased_plot$height}
+if (!is.null(clasp1)) print(clasp1$phased_plot$panels$combined)
+```
+
+```{r clasp1-configuration-figure, echo=FALSE, fig.width=12, fig.height=6}
+if (!is.null(clasp1)) print(clasp1$phased_plot$bars)
+```
+
+#### CLASP1: phased-molecule m6A heatmaps and Manhattan/Leiden clustering
+
+```{r clasp1-clustering-summary, echo=FALSE}
+if (!is.null(clasp1)) knitr::kable(as.data.table(clasp1$phased_molecules$assignments)[,
+  .(molecules = .N, samples = uniqueN(sample_name), in_phased_plot = sum(in_phased_plot),
+    zero_m6a_molecules = sum(n_m6a_calls == 0)), by = cluster][order(cluster)])
+```
+
+```{r clasp1-phased-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(clasp1)) 8 else clasp1$heatmap_height}
+if (!is.null(clasp1)) draw_pair_m6a_heatmap(clasp1$heatmap_unclustered)
+```
+
+```{r clasp1-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(clasp1)) 8 else clasp1$heatmap_height}
+if (!is.null(clasp1)) draw_pair_m6a_heatmap(clasp1$heatmap_leiden)
+```
+
+```{r clasp1-leiden-profile-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(clasp1)) 6 else 1.3 * (clasp1$phased_molecules$n_clusters + 1) + 1}
+if (!is.null(clasp1)) print(clasp1$profile_plot)
+```
+
+### domain, loops and CTCF annotation of selected CRE pairs
+
+```{r domain-ctcf-data, include=FALSE}
+if (isTRUE(params$make_molecule_plots)) {
+  gene_models = load_canonical_gene_models("/project/spott/cshan/annotations/gencode.v46.annotation.gtf.gz")
+  rao_hg38 = load_rao_hg38("/project/spott/cshan/annotations/LCL_public_data/rao2014_GM12878/hg38")
+}
+```
+
+```{r domain-ctcf-examples, include=FALSE}
+domain_ctcf = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  domain_ctcf = list(
+    CLASP1 = plot_cre_pair_domain_ctcf(
+      c("EH38D3172088.EH38E2029449.dELS", "EH38D5230574.EH38E3368841.dELS"), "CLASP1"))
+}
+```
+
+```{r domain-ctcf-group-sizes, echo=FALSE}
+if (!is.null(domain_ctcf)) knitr::kable(rbindlist(lapply(names(domain_ctcf), function(gene)
+  domain_ctcf[[gene]]$group_sizes[, .(gene, focal_snv = domain_ctcf[[gene]]$allele$variant_id,
+    group = cluster, molecules, samples, donors)])))
+```
+
+```{r domain-ctcf-genotypes, echo=FALSE}
+
+if (!is.null(domain_ctcf)) knitr::kable(dcast(rbindlist(lapply(names(domain_ctcf), function(gene)
+  domain_ctcf[[gene]]$genotypes[, .(gene, sample = sub("_.*$", "", sample_name),
+    call = sprintf("%s (%d/%d)", genotype, n_ref, n_alt))])), sample ~ gene, value.var = "call"))
+```
+
+```{r clasp1-domain-ctcf-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(domain_ctcf)) 12 else 16 + .035 * nrow(domain_ctcf$CLASP1$assignments)}
+if (!is.null(domain_ctcf)) print(domain_ctcf$CLASP1$combined)
+```
+
+## co-accessible pairs with allele-specific chromatin accessibility
+
+Significant positive co-accessibility: co-accessibility BH FDR <0.05, OR >1, and observed both-open counts above expectation.
+Nominal allele-selective accessibility: pooled REF/ALT Fisher raw p <0.05, without requiring allele BH FDR <0.05.
+
+### SLFN5: single-molecule view of both cCREs
+
+```{r slfn5-pair-example, include=FALSE}
+slfn5 = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  slfn5 = plot_cre_pair(
+    c("EH38D5005816.EH38E3219251.PLS", "EH38D6268395.EH38E4160235.pELS"),
+    label = "SLFN5", output_prefix = "LCL_hsca_SLFN5")
+}
+```
+
+```{r slfn5-retained-counts, echo=FALSE}
+if (!is.null(slfn5)) knitr::kable(slfn5$read_labels[, .(molecules = .N,
+  samples = uniqueN(sample_name)), by = allele_group])
+```
+
+```{r slfn5-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(slfn5)) 6 else slfn5$phased_plot$height}
+if (!is.null(slfn5)) print(slfn5$phased_plot$panels$combined)
+```
+
+```{r slfn5-configuration-figure, echo=FALSE, fig.width=12, fig.height=6}
+if (!is.null(slfn5)) print(slfn5$phased_plot$bars)
+```
+
+### SLFN5: phased-molecule m6A heatmaps and Manhattan/Leiden clustering
+
+```{r slfn5-clustering-summary, echo=FALSE}
+if (!is.null(slfn5)) knitr::kable(as.data.table(slfn5$phased_molecules$assignments)[,
+  .(molecules = .N, samples = uniqueN(sample_name), in_phased_plot = sum(in_phased_plot),
+    zero_m6a_molecules = sum(n_m6a_calls == 0)), by = cluster][order(cluster)])
+```
+
+```{r slfn5-phased-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(slfn5)) 8 else slfn5$heatmap_height}
+if (!is.null(slfn5)) draw_pair_m6a_heatmap(slfn5$heatmap_unclustered)
+```
+
+```{r slfn5-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(slfn5)) 8 else slfn5$heatmap_height}
+if (!is.null(slfn5)) draw_pair_m6a_heatmap(slfn5$heatmap_leiden)
+```
+
+```{r slfn5-leiden-profile-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(slfn5)) 6 else 1.3 * (slfn5$phased_molecules$n_clusters + 1) + 1}
+if (!is.null(slfn5)) print(slfn5$profile_plot)
+```
+
+## SLFN5: gene, domain and CTCF context
+
+The same locus-context and molecule plotting method is used for SLFN5.
+
+```{r slfn5-domain-ctcf-example, include=FALSE}
+slfn5_domain_ctcf = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  slfn5_domain_ctcf = list(SLFN5 = plot_cre_pair_domain_ctcf(
+    c("EH38D5005816.EH38E3219251.PLS", "EH38D6268395.EH38E4160235.pELS"), "SLFN5"))
+}
+```
+
+```{r slfn5-domain-ctcf-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(slfn5_domain_ctcf)) 12 else 16 + .035 * nrow(slfn5_domain_ctcf$SLFN5$assignments)}
+if (!is.null(slfn5_domain_ctcf)) print(slfn5_domain_ctcf$SLFN5$combined)
+```
+
+# GTEx eQTL variants in co-accessible pairs
+
+Which cCREs in significant positive co-accessible pairs contain the lead variant of a GTEx v8 LCL
+(`Cells_EBV-transformed_lymphocytes`) cis-eGene? 
+
+- Lead variant: the most significant variant GTEx reports for an eGene (`egenes` file, qval <= 0.05)
+
+- only co-accessible pairs that survive BH correction, i.e. co-accessibility BH FDR < 0.05 (`fdr` in the 27-sample pooled table, BH across all genome-wide pairs with >= 20 fibers spanning both cCREs), OR > 1, and observed both-open counts above expectation, autosomes only
+
+Allele-specific m6A: reads are labelled REF or ALT by the base they carry at the GTEx lead variant
+(`pair_genotype_calls()`, the read-base rule of the pooled allele test). Only het samples contribute
+(at least 5 informative reads, minor allele at least 2 reads and 15%)
+
+  - `fiber_m6a_proportions()`: scores each het-sample fiber that spans the whole cCRE: its m6A calls / the cCRE positions with at least one m6A call among those fibers (not divided by A/T bases). `ref_m6a_prop` and `alt_m6a_prop` ggregate each allele's fibers: total m6A calls / (fibers x positions).
+
+```{r coaccess-gtex-lead-eqtl}
+gtex_egenes = fread(file.path("/project/spott/cshan/annotations/LCL_public_data/GTEx_Analysis_v8_eQTL",
+  "Cells_EBV-transformed_lymphocytes.v8.egenes.txt.gz"),
+  select = c("gene_id", "gene_name", "variant_id", "pval_nominal", "qval"))[qval <= fdr_cut]
+gtex_egenes[, `:=`(chrom = sub("_.*$", "", variant_id),
+  pos = as.integer(sub("^[^_]+_([0-9]+)_.*$", "\\1", variant_id)))]
+
+# BH-significant positive co-accessible pairs (fdr = BH-adjusted), autosomes only; one row per cCRE and partner
+sig_autosomal = pooled[!is.na(fdr) & fdr < fdr_cut & OR > 1 & co_access > expected_co_access &
+  !chrom %in% c("chrX", "chrY")]
+pair_sides = rbind(
+  sig_autosomal[, .(CRE_ID = CRE1, chrom, start = cre1_start, end = cre1_end, partner = CRE2, dist, OR, fdr)],
+  sig_autosomal[, .(CRE_ID = CRE2, chrom, start = cre2_start, end = cre2_end, partner = CRE1, dist, OR, fdr)])
+sig_cres = unique(pair_sides[, .(CRE_ID, chrom, start, end)])
+lead_in_cre = merge(sig_cres, gtex_egenes, by = "chrom", allow.cartesian = TRUE)[start < pos & pos <= end]
+
+cre_partners = pair_sides[order(fdr), .(n_sig_pairs = .N, partners = paste(sprintf("%s (%s bp, OR %.1f, BH FDR %.2g)",
+  sub("^EH38D[0-9]+\\.", "", partner), dist, OR, fdr), collapse = "; ")), by = CRE_ID]
+coaccess_lead_eqtl = cre_partners[lead_in_cre[, .(CRE_ID, chrom, start, end, lead_variant = variant_id,
+  egene = gene_name, gene_id, eqtl_p = pval_nominal)], on = "CRE_ID"][order(eqtl_p)]
+
+# Aggregated m6A proportion per allele of the lead variant, het samples' full-span fibers
+hsca_manifest = hsca_sample_manifest(params)
+allele_m6a = function(cre_id, chrom, start, end, lead_variant) {
+  snv = strsplit(sub("_b38$", "", lead_variant), "_", fixed = TRUE)[[1]]
+  stopifnot(length(snv) == 4L, nchar(snv[3]) == 1L, nchar(snv[4]) == 1L)
+  region = data.frame(region_id = cre_id, chr = chrom, start = start, end = end,
+    focal_pos = as.integer(snv[2]), ref = snv[3], alt = snv[4])
+  genotypes = pair_genotype_calls(region, hsca_manifest, "/project/spott/cshan/envs/Jupyter-notebook/bin/python3",
+    file.path(params$code_root, "co-accessibility/LCL/hsca/hsca_functions.py"))
+  het = genotypes$calls[genotype == "het", sample_name]
+  out = data.table(n_het_samples = length(het), ref_m6a_prop = NA_real_, alt_m6a_prop = NA_real_,
+                   n_ref_fibers = 0L, n_alt_fibers = 0L)
+  if (!length(het)) return(out)
+  fibers = genotypes$alleles[sample_name %in% het, .(sample_name, original_RID = read_name, allele)]
+  scored = fiber_m6a_proportions(as.data.frame(hsca_manifest[sample_name %in% het]), region, fibers)$fibers[
+    status == "retained"]
+  agg = scored[, .(prop = sum(n_m6a_calls) / sum(n_positions), n = .N), by = allele]
+  out[, `:=`(ref_m6a_prop = agg[allele == "ref", prop][1], alt_m6a_prop = agg[allele == "alt", prop][1],
+             n_ref_fibers = scored[allele == "ref", .N], n_alt_fibers = scored[allele == "alt", .N])]
+  out
+}
+lead_cres = unique(coaccess_lead_eqtl[, .(CRE_ID, chrom, start, end, lead_variant)])
+lead_cres = cbind(lead_cres, rbindlist(Map(allele_m6a, lead_cres$CRE_ID, lead_cres$chrom,
+  lead_cres$start, lead_cres$end, lead_cres$lead_variant)))
+coaccess_lead_eqtl = lead_cres[coaccess_lead_eqtl, on = .(CRE_ID, chrom, start, end, lead_variant)][order(eqtl_p)]
+setcolorder(coaccess_lead_eqtl, c("CRE_ID", "chrom", "start", "end", "lead_variant", "egene", "gene_id", "eqtl_p"))
+fwrite(coaccess_lead_eqtl, file.path(tables_dir, "LCL_hsca_coaccess_cre_gtex_lead_eqtl.tsv"), sep = "\t")
+
+knitr::kable(data.table(
+  set = c("Autosomal BH-significant co-accessible pairs", "cCREs in those pairs",
+          "cCREs containing an eGene lead variant", "eGenes"),
+  n = c(nrow(sig_autosomal), nrow(sig_cres), uniqueN(coaccess_lead_eqtl$CRE_ID), uniqueN(coaccess_lead_eqtl$gene_id))))
+knitr::kable(coaccess_lead_eqtl[, .(cCRE = sub("^EH38D[0-9]+\\.", "", CRE_ID),
+  location = paste0(chrom, ":", start, "-", end), lead_variant, egene,
+  eqtl_p = formatC(eqtl_p, format = "e", digits = 1), n_het_samples,
+  ref_m6a_prop = round(ref_m6a_prop, 3), alt_m6a_prop = round(alt_m6a_prop, 3), n_ref_fibers, n_alt_fibers,
+  n_sig_pairs, partners)])
+```
+
+Two lead-eQTL pairs are plotted with the same molecule, clustering and domain/CTCF methods
+as SLFN5. In both, the pair's focal SNV used to split molecules is the GTEx lead variant.
+
+| Locus | eQTL cCRE | Partner cCRE | Lead variant |
+|---|---|---|---|
+| LZIC | `EH38E1317631.PLS` | `EH38E2785168.pELS` | chr1:9943262 G>A |
+| LINC00462 | `EH38E3065725.pELS` | `EH38E3065723.PLS` | chr13:48591739 G>A |
+
+## LZIC: single-molecule view of both cCREs
+
+```{r lzic-pair-example, include=FALSE}
+lzic = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  lzic = plot_cre_pair(
+    c("EH38D2125386.EH38E1317631.PLS", "EH38D4340705.EH38E2785168.pELS"),
+    label = "LZIC", output_prefix = "LCL_hsca_LZIC")
+}
+```
+
+```{r lzic-retained-counts, echo=FALSE}
+if (!is.null(lzic)) knitr::kable(lzic$read_labels[, .(molecules = .N,
+  samples = uniqueN(sample_name)), by = allele_group])
+```
+
+```{r lzic-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(lzic)) 6 else lzic$phased_plot$height}
+if (!is.null(lzic)) print(lzic$phased_plot$panels$combined)
+```
+
+```{r lzic-configuration-figure, echo=FALSE, fig.width=12, fig.height=6}
+if (!is.null(lzic)) print(lzic$phased_plot$bars)
+```
+
+### LZIC: phased-molecule m6A heatmaps and Manhattan/Leiden clustering
+
+```{r lzic-clustering-summary, echo=FALSE}
+if (!is.null(lzic)) knitr::kable(as.data.table(lzic$phased_molecules$assignments)[,
+  .(molecules = .N, samples = uniqueN(sample_name), in_phased_plot = sum(in_phased_plot),
+    zero_m6a_molecules = sum(n_m6a_calls == 0)), by = cluster][order(cluster)])
+```
+
+```{r lzic-phased-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(lzic)) 8 else lzic$heatmap_height}
+if (!is.null(lzic)) draw_pair_m6a_heatmap(lzic$heatmap_unclustered)
+```
+
+```{r lzic-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(lzic)) 8 else lzic$heatmap_height}
+if (!is.null(lzic)) draw_pair_m6a_heatmap(lzic$heatmap_leiden)
+```
+
+```{r lzic-leiden-profile-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(lzic)) 6 else 1.3 * (lzic$phased_molecules$n_clusters + 1) + 1}
+if (!is.null(lzic)) print(lzic$profile_plot)
+```
+
+## LINC00462: single-molecule view of both cCREs
+
+```{r linc00462-pair-example, include=FALSE}
+linc00462 = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  linc00462 = plot_cre_pair(
+    c("EH38D4766358.EH38E3065725.pELS", "EH38D4766356.EH38E3065723.PLS"),
+    label = "LINC00462", output_prefix = "LCL_hsca_LINC00462")
+}
+```
+
+```{r linc00462-retained-counts, echo=FALSE}
+if (!is.null(linc00462)) knitr::kable(linc00462$read_labels[, .(molecules = .N,
+  samples = uniqueN(sample_name)), by = allele_group])
+```
+
+```{r linc00462-molecule-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(linc00462)) 6 else linc00462$phased_plot$height}
+if (!is.null(linc00462)) print(linc00462$phased_plot$panels$combined)
+```
+
+```{r linc00462-configuration-figure, echo=FALSE, fig.width=12, fig.height=6}
+if (!is.null(linc00462)) print(linc00462$phased_plot$bars)
+```
+
+### LINC00462: phased-molecule m6A heatmaps and Manhattan/Leiden clustering
+
+```{r linc00462-clustering-summary, echo=FALSE}
+if (!is.null(linc00462)) knitr::kable(as.data.table(linc00462$phased_molecules$assignments)[,
+  .(molecules = .N, samples = uniqueN(sample_name), in_phased_plot = sum(in_phased_plot),
+    zero_m6a_molecules = sum(n_m6a_calls == 0)), by = cluster][order(cluster)])
+```
+
+```{r linc00462-phased-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(linc00462)) 8 else linc00462$heatmap_height}
+if (!is.null(linc00462)) draw_pair_m6a_heatmap(linc00462$heatmap_unclustered)
+```
+
+```{r linc00462-leiden-heatmap-figure, echo=FALSE, fig.width=14, fig.height=if (is.null(linc00462)) 8 else linc00462$heatmap_height}
+if (!is.null(linc00462)) draw_pair_m6a_heatmap(linc00462$heatmap_leiden)
+```
+
+```{r linc00462-leiden-profile-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(linc00462)) 6 else 1.3 * (linc00462$phased_molecules$n_clusters + 1) + 1}
+if (!is.null(linc00462)) print(linc00462$profile_plot)
+```
+
+## LZIC and LINC00462: gene, domain and CTCF context
+
+```{r gtex-domain-ctcf-examples, include=FALSE}
+gtex_domain_ctcf = NULL
+if (isTRUE(params$make_molecule_plots)) {
+  gtex_domain_ctcf = list(
+    LZIC = plot_cre_pair_domain_ctcf(
+      c("EH38D2125386.EH38E1317631.PLS", "EH38D4340705.EH38E2785168.pELS"), "LZIC"),
+    LINC00462 = plot_cre_pair_domain_ctcf(
+      c("EH38D4766358.EH38E3065725.pELS", "EH38D4766356.EH38E3065723.PLS"), "LINC00462"))
+}
+```
+
+```{r lzic-domain-ctcf-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(gtex_domain_ctcf)) 12 else 16 + .035 * nrow(gtex_domain_ctcf$LZIC$assignments)}
+if (!is.null(gtex_domain_ctcf)) print(gtex_domain_ctcf$LZIC$combined)
+```
+
+```{r linc00462-domain-ctcf-figure, echo=FALSE, fig.width=12, fig.height=if (is.null(gtex_domain_ctcf)) 12 else 16 + .035 * nrow(gtex_domain_ctcf$LINC00462$assignments)}
+if (!is.null(gtex_domain_ctcf)) print(gtex_domain_ctcf$LINC00462$combined)
+```
+
+```{r session-information, include=FALSE}
+sessionInfo()
+```

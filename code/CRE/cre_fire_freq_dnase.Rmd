@@ -49,7 +49,7 @@ if (params$test) samples <- samples[1]
 `n_reads` counts covered fibers; `n_fire` counts covered fibers with an overlapping
 FIRE element. Before plotting, check all expected region IDs and coordinates,
 sample columns, nonnegative integer counts, pooled totals, and FIRE frequencies.
-Missing or incomplete tables stop the report; they do not trigger counting.
+
 
 ```{r read_counts}
 count_files <- setNames(file.path(run_dir, sprintf("fire_freq.%s.tsv", sets)), sets)
