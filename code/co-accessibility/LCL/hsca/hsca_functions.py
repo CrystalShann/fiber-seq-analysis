@@ -53,6 +53,31 @@ def bedtools_overlaps(a, b):
 # Subset the donor before testing heterozygosity so another donor’s genotype cannot qualify a site.
 # Intersect the SNVs with cCREs and return one row per variant/cCRE overlap.
 
+def focal_vcf_genotype(vcf, cell_line, chrom, pos, ref, alt):
+    """Call an exact PASS biallelic SNV from donor GT, independent of read counts.
+
+    Missing, filtered, non-SNV and allele-mismatched records are uncalled.
+    Phased and unphased diploid GTs use the same heterozygosity rule as het_snvs.
+    File/index errors and absent donor columns fail rather than falling back to reads.
+    """
+    if len(ref) != 1 or len(alt) != 1 or ref == alt:
+        return "uncalled"
+    with pysam.VariantFile(vcf) as variants:
+        if cell_line not in variants.header.samples:
+            raise ValueError(f"Donor {cell_line} is absent from VCF {vcf}")
+        calls = set()
+        for record in variants.fetch(chrom, int(pos) - 1, int(pos)):
+            if (record.pos != int(pos) or record.ref != ref or record.alts != (alt,)
+                    or "PASS" not in record.filter):
+                continue
+            gt = record.samples[cell_line].get("GT")
+            calls.add({(0, 0): "hom_ref", (1, 1): "hom_alt",
+                       (0, 1): "het", (1, 0): "het"}.get(gt, "uncalled"))
+        if len(calls) > 1:
+            raise ValueError(f"Conflicting GTs for {cell_line} at {chrom}:{pos}:{ref}:{alt}")
+        return next(iter(calls), "uncalled")
+
+
 def het_snvs(vcf, cell_line, cres):
     """PASS heterozygous biallelic SNVs of one sample that fall inside a cCRE.
 

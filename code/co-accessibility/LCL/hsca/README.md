@@ -47,3 +47,22 @@ REF/ALT tests use the same coverage threshold throughout: at least 10 REF reads 
 10 ALT reads per donor and cCRE/pair. Pooled tests sum only donor/unit rows meeting
 that threshold. H1/H2 tests and FIRE haplotype-peak intersections are no longer run.
 Phasing remains available for assigning REF/ALT labels in molecule figures.
+
+Donor genotypes in `pair_genotype_calls()` now come from the donor's `cell_line`
+column in `phased_vcf_file`, at the exact chromosome, position, REF and ALT.
+Only PASS biallelic SNVs qualify. Diploid 0/1 and 1/0 are heterozygous whether
+phased or unphased; 0/0 and 1/1 are homozygous. Missing or ineligible records
+are uncalled, never inferred from read counts. REF/ALT read counts remain
+diagnostics and read bases still label individual molecules. The statistical
+tests retain their separate minimum of 10 reads per allele.
+
+For this genotype-source change, rerun the report
+`haplotype_selective_chromatin_accessibility_LCL.Rmd` with
+`make_molecule_plots = TRUE`. This refreshes the domain/CTCF figures and genotype
+summaries for CLASP1, SLFN5, LZIC and LINC00462, plus the GTEx lead-eQTL m6A
+table. In an existing R session, source `hap_sele_access_plots.r` again before
+rerunning those chunks. The step-5 statistical tables already use VCF genotypes:
+neither `LCL_run_hsca.sh` nor upstream co-accessibility needs rerunning solely
+for this change. The separate phased-molecule/clustering panels retain their
+VCF phasing requirement for assigning alleles; that is a molecule-assignment
+filter, not a read-count genotype call.

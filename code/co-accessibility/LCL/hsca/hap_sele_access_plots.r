@@ -850,50 +850,45 @@ plot_rao_zoom = function(rao, region, xlim) {
   list(plot = p + scale_y_continuous(limits = c(-n - .6, .75)), rows = n)
 }
 
-# Genotype of every sample at the focal SNV from each read's own base (hsca_functions.read_alleles,
-# the rule of the pooled allele test), so homozygous donors and samples with wrong or missing VCFs
-# are labelled too. A sample needs >= 5 allele-informative reads; it is het when the minor allele
-# has >= 2 reads and >= 15% of them (a lone discordant HiFi read, or 2 of 48, is an error, not a
-# het), else homozygous for the majority allele.
-#################################################
-# call focal-SNP genotypes from read bases
-#################################################
-# Read REF/ALT bases from each phased-cohort sample CRAM through the Python pileup helper.
-# Require five informative reads; call heterozygous with at least two minor reads and 15% support.
-# Return per-sample genotype calls and per-read allele assignments.
+# Call donor genotypes from the exact PASS biallelic SNV in each donor's VCF.
+# Read counts are diagnostics only; read bases still assign individual REF/ALT molecules.
+# Missing or ineligible VCF records remain uncalled, with no read-count fallback.
 pair_genotype_calls = function(region, manifest, python, hsca_functions) {
   work = tempfile("pair_genotypes_")
   dir.create(work)
   on.exit(unlink(work, recursive = TRUE), add = TRUE)
-  fwrite(manifest[, .(sample_name, cram_path)], file.path(work, "manifest.tsv"), sep = "\t")
+  fwrite(manifest[, .(sample_name, cell_line, phased_vcf_file, cram_path)], file.path(work, "manifest.tsv"), sep = "\t")
   runner = r"---(
 import importlib.util, sys
 import pandas as pd
-source, manifest, chrom, pos, ref, alt, out = sys.argv[1:8]
+source, manifest, chrom, pos, ref, alt, out, calls_out = sys.argv[1:9]
 spec = importlib.util.spec_from_file_location("hsca_functions", source)
 hsca = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hsca)
 variant = pd.DataFrame(dict(variant_id=["focal"], pos=[int(pos)], ref=[ref], alt=[alt]))
+samples = pd.read_csv(manifest, sep="\t")
+calls = [(s.sample_name, hsca.focal_vcf_genotype(
+    s.phased_vcf_file, s.cell_line, chrom, int(pos), ref, alt))
+    for s in samples.itertuples(index=False)]
+pd.DataFrame(calls, columns=["sample_name", "genotype"]).to_csv(calls_out, sep="\t", index=False)
 rows = [(s.sample_name, read, allele)
-        for s in pd.read_csv(manifest, sep="\t").itertuples(index=False)
+        for s in samples.itertuples(index=False)
         for read, allele in hsca.read_alleles(s.cram_path, chrom, variant)["focal"].items()]
 pd.DataFrame(rows, columns=["sample_name", "read_name", "allele"]).to_csv(out, sep="\t", index=False)
 )---"
   writeLines(runner, file.path(work, "run.py"))
   log = file.path(work, "run.log")
   args = c(file.path(work, "run.py"), hsca_functions, file.path(work, "manifest.tsv"), region$chr,
-    region$focal_pos, region$ref, region$alt, file.path(work, "alleles.tsv"))
+    region$focal_pos, region$ref, region$alt, file.path(work, "alleles.tsv"), file.path(work, "calls.tsv"))
   status = system2(python, shQuote(args), stdout = log, stderr = log, env = "PYTHONDONTWRITEBYTECODE=1")
-  if (status != 0L) stop("Focal SNV pileup failed:\n", paste(readLines(log), collapse = "\n"))
+  if (status != 0L) stop("Focal SNV VCF/pileup query failed:\n", paste(readLines(log), collapse = "\n"))
   alleles = fread(file.path(work, "alleles.tsv"))
   calls = merge(manifest[, .(sample_name, donor)],
     alleles[, .(n_ref = sum(allele == "ref"), n_alt = sum(allele == "alt")), by = sample_name],
     by = "sample_name", all.x = TRUE)
   calls[is.na(n_ref), `:=`(n_ref = 0L, n_alt = 0L)]
   calls[, alt_fraction := n_alt / (n_ref + n_alt)]
-  calls[, genotype := fcase(n_ref + n_alt < 5L, "uncalled", pmin(n_ref, n_alt) >= 2L &
-    pmin(n_ref, n_alt) >= .15 * (n_ref + n_alt), "het",
-    n_ref > n_alt, "hom_ref", default = "hom_alt")]
+  calls = merge(calls, fread(file.path(work, "calls.tsv")), by = "sample_name", all.x = TRUE)
   list(calls = calls[order(as.integer(sub("^AL-?([0-9]+).*$", "\\1", sample_name)))], alleles = alleles)
 }
 
@@ -906,7 +901,7 @@ pd.DataFrame(rows, columns=["sample_name", "read_name", "allele"]).to_csv(out, s
 # combine locus context with genotype-grouped molecules
 #################################################
 # Load only the 27 phased samples and verify their pooled co-accessibility counts.
-# Group full-window primary molecules by read-derived genotype and allele, without clustering.
+# Group full-window primary molecules by VCF genotype and read allele, without clustering.
 # Combine gene, loop, domain, motif, cCRE, and m6A tracks into a PDF and return its data.
 plot_cre_pair_domain_ctcf = function(cre_pair, label, region_description = NULL,
     context_flank_bp = 250000, output_dir = file.path(hsca_dir, "CRE_domain_CTCF_anno"),
@@ -1034,8 +1029,8 @@ plot_cre_pair_domain_ctcf = function(cre_pair, label, region_description = NULL,
   molecules = suppressMessages(molecules + snp_line() +
     geom_vline(xintercept = c(cre$left, cre$right), color = "grey60", linetype = "dotted", linewidth = .25) +
     labs(title = NULL, subtitle = NULL, y = "m6A: one row per molecule", caption = paste0(
-      "Left bars: genotype group, sample. Genotype from each sample's reads at the SNP ",
-      "(>= 5 reads; het if the minor allele has >= 2 reads and >= 15%, else the majority allele). ",
+      "Left bars: genotype group, sample. Genotype from donor VCF GT at the exact PASS biallelic SNV. ",
+      "Phased or unphased 0/1 and 1/0 are het; read bases assign REF/ALT molecules. ",
       n_excluded, " molecules without a group excluded.")) +
     guides(fill = guide_legend(ncol = 11, byrow = TRUE)))
 

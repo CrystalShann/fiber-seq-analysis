@@ -172,76 +172,174 @@ pooled_tallies = data.table(
 knitr::kable(pooled_tallies)
 ```
 
-### volcano and scatter plots for REF/ALT allele skew  
+### REF/ALT accessibility and allele-skew plots
 
-REF-vs-ALT accessibility and the volcano, one panel per sample. Blue dashed line: p = 0.05; red dashed line: the largest p-value with BH p \<= 0.05 in that sample
+These eight plots compare REF and ALT molecules from donors who are VCF-heterozygous
+at the selected PASS biallelic SNV. Each donor must have at least 10 REF and 10 ALT
+reads for the cCRE or pair to contribute, including before pooling.
 
-**scatter plots**
+All plots use hexagonal bins: color represents the number of observations in a bin,
+not the direction or significance of an effect. A hexagon can contain multiple cCREs
+or pairs.
 
-REF/ALT accessibility scatterplot
-- X-axis: fraction of REF reads that are open.
-- Y-axis: fraction of ALT reads that are open.
-- For a single cCRE, “open” means that element is accessible.
-- For a pair, “open” means both elements are accessible on the same read
+In every volcano plot, the horizontal axis is ALT minus REF fraction, expressed in
+percentage points. The vertical position uses **−log10(raw p-value)**, with ticks
+labelled by the original p-values; higher means stronger statistical evidence.
+The blue dashed line marks raw p = 0.05. The red dashed line marks the largest raw
+p-value passing BH-adjusted p ≤ 0.05 in that panel; observations at or above it pass
+that corrected threshold. No red line appears if no tests pass BH correction.
 
-| Position | Interpretation |
-|---|---|
-| Near `y = x` | Similar accessibility for REF and ALT |
-| Above the diagonal | ALT has higher accessibility |
-| Below the diagonal | REF has higher accessibility |
-
-**volcano plots**
-X-axis: ALT open fraction − REF open fraction.
-Y-axis: -log2(p), higher means smaller p-value
-Blue dashed line: nominal p = 0.05.
-Red dashed line: the largest raw p-value passing BH-adjusted p ≤0.05 
-
-Far from zero: a substantial accessibility difference.
-High on the plot: strong statistical evidence
-
-X-axis: ALT accessibility − REF accessibility. Right favors ALT; left favors REF; zero means equal accessibility.
-
-| Line | Meaning |
-|---|---|
-| **Blue dashed** | Raw p = 0.05. Observations above it are nominally significant. |
-| **Red dashed** | The largest raw p-value passing BH-adjusted p ≤0.05 in that panel. Observations at or above it pass the corrected threshold. |
-
-Outputs:
-
-| file | What it shows |
-|---|---|
-| `cre_allele_by_sample_ref_vs_alt.pdf` | Single-cCRE REF versus ALT accessibility, one panel per donor |
-| `cre_allele_by_sample_volcano.pdf` | Single-cCRE allele differences and significance, per donor |
-| `pair_allele_by_sample_ref_vs_alt.pdf` | Pair REF versus ALT **both-open fractions**, one panel per donor |
-| `pair_allele_by_sample_volcano.pdf` | Pair allele differences and significance, per donor |
-| `cre_allele_ref_vs_alt.pdf` | Single-cCRE REF versus ALT accessibility pooled across donors |
-| `cre_allele_volcano.pdf` | Pooled single-cCRE allele differences and significance |
-| `pair_allele_ref_vs_alt.pdf` | Pair REF versus ALT both-open fractions pooled across donors |
-| `pair_allele_volcano.pdf` | Pooled pair allele differences and significance |
-
-cCRE-level analysis: For each cCRE, compare its accessibility between REF and ALT reads. Each observation in the plot represents one cCRE.
-Pair-level analysis: For each pair of cCREs, compare how often both are open on the same read between REF and ALT reads. Each observation represents one pair
-
-
-```{r skew-plots}
-
-allele_labels = c("REF accessibility", "ALT accessibility", "Difference between ALT and REF accessibility")
-pair_allele_labels = c("REF both-open fraction", "ALT both-open fraction", "Difference between ALT and REF both-open fraction")
-panels = list(
-  list("LCL_hsca_cre_allele_by_sample", cre_allele_by_sample, "ref_frac_open", "alt_frac_open", allele_labels, "p_adjust", "sample_name"),
-  list("LCL_hsca_pair_allele_by_sample", pair_allele_by_sample, "ref_frac_open", "alt_frac_open", pair_allele_labels, "p_adjust", "sample_name"),
-  list("LCL_hsca_cre_allele", cre_allele[!is.na(p_value)], "ref_frac_open", "alt_frac_open", allele_labels, "fdr", NULL),
-  list("LCL_hsca_pair_allele", pair_allele[!is.na(p_value)], "ref_frac_open", "alt_frac_open", pair_allele_labels, "fdr", NULL))
-for (panel in panels) {
-  name = panel[[1]]; dt = panel[[2]]; labels = panel[[5]]; facet = panel[[7]]
-  if (!nrow(dt)) next
-  size = if (is.null(facet)) c(4, 3.5) else c(10, 9)
-  p1 = plot_ref_vs_alt(dt, panel[[3]], panel[[4]], labels[1], labels[2], facet = facet)
-  p2 = plot_allele_volcano(dt, labels[3], p_adjust = panel[[6]], facet = facet)
-  save_pdf(p1, file.path(plots_dir, paste0(name, "_ref_vs_alt.pdf")), width = size[1], height = size[2])
-  save_pdf(p2, file.path(plots_dir, paste0(name, "_volcano.pdf")), width = size[1], height = size[2])
-  print(p1); print(p2)
+```{r skew-plot-helpers, include=FALSE}
+# Save and display one plot per chunk so its explanation appears directly above it.
+show_allele_plot = function(dt, name, type, pair = FALSE, pooled = FALSE) {
+  if (!nrow(dt)) return(invisible(NULL))
+  facet = if (pooled) NULL else "sample_name"
+  size = if (pooled) c(4, 3.5) else c(10, 9)
+  measure = if (pair) "both-open fraction" else "accessibility"
+  if (type == "ref_vs_alt") {
+    p = plot_ref_vs_alt(dt, "ref_frac_open", "alt_frac_open",
+      paste("REF", measure), paste("ALT", measure), facet = facet)
+  } else {
+    p = plot_allele_volcano(dt, paste("Difference between ALT and REF", measure),
+      p_adjust = if (pooled) "fdr" else "p_adjust", facet = facet)
+  }
+  save_pdf(p, file.path(plots_dir, paste0(name, "_", type, ".pdf")),
+    width = size[1], height = size[2])
+  print(p)
 }
+```
+
+#### 1. Single-cCRE accessibility within each donor
+
+Each panel is one donor, and each observation is one cCRE. The x-axis is the
+fraction of REF reads on which the cCRE is open; the y-axis is the corresponding
+ALT fraction. Above the diagonal means greater ALT accessibility, below means
+greater REF accessibility, and near the diagonal means similar accessibility.
+This plot shows the size and direction of differences; distance from the diagonal
+alone does not establish statistical significance.
+
+Output: `LCL_hsca_cre_allele_by_sample_ref_vs_alt.pdf`.
+
+```{r cre-by-sample-ref-vs-alt}
+show_allele_plot(cre_allele_by_sample, "LCL_hsca_cre_allele_by_sample", "ref_vs_alt",
+  pair = FALSE, pooled = FALSE)
+```
+
+#### 2. Single-cCRE allele differences within each donor
+
+Each panel is one donor, and each observation is one cCRE. The x-axis is ALT open
+fraction minus REF open fraction. For example, 50% ALT versus 20% REF gives
++30 percentage points. The y-axis shows evidence from a two-sided Fisher exact
+test comparing open versus closed read counts between alleles. High observations
+on the right support greater ALT accessibility; high observations on the left
+support greater REF accessibility. BH correction is performed separately within
+each donor across tested cCREs.
+
+Output: `LCL_hsca_cre_allele_by_sample_volcano.pdf`.
+
+```{r cre-by-sample-volcano}
+show_allele_plot(cre_allele_by_sample, "LCL_hsca_cre_allele_by_sample", "volcano",
+  pair = FALSE, pooled = FALSE)
+```
+
+#### 3. Pair both-open fractions within each donor
+
+Each panel is one donor, and each observation is one cCRE pair. The x-axis is the
+fraction of REF reads spanning the pair on which both cCREs are open; the y-axis
+is the corresponding ALT fraction. The denominator includes all eligible spanning
+reads, including those with only one or neither cCRE open. Above the diagonal
+means simultaneous opening is more frequent on ALT molecules; below means it is
+more frequent on REF molecules.
+
+Output: `LCL_hsca_pair_allele_by_sample_ref_vs_alt.pdf`.
+
+```{r pair-by-sample-ref-vs-alt}
+show_allele_plot(pair_allele_by_sample, "LCL_hsca_pair_allele_by_sample", "ref_vs_alt",
+  pair = TRUE, pooled = FALSE)
+```
+
+#### 4. Pair allele differences within each donor
+
+Each observation is one pair in one donor. The x-axis is ALT both-open fraction
+minus REF both-open fraction. Fisher's exact test compares both-open versus all
+other spanning reads between alleles. High observations on the right support more
+frequent simultaneous opening on ALT molecules; high observations on the left
+support REF. BH correction is performed separately within each donor across tested
+pairs. This tests a difference in both-open fractions, not a difference in
+co-accessibility strength after accounting for each cCRE's individual accessibility:
+a difference can arise because one or both cCREs are individually more accessible.
+
+Output: `LCL_hsca_pair_allele_by_sample_volcano.pdf`.
+
+```{r pair-by-sample-volcano}
+show_allele_plot(pair_allele_by_sample, "LCL_hsca_pair_allele_by_sample", "volcano",
+  pair = TRUE, pooled = FALSE)
+```
+
+#### 5. Single-cCRE accessibility pooled across donors
+
+Each observation is one cCRE. Qualifying donors' REF counts are summed together,
+and their ALT counts are summed together, before calculating open fractions.
+The x-axis shows pooled REF accessibility and the y-axis pooled ALT accessibility.
+Above the diagonal favors ALT; below favors REF. These are pooled read fractions,
+not equal-weight averages of donor fractions: donors with more qualifying reads
+contribute more to the corresponding allele's fraction.
+
+Output: `LCL_hsca_cre_allele_ref_vs_alt.pdf`.
+
+```{r cre-pooled-ref-vs-alt}
+show_allele_plot(cre_allele[!is.na(p_value)], "LCL_hsca_cre_allele", "ref_vs_alt",
+  pair = FALSE, pooled = TRUE)
+```
+
+#### 6. Single-cCRE allele differences pooled across donors
+
+Each observation is one cCRE. The x-axis is pooled ALT accessibility minus pooled
+REF accessibility; the y-axis shows Fisher-test evidence from pooled open and
+closed counts. BH correction is across tested cCREs. High observations on the
+right support greater pooled ALT accessibility; those on the left support REF.
+A significant pooled result supports a difference in the combined reads, but does
+not establish that every donor shows the same direction or that the effect is
+consistent across donors.
+
+Output: `LCL_hsca_cre_allele_volcano.pdf`.
+
+```{r cre-pooled-volcano}
+show_allele_plot(cre_allele[!is.na(p_value)], "LCL_hsca_cre_allele", "volcano",
+  pair = FALSE, pooled = TRUE)
+```
+
+#### 7. Pair both-open fractions pooled across donors
+
+Each observation is one cCRE pair. The axes show pooled REF (x) and ALT (y)
+both-open fractions after summing qualifying donors' counts. All eligible spanning
+reads enter the corresponding allele's denominator, including reads with only one
+or neither cCRE open. Above the diagonal means simultaneous opening is more frequent
+among pooled ALT molecules; below means it is more frequent among pooled REF
+molecules. Donors contribute in proportion to their qualifying read counts.
+
+Output: `LCL_hsca_pair_allele_ref_vs_alt.pdf`.
+
+```{r pair-pooled-ref-vs-alt}
+show_allele_plot(pair_allele[!is.na(p_value)], "LCL_hsca_pair_allele", "ref_vs_alt",
+  pair = TRUE, pooled = TRUE)
+```
+
+#### 8. Pair allele differences pooled across donors
+
+Each observation is one pair. The x-axis is pooled ALT both-open fraction minus
+pooled REF both-open fraction. The y-axis shows Fisher-test evidence comparing
+both-open versus other spanning-read counts between alleles. BH correction is
+across tested pairs. High observations away from zero identify supported allele
+differences in simultaneous accessibility: right favors ALT and left favors REF.
+This does not establish a consistent effect in every donor, or an allele difference
+in co-accessibility strength independent of the individual cCREs' accessibility.
+
+Output: `LCL_hsca_pair_allele_volcano.pdf`.
+
+```{r pair-pooled-volcano}
+show_allele_plot(pair_allele[!is.na(p_value)], "LCL_hsca_pair_allele", "volcano",
+  pair = TRUE, pooled = TRUE)
 ```
 
 #### Are pooled co-accessible pairs allele-skewed?
@@ -517,8 +615,10 @@ Which cCREs in significant positive co-accessible pairs contain the lead variant
 - only co-accessible pairs that survive BH correction, i.e. co-accessibility BH FDR < 0.05 (`fdr` in the 27-sample pooled table, BH across all genome-wide pairs with >= 20 fibers spanning both cCREs), OR > 1, and observed both-open counts above expectation, autosomes only
 
 Allele-specific m6A: reads are labelled REF or ALT by the base they carry at the GTEx lead variant
-(`pair_genotype_calls()`, the read-base rule of the pooled allele test). Only het samples contribute
-(at least 5 informative reads, minor allele at least 2 reads and 15%)
+(`pair_genotype_calls()`). Only donors with a heterozygous VCF GT (0/1 or 1/0, phased or
+unphased) at the exact PASS biallelic SNV contribute, matching the statistical tests' genotype
+rule. Read counts do not determine genotype. `n_het_samples` counts VCF-het donors even if
+no usable fibers are available; fiber counts report the actual m6A coverage.
 
   - `fiber_m6a_proportions()`: scores each het-sample fiber that spans the whole cCRE: its m6A calls / the cCRE positions with at least one m6A call among those fibers (not divided by A/T bases). `ref_m6a_prop` and `alt_m6a_prop` ggregate each allele's fibers: total m6A calls / (fibers x positions).
 
