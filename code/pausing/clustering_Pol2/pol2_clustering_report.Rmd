@@ -1,0 +1,100 @@
+---
+title: "Global Pol II footprint-positive LCL clustering"
+output:
+  html_document:
+    self_contained: true
+params:
+  output: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(data.table)
+library(ggplot2)
+cfg <- yaml::read_yaml(file.path(params$output, "run_config.yaml"))
+here <- file.path(cfg$project, "code/pausing/clustering_Pol2")
+source(file.path(here, "pol2_clustering_functions.R"))
+source(file.path(here, "pol2_clustering_plots.R"))
+pol2_load_helpers(cfg$project)
+x <- readRDS(file.path(params$output, "tables", "clustering.rds"))
+annotation <- readRDS(file.path(params$output, "tables", "annotations.rds"))
+m <- annotation$molecules
+fp <- annotation$footprints
+res <- pol2_heatmap_result(x, annotation, cfg$heatmap_max_reads, cfg$seed)
+sample_colors <- pol2_sample_colors(cfg, res$assignments$sample_name)
+clusters <- levels(res$assignments$cluster)
+k <- length(clusters)
+```
+
+This is one global clustering across all configured LCL samples. Each included molecule
+fully spans the window (−1000 to +999 bp) of a FANTOM5 dominant TSS that lies in a Pol II
+IDR peak, and carries at least one 30–60 bp FiberHMM v2 footprint, from its own sample's
+`recalled_tf` calls, overlapping that window.
+Duplicate footprint records are counted once. Other molecules do not enter clustering.
+Denominators use observed m6A sites across all full-window
+molecules at each TSS, before random sampling.
+
+The analysis contains `r nrow(m)` randomly selected molecules, out of
+`r x$eligible_molecules` eligible ones, from `r uniqueN(m$sample_name)` contributing
+samples and `r uniqueN(m$tss_id)` TSSs.
+Up to 5,000 unique sample/read molecules are drawn without replacement from all samples
+combined, using seed 1. When a molecule qualifies at multiple TSSs, one eligible TSS
+is randomly selected for that molecule. Cluster fractions describe this random sample
+of the selected population, not all TSS-spanning molecules or cells.
+The footprint criterion is candidate evidence for Pol II association, not protein identification.
+
+Clusters are shown in order of their median pausing index (Day 2016 PI from
+`pause_index.tsv`, joined by Ensembl gene ID; each TSS counted once per cluster), lowest first.
+
+```{r heatmap, fig.width=14, fig.height=11 + 0.55 * k}
+pol2_draw_heatmap(pol2_molecule_heatmap(res, sample_colors), clusters, profiles = TRUE)
+```
+
+```{r profiles, fig.width=10, fig.height=1.4 * k + 2.5}
+pol2_plot_profiles(annotation)
+```
+
+Heatmap, average profiles with the median PI, and bulk Pol II ChIP fold-enrichment over
+each molecule's TSS region (−50 to +299 bp; log2 of the cluster mean over the mean of all
+molecules, Wilcoxon test of the cluster against all others, BH over clusters), in the
+layout of Fig. 1c of the nano-NOMe-seq paper.
+
+```{r fig1c, fig.width=16, fig.height=max(7, 0.9 * k + 2)}
+pol2_fig1c(res, annotation, sample_colors)
+```
+
+```{r summary}
+knitr::kable(annotation$summary, digits = 3)
+```
+
+```{r footprints, fig.width=10, fig.height=1.4 * k + 2.5}
+pol2_plot_footprints(annotation)
+```
+
+Each molecule's 30–60 bp footprints, one row per molecule in the heatmap's order.
+
+```{r footprint-molecules, fig.width=9, fig.height=11 + 0.55 * k}
+pol2_plot_footprint_molecules(res, annotation)
+```
+
+Pol II fold-enrichment is measured over each candidate footprint. The boxplot
+summarizes a molecule's footprints first, to avoid giving molecules with several
+footprints extra weight. Bulk Pol II signal is shared locus evidence, not an independent
+measurement of polymerase binding on each molecule.
+
+```{r signal, fig.width=9, fig.height=4}
+signal <- fp[, .(signal = if (all(is.na(pol2_mean))) NA_real_ else mean(pol2_mean, na.rm = TRUE)), by = .(cluster, observation_id)]
+ggplot(signal, aes(cluster, signal)) + geom_boxplot(outlier.shape = NA) + theme_bw() +
+  labs(x = "Cluster", y = "Mean Pol II fold-enrichment across candidate footprints")
+```
+
+PI is joined by Ensembl gene ID; the RefSeq TSS of `pause_index.tsv` can differ from the
+FANTOM5 TSS used here.
+
+```{r pi, fig.width=9, fig.height=4}
+pi_sites <- unique(m[, .(cluster, tss_id, pi)])
+if (any(is.finite(pi_sites$pi))) {
+  print(ggplot(pi_sites[is.finite(pi)], aes(cluster, pi)) + geom_boxplot(outlier.shape = NA) +
+          scale_y_log10() + theme_bw() + labs(y = "PI (one value per TSS within each cluster)"))
+} else cat("No matching PI values have been supplied.")
+```

@@ -1,0 +1,28 @@
+project: /project/spott/cshan/fiber-seq
+samples: /project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv
+expected_samples: 31
+tss: /project/spott/cshan/annotations/fantom5_LCL/fantom5.hg38.LCL.dominant_TSS.bed.gz
+chrom_sizes: /project/spott/cshan/annotations/hg38.chrom.sizes
+# Per-sample FiberHMM v2 TF calls: <footprint_dir>/<sample>/<sample>.recalled_tf.bed.gz (BED15, tabix).
+footprint_dir: /project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/FiberHMM_v2/results/results_v1_trained_model
+# The TSS base must overlap a Pol II IDR peak.
+peaks: /project/spott/cshan/annotations/LCL_public_data/Pol2_chip/ENCFF886PSD.bed.gz
+# Pol II fold-enrichment over each TSS (-50..+299, Fig. 1c bars) and over sampled footprints.
+signal: /project/spott/cshan/annotations/LCL_public_data/Pol2_chip/ENCFF328MMS.bigWig
+output: /project/spott/cshan/fiber-seq/LCL_project/pausing/clustering_Pol2
+chromosomes: [chr1, chr2, chr3, chr4, chr5, chr6, chr7, chr8, chr9, chr10, chr11, chr12, chr13, chr14, chr15, chr16, chr17, chr18, chr19, chr20, chr21, chr22, chrX]
+bin_bp: 50
+k_neighbors: 10
+resolution: 1
+seed: 1
+sample_n: 5000
+# Conservative estimate includes dense distance workspaces, not just the final matrix.
+max_memory_gb: 24
+heatmap_max_reads: 5000
+# Day 2016 PI; joined by Ensembl gene ID (column ensg) although its RefSeq TSSs differ.
+# null = no PI; clusters then keep their Leiden size order.
+pi_table: /project/spott/cshan/fiber-seq/LCL_project/pausing/pause_index.tsv
+# ENCODE GM12878 RNA-seq ENCSR820PHH (RSEM gene TPM, two replicates), used by pol2_expression.R.
+expression:
+- /project/spott/cshan/annotations/LCL_public_data/gene_quan_ENCSR820PHH/ENCFF873VWU.gene_quan.tsv
+- /project/spott/cshan/annotations/LCL_public_data/gene_quan_ENCSR820PHH/ENCFF345SHY.gene_quan.tsv

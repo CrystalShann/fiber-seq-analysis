@@ -1,0 +1,93 @@
+---
+title: "Pol II pausing: example genes"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Example genes for the Tullius et al. Figure 1F plots, chosen from the Day et al. 2016 pausing
+index (`LCL_project/pausing/pause_index.tsv`, `code/pausing/cal_pausing_index/pause_index.R`).
+Reads are read for each gene's TSS ± 1 kb when needed: fibertools nucleosome calls of the 31 LCL
+samples (`ft extract --nuc`) and the FiberHMM combined 10–80 bp footprints. The selection
+functions are in `pol2_functions.R`, the plot in `polII_pausing_plots.r`.
+
+Outputs: `LCL_project/pausing/PolII/tables/example_genes.tsv` and
+`LCL_project/pausing/PolII/plots/example_reads/<gene>.pdf`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("/project/spott/cshan/fiber-seq/code/pausing/PolII/polII_pausing_plots.r")
+```
+
+## Inputs
+
+The pausing-index table.
+
+```{r inputs}
+pi_tab <- fread(PI_TABLE)
+pi_tab[analysis_set == TRUE,
+       .(genes = .N, median_pi = median(pi), median_fpkm = median(fpkm)),
+       keyby = .(pi_bin = factor(pi_bin, levels = PI_BINS))]
+```
+
+## Candidates
+
+`example_candidates()`: analysis-set genes with no other gene's CAGE dominant TSS within
+`OTHER_TSS_BP`; FPKM band = middle 50% of the analysis set; distance = |PI percentile − percentile
+of the tertile median| + |FPKM percentile − 0.5|.
+
+```{r candidates}
+an <- example_candidates(pi_tab)
+an[, .(genes = .N, candidates = sum(candidate), in_fpkm_band = sum(candidate & in_fpkm_band)),
+   keyby = pi_bin]
+```
+
+## Examples per PI tertile
+
+`pick_examples()`: per tertile, the first `N_EXAMPLES` candidates in the FPKM band, nearest the
+target first, with at least `MIN_READS` fibers (`window_fiber_count()`: reads with an ft nucleosome
+record in TSS ± 1 kb, counted only for the genes looked at).
+
+```{r picks}
+picks <- pick_examples(an)
+picks[, .(group, gene_name, pi = signif(pi, 3), fpkm, n_reads, nearest_tss_bp,
+          distance = round(distance, 3))]
+```
+
+## Positive control
+
+`control_status()`: why each textbook paused gene (`CONTROL_GENES`) passes or fails (high
+tertile, no other TSS within 1 kb, at least `MIN_READS` fibers); `add_control()` adds the
+highest-PI one that passes.
+
+```{r control}
+controls <- control_status(pi_tab, an)
+controls[, .(gene_name, chrom, pi = signif(pi, 3), fpkm, pi_bin, n_reads, status)]
+picks <- add_control(picks, an, controls)
+```
+
+## Table
+
+`write_example_table()`: `tables/example_genes.tsv`.
+
+```{r table}
+write_example_table(picks)
+```
+
+## Plots
+
+`plot_tss_example()`: one PDF per gene in `plots/example_reads/`, centered on the gene's
+FANTOM5 LCL dominant TSS (`fantom5.hg38.LCL.dominant_TSS.bed.gz`). Matching uses ENSG,
+then gene symbol, on the same chromosome and strand; missing or ambiguous matches stop plotting.
+30–<60 bp footprints containing a called sense GRO-seq peak are labeled PPP; 60–80 bp
+footprints containing a called sense CAGE peak are labeled PIC. Other footprints in these
+two size classes are gray and labeled unknown. Peak overlap means containing a called peak
+base, not merely lying inside the peak-search window. GRO-seq peaks are searched at +20..+349 bp
+and CAGE peaks at −50..+49 bp relative to the FANTOM5 TSS.
+Example selection, the exported table's TSS, and pausing indices retain the original RefSeq
+TSS definition; plotting rereads fibers and signals around the FANTOM5 TSS.
+
+```{r plots}
+for (g in picks$gene_name) plot_tss_example(g)
+list.files(file.path(OUT_DIR, "plots/example_reads"))
+```
