@@ -10,7 +10,7 @@
 #'   expression   ENCSR820PHH gene_quan FPKM, mean of the two replicates (GENCODE V29), joined on
 #'                the GENCODE v46 gene_id of the RefSeq gene symbol
 #'
-#' Method (Day et al.)
+#' Method (Day et al., 2026)
 #'   TSSR       TSS -50..+299 (L1 = 350 bp)
 #'   gene body  TSS +300 .. TES +3000 (L2 = its length)
 #'   reads      counted at their 5' end; reads with the same 5' end and strand in a replicate are
@@ -27,9 +27,7 @@
 #'   filters    near_other_gene: the gene (all isoforms) +/- 3 kb overlaps another RefSeq gene
 #'              (either strand); short: chosen isoform TSS..TES < 1 kb
 #'
-#' analysis_set (PolII example genes): chosen isoform NM_ (protein-coding),
-#'   chr1-22 (FiberHMM is autosomal), FPKM > 1, neither filter, has a PI. pi_bin = PI tertile
-#'   within it.
+#' analysis_set (PolII example genes): chosen isoform NM_ (protein-coding)
 #'
 #' Output: LCL_project/pausing/pause_index.tsv, one row per RefSeq gene; gene_id = gene_name =
 #'   RefSeq symbol; coordinates 1-based inclusive.
@@ -63,33 +61,66 @@ EXPR_FPKM <- 1
 stopifnot(all(file.exists(c(REFSEQ, GTF, CHIP, INPUT, EXPR))))
 
 # --- RefSeq isoforms --------------------------------------------------------------
+# loads RefSeq transcripts from hg38.refGene.gtf.gz
+
+#bgene_id is the gene symbol (for example TP53), and transcript_id is the RefSeq accession (NM_… for protein-coding, NR_… for non-coding)
 tx <- fread(cmd = paste("zcat", REFSEQ, "| awk -F'\t' '$3 == \"transcript\"' | cut -f1,4,5,7,9"),
             header = FALSE, col.names = c("chrom", "start", "end", "strand", "attr"), quote = "")
 tx[, `:=`(gene = sub('.*gene_id "([^"]+)".*', "\\1", attr),
           tx_id = sub('.*transcript_id "([^"]+)".*', "\\1", attr), attr = NULL)]
+
+# only keeps chr1-22, X because GM12878 is derived from female
 tx <- tx[chrom %in% CHROMS]
+
+# build a gene table for all isoforms for a given gene
+
+# 1. groups all isoforms of a gene and takes the smallest start and largest end --> each gene’s window
+# 2. group by gene and chr -> a gene that has isoforms on two chromosomes gets two rows
+# 3. strand is ignored ->  + and − isoforms of the same gene are merged into one span
+
 all_genes <- tx[, .(start = min(start), end = max(end)), by = .(gene, chrom)]   # for the 3 kb filter
+
+# remove genes have isoform in more than one (chr, strand) combination
 multi <- tx[, uniqueN(paste(chrom, strand)), by = gene][V1 > 1L, gene]
 tx <- tx[!gene %in% multi]
+
+# calculate TSS, TES and gene length (1-based GTF coordinates)
+# length include introns
 tx[, `:=`(tss = fifelse(strand == "+", start, end), tes = fifelse(strand == "+", end, start),
           len = end - start + 1L)]
+
+# how many genes and isoforms remain after the filtering, and how many genes were removed for having multiple locations
 message(uniqueN(tx$gene), " RefSeq genes (", nrow(tx), " isoforms) on chr1-22, chrX; ",
         length(multi), " genes on several chromosomes / strands dropped")
 
 # --- Pol II ChIP and input reads --------------------------------------------------
-# 5' ends of one replicate, collapsed by position and strand
+# Pol II ready density
+
+# 1. read_ends() reads one alignment BED file and keeps one entry per distinct read 5′ end
+# 2. read_library() pools replicates and builds a per-base coverage track plus a library size
+# 3. region_reads() counts the 5′ ends that fall in any 1-based region
+# 4. rpm_bp() turns a count into a depth- and length-normalized density
+# 5. tssr() applies all of this to the window around each TSS and subtracts the input
+
+# get 5' ends of one replicate, collapsed by position and strand
+# each row is one aligned read of where PolII is bound extracted from bam files
 read_ends <- function(path) {
   r <- fread(cmd = paste("zcat", shQuote(path)), header = FALSE, select = c(1, 2, 3, 6),
              col.names = c("chrom", "start0", "end", "strand"))
   unique(r[, .(chrom, pos = fifelse(strand == "+", start0 + 1L, end), strand)])
 }
+
 # per-base 5'-end counts and library size of pooled replicates
+# takes takes the BED files of one experiment (the 7 Pol II ChIP replicates, or the 2 input replicates)
+# return: how many read 5' ends are in total, used for "per million scaling" AND per-chr track says how many 5' ends at each base
 read_library <- function(paths) {
   ends <- rbindlist(lapply(paths, read_ends))
   list(n = nrow(ends), cov = coverage(GRanges(ends$chrom, IRanges(ends$pos, width = 1L))))
 }
-# reads of a library in 1-based regions (coverage stops at the chromosome's last read, so regions
-# beyond it have none)
+
+# rpm/bp = reads per million, per base pair = rpm/bp = reads / len / (n / 1e6)
+# n = library size, total # of 5' ends in the pooled library
+# returns the number of 5' ends in each region
 region_reads <- function(lib, chrom, start, end) {
   out <- numeric(length(chrom))
   for (cc in intersect(unique(chrom), names(lib$cov))) {
@@ -105,6 +136,7 @@ input <- read_library(INPUT)
 message("library reads (collapsed, pooled replicates): ChIP ", chip$n, ", input ", input$n)
 
 # TSSR of an annotated TSS: list(start, end, chip, input, signal)
+# finds each TSSR, counts the ChIP and input reads in it, and returns the background-subtracted signal
 tssr <- function(chrom, tss, strand) {
   s <- pmax(1L, fifelse(strand == "+", tss + TSSR[1], tss - TSSR[2]))
   e <- fifelse(strand == "+", tss + TSSR[2], tss - TSSR[1])
@@ -114,6 +146,12 @@ tssr <- function(chrom, tss, strand) {
 }
 
 # --- optimal isoform: strongest TSSR, then the longest isoform with that TSS ------
+# picks one isoform per gene to caclulate pausing pausing index
+
+# 1. for a gene's distinct annotated TSS, choose the one with the strongest Pol II signal in TSSR
+# 2. among isoforms that share that TSS, choose the longest
+# 3. record how many isoforms and distinct TSS the gene has
+
 cand <- unique(tx[, .(gene, chrom, strand, tss)])
 cand[, tssr_dens := tssr(chrom, tss, strand)$signal]
 setorder(cand, gene, -tssr_dens, tss)
@@ -124,6 +162,11 @@ g <- g[!duplicated(gene)]
 g <- merge(g, tx[, .(n_isoforms = .N, n_tss = uniqueN(tss)), by = gene], by = "gene")
 
 # --- regions, densities, PI -------------------------------------------------------
+# computes pausing index for each gene's chosen isoform
+# TSSR signal is the background-subtracted Pol II density at the promoter.
+# Gene-body signal is the background-subtracted Pol II density along the transcribed region
+# PI = TSSR signal / gene-body signal. A high value means Pol II is concentrated at the promoter relative to the body
+
 ts <- tssr(g$chrom, g$tss, g$strand)
 plus <- g$strand == "+"
 g[, `:=`(tssr_start = ts$start, tssr_end = ts$end, chip_tssr = ts$chip, input_tssr = ts$input,
@@ -138,7 +181,11 @@ g[, active := tssr_dens >= MIN_DENS]
 g[, pi := fifelse(active & body_dens > 0, tssr_dens / body_dens, NA_real_)]
 g[, paused := !is.na(pi) & pi >= PAUSED_PI]
 
-# --- Day et al. gene filters ------------------------------------------------------
+# --- gene filters -----------------------------------------------------
+# filter for genes that are near other genes and/or short
+# 1. near other gene: other genes lies within 3kb of this gene
+# 2. short: isoform span less than 1kb from TSS to TES
+
 span <- tx[, .(chrom = chrom[1], start = min(start), end = max(end)), by = gene][match(g$gene, gene)]
 hits <- findOverlaps(GRanges(span$chrom, IRanges(pmax(1L, span$start - PAD), span$end + PAD)),
                      GRanges(all_genes$chrom, IRanges(all_genes$start, all_genes$end)))
@@ -147,6 +194,11 @@ g[, near_other_gene := seq_len(.N) %in% queryHits(hits)]
 g[, short := abs(tes - tss) + 1L < MIN_LEN]
 
 # --- expression, analysis set, tertiles -------------------------------------------
+
+# 1. link RefSeq gene symbols to GENCODE gene IDs (pausing index is computed using RefSeq, but expression data uses Ensembl ID)
+# 2. load expression data and average between replicates
+# 3. for genes that are expressed, not short or near other genes, split them into low/mid/high PI groups
+
 gc <- fread(cmd = paste("zcat", GTF, "| awk -F'\t' '$3 == \"gene\"' | cut -f9"), header = FALSE,
             col.names = "attr", quote = "", sep = "\t")
 gc <- unique(gc[, .(ensg = sub("\\..*", "", sub('.*gene_id "([^"]+)".*', "\\1", attr)),

@@ -1,9 +1,9 @@
 # Count footprint-positive full-window molecules independently of m6A denominators.
 project <- "/project/spott/cshan/fiber-seq"
 here <- file.path(project, "code/pausing/clustering_Pol2")
-source(file.path(here, "pol2_clustering_functions.R"))
+source(file.path(here, "pol2_chip_cluster_utils", "pol2_clustering_functions.R"))
 pol2_load_helpers(project)
-if (!exists("cfg", inherits = FALSE)) cfg <- yaml::read_yaml(file.path(here, "config.yaml"))
+if (!exists("cfg", inherits = FALSE)) cfg <- yaml::read_yaml(file.path(here, "pol2_chip_cluster_utils", "config.yaml"))
 prep <- pol2_read_prepared(cfg)
 tf_paths <- pol2_tf_path(prep$samples, cfg$footprint_dir)
 count_chrom <- function(chromosome) {

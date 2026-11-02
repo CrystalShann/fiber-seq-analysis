@@ -410,31 +410,37 @@ report_figure_frame <- function(plot, region_data, caption = NULL) {
 
 <!-- plot the mean ACF of each cluster as curves and as a heatmap. Parameters: lag 0 omitted, no smoothing; lower/upper set the lag range (default all nonzero lags) -->
 ```{r report-cluster-acf-function, include=FALSE}
-plot_report_cluster_acf <- function(region_data, lower = 1, upper = Inf, title = "Cluster averages; no smoothing") {
+plot_report_cluster_acf <- function(region_data, lower = 1, upper = Inf, title = "Cluster averages; no smoothing",
+                                    groups = NULL, colors = NULL, panels = FALSE,
+                                    display = "combined", show_counts = TRUE, frame = TRUE) {
   source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r", local = TRUE)
   d <- region_data$tables$cluster_acf_summary
   if (!is.data.frame(d) || !nrow(d)) return(report_empty_plot("No clustered reads", region_data$region$region_id))
   d <- d[d$lag_bp >= lower & d$lag_bp <= upper, , drop = FALSE]
   if (!nrow(d)) return(report_empty_plot("No nonzero ACF lags available", region_data$region$region_id))
-  groups <- as.character(sort(unique(as.integer(as.character(d$cluster)))))
+  if (is.null(groups)) groups <- as.character(sort(unique(as.integer(as.character(d$cluster)))))
   d$cluster <- factor(d$cluster, levels = groups)
-  colors <- cluster_id_palette(groups)
+  if (is.null(colors)) colors <- cluster_id_palette(groups)
   counts <- d$n_reads[match(groups, d$cluster)]
   curves <- ggplot2::ggplot(d, ggplot2::aes(lag_bp, mean_acf, color = cluster)) +
     ggplot2::geom_hline(yintercept = 0, color = "grey60", linewidth = .3) +
     ggplot2::geom_line(linewidth = .4) +
-    ggplot2::scale_color_manual(values = colors, labels = paste0("C", groups, " (n=", counts, ")")) +
+    ggplot2::scale_color_manual(values = colors, labels = if (show_counts) paste0("C", groups, " (n=", counts, ")") else groups) +
     ggplot2::labs(title = title, x = "Lag (bp)", y = "Mean ACF", color = "Cluster") +
     ggplot2::theme_bw(base_size = 10)
   bound <- max(c(abs(d$mean_acf[is.finite(d$mean_acf)]), .01))
   heatmap <- ggplot2::ggplot(d, ggplot2::aes(lag_bp, cluster, fill = mean_acf)) +
     ggplot2::geom_tile(width = 1, height = 1) +
-    ggplot2::scale_y_discrete(limits = rev(groups), labels = paste0("C", rev(groups))) +
+    ggplot2::scale_y_discrete(limits = rev(groups), labels = if (show_counts) paste0("C", rev(groups)) else rev(groups)) +
     ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
       midpoint = 0, limits = c(-bound, bound), name = "Mean ACF") +
     ggplot2::scale_x_continuous(expand = c(0, 0)) +
     ggplot2::labs(x = "Lag (bp)", y = "Cluster") + ggplot2::theme_bw(base_size = 10)
-  report_figure_frame(cowplot::plot_grid(curves, heatmap, ncol = 1), region_data)
+  if (panels) curves <- curves + ggplot2::facet_wrap(~cluster, ncol = 1, drop = FALSE)
+  heatmap <- heatmap + ggplot2::labs(title = title)
+  result <- switch(display, curves = curves, heatmap = heatmap,
+    combined = cowplot::plot_grid(curves, heatmap, ncol = 1), stop("Unknown ACF display"))
+  if (frame) report_figure_frame(result, region_data) else result
 }
 ```
 

@@ -132,7 +132,17 @@ load_promoter_table <- function(path) {
 #     (tss_offset = canonical - promoter TSS).
 #   custom regions: anchor = region centre, plus strand, window = the region.
 build_region_anchors <- function(regions, promoters, gencode_tss,
-                                 half_width = VIEW_HALF_WIDTH) {
+                                 half_width = VIEW_HALF_WIDTH, relative_window = c(-half_width, half_width),
+                                 anchor_table = NULL) {
+  if (!is.null(anchor_table)) {
+    a <- as.data.table(copy(anchor_table))
+    stopifnot(length(relative_window) == 2L, relative_window[1] <= relative_window[2],
+      all(c("region_id", "chr", "anchor", "strand") %in% names(a)))
+    a[, `:=`(view_start = anchor + fifelse(strand == "-", -relative_window[2], relative_window[1]),
+      view_end = anchor + fifelse(strand == "-", -relative_window[1], relative_window[2]),
+      rel_view_start = relative_window[1], rel_view_end = relative_window[2])]
+    return(a)
+  }
   reg <- as.data.table(regions)[, .(region_id = as.character(region_id),
                                      chr = as.character(chr),
                                      start = as.integer(start), end = as.integer(end))]
@@ -153,7 +163,8 @@ build_region_anchors <- function(regions, promoters, gencode_tss,
     anchor_source = "GENCODE v46 canonical TSS",
     tss_offset = fifelse(canonical_strand == "+", canonical_tss - promoter_tss,
                          promoter_tss - canonical_tss),
-    view_start = canonical_tss - half_width, view_end = canonical_tss + half_width)]
+    view_start = canonical_tss + fifelse(canonical_strand == "-", -relative_window[2], relative_window[1]),
+    view_end = canonical_tss + fifelse(canonical_strand == "-", -relative_window[1], relative_window[2]))]
   a[region_type == "custom", `:=`(
     anchor = (start + end) %/% 2L, strand = "+", anchor_source = "region centre",
     view_start = start, view_end = end)]
@@ -238,7 +249,7 @@ build_read_table <- function(assignments, anchors) {
              by = "region_id")
   r[, c("rel_read_start", "rel_read_end") :=
         rel_interval(read_start, read_end, anchor, strand)]
-  setorder(r, region_id, cluster, timepoint, RID)
+  setorderv(r, intersect(c("region_id", "cluster", "timepoint", "RID"), names(r)))
   r[]
 }
 
@@ -269,7 +280,44 @@ extract_tf_footprints <- function(reads, chr, view_start, view_end,
 # Footprints of every clustered read over its region's window, in genomic
 # (BED) and anchor-relative coordinates. One row per footprint; join to the
 # read table on (region_id, RID, sample_name) to attach cluster and timepoint.
-extract_region_footprints <- function(reads, anchors) {
+extract_region_footprints <- function(reads, anchors, input_paths = NULL, include_tf = TRUE,
+                                      original_id_col = "RID") {
+  # Explicit per-sample paths support other cohorts without changing macrophage defaults.
+  # Batch tabix queries return complete BED records; never clip block boundaries.
+  if (!is.null(input_paths)) {
+    stopifnot(!include_tf, all(unique(reads$sample_name) %in% names(input_paths)),
+      !anyDuplicated(reads[, .(region_id, RID)]))
+    out <- list()
+    for (sn in unique(reads$sample_name)) {
+      rr <- reads[sample_name == sn]
+      aa <- anchors[region_id %in% rr$region_id]
+      path <- input_paths[[sn]]
+      if (!all(file.exists(c(path, paste0(path, ".tbi"))))) stop("Missing footprint input/index: ", path)
+      ranges <- GenomicRanges::reduce(GRanges(aa$chr, IRanges(aa$view_start, aa$view_end)))
+      raw <- read_tabix_region(path, ranges)
+      if (!nrow(raw)) next
+      raw <- unique(raw[raw[[4]] %in% rr[[original_id_col]], , drop = FALSE])
+      if (!nrow(raw)) next
+      blocks <- as.data.table(convert_ft_bed12_to_bed6(raw, format = "bed13_fiberhmm",
+        source = path, keep_block_scores = TRUE, validate_blocks = TRUE))
+      blocks <- unique(blocks[, .(original_read = RID, chr, fp_start = start, fp_end = end, block_score)])
+      map <- rr[, .(original_read = get(original_id_col), region_id, RID)]
+      fp <- merge(blocks, map, by = "original_read", allow.cartesian = TRUE)
+      fp <- merge(fp, aa[, .(region_id, anchor_chr = chr, anchor, strand, view_start, view_end)], by = "region_id")
+      fp <- fp[chr == anchor_chr & fp_end >= view_start & fp_start < view_end]
+      if (!nrow(fp)) next
+      fp[, c("rel_start", "rel_end") := rel_interval(fp_start + 1L, fp_end, anchor, strand)]
+      fp[, `:=`(fp_mid = (fp_start + 1L + fp_end)/2, rel_mid = (rel_start + rel_end)/2,
+        fp_size = fp_end - fp_start, sample_name = sn, fp_class = "nucleosome")]
+      out[[sn]] <- fp[, .(region_id, RID, sample_name, fp_class, fp_start, fp_end,
+        fp_mid, rel_start, rel_end, rel_mid, fp_size, block_score)]
+      message("Nucleosome extraction: ", sn, "; ", nrow(rr), " molecules")
+    }
+    if (!length(out)) return(data.table(region_id=character(), RID=character(), sample_name=character(),
+      fp_class=character(), fp_start=integer(), fp_end=integer(), fp_mid=numeric(), rel_start=integer(),
+      rel_end=integer(), rel_mid=numeric(), fp_size=integer(), block_score=numeric()))
+    return(rbindlist(out))
+  }
   out <- list()
   for (i in seq_len(nrow(anchors))) {
     m  <- anchors[i]
@@ -294,7 +342,7 @@ extract_region_footprints <- function(reads, anchors) {
     }))
     fp <- rbindlist(list(
       nuc,
-      extract_tf_footprints(rr, m$chr, m$view_start, m$view_end)),
+      if (include_tf) extract_tf_footprints(rr, m$chr, m$view_start, m$view_end)),
       use.names = TRUE)
     if (!nrow(fp)) next
     fp[, c("rel_start", "rel_end") := rel_interval(fp_start + 1L, fp_end, m$anchor, m$strand)]
@@ -334,7 +382,32 @@ covered_positions <- function(dt, start_col, end_col, positions) {
 #   denominator reads of the group whose alignment spans pos
 # `by` must include region_id (relative coordinates are per region).
 occupancy_profile <- function(footprints, reads, anchors, by = c("region_id", "cluster"),
-                              bin_size = PROFILE_BIN_BP) {
+                              bin_size = PROFILE_BIN_BP, metric = "occupancy") {
+  if (metric == "centers") {
+    # Half-open bins partition the closed display window; density is centers/molecule/bp.
+    result <- list()
+    windows <- unique(anchors[, .(rel_view_start,rel_view_end)])
+    for (j in seq_len(nrow(windows))) {
+      a <- windows[j]
+      region_ids <- anchors[rel_view_start == a$rel_view_start & rel_view_end == a$rel_view_end,region_id]
+      rr <- reads[region_id %in% region_ids]
+      starts <- seq(a$rel_view_start, a$rel_view_end, by=bin_size)
+      for (lo in starts) {
+        hi <- min(lo + bin_size, a$rel_view_end + 1L)
+        span <- rr[rel_read_start <= lo & rel_read_end >= hi - 1L]
+        centers <- footprints[region_id %in% region_ids & fp_class == "nucleosome" & rel_mid >= lo & rel_mid < hi]
+        count <- centers[, .(n_centers=.N), by=.(region_id,RID)]
+        span <- merge(span,count,by=c("region_id","RID"),all.x=TRUE)
+        span[is.na(n_centers),n_centers:=0L]
+        d <- span[, .(n_reads=.N,n_centers=sum(n_centers)),by=by]
+        d[, `:=`(bin_start=lo,bin_end_exclusive=hi,bin_width_bp=hi-lo,pos=(lo+hi)/2,
+          density=n_centers/(n_reads*(hi-lo)))]
+        result[[length(result)+1L]] <- d
+      }
+    }
+    return(rbindlist(result))
+  }
+  stopifnot(metric == "occupancy")
   half <- ceiling(max(abs(c(anchors$rel_view_start, anchors$rel_view_end))) / bin_size) * bin_size
   positions <- seq(-half, half, by = bin_size)
   nuc <- footprints[fp_class == "nucleosome", .(region_id, RID, rel_start, rel_end)]
@@ -363,31 +436,56 @@ occupancy_profile <- function(footprints, reads, anchors, by = c("region_id", "c
 #                           footprint start (NA unless both exist)
 #   anchor_occupied         a nucleosome footprint covers the anchor base
 #   n_nuc                   nucleosome footprints overlapping the window
-read_position_summary <- function(footprints, reads) {
+read_position_summary <- function(footprints, reads, include_gap = TRUE) {
   nuc  <- footprints[fp_class == "nucleosome"]
   up   <- nuc[rel_mid < 0][order(-rel_mid),
-              .(minus1_mid = rel_mid[1], minus1_end = rel_end[1]), by = .(region_id, RID)]
+              .(minus1_mid = rel_mid[1], minus1_start = rel_start[1], minus1_end = rel_end[1]), by = .(region_id, RID)]
   down <- nuc[rel_mid >= 0][order(rel_mid),
-              .(plus1_mid = rel_mid[1], plus1_start = rel_start[1]), by = .(region_id, RID)]
+              .(plus1_mid = rel_mid[1], plus1_start = rel_start[1], plus1_end = rel_end[1]), by = .(region_id, RID)]
   occ  <- nuc[, .(anchor_occupied = any(rel_start <= 0 & rel_end >= 0), n_nuc = .N),
               by = .(region_id, RID)]
-  s <- reads[, .(region_id, gene, RID, sample_name, timepoint, cluster)]
+  s <- copy(reads)
   for (x in list(up, down, occ)) s <- merge(s, x, by = c("region_id", "RID"), all.x = TRUE)
   s[is.na(n_nuc), `:=`(n_nuc = 0L, anchor_occupied = FALSE)]
-  s[, nfr_width := as.numeric(plus1_start - minus1_end - 1L)]
-  setorder(s, region_id, cluster, timepoint, RID)
+  if (include_gap) s[, nfr_width := as.numeric(plus1_start - minus1_end - 1L)]
+  setorderv(s, intersect(c("region_id", "cluster", "timepoint", "RID"), names(s)))
   s[]
 }
 
 # Median positional summaries per (region, cluster, timepoint).
-position_summary_by_group <- function(read_positions) {
-  read_positions[, .(
+position_summary_by_group <- function(read_positions, by = c("region_id", "cluster", "timepoint"),
+                                      include_gap = TRUE, bootstrap = 0L, seed = 1L,
+                                      sample_col = "sample_name") {
+  out <- read_positions[, .(
     n_reads        = .N,
     n_minus1       = sum(!is.na(minus1_mid)),
     minus1_median  = as.numeric(median(minus1_mid, na.rm = TRUE)),
     n_plus1        = sum(!is.na(plus1_mid)),
     plus1_median   = as.numeric(median(plus1_mid, na.rm = TRUE)),
-    nfr_median     = as.numeric(median(nfr_width, na.rm = TRUE)),
+    nfr_median     = if (include_gap) as.numeric(median(nfr_width, na.rm = TRUE)) else NA_real_,
+    occupied_count = sum(anchor_occupied),
+    n_promoters = uniqueN(region_id), n_samples = uniqueN(sample_name),
     frac_anchor_occupied = mean(anchor_occupied)
-  ), by = .(region_id, cluster, timepoint)][order(region_id, cluster, timepoint)]
+  ), by = by]
+  if (!include_gap) out[, nfr_median := NULL]
+  if (bootstrap > 0L) {
+    set.seed(seed)
+    out[, `:=`(tss_lower = NA_real_, tss_upper = NA_real_)]
+    for (i in seq_len(nrow(out))) {
+      d <- merge(read_positions, out[i, ..by], by=by)
+      samples <- unique(d[[sample_col]]); promoters <- unique(d$region_id)
+      if (length(samples) < 2L || length(promoters) < 2L) next
+      estimates <- rep(NA_real_,bootstrap)
+      for (b in seq_len(bootstrap)) {
+        sw <- tabulate(sample.int(length(samples),length(samples),replace=TRUE),nbins=length(samples))
+        pw <- tabulate(sample.int(length(promoters),length(promoters),replace=TRUE),nbins=length(promoters))
+        w <- sw[match(d[[sample_col]],samples)] * pw[match(d$region_id,promoters)]
+        if (sum(w)>0) estimates[b] <- sum(w*d$anchor_occupied)/sum(w)
+      }
+      bounds <- quantile(estimates,c(.025,.975),na.rm=TRUE,names=FALSE)
+      out[i, `:=`(tss_lower=bounds[1],tss_upper=bounds[2])]
+    }
+  }
+  setorderv(out, by)
+  out[]
 }

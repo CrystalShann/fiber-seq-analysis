@@ -20,7 +20,7 @@ if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   else
     chrom="chr${SLURM_ARRAY_TASK_ID}"
   fi
-  exec /software/R-4.4.1-el8-x86_64/bin/Rscript --vanilla "$script_dir/run_pol2_clustering.R" \
+  exec /software/R-4.4.1-el8-x86_64/bin/Rscript --vanilla "$script_dir/01_run_pol2_clustering.R" \
     --stage features --chrom "$chrom" "$@"
 fi
-exec /software/R-4.4.1-el8-x86_64/bin/Rscript --vanilla "$script_dir/run_pol2_clustering.R" "$@"
+exec /software/R-4.4.1-el8-x86_64/bin/Rscript --vanilla "$script_dir/01_run_pol2_clustering.R" "$@"

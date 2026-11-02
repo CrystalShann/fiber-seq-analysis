@@ -1673,3 +1673,427 @@ plot_tf_cluster_profiles <- function(examples, reference_result, show_reads, exa
   }
   invisible(NULL)
 }
+
+
+# ===========================================================================
+# Locus context: gene models, Rao 2014 GM12878 loops/domains and their tracks,
+# moved unchanged from co-accessibility/LCL/hsca/hap_sele_access_plots.r so the
+# HSCA and Pol II clustering reports share them, then plot_locus_molecules().
+# These use data.table and unqualified ggplot2 calls: attach both first.
+# ===========================================================================
+
+# Exon rows (BED coordinates) of each protein-coding and lncRNA gene's Ensembl_canonical transcript.
+#################################################
+# load canonical transcript exons
+#################################################
+# Extract protein-coding and lncRNA Ensembl_canonical exons from GENCODE.
+# Convert to BED coordinates and retain gene, transcript, and strand annotations.
+load_canonical_gene_models = function(gtf) {
+  awk = '$3 == "exon" && $9 ~ /Ensembl_canonical/ && $9 ~ /gene_type "(protein_coding|lncRNA)"/ {print $1, $4 - 1, $5, $7, $9}'
+  exons = fread(cmd = paste("zcat", shQuote(gtf), "| awk -F'\\t' -v OFS='\\t'", shQuote(awk)),
+    header = FALSE, sep = "\t", quote = "", col.names = c("chrom", "start", "end", "strand", "attr"))
+  exons[, `:=`(gene_name = sub('.*gene_name "([^"]+)".*', "\\1", attr),
+    gene_type = sub('.*gene_type "([^"]+)".*', "\\1", attr),
+    transcript_id = sub('.*transcript_id "([^"]+)".*', "\\1", attr), attr = NULL)]
+  exons[]
+}
+
+# Rao et al. 2014 GM12878 HiCCUPS loops and Arrowhead domains lifted to hg38
+# (rao2014_GM12878/liftover_to_hg38.sh). loopN = row N of the lifted loop list. Rao's motif
+# columns are 1-based starts (sequence = hg38[motif_x1 - 1, motif_x2 - 1)); stored here as BED.
+#################################################
+# load lifted GM12878 loop and domain annotations
+#################################################
+# Read hg38 HiCCUPS loops, CTCF motifs, and Arrowhead domains.
+# Validate unique loop/motif keys and attach motif information to loop anchors.
+load_rao_hg38 = function(dir) {
+  read = function(name) fread(file.path(dir, paste0("GSE63525_GM12878_primary+replicate_", name, ".hg38.txt.gz")))
+  key = c("chr1", "x1", "x2", "y1", "y2")
+  loops = read("HiCCUPS_looplist")[, ..key][, loop_id := paste0("loop", .I)]
+  motifs = read("HiCCUPS_looplist_with_motifs")[, c(key, "motif_x1", "motif_x2", "orientation_1",
+    "motif_y1", "motif_y2", "orientation_2"), with = FALSE]
+  stopifnot(!anyDuplicated(loops[, ..key]), !anyDuplicated(motifs[, ..key]))
+  loops = merge(loops, motifs, by = key, all.x = TRUE)[order(as.integer(sub("loop", "", loop_id)))]
+  loops[, convergent := fifelse(is.na(orientation_1) | is.na(orientation_2), NA,
+    orientation_1 == "p" & orientation_2 == "n")]
+  strand = c(p = "+", n = "-")
+  side = function(s, e, ms, me, o, os, oe, label) loops[, .(loop_id, side = label, chrom = chr1,
+    start = get(s), end = get(e), motif_start = get(ms) - 1L, motif_end = get(me) - 1L,
+    motif_strand = unname(strand[get(o)]), partner = paste0(chr1, ":", get(os), "-", get(oe)),
+    loop_size = y1 - x1, convergent)]
+  anchors = rbind(side("x1", "x2", "motif_x1", "motif_x2", "orientation_1", "y1", "y2", "A"),
+    side("y1", "y2", "motif_y1", "motif_y2", "orientation_2", "x1", "x2", "B"))
+  domains = read("Arrowhead_domainlist")[, .(chrom = chr1, start = x1, end = x2)]
+  edges = unique(rbind(domains[, .(chrom, pos = start)], domains[, .(chrom, pos = end)]))
+  list(loops = loops, anchors = anchors, domains = domains, edges = edges)
+}
+
+# Shared look of the browser tracks: no y axis; each track sets its own x range.
+#################################################
+# set the gene and chromatin-context theme
+#################################################
+# Return a compact cowplot theme shared by the domain/CTCF figure tracks.
+domain_ctcf_theme = function() cowplot::theme_cowplot(font_size = 9) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank(),
+    axis.title.y = element_text(angle = 0, vjust = .5, size = 8), plot.margin = margin(2, 5, 2, 5))
+
+# Canonical transcripts overlapping win_chrom:[win_start, win_end) (BED), packed into rows: intron
+# line with strand chevrons, exon boxes, gene name. With region, x is SNP-relative bp
+# (plot_positions()); otherwise genomic Mb. A zoom window without transcripts names the nearest
+# protein-coding TSS. Returns list(plot, rows).
+#################################################
+# draw canonical gene structures in a genomic window
+#################################################
+# Select overlapping transcripts and draw exons, introns, and strand arrows.
+# Use genomic Mb or SNP-relative coordinates and return the plot plus its row count.
+plot_gene_track = function(models, win_chrom, win_start, win_end, xlim, region = NULL, focus = NULL) {
+  to_x = function(pos) if (is.null(region)) pos / 1e6 else plot_positions(pos, region)
+  tx = models[chrom == win_chrom, .(start = min(start), end = max(end)),
+    by = .(gene_name, gene_type, strand, transcript_id)]
+  shown = tx[start < win_end & end > win_start][order(start)]
+  p = ggplot() + scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = xlim) +
+    labs(x = NULL, y = "Genes") + domain_ctcf_theme()
+  if (!is.null(focus)) p = p + annotate("rect", xmin = to_x(focus[1] + 1), xmax = to_x(focus[2]),
+    ymin = -Inf, ymax = Inf, fill = "#FFFF00", alpha = .35)
+  if (!nrow(shown)) {
+    label = "No canonical transcript in window"
+    if (!is.null(region)) {
+      tss = tx[gene_type == "protein_coding", .(gene_name, tss = fifelse(strand == "+", start + 1L, end))]
+      near = tss[which.min(abs(tss - region$focal_pos))]
+      label = sprintf("%s; nearest protein-coding TSS: %s at %s:%s (%+.0f kb from SNP)", label,
+        near$gene_name, win_chrom, format(near$tss, big.mark = ","), (near$tss - region$focal_pos) / 1e3)
+    }
+    return(list(plot = p + annotate("text", x = mean(xlim), y = 0, size = 3, label = label) +
+      scale_y_continuous(limits = c(-1, 1)), rows = 1L))
+  }
+  # greedy packing; the gap leaves room for the name
+  gap = .12 * (win_end - win_start)
+  row_end = numeric()
+  shown[, row := 0L]
+  for (i in seq_len(nrow(shown))) {
+    r = which(row_end + gap < shown$start[i])[1]
+    if (is.na(r)) r = length(row_end) + 1L
+    row_end[r] = shown$end[i]
+    set(shown, i, "row", r)
+  }
+  shown[, `:=`(left = to_x(pmax(start, win_start) + 1), right = to_x(pmin(end, win_end)))]
+  exons = merge(models[chrom == win_chrom & start < win_end & end > win_start,
+    .(transcript_id, xmin = to_x(pmax(start, win_start) + 1), xmax = to_x(pmin(end, win_end)))],
+    shown[, .(transcript_id, row)], by = "transcript_id")
+  orientation = if (is.null(region)) 1 else plot_anchor(region)$direction
+  step = diff(xlim) / 40
+  chevrons = shown[, .(x = seq(min(left, right), max(left, right), by = step)), by = .(transcript_id, row, strand)]
+  chevrons[, xend := x + fifelse(strand == "+", 1, -1) * orientation * .35 * step]
+  name = if (is.null(region)) shown$gene_name else paste0(shown$gene_name, " (", shown$strand, ")")
+  p = p + geom_segment(data = shown, aes(x = left, xend = right, y = -row, yend = -row),
+      color = "grey30", linewidth = .3) +
+    geom_segment(data = chevrons, aes(x = x, xend = xend, y = -row, yend = -row), color = "grey30",
+      linewidth = .3, arrow = arrow(length = unit(1, "mm"), type = "open")) +
+    geom_rect(data = exons, aes(xmin = xmin, xmax = xmax, ymin = -row - .22, ymax = -row + .22),
+      fill = "#1F3A93") +
+    annotate("text", x = (shown$left + shown$right) / 2, y = -shown$row + .45, label = name,
+      size = 2.6, fontface = "italic") +
+    scale_y_continuous(limits = c(-max(shown$row) - .5, -.3))
+  list(plot = p, rows = max(shown$row))
+}
+
+# Context tracks over chrom:[start, end): HiCCUPS loops with both anchors in view as arcs between
+# anchor midpoints (loops with an anchor in focus coloured and labelled), anchors and CTCF motif
+# arrows at the base; Arrowhead domains as triangles with edge ticks.
+#################################################
+# draw broad chromatin loop and domain context
+#################################################
+# Display overlapping loops and domains around the pair window.
+# Highlight relevant anchors and mark the zoomed CRE-pair interval.
+plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
+  xlim = c(win_start, win_end) / 1e6
+  band = annotate("rect", xmin = (focus[1] + 1) / 1e6, xmax = focus[2] / 1e6, ymin = -Inf, ymax = Inf,
+    fill = "#FFFF00", alpha = .35)
+  loops = rao$loops[chr1 == win_chrom & x1 >= win_start & y2 <= win_end]
+  loops[, focal := (x1 < focus[2] & x2 > focus[1]) | (y1 < focus[2] & y2 > focus[1])]
+  tallest = max(c(loops$y1 - loops$x1, 1))
+  arc_t = seq(0, pi, length.out = 60)
+  arcs = loops[, .(x = ((x1 + x2 + y1 + y2) / 4 - (y1 + y2 - x1 - x2) / 4 * cos(arc_t)) / 1e6,
+    y = (y1 - x1) / tallest * sin(arc_t)), by = .(loop_id, focal)]
+  anchors = rao$anchors[loop_id %in% loops$loop_id]
+  anchors[, focal := loop_id %in% loops[focal == TRUE, loop_id]]
+  motifs = unique(anchors[!is.na(motif_start), .(motif_start, motif_end, motif_strand)])
+  arrow_bp = .012 * (win_end - win_start)
+  labels = loops[focal == TRUE, .(x = (x1 + x2 + y1 + y2) / 4e6, y = (y1 - x1) / tallest + .1,
+    label = sprintf("%s (%.0f kb%s)", loop_id, (y1 - x1) / 1e3,
+      fifelse(is.na(convergent), "", fifelse(convergent, ", convergent CTCF", ", not convergent"))))]
+  colors = c("TRUE" = "#B2182B", "FALSE" = "grey70")
+  p_loops = ggplot() + band +
+    geom_path(data = arcs, aes(x, y, group = loop_id, color = as.character(focal)), linewidth = .4) +
+    geom_rect(data = anchors, aes(xmin = (start + 1) / 1e6, xmax = end / 1e6, ymin = -.12, ymax = -.02,
+      fill = as.character(focal))) +
+    geom_segment(data = motifs, aes(x = (motif_start + motif_end) / 2e6,
+      xend = ((motif_start + motif_end) / 2 + fifelse(motif_strand == "+", arrow_bp, -arrow_bp)) / 1e6,
+      y = -.22, yend = -.22, color = motif_strand), linewidth = .5,
+      arrow = arrow(length = unit(1.3, "mm"), type = "closed")) +
+    geom_text(data = labels, aes(x, y, label = label), size = 2.5, color = colors[["TRUE"]]) +
+    scale_color_manual(values = c(colors, "+" = "#D6604D", "-" = "#4393C3"), guide = "none") +
+    scale_fill_manual(values = colors, guide = "none") +
+    scale_x_continuous(expand = c(0, 0)) + scale_y_continuous(limits = c(-.3, 1.25)) +
+    coord_cartesian(xlim = xlim) + labs(x = NULL, y = "HiCCUPS\nloops\n(CTCF motif\narrows)") +
+    domain_ctcf_theme()
+  if (!nrow(loops)) p_loops = p_loops + annotate("text", x = mean(xlim), y = .5, size = 3,
+    label = "No HiCCUPS loop with both anchors in this window")
+  domains = rao$domains[chrom == win_chrom & start < win_end & end > win_start]
+  widest = max(c(domains$end - domains$start, 1))
+  triangles = domains[, .(x = c(start, (start + end) / 2, end) / 1e6, y = c(0, (end - start) / widest, 0)),
+    by = .(id = paste(start, end))]
+  edges = rao$edges[chrom == win_chrom & pos >= win_start & pos <= win_end]
+  p_domains = ggplot() + band +
+    geom_polygon(data = triangles, aes(x, y, group = id), fill = "grey60", alpha = .25,
+      color = "grey35", linewidth = .25) +
+    geom_segment(data = edges, aes(x = pos / 1e6, xend = pos / 1e6, y = -.12, yend = 0),
+      color = "grey20", linewidth = .3) +
+    scale_x_continuous(expand = c(0, 0)) + scale_y_continuous(limits = c(-.15, 1.05)) +
+    coord_cartesian(xlim = xlim) +
+    labs(x = paste0(win_chrom, " position (Mb, hg38)"), y = "Arrowhead\ndomains") + domain_ctcf_theme()
+  list(loops = p_loops, domains = p_domains)
+}
+
+# Zoom track over the pair window: loop anchors overlapping it (clipped, one row per anchor interval,
+# labelled with every loop using it), CTCF motif arrows and domain edges; SNP-relative x.
+# Returns list(plot, rows).
+#################################################
+# draw local loop anchors and CTCF motifs
+#################################################
+# Place loop anchors, motif directions, and domain edges in focal-SNP-relative coordinates.
+# Return the local annotation plot and row count for layout.
+plot_rao_zoom = function(rao, region, xlim) {
+  s = region$start
+  e = region$end
+  to_x = function(pos) plot_positions(pos, region)
+  anchors = rao$anchors[chrom == region$chr & start < e & end > s]
+  rows = anchors[, .(label = paste(sprintf("%s %s anchor -> partner %s (%.0f kb loop%s)", loop_id, side,
+      partner, loop_size / 1e3, fifelse(is.na(convergent), "", fifelse(convergent, ", convergent CTCF",
+      ", not convergent"))), collapse = "\n")), by = .(start, end)][order(start, end)]
+  rows[, row := .I]
+  motifs = unique(anchors[!is.na(motif_start) & motif_start < e & motif_end > s,
+    .(motif_start, motif_end, motif_strand)])
+  edges = rao$edges[chrom == region$chr & pos > s & pos <= e]
+  p = ggplot() + scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = xlim) +
+    labs(x = NULL, y = "Rao 2014") + domain_ctcf_theme()
+  if (!nrow(rows) && !nrow(edges)) {
+    distance = function(pos) min(abs(pos - region$focal_pos)) / 1e3
+    others = rao$anchors[chrom == region$chr]
+    return(list(plot = p + scale_y_continuous(limits = c(-1, 1)) + annotate("text", x = mean(xlim), y = 0,
+      size = 3, label = sprintf("No loop anchor or domain edge in window; nearest anchor %.0f kb, nearest domain edge %.0f kb from SNP",
+        distance(c(others$start, others$end)), distance(rao$edges[chrom == region$chr, pos]))), rows = 1L))
+  }
+  if (nrow(edges)) p = p + geom_vline(xintercept = to_x(edges$pos), linetype = "dashed",
+    color = "grey20", linewidth = .4) +
+    annotate("text", x = to_x(edges$pos), y = .6, label = " domain edge", size = 2.4, hjust = 0)
+  if (nrow(rows)) p = p + geom_rect(data = rows, aes(xmin = to_x(pmax(start, s) + 1),
+      xmax = to_x(pmin(end, e)), ymin = -row - .35, ymax = -row + .05), fill = "#B2182B", alpha = .3) +
+    annotate("text", x = xlim[1] + .01 * diff(xlim), y = -rows$row - .15, label = rows$label,
+      hjust = 0, size = 2.3, lineheight = .9)
+  if (nrow(motifs)) p = p +
+    geom_rect(data = motifs, aes(xmin = to_x(motif_start + 1), xmax = to_x(motif_end), ymin = .15,
+      ymax = .35, color = motif_strand), fill = NA, linewidth = .3) +
+    geom_segment(data = motifs, aes(x = to_x((motif_start + motif_end) / 2),
+      xend = to_x((motif_start + motif_end) / 2) + fifelse(motif_strand == "+", 1, -1) * .02 * diff(xlim),
+      y = .25, yend = .25, color = motif_strand), linewidth = .6,
+      arrow = arrow(length = unit(1.5, "mm"), type = "closed")) +
+    annotate("text", x = to_x((motifs$motif_start + motifs$motif_end) / 2), y = .5, size = 2.4,
+      label = paste0("CTCF motif (", motifs$motif_strand, ")")) +
+    scale_color_manual(values = c("+" = "#D6604D", "-" = "#4393C3"), guide = "none")
+  n = max(nrow(rows), 1L)
+  list(plot = p + scale_y_continuous(limits = c(-n - .6, .75)), rows = n)
+}
+
+# ---------------------------------------------------------------------------
+# Locus figure with one row per molecule: the plotting part of
+# plot_cre_pair_domain_ctcf() (co-accessibility/LCL/hsca/hap_sele_access_plots.r),
+# shared with the Pol II clustering report. Top: canonical genes over the
+# context window (region midpoint +/- context_flank_bp; with `rao`, widened to
+# whole HiCCUPS loops with an anchor in the region and followed by the loop and
+# Arrowhead domain tracks), the region shaded yellow. Bottom, over the region
+# with x relative to plot_anchor() (focal SNP, or TSS for promoters): genes,
+# Rao loop anchors / CTCF motifs / domain edges (with `rao`), a strip of
+# highlighted intervals and point marks, optional group proportions, the
+# per-base fraction of molecules with m6A per group, and one row per molecule
+# (plot_smf_reads()). Without `rao` no CTCF, loop or domain track is drawn.
+# Uses data.table and unqualified ggplot2 calls (attach both), plot_anchor(),
+# plot_positions(), plot_smf_reads(), m6a_intervals(), cluster_site_profiles()
+# and sample_palette() from leiden_manhattan_plots.r.
+#
+# Inputs:
+#   result           - list(region, assignments, site_met_mat), as for
+#                      plot_smf_reads(): assignments with RID, cluster (factor
+#                      of the groups in display order, no NA), start, end,
+#                      sample_name, original_RID; site_met_mat = reads x 1-based
+#                      positions in region$analysis_start..analysis_end
+#   models           - load_canonical_gene_models() result
+#   group_colors     - colours named by group (every level of
+#                      assignments$cluster)
+#   rao              - optional load_rao_hg38() result; NULL drops the loop,
+#                      domain and anchor/CTCF motif tracks
+#   bands            - optional data.frame start (0-based), end, label, color:
+#                      intervals boxed in the strip and shaded yellow over the
+#                      profile and molecule tracks
+#   marks            - optional data.frame pos (1-based) and optional label
+#                      (NA = unlabelled): diamonds in the strip, e.g. variants
+#   strip_label      - y label of the strip (drawn when bands or marks exist)
+#   group_labels     - profile facet labels named by group (default
+#                      "<group>\n<n> molecules")
+#   show_proportions - add a stacked bar of the group proportions
+#   reference_counts - optional group counts (named by group) drawn as a second
+#                      proportion bar; region_label / reference_label name the
+#                      two bars
+#   sample_colors    - colours named by sample label (default sample_palette())
+#   context_flank_bp - half-width of the context window
+#   title, subtitle  - shown on the first track
+#   caption          - shown under the molecule track
+#   x_label          - optional x axis title of the molecule track
+# Output:
+#   list(combined = cowplot figure, height = its height in inches at 12 in
+#   wide, context = context window c(start, end), profile = per-base profile
+#   table, panels = named list of the stacked plots)
+# ---------------------------------------------------------------------------
+plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands = NULL,
+                                 marks = NULL, strip_label = "cCREs", group_labels = NULL,
+                                 show_proportions = FALSE, reference_counts = NULL,
+                                 region_label = "This window", reference_label = "Reference",
+                                 sample_colors = NULL, context_flank_bp = 250000,
+                                 title = result$region$annotation, subtitle = NULL,
+                                 caption = NULL, x_label = NULL) {
+  region <- result$region
+  a <- result$assignments
+  stopifnot(is.factor(a$cluster), !anyNA(a$cluster), all(levels(a$cluster) %in% names(group_colors)))
+  if (is.null(sample_colors)) sample_colors <- sample_palette(a$sample_name)
+  if (is.null(group_labels)) {
+    n <- table(a$cluster)
+    group_labels <- setNames(sprintf("%s\n%d molecules", names(n), as.integer(n)), names(n))
+  }
+  stopifnot(all(levels(a$cluster) %in% names(group_labels)))
+  group_labels <- group_labels[levels(a$cluster)]
+
+  # zoom x range = plot_smf_reads() limits without the haplotype bar
+  anchor <- plot_anchor(region)
+  bounds <- c(anchor$left - .085 * max(1, anchor$right - anchor$left), anchor$right + .5)
+  ticks <- pretty(c(anchor$left, anchor$right), n = 6)
+  zoom_x <- function(p) suppressMessages(p + scale_x_continuous(expand = c(0, 0),
+    breaks = ticks[ticks >= anchor$left & ticks <= anchor$right]))
+  has_bands <- !is.null(bands) && nrow(bands) > 0L
+  has_marks <- !is.null(marks) && nrow(marks) > 0L
+  if (has_bands) {
+    bands <- as.data.frame(bands)
+    ends <- cbind(plot_positions(bands$start + 1L, region), plot_positions(bands$end, region))
+    bands$left <- pmin(ends[, 1], ends[, 2])
+    bands$right <- pmax(ends[, 1], ends[, 2])
+  }
+  # yellow bands behind every other layer
+  shade <- function(p) {
+    if (has_bands) p$layers <- c(list(geom_rect(data = bands, aes(xmin = left, xmax = right,
+      ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill = "#FFFF00", alpha = .22)), p$layers)
+    p
+  }
+  anchor_line <- function() geom_vline(xintercept = 0, color = "#984EA3", linetype = "dashed", linewidth = .4)
+
+  # context: region midpoint +- flank, widened to whole loops with an anchor in the region
+  mid <- (region$start + region$end) %/% 2
+  touching <- if (is.null(rao)) NULL else rao$loops[chr1 == region$chr &
+    ((x1 < region$end & x2 > region$start) | (y1 < region$end & y2 > region$start))]
+  context <- c(max(0, min(mid - context_flank_bp, touching$x1 - 20000)),
+    max(mid + context_flank_bp, touching$y2 + 20000))
+  focus <- c(region$start, region$end)
+  context_genes <- plot_gene_track(models, region$chr, context[1], context[2], xlim = context / 1e6, focus = focus)
+  panels <- list(context_genes = context_genes$plot + labs(title = title, subtitle = subtitle))
+  heights <- c(context_genes = .9 + .3 * context_genes$rows)
+  if (!is.null(rao)) {
+    context_rao <- plot_rao_context(rao, region$chr, context[1], context[2], focus)
+    panels$loops <- context_rao$loops
+    panels$domains <- context_rao$domains
+    heights[c("loops", "domains")] <- c(1.8, 1.1)
+  }
+
+  # zoom tracks
+  zoom_genes <- plot_gene_track(models, region$chr, region$start, region$end, xlim = bounds, region = region)
+  panels$zoom_genes <- zoom_x(zoom_genes$plot)
+  heights["zoom_genes"] <- .5 + .3 * zoom_genes$rows
+  if (!is.null(rao)) {
+    zoom_rao <- plot_rao_zoom(rao, region, bounds)
+    panels$zoom_rao <- zoom_x(zoom_rao$plot)
+    heights["zoom_rao"] <- .6 + .35 * zoom_rao$rows
+  }
+  if (has_bands || has_marks) {
+    strip <- ggplot()
+    if (has_bands) strip <- strip +
+      geom_rect(data = bands, aes(xmin = left, xmax = right, ymin = .3, ymax = .6, fill = color)) +
+      geom_text(data = bands, aes(x = (left + right) / 2, y = .8, label = label), size = 3)
+    strip <- strip + anchor_line()
+    if (has_marks) {
+      mark_x <- plot_positions(marks$pos, region)
+      strip <- strip + annotate("point", x = mark_x, y = .1, shape = 18, size = 3, color = "#984EA3")
+      labelled <- if (is.null(marks$label)) rep(FALSE, nrow(marks)) else !is.na(marks$label) & nzchar(marks$label)
+      if (any(labelled)) strip <- strip + annotate("text", x = mark_x[labelled], y = .45,
+        label = marks$label[labelled], size = 2.6)
+    }
+    strip <- shade(strip) + scale_fill_identity() + scale_x_continuous(expand = c(0, 0)) +
+      coord_cartesian(xlim = bounds) + scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+      labs(x = NULL, y = strip_label) + domain_ctcf_theme()
+    panels$strip <- zoom_x(strip)
+    heights["strip"] <- .7
+  }
+  if (show_proportions) {
+    bar <- function(set, counts) data.frame(set = sprintf("%s (n = %s)", set,
+      format(sum(counts), big.mark = ",")), group = names(counts), n = as.integer(counts))
+    bars <- bar(region_label, table(a$cluster))
+    if (!is.null(reference_counts)) bars <- rbind(bars, bar(reference_label, reference_counts))
+    bars <- bars[bars$n > 0, , drop = FALSE]
+    stopifnot(all(bars$group %in% names(group_colors)))
+    bars$fraction <- bars$n / ave(bars$n, bars$set, FUN = sum)
+    bars$group <- factor(bars$group, levels = intersect(names(group_colors), bars$group))
+    bars$set <- factor(bars$set, levels = rev(unique(bars$set)))
+    rgb <- grDevices::col2rgb(group_colors[as.character(bars$group)])
+    bars$text_color <- ifelse(colSums(rgb * c(.299, .587, .114)) / 255 < .5, "white", "black")
+    stack <- position_stack(vjust = .5, reverse = TRUE)
+    # explicit group: the text colour must not change the stacking order of the labels
+    panels$proportions <- ggplot(bars, aes(x = fraction, y = set, fill = group, group = group)) +
+      geom_col(position = position_stack(reverse = TRUE), width = .75, color = "white", linewidth = .2) +
+      geom_text(aes(label = ifelse(fraction >= .06, sprintf("%s\n%.0f%%", group, 100 * fraction), ""),
+        color = text_color), position = stack, size = 2.3, lineheight = .85) +
+      scale_fill_manual(values = group_colors, guide = "none") + scale_color_identity() +
+      scale_x_continuous(labels = scales::percent, expand = c(0, 0)) +
+      labs(x = NULL, y = NULL) + domain_ctcf_theme() + theme(axis.text.y = element_text(size = 7))
+    heights["proportions"] <- .45 + .35 * nlevels(bars$set)
+  }
+  profile <- as.data.table(cluster_site_profiles(result, result$site_met_mat))
+  profile[, strip := factor(group_labels[cluster], levels = group_labels)]
+  profiles <- plot_group_profile(profile, group_col = "strip", x_col = "pos", y_col = "met",
+    facet_col = "strip", facet_layout = "grid", facet_scales = "fixed",
+    colors = setNames(group_colors[names(group_labels)], group_labels), coordinates = "relative",
+    region = region, layers = list(list(geom = "line", linewidth = .3)))
+  profiles <- shade(profiles) + anchor_line() + scale_x_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = bounds) + scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1)) +
+    labs(x = NULL, y = "m6A fraction") + domain_ctcf_theme() +
+    theme(legend.position = "none", strip.text.y = element_text(angle = 0, size = 7),
+      axis.text.y = element_text(size = 7), axis.ticks.y = element_line(), axis.line.y = element_line())
+  panels$profiles <- zoom_x(profiles)
+  heights["profiles"] <- .8 * nlevels(a$cluster)
+
+  # molecules: plot_smf_reads() with the group palette on its first bar (private copy)
+  renderer <- plot_smf_reads
+  renderer_env <- new.env(parent = environment(renderer))
+  renderer_env$cluster_id_palette <- function(groups) group_colors[groups]
+  environment(renderer) <- renderer_env
+  molecules <- shade(renderer(result, m6a_intervals(result), sample_colors, tracks = "m6A"))
+  molecules <- molecules + anchor_line()
+  if (has_bands) molecules <- molecules + geom_vline(xintercept = c(bands$left, bands$right),
+    color = "grey60", linetype = "dotted", linewidth = .25)
+  molecules <- suppressMessages(molecules +
+    labs(title = NULL, subtitle = NULL, y = "m6A: one row per molecule", caption = caption) +
+    guides(fill = guide_legend(ncol = 11, byrow = TRUE)))
+  if (!is.null(x_label)) molecules <- molecules + labs(x = x_label)
+  panels$molecules <- molecules
+  heights["molecules"] <- max(3.5, .035 * nrow(a) + 1.8)
+
+  heights <- heights[names(panels)]
+  combined <- cowplot::plot_grid(plotlist = unname(panels), ncol = 1, align = "v", axis = "lr",
+    rel_heights = unname(heights))
+  list(combined = combined, height = sum(heights), context = context, profile = profile, panels = panels)
+}

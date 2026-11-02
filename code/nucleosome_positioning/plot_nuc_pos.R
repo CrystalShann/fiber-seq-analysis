@@ -40,11 +40,13 @@ NUC_FP_LABELS <- c(nucleosome = "nucleosome footprint (FiberHMM)",
 # ---------------------------------------------------------------------------
 
 position_label <- function(meta) {
+  if (!is.null(meta$position_label)) return(meta$position_label)
   if (meta$region_type == "promoter") "Position relative to canonical TSS (bp)"
   else "Position relative to region centre (bp)"
 }
 
 region_title <- function(meta) {
+  if (!is.null(meta$title)) return(meta$title)
   if (meta$region_type == "promoter")
     sprintf("%s (%s)   %s:%s-%s, %s strand", meta$gene, meta$gencode_name, meta$chr,
             format(meta$view_start, big.mark = ","), format(meta$view_end, big.mark = ","),
@@ -146,11 +148,36 @@ plot_read_footprints <- function(fp_r, reads_r, pos_r, meta) {
 # ---------------------------------------------------------------------------
 # Supporting: -1 / +1 nucleosome position and NFR width per read
 # ---------------------------------------------------------------------------
-plot_position_summary <- function(pos_r, reads_r, meta) {
-  long <- melt(pos_r[, .(RID, cluster = droplevels(cluster), timepoint,
-                         minus1_mid, plus1_mid, nfr_width)],
-               id.vars = c("RID", "cluster", "timepoint"),
-               variable.name = "metric", value.name = "value")[!is.na(value)]
+plot_position_summary <- function(pos_r, reads_r, meta, include_gap = TRUE,
+                                  group_col = "timepoint", colors = TP_COLORS, x_label = "LPS (min)",
+                                  profile = NULL, profile_y = "fraction", profile_label = NULL) {
+  if (!is.null(profile) && profile_y == "tss_occupancy") {
+    return(ggplot(profile,aes(cluster,frac_anchor_occupied,color=cluster)) + geom_point(size=2) +
+      geom_errorbar(aes(ymin=tss_lower,ymax=tss_upper),width=.15) +
+      geom_text(aes(label=paste0(occupied_count,"/",n_reads)),vjust=-1,size=3) +
+      scale_color_manual(values=colors,guide="none") + scale_y_continuous(limits=c(0,1)) +
+      labs(x="Cluster",y="Fraction with a nucleosome covering the TSS base",title=region_title(meta),
+        caption="95% crossed promoter × biological-sample bootstrap intervals; labels: occupied / spanning molecules") +
+      theme_cowplot(font_size=10))
+  }
+  if (!is.null(profile)) {
+    return(plot_group_profile(profile, group_col="cluster", style="line", x_col="pos", y_col=profile_y,
+      colors=colors) + anchor_line() + position_scale(meta) +
+      facet_wrap(~cluster,ncol=1) + profile_theme() +
+      labs(x=position_label(meta),y=profile_label,title=region_title(meta)))
+  }
+  metrics <- c("minus1_mid", "plus1_mid", if (include_gap) "nfr_width")
+  ids <- unique(c("RID", "cluster", group_col))
+  long <- melt(pos_r[, c(ids,metrics), with=FALSE], id.vars=ids,
+    measure.vars=metrics, variable.name="metric",value.name="value")[!is.na(value)]
+  if (group_col != "timepoint") {
+    return(ggplot(long,aes(x=.data[[group_col]],y=value,fill=.data[[group_col]])) +
+      geom_boxplot(outlier.shape=NA,width=.6,alpha=.7) +
+      facet_wrap(~metric,scales="free_y",labeller=as_labeller(c(minus1_mid="−1 inferred footprint center (bp)",
+        plus1_mid="+1 inferred footprint center (bp)",nfr_width="Inter-nucleosome gap (bp)"))) +
+      scale_fill_manual(values=colors,guide="none") + labs(x=x_label,y=NULL,title=region_title(meta)) +
+      theme_cowplot(font_size=9) + panel_border())
+  }
   metric_labels <- c(minus1_mid = "-1 nucleosome midpoint (bp)",
                      plus1_mid  = "+1 nucleosome midpoint (bp)",
                      nfr_width  = "NFR width (bp)")
@@ -160,8 +187,8 @@ plot_position_summary <- function(pos_r, reads_r, meta) {
     geom_jitter(width = 0.15, size = 0.5, alpha = 0.5, colour = "grey20") +
     facet_grid(metric ~ cluster, scales = "free_y",
                labeller = labeller(metric = metric_labels, cluster = cluster_labels(reads_r))) +
-    scale_fill_manual(values = TP_COLORS, guide = "none") +
-    labs(x = "LPS (min)", y = NULL,
+    scale_fill_manual(values = colors, guide = "none") +
+    labs(x = x_label, y = NULL,
          title = "Nearest upstream (-1) and downstream (+1) nucleosome per read",
          subtitle = region_title(meta)) +
     theme_cowplot(font_size = 9) +

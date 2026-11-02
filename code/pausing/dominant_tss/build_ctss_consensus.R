@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# Rebuild consensus from existing inputs; source URLs are in the annotation README.
+
 suppressPackageStartupMessages(library(data.table))
 
 validate_gzip <- function(path) {
@@ -18,6 +18,9 @@ read_gzip_table <- function(path, ...) {
         ...)
 }
 
+#####################################
+# return each replicate CTSS as a data table
+#####################################
 read_replicate_counts <- function(path, chunk_size = 200000L) {
     con <- gzfile(path, "rt")
     on.exit(close(con))
@@ -43,12 +46,22 @@ read_replicate_counts <- function(path, chunk_size = 200000L) {
     x
 }
 
+
+#####################################
+# merge tables of CTSS sites found in all replicates
+#####################################
+
+# keeps sites where replicate has at least 1 tag
 consensus_bed <- function(common, minimum_count = 1) {
     stopifnot(length(minimum_count) == 1L, is.finite(minimum_count), minimum_count >= 1, minimum_count%%1 == 0)
     common[minimum_replicate_count >= minimum_count, .(chrom, start0, end0, name = paste0(chrom, ":", start0, "..",
         end0, ",", strand), score = summed_count, strand, thickStart = start0, thickEnd = end0, itemRgb = "0,0,0")]
 }
 
+
+#####################################
+# read each replicate and keeps only the sites that appear in every replicate
+#####################################
 intersect_replicate_counts <- function(paths) {
   stopifnot(length(paths) >= 2L, !anyDuplicated(paths))
   common <- NULL

@@ -60,8 +60,11 @@ For this genotype-source change, rerun the report
 `haplotype_selective_chromatin_accessibility_LCL.Rmd` with
 `make_molecule_plots = TRUE`. This refreshes the domain/CTCF figures and genotype
 summaries for CLASP1, SLFN5, LZIC and LINC00462, plus the GTEx lead-eQTL m6A
-table. In an existing R session, source `hap_sele_access_plots.r` again before
-rerunning those chunks. The step-5 statistical tables already use VCF genotypes:
+table. In an existing R session, source `hap_sele_access_plots.r` and
+`parsing_functions/plotting_functions.r` again before rerunning those chunks.
+The domain/CTCF figure is drawn by `plot_locus_molecules()` in
+`plotting_functions.r`, which also holds the gene-model and Rao loaders and the track
+functions; the Pol II clustering report uses it too. The step-5 statistical tables already use VCF genotypes:
 neither `LCL_run_hsca.sh` nor upstream co-accessibility needs rerunning solely
 for this change. The separate phased-molecule/clustering panels retain their
 VCF phasing requirement for assigning alleles; that is a molecule-assignment
