@@ -479,7 +479,10 @@ pol2_save_figures <- function(x, annotation, cfg) {
   clusters <- levels(res$assignments$cluster)
   k <- length(clusters)
   plots <- file.path(cfg$output, "plots")
-  save_figure(pol2_molecule_heatmap(res, colors), file.path(plots, "molecule_heatmap.pdf"),
+  masks <- pol2_observed_masks(cfg,x)
+  profile <- pol2_observed_profile(x$sites,res$assignments,masks,
+    x$molecules$tss_id[match(res$assignments$RID,x$molecules$observation_id)])
+  save_figure(pol2_observed_heatmap(res, colors, profile), file.path(plots, "molecule_heatmap.pdf"),
               width = 14, height = 11 + 0.55 * k, draw = function(h) pol2_draw_heatmap(h, clusters, profiles = TRUE))
   save_figure(pol2_plot_footprints(annotation), file.path(plots, "footprint_positions.pdf"),
               width = 10, height = 1.4 * k + 2.5)
@@ -499,7 +502,7 @@ pol2_save_figures <- function(x, annotation, cfg) {
   fwrite(features$molecules[, .(observation_id, cluster, tss_id, m6a_proportion, cpg, grocap, dnase)],
     file.path(tables, "cluster_features", "cluster_feature_molecules.tsv.gz"), sep = "\t")
   save_figure(pol2_plot_cluster_features(features, clusters), file.path(plots, "cluster_features.pdf"), width = 12, height = 8)
-  loci <- pol2_locus_figures(cfg, x, annotation)
+  loci <- pol2_observed_loci(cfg, x, annotation, masks)
   for (gene in names(loci))
     save_figure(loci[[gene]]$combined, file.path(plots, "loci", paste0(gene, "_TSS_molecules.pdf")),
                 width = 12, height = loci[[gene]]$height, limitsize = FALSE)

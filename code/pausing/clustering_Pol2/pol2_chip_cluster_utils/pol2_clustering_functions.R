@@ -33,6 +33,7 @@ pol2_load_helpers <- function(project) {
 #    - Shift each start by one base
 #    - Keep the chromosome and end position.
 pol2_gr <- function(chrom, start0, end0) GRanges(chrom, IRanges(start0 + 1L, end0))
+
 ###########################
 # Check required files
 ############################
@@ -46,20 +47,22 @@ pol2_required <- function(paths) {
   absent <- paths[!file.exists(paths)]
   if (length(absent)) stop("Missing input: ", paste(absent, collapse = ", "))
 }
+
 ###########################
 # Record file details
 ############################
 # 1. Input: Paths to input files.
-# 2. Output: A table of full paths, sizes and modification times.
+# 2. Output: A table of full paths, sizes 
 #
 # 3. Steps:
 #    - Check that the files exist
-#    - Collect their details.
+#    - Collect their details
 pol2_stamp <- function(paths) {
   pol2_required(paths)
   x <- file.info(paths)
   data.frame(path = normalizePath(paths), size = x$size, mtime = as.numeric(x$mtime))
 }
+
 ###########################
 # Identify workflow inputs
 ############################
@@ -68,15 +71,16 @@ pol2_stamp <- function(paths) {
 #
 # 3. Steps:
 #    - Select settings that affect the features
-#    - Record input details and checksums.
+#    - Record input details and checksums
+
 pol2_signature <- function(cfg) {
   keys <- c("samples", "expected_samples", "tss", "chrom_sizes", "footprint_dir", "peaks", "signal", "chromosomes", "bin_bp")
   list(version = 2L, config = cfg[keys], inputs = pol2_stamp(unlist(cfg[c("samples", "tss", "chrom_sizes", "peaks", "signal")])),
-       source = tools::md5sum(file.path(cfg$project, c("code/pausing/clustering_Pol2/pol2_clustering_functions.R",
+       source = tools::md5sum(file.path(cfg$project, c("code/pausing/clustering_Pol2/pol2_chip_cluster_utils/pol2_clustering_functions.R",
          "code/parsing_functions/parsing_footprints_functions.r", "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r"))))
 }
 ###########################
-# Save a result safely
+# Save a result 
 ############################
 # 1. Input: An object and its destination.
 # 2. Output: A saved R data file.
@@ -100,7 +104,8 @@ pol2_save <- function(x, path) {
 #
 # 3. Steps:
 #    - Place the window from 1,000 bases upstream to 999 bases downstream
-#    - Orient the boundaries to each strand.
+#    - Orient the boundaries to each strand
+
 pol2_windows <- function(tss) {
   tss <- copy(tss)
   tss[, `:=`(window_start = ifelse(strand == "+", tss - 1001L, tss - 1000L),
@@ -116,7 +121,8 @@ pol2_windows <- function(tss) {
 #
 # 3. Steps:
 #    - Use 50 bases upstream through 299 bases downstream
-#    - Convert the window to genomic coordinates.
+#    - Convert the window to genomic coordinates
+
 pol2_tssr <- function(tss) {
   data.table(chrom = tss$chrom,
              start = ifelse(tss$strand == "+", tss$tss - 51L, tss$tss - 300L),
@@ -133,7 +139,8 @@ pol2_tssr <- function(tss) {
 # 3. Steps:
 #    - Keep footprints 30–60 bases long
 #    - Find overlaps with promoter windows
-#    - Record strand-relative midpoints.
+#    - Record strand-relative midpoints
+
 pol2_candidates <- function(tss, fp) {
   fp <- unique(copy(fp))
   if (!nrow(fp) || !nrow(tss)) return(data.table())
@@ -159,7 +166,8 @@ pol2_candidates <- function(tss, fp) {
 # 3. Steps:
 #    - Read overlapping signal
 #    - Weight each value by its overlap length
-#    - Divide by covered bases.
+#    - Divide by covered bases
+
 pol2_signal <- function(fp, path) {
   fp <- copy(fp)
   if (!nrow(fp)) return(fp)
@@ -182,13 +190,14 @@ pol2_signal <- function(fp, path) {
 ###########################
 # Prepare samples and TSSs
 ############################
-# 1. Input: Workflow settings and configured input files.
+# 1. Input: Workflow settings and configured input files
 # 2. Output: Saved sample and promoter information.
 #
 # 3. Steps:
 #    - Check samples and TSS coordinates
 #    - Keep promoters within chromosome bounds and Pol II peaks
-#    - Add promoter signal and save.
+#    - Add promoter signal and save
+
 pol2_prepare <- function(cfg) {
   sig <- pol2_signature(cfg)
   samples <- fread(cfg$samples)
@@ -245,6 +254,7 @@ pol2_read_prepared <- function(cfg) {
 #    - Add the sample and chromosome names.
 pol2_ft_path <- function(samples, chrom) file.path(samples$fire_dir, "extracted_results/m6a_by_chr",
   paste0(samples$sample_name, ".ft_extracted_m6a.", chrom, ".bed.gz"))
+
 ###########################
 # Locate TF footprint files
 ############################
@@ -302,7 +312,8 @@ pol2_eligible_reads <- function(bed, candidate, site) {
 #    - Find observed m6A positions using full-window reads
 #    - Select eligible molecules
 #    - Build strand-oriented calls and 50-base bins
-#    - Attach identities and denominators.
+#    - Attach identities and denominators
+
 pol2_locus_features <- function(bed, candidate, site) {
   pool <- copy(bed[start <= site$window_start & end >= site$window_end])
   if (!nrow(pool)) return(NULL)
@@ -349,7 +360,7 @@ pol2_locus_features <- function(bed, candidate, site) {
 #    - Reuse a matching cache when available
 #    - Read promoters in batches
 #    - Build each promoter's features
-#    - Combine and save the results.
+#    - Combine and save the results
 pol2_features <- function(cfg, chrom) {
   prep <- pol2_read_prepared(cfg)
   chromosome <- chrom
@@ -409,19 +420,7 @@ pol2_features <- function(cfg, chrom) {
 }
 
 ###########################
-# Estimate clustering memory
-############################
-# 1. Input: Number of molecules and feature columns.
-# 2. Output: Estimated memory use in GiB.
-#
-# 3. Steps:
-#    - Allow for pairwise distances and feature storage
-#    - Add working space.
-pol2_memory_gb <- function(n, p = 40) (32 * as.double(n)^2 + 8 * as.double(n) * p) / 1024^3 + 2
-
-
-###########################
-# Sample distinct molecules
+# Sample molecules at the TSS that have Pol II ChIP signal
 ############################
 # 1. Input: Molecule metadata, sample size and random seed.
 # 2. Output: Selected row numbers.
@@ -449,9 +448,9 @@ pol2_sample_rows <- function(meta, n = 5000L, seed = 1L) {
 #
 # 3. Steps:
 #    - Check the feature caches
-#    - Sample distinct molecules and check memory
+#    - Sample distinct molecules
 #    - Build the neighbour graph and run Leiden clustering
-#    - Add footprint signal and save.
+#    - Add footprint signal and save
 pol2_cluster <- function(cfg) {
   prep <- pol2_read_prepared(cfg)
   files <- file.path(cfg$output, "tables", "features", paste0(cfg$chromosomes, ".rds"))
@@ -478,21 +477,13 @@ pol2_cluster <- function(cfg) {
   sites <- sites[selected, , drop = FALSE]
   meta <- meta[selected]
   stopifnot(!anyDuplicated(meta$RID), identical(rownames(mat), meta$observation_id))
-  estimate <- pol2_memory_gb(nrow(mat), ncol(mat))
-  limit <- cfg$max_memory_gb
-  slurm_mb <- suppressWarnings(as.numeric(Sys.getenv("SLURM_MEM_PER_NODE", "")))
-  if (is.finite(slurm_mb)) limit <- min(limit, 0.8 * slurm_mb / 1024)
-  if (estimate > limit) stop(sprintf(
-    "Exact global clustering of %s sampled molecules needs an estimated %.1f GiB (budget %.1f). Features are saved; no approximate graph was substituted.", nrow(mat), estimate, limit))
-  message("One pooled clustering: ", nrow(mat), " molecules randomly selected from ", eligible_n,
-          "; estimated working memory ", round(estimate, 1), " GiB")
+  message("One pooled clustering: ", nrow(mat), " molecules randomly selected from ", eligible_n)
   knn <- manhattan_knn_graph(mat, k_neighbors = cfg$k_neighbors, sigma = NULL)
   part <- leiden_partition(knn$graph, resolution = cfg$resolution, seed = cfg$seed)
   membership <- part$membership[rownames(mat)]
   meta[, cluster := as.character(relabel_clusters_by_size(membership))]
   profiles <- cluster_feature_profiles(mat, relabel_clusters_by_size(membership))
   footprints <- rbindlist(lapply(chunks, `[[`, "footprints"))[observation_id %in% meta$observation_id]
-  # Bulk Pol II signal is only measured over the footprints of sampled molecules.
   signal <- pol2_signal(unique(footprints[, .(chrom, start, end)]), cfg$signal)
   footprints <- merge(footprints, signal, by = c("chrom", "start", "end"), sort = FALSE)
   result <- list(signature = prep$signature, feature_stamps = pol2_stamp(files),
@@ -516,7 +507,8 @@ pol2_cluster <- function(cfg) {
 # 3. Steps:
 #    - Remove gene-version suffixes
 #    - Match gene identities
-#    - Mark matched and unmatched entries.
+#    - Mark matched and unmatched entries
+
 pol2_attach_pi <- function(meta, path) {
   out <- copy(meta)
   out[, `:=`(pi = NA_real_, pi_status = "not_supplied")]
@@ -543,7 +535,8 @@ pol2_attach_pi <- function(meta, path) {
 # 3. Steps:
 #    - Compare each cluster mean with the overall mean
 #    - Test each cluster against the remaining molecules
-#    - Adjust for multiple comparisons.
+#    - Adjust for multiple comparisons
+
 pol2_signal_enrichment <- function(m) {
   m <- m[is.finite(pol2_tss_signal)]
   overall <- mean(m$pol2_tss_signal)
@@ -566,7 +559,8 @@ pol2_signal_enrichment <- function(m) {
 # 3. Steps:
 #    - Count molecules and summarize signal
 #    - Calculate median pausing index across distinct TSSs
-#    - Order clusters by pausing index.
+#    - Order clusters by pausing index
+
 pol2_cluster_summary <- function(m) {
   pi <- unique(m[is.finite(pi), .(cluster, tss_id, pi)])[, .(median_pi = median(pi), n_tss_with_pi = .N), by = cluster]
   out <- merge(m[, .(n = .N), by = cluster], pol2_signal_enrichment(m), by = "cluster", all.x = TRUE)
@@ -589,7 +583,8 @@ pol2_cluster_summary <- function(m) {
 #    - Check saved clustering inputs
 #    - Add annotations and summaries
 #    - Save figures and run details
-#    - Render the report.
+#    - Render the report
+
 pol2_report <- function(cfg, here) {
   tables <- file.path(cfg$output, "tables")
   pol2_required(file.path(tables, "clustering.rds"))
@@ -621,7 +616,7 @@ pol2_report <- function(cfg, here) {
   pol2_save_figures(x, annotation, cfg)
   yaml::write_yaml(cfg, file.path(cfg$output, "run_config.yaml"))
   capture.output(sessionInfo(), file = file.path(cfg$output, "session_info.txt"))
-  rmarkdown::render(file.path(here, "pol2_clustering_report.Rmd"), output_file = "pol2_clustering_report.html", output_dir = cfg$output,
+  rmarkdown::render(file.path(here, "06_pol2_clustering_report.Rmd"), output_file = "pol2_clustering_report.html", output_dir = cfg$output,
                     params = list(output = cfg$output), envir = new.env(parent = globalenv()), quiet = TRUE)
   message("Saved pooled report to ", file.path(cfg$output, "pol2_clustering_report.html"))
 }

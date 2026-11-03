@@ -123,9 +123,9 @@ main <- function() {
     return(invisible(NULL))
   }
   if (!length(args) %in% c(4L, 5L))
-    stop("Usage: 02_build_m6a_input.r functions.r selection_signature.rds region_id ft_result_dir [window_size=2000]\n",
-      "   or: 02_build_m6a_input.r --regions selection_signature.rds [selected_regions.tsv] window_size\n",
-      "   or: 02_build_m6a_input.r --recover-selection leiden_dir selection_signature.rds")
+    stop("Usage: 01_prepare_m6a_input.R functions.r selection_signature.rds region_id ft_result_dir [window_size=2000]\n",
+      "   or: 01_prepare_m6a_input.R --regions selection_signature.rds [selected_regions.tsv] window_size\n",
+      "   or: 01_prepare_m6a_input.R --recover-selection leiden_dir selection_signature.rds")
   project <- dirname(dirname(dirname(normalizePath(args[1]))))
   selection <- readRDS(args[2])
   window_size <- if (length(args) >= 5L) as.numeric(args[5]) else 2000L
@@ -138,7 +138,7 @@ main <- function() {
   offsets <- split(calls$j[calls$x == 1] - 1L, calls$i[calls$x == 1])
   z$read_meta$call_offsets <- vapply(seq_len(nrow(z$met_mat)), function(i)
     paste(offsets[[as.character(i)]], collapse = ","), "")
-  # Pipe sparse call offsets to Python; never write a matrix or input cache.
+  # Write sparse call offsets as TSV for downstream consumers.
   write.table(z$read_meta, stdout(), sep = "\t", quote = TRUE, row.names = FALSE)
 }
 if (sys.nframe() == 0L) main()

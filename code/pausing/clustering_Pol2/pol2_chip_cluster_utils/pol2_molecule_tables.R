@@ -146,3 +146,26 @@ pol2_project <- function(cfg) {
   message("Projected ", nrow(out), " observations of ", uniqueN(out$RID), " physical molecules")
   invisible(out)
 }
+
+###########################
+# Select example promoters
+############################
+# 1. Input: Workflow settings.
+# 2. Output: One promoter per cluster with its read counts.
+#
+# 3. Steps:
+#    - Count all eligible reads at each TSS, using the saved cluster projections
+#    - Keep protein-coding TSSs with at least 100 reads present in every sample
+#    - Per cluster, choose the TSS with the highest fraction of its reads in that cluster.
+pol2_select_example_promoters <- function(cfg) {
+  prep <- readRDS(file.path(cfg$output, "tables", "prepared.rds"))
+  p <- fread(file.path(cfg$output, "tables", "tracks", "molecule_projection.tsv.gz"))
+  totals <- p[, .(n_total = .N, n_samples = uniqueN(sample_name)), by = tss_id]
+  counts <- p[, .(n_cluster = .N), by = .(tss_id, cluster)][totals, on = "tss_id"]
+  counts[, fraction := n_cluster / n_total]
+  counts <- merge(counts, prep$tss[, .(tss_id, gene_name, gene_type)], by = "tss_id")
+  counts <- counts[gene_type == "protein_coding" & n_total >= 100L & n_samples == nrow(prep$samples)]
+  setorder(counts, -fraction, -n_total, tss_id)
+  selected <- counts[, .SD[1L], by = cluster]
+  selected[order(as.integer(sub("^cluster", "", cluster)))]
+}

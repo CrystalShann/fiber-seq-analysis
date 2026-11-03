@@ -37,7 +37,7 @@ need helpers from `code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plo
 Sourced by the Snakemake workflow (`code/snakemake/leiden_manhattan/scripts/common.R`,
 configured in `config/config.yaml`), the Leiden notebooks
 (`leiden_LCL.Rmd`, `marcophage_leiden_manhattan.Rmd`, `testing_clustering_parameters.Rmd`),
-the autocorrelation pipeline (`02_build_m6a_input.r`, `06_autocorrelation.Rmd`),
+the autocorrelation pipeline (`01_prepare_m6a_input.R`, `06_autocorrelation.Rmd`),
 `fire_frequency/05_vis_fire_freq.Rmd`, `fire_frequency/06_footprints_in_FIRE.Rmd` and
 `TF_enrichment.ipynb`, the topic model (`topic_modelling_functions.r`,
 `topic_model/1_plot_promoter_regions.Rmd`), `nucleosome_positioning/process_nuc_pos.R`
@@ -362,3 +362,11 @@ In LCL aligned-block mode, only aligned bases of the same FIRE element count
 toward that threshold. D/N gaps are unobserved. `clip_to_aligned_blocks()` also
 breaks display annotations at those gaps, and the m6A profile denominator counts
 only fibers aligned at each position. Macrophage behavior is unchanged.
+
+Methylation profiles use observed m6A-call positions and are drawn as color-filled
+areas without smoothing by default. `pileup_reads()` and `load_region_results()`
+default to no smoothing; region figures use the raw `frac` column. Genomic read
+heatmaps and locus figures omit unobserved positions from their profile values.
+A caller can supply `observed_positions` to retain the site set defined before
+read filtering, or `profile_opportunities` (read × position) for pooled TSSs.
+These options affect profiles, not the binary read heatmap.

@@ -111,7 +111,8 @@ retained reads
 
 The defaults are a **2,000-bp window and all 2,000 non-negative ACF lags**
 
-The analysis accepts `--window-size` and `--n-features`
+The R `autocorrelations()` function accepts an optional inclusive `window` and
+`n_features` (number of lags). This report reads the saved run parameters.
 
 
 # Method
@@ -138,6 +139,25 @@ Previous analysis using Fourier transformation does not give base pair resolutio
   - Autocorrelation represents the information on a distance axis, whereas the FFT represents it on an evenly spaced frequency axis
 
 Constant molecules have undefined ACF and are excluded from clustering
+
+The shared R implementation uses `stats::acf()` with the same fixed lag-zero
+normalization. This small example uses the three reads and twelve consecutive
+bases shown in Step 6:
+
+```{r example-autocorrelation-r}
+source("/project/spott/cshan/fiber-seq/code/clustering_methods/auto_correlation/02_compute_autocorrelations.R", local = TRUE)
+example_calls <- rbind(
+  A = c(1,0,1,0,1,0,0,1,0,0,0,0),
+  B = c(0,0,0,0,0,0,0,0,0,0,0,0),
+  C = c(1,0,1,0,1,0,0,1,0,0,0,1))
+example_acf <- autocorrelations(example_calls)
+stopifnot(identical(example_acf$valid, c(TRUE, FALSE, TRUE)),
+  all(is.na(example_acf$profiles[2L, ])))
+knitr::kable(data.frame(read = rownames(example_calls),
+  valid = example_acf$valid, example_acf$profiles[, 1:6]), digits = 6,
+  col.names = c("Read", "Valid", paste0("Lag ", 0:5)))
+```
+
 
 <!-- set knitr options and find the region folders. Parameters: figures 12 x 8 in, 300 dpi, SVG; run folder = params$output_dir; regions = every rank* folder under outputs/, or only those in params$regions -->
 ```{r setup, include=FALSE, purl=FALSE}
@@ -283,11 +303,33 @@ prepare_fiberhmm_track <- function(region, assignments, size, project, tracks_ro
 ```
 
 run autocorrelation, and get nucleeosomes and footprints
+```{r observed-methylation-function, include=FALSE}
+observed_methylation_metadata <- function(region_data) {
+  offsets <- region_data$call_offsets
+  if (is.matrix(offsets)) offsets <- asplit(offsets,1L)
+  offsets <- lapply(offsets,function(z) as.integer(unlist(z,use.names=FALSE)))
+  stopifnot(length(offsets)==nrow(region_data$records))
+  n_sites <- length(unique(unlist(offsets,use.names=FALSE)))
+  region_data$records$m6a_calls <- lengths(offsets)
+  region_data$records$n_observed_sites <- n_sites
+  region_data$records$m6a_call_fraction <- if (n_sites) lengths(offsets)/n_sites else NA_real_
+  d <- region_data$tables$cluster_summary
+  if (nrow(d)) for (i in seq_len(nrow(d))) {
+    a <- region_data$records
+    d$mean_m6a_call_fraction[i] <- mean(a$m6a_call_fraction[a$cluster==d$cluster[i] & a$status=="clustered"])
+  }
+  region_data$tables$cluster_summary <- d
+  region_data$methylation_fraction_definition <- "Per-read calls / pooled observed m6A-call positions across input reads; no smoothing. ACF input and lags unchanged."
+  region_data
+}
+
+```
+
 ```{r prepare-report-data-function, include=FALSE}
 prepare_report_data <- function(region_data, project, destination,
     ft_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FIRE/results",
     tracks_root = "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged/combined/joint_trained_tracks") {
-  # Python extracts function chunks only, so load these dependencies here too.
+  # Load dependencies here so this function can also be called independently.
   source(file.path(project, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
   source(file.path(project, "code/parsing_functions/plotting_functions.r"), local = TRUE)
   source(file.path(project, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_plots.r"), local = TRUE)
@@ -297,6 +339,7 @@ prepare_report_data <- function(region_data, project, destination,
   region_data$acf <- autocor_payload_matrix(region_data$acf, nrow(region_data$records))
   stopifnot(nrow(region_data$acf) == nrow(region_data$records),
     ncol(region_data$acf) == region_data$params$n_features)
+  region_data <- observed_methylation_metadata(region_data)
   a <- region_data$records[region_data$records$status == "clustered", , drop = FALSE]
   a$original_RID <- a$RID
   a$RID <- paste(a$sample_name, a$original_RID, sep = "::")
@@ -332,12 +375,12 @@ prepare_report_data <- function(region_data, project, destination,
 }
 ```
 
-<!-- load one region's report_data.rds, check that reads and ACF rows line up, number the ACF clusters from 1 as Leiden_Manhattan does (saved Scanpy cluster 0, the largest, becomes cluster 1) in the reads and every summary table, compute the repeat-length candidates and build the plotting object -->
+<!-- load one region's report_data.rds, check that reads and ACF rows line up, number the ACF clusters from 1 as Leiden_Manhattan does (saved cluster 0 becomes display cluster 1) in the reads and every summary table, compute the repeat-length candidates and build the plotting object -->
 ```{r read-report-data-function, include=FALSE}
 read_report_data <- function(folder) {
   path <- file.path(folder, "report_data.rds")
   if (!file.exists(path)) stop("Missing analysis data for direct plotting: ", path)
-  region_data <- readRDS(path)
+  region_data <- observed_methylation_metadata(readRDS(path))
   stopifnot(identical(as.integer(region_data$schema_version), 1L),
     nrow(region_data$region) == 1L, region_data$region$region_id == basename(folder),
     identical(region_data$row_ids, region_data$records$row_id),
@@ -627,7 +670,7 @@ plot_acf_umap <- function(region_data) {
   methylation <- ggplot2::ggplot(a, ggplot2::aes(umap1, umap2, color = m6a_call_fraction)) +
     ggplot2::geom_point(size = 1) + ggplot2::scale_color_viridis_c() +
     ggplot2::labs(title = region_data$region$region_id, x = "UMAP 1", y = "UMAP 2",
-      color = "m6A call fraction") + ggplot2::theme_bw(base_size = 10)
+      color = "m6A / observed sites") + ggplot2::theme_bw(base_size = 10)
   cowplot::plot_grid(clusters, methylation, ncol = 2)
 }
 ```
@@ -1178,7 +1221,7 @@ missing_data <- region_dirs[!file.exists(file.path(region_dirs, "report_data.rds
 if (length(missing_data)) stop(
   "Direct plotting requires report_data.rds for each region. Missing: ",
   paste(basename(missing_data), collapse = ", "),
-  ". Run 01_run_autocorrelation.py to save numerical inputs, or set output_dir to a prepared run.")
+  ". Run 05_run_autocorrelation.R to prepare inputs, or set output_dir to a prepared run.")
 autocor_fiberseq_packages()
 region_results <- lapply(region_dirs, read_report_data)
 ```

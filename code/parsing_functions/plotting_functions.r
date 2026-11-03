@@ -514,7 +514,7 @@ plot_group_profile <- function(profile, window = NULL, group_col = NULL,
 #'
 #' res contains region (chr/start/end), reads (RID/pos/base), rids_df
 #' (RID/start/end, arrow_end when arrows are enabled), fire/nucs/fps_infire
-#' (RID/start/end/class), pileup (pos/base/smooth_frac), size_levels in ascending
+#' (RID/start/end/class), pileup (pos/base/frac), size_levels in ascending
 #' size order, nuc_label and group_col. Read tables also carry the grouping column
 #' and share RID factor levels. Optional fire_peaks contains start/end/logFDR.
 #' Preparation and fraction calculations belong to the calling data helpers.
@@ -577,7 +577,7 @@ plot_region_panels <- function(res,
   highlight_position <- match.arg(highlight_position)
   highlights <- .fiberseq_highlights(highlight,
     list(fill = highlight_fill, alpha = highlight_alpha, position = highlight_position))
-  po <- .fiberseq_options(list(colour_by = "base", colors = bp, y_col = "smooth_frac",
+  po <- .fiberseq_options(list(colour_by = "base", colors = bp, y_col = "frac",
     linewidth = NULL, facet_scales = "free_y", facet_space = "free_y",
     require_data = FALSE), profile_options)
   po$colour_by <- match.arg(po$colour_by, c("base", "group"))
@@ -605,7 +605,7 @@ plot_region_panels <- function(res,
     if (is.null(colour_col)) stop("group-coloured profiles require group_col")
     line <- list(geom = "line")
     if (!is.null(po$linewidth)) line$linewidth <- po$linewidth
-    layers <- list(line)
+    layers <- list(list(geom = "area", position = "identity", alpha = .65), line)
     profile_data <- pil
     if (po$colour_by == "base") {
       profile_data <- dplyr::filter(pil, base == "A")
@@ -613,11 +613,12 @@ plot_region_panels <- function(res,
         mapping = ggplot2::aes(y = .data[[po$y_col]]))), layers)
     }
     gg$pileup <- plot_group_profile(profile_data, group_col = colour_col,
-      style = "line", y_col = po$y_col,
-      mapping = ggplot2::aes(x = pos, y = .data[[po$y_col]], colour = .data[[colour_col]]),
+      style = "area", y_col = po$y_col,
+      mapping = ggplot2::aes(x = pos, y = .data[[po$y_col]], colour = .data[[colour_col]],
+        fill = .data[[colour_col]], group = .data[[colour_col]]),
       layers = layers, highlight = highlights, facet_col = group_col,
       facet_layout = "grid", facet_scales = po$facet_scales, facet_space = po$facet_space,
-      colors = po$colors,
+      colors = po$colors, fill_colors = po$colors,
       scales = list(ggplot2::scale_y_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1))),
       theme = panel_theme("pileup", list(legend.position = "none")),
       labels = list(x = NULL, y = y_labels[["pileup"]], title = plot_name, subtitle = subtitle)) +
@@ -792,7 +793,7 @@ plot_region_panels <- function(res,
 #   variants              - "genomic": SNP table (chr, pos, ref, alt,
 #                           variant_id) marked below the heatmap when the
 #                           region has no focal SNP
-#   show_cluster_profiles - "genomic": add per-cluster m6A fraction lines on top
+#   show_cluster_profiles - "genomic": add per-cluster observed-site m6A filled profiles on top
 #   split_alleles         - "genomic": split rows by allele, then cluster
 #   cluster_label         - "genomic": title text used with include_haplotype
 #   sample_label_column   - "genomic": assignments column for sample labels
@@ -817,6 +818,27 @@ plot_region_panels <- function(res,
 #   draw = FALSE: ComplexHeatmap Heatmap object; draw = TRUE: invisible NULL
 #   (the heatmap is drawn as a side effect)
 # ---------------------------------------------------------------------------
+# Filled unsmoothed methylation profile on the original genomic coordinate axis.
+# Missing positions are omitted from the profile, rather than assigned zero.
+methylation_area_annotation <- function(values, color, height = grid::unit(12, "mm")) {
+  ComplexHeatmap::AnnotationFunction(which="column", n=length(values), height=height,
+    var_import=list(values=values,color=color), fun=function(index) {
+      y <- values[index]
+      x <- seq_along(index)
+      keep <- is.finite(y)
+      grid::pushViewport(grid::viewport(xscale=c(.5,length(index)+.5),yscale=c(0,1),clip=FALSE))
+      if (any(keep)) {
+        xx <- x[keep]; yy <- y[keep]
+        grid::grid.polygon(x=grid::unit(c(xx[1],xx,tail(xx,1)),"native"),
+          y=grid::unit(c(0,yy,0),"native"),gp=grid::gpar(fill=color,col=NA))
+        grid::grid.lines(x=grid::unit(xx,"native"),y=grid::unit(yy,"native"),
+          gp=grid::gpar(col=color,lwd=.6))
+      }
+      grid::grid.yaxis(at=c(0,.5,1),label=c("0",".5","1"),gp=grid::gpar(fontsize=6))
+      grid::popViewport()
+    })
+}
+
 plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
                               include_haplotype = FALSE, variants = NULL,
                               show_cluster_profiles = FALSE, split_alleles = FALSE,
@@ -953,11 +975,26 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
       cluster_colors <- cluster_id_palette(levels(assignments$cluster))
       profile_annotations <- lapply(levels(assignments$cluster), function(cluster) {
         selected <- assignments$cluster == cluster
-        ComplexHeatmap::anno_lines(
-          colMeans(met[selected, , drop = FALSE]),
-          ylim = c(0, 1), gp = grid::gpar(col = cluster_colors[[cluster]], lwd = 0.7),
-          axis_param = list(at = c(0, 0.5, 1), labels = c("0", ".5", "1")),
-          height = grid::unit(12, "mm"))
+        # The matrix is for display; profile opportunities are separate.
+        # Default to the union of observed calls in the original matrix, before
+        # selecting clusters. Callers pooling TSSs can supply per-read masks.
+        if (!is.null(res$profile_opportunities)) {
+          opportunity <- as.matrix(res$profile_opportunities[assignments$RID,,drop=FALSE])
+          stopifnot(identical(colnames(opportunity),colnames(res$site_met_mat)),
+            all(res$site_met_mat[assignments$RID,,drop=FALSE][!opportunity]==0))
+          counts <- colSums(res$site_met_mat[assignments$RID[selected],,drop=FALSE])
+          denominator <- colSums(opportunity[selected,,drop=FALSE])
+          fraction <- ifelse(denominator>0,counts/denominator,NA_real_)
+          values <- rep(NA_real_,ncol(met))
+          values[match(colnames(res$site_met_mat),as.character(seq.int(region$analysis_start,region$analysis_end)))] <- fraction
+          if (anchor$direction == -1L) values <- rev(values)
+        } else {
+          observed <- if (!is.null(res$observed_positions)) as.character(res$observed_positions) else
+            colnames(res$site_met_mat)[Matrix::colSums(res$site_met_mat,na.rm=TRUE)>0]
+          values <- colMeans(met[selected,,drop=FALSE],na.rm=TRUE)
+          values[!colnames(met) %in% observed] <- NA_real_
+        }
+        methylation_area_annotation(values,cluster_colors[[cluster]])
       })
       names(profile_annotations) <- paste0(levels(assignments$cluster), " m6A")
       top <- do.call(ComplexHeatmap::HeatmapAnnotation, c(profile_annotations,
@@ -1002,7 +1039,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
       column_title = paste(c(region$annotation,
         if (include_haplotype) paste0(cluster_label, "; focal allele annotated per sample"),
         if (split_alleles) "Rows split by focal allele, then cluster",
-        if (show_cluster_profiles) "Top: m6A call fraction per cluster (all full-span reads)",
+        if (show_cluster_profiles) "Top: m6A at observed sites per cluster; filled, no smoothing",
         if (anchor$promoter) anchor$x_label,
         if (include_haplotype && !nrow(snps)) "No phased heterozygous SNP in this window",
         paste0(region$chr, ":", region$analysis_start, "-", region$analysis_end)), collapse = "\n"),
@@ -1630,7 +1667,7 @@ plot_tf_cluster_profiles <- function(examples, reference_result, show_reads, exa
           strip <- setNames(sprintf("%s\nn = %d", group_levels,
                                     as.integer(n_reads[group_levels])), group_levels)
           plot_group_profile(pileup, group_col = "accessibility_group", style = "area",
-            y_col = "smooth_frac", mapping = aes(pos, smooth_frac),
+            y_col = "frac", mapping = aes(pos, frac),
             highlight = list(xmin = ex$start, xmax = ex$end, fill = "grey88", position = "under"),
             layers = list(list(geom = "area", mapping = aes(fill = accessibility_group), alpha = 0.9),
               list(geom = "line", linewidth = 0.25, colour = "grey15"))) +
@@ -1638,7 +1675,7 @@ plot_tf_cluster_profiles <- function(examples, reference_result, show_reads, exa
             scale_fill_manual(values = group_cols, guide = "none") +
             scale_x_continuous(breaks = window_breaks(ex), labels = scales::comma) +
             scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.05))) +
-            labs(x = NULL, y = "m6A fraction (+/- 5 bp mean)") +
+            labs(x = NULL, y = "m6A fraction (observed sites)") +
             theme_fiberseq("classic", base_size = 9, overrides = example_theme_settings) +
             theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
                   axis.line.x = element_blank())
@@ -2063,11 +2100,15 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands
     heights["proportions"] <- .45 + .35 * nlevels(bars$set)
   }
   profile <- as.data.table(cluster_site_profiles(result, result$site_met_mat))
+  observed <- if (!is.null(result$observed_positions)) as.numeric(result$observed_positions) else
+    as.numeric(colnames(result$site_met_mat)[Matrix::colSums(result$site_met_mat,na.rm=TRUE)>0])
+  profile <- profile[pos %in% observed]
   profile[, strip := factor(group_labels[cluster], levels = group_labels)]
-  profiles <- plot_group_profile(profile, group_col = "strip", x_col = "pos", y_col = "met",
+  profiles <- plot_group_profile(profile, group_col = "strip", style = "area", x_col = "pos", y_col = "met",
     facet_col = "strip", facet_layout = "grid", facet_scales = "fixed",
     colors = setNames(group_colors[names(group_labels)], group_labels), coordinates = "relative",
-    region = region, layers = list(list(geom = "line", linewidth = .3)))
+    region = region, fill_colors = setNames(group_colors[names(group_labels)], group_labels),
+    layers = list(list(geom = "area", position = "identity", alpha = .65), list(geom = "line", linewidth = .3)))
   profiles <- shade(profiles) + anchor_line() + scale_x_continuous(expand = c(0, 0)) +
     coord_cartesian(xlim = bounds) + scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1)) +
     labs(x = NULL, y = "m6A fraction") + domain_ctcf_theme() +

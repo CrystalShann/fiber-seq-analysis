@@ -16,8 +16,6 @@ k_neighbors: 10
 resolution: 1
 seed: 1
 sample_n: 5000
-# Conservative estimate includes dense distance workspaces, not just the final matrix.
-max_memory_gb: 24
 heatmap_max_reads: 5000
 # Day 2016 PI; joined by Ensembl gene ID (column ensg) although its RefSeq TSSs differ.
 # null = no PI; clusters then keep their Leiden size order.

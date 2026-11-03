@@ -957,7 +957,7 @@ smooth_mean_slidewindow <- function(x, pos, n = 20) {
 #   stops when no modified position falls inside the window
 # ---------------------------------------------------------------------------
 pileup_reads <- function(reads, rids_df, window_start, window_end,
-                         split_by = NULL, smooth = TRUE, window_n = 10) {
+                         split_by = NULL, smooth = FALSE, window_n = 10) {
 
   if (!is.null(split_by) && !split_by %in% colnames(rids_df))
     stop("column '", split_by, "' not found in rids_df")
@@ -1184,7 +1184,7 @@ load_region_results <- function(region,
                                 nucleosome_label = "130-160 bp nucleosome",
                                 nucleosome_source = c("fiberhmm", "ft"),
                                 window_n = 10,
-                                smooth_pileup = TRUE,
+                                smooth_pileup = FALSE,
                                 verbose = TRUE) {
 
   stopifnot(is.data.frame(region), nrow(region) == 1)
