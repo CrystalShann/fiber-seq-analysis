@@ -3,10 +3,10 @@ if (opt$stage == "motif-inputs") {
   x <- readRDS(file.path(cfg$output,"tables/clustering.rds"))
   example_gene <- opt$gene
   tables <- file.path(cfg$output, "tables")
-  tabdir <- file.path(tables, "promoter_motif_cluster_examples")
+  tabdir <- file.path(tables, "promoter_motif_cluster_examples", "examples")
   shared_read_cache <- file.path(tabdir,"promoter_read_data.rds")
   if (!is.null(example_gene)) tabdir <- file.path(tabdir,example_gene)
-  plotdir <- file.path(cfg$output, "plots", "promoter_motif_cluster_examples")
+  plotdir <- file.path(cfg$output, "plots", "promoter_motif_cluster_examples", "examples")
   dir.create(tabdir, recursive = TRUE, showWarnings = FALSE)
   dir.create(plotdir, recursive = TRUE, showWarnings = FALSE)
   selected <- pol2_select_example_promoters(cfg)

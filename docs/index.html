@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Fiber-seq reports on macrophage FIRE frequency, LCL AS-FIRE clustering, autocorrelation, and LCL co-accessibility.">
+  <meta name="description" content="Fiber-seq reports on macrophage FIRE frequency, LCL AS-FIRE clustering, autocorrelation, LCL co-accessibility, and clustering at TSS with Pol II ChIP peaks.">
   <title>Fiber-seq Analysis</title>
   <style>
     :root { color-scheme: light; }
@@ -43,6 +43,7 @@
       <nav aria-label="Analysis categories">
         <a href="#fire-frequency">Macrophage FIRE frequency</a>
         <a href="#manhattan-leiden">Manhattan distance &amp; Leiden clustering</a>
+        <a href="#tss-pol2-clustering">Clustering at TSS with Pol II ChIP peaks</a>
         <a href="#autocorrelation">Autocorrelation</a>
         <a href="#co-accessibility">Co-accessibility in LCL</a>
         <a href="#tutorials">Tutorials</a>
@@ -80,6 +81,16 @@
             <article>
               <h3><a href="testing_clustering_parameters.html">Clustering parameter comparison</a></h3>
               <p>Comparison of neighbor-count and Leiden resolution settings to assess their effects on clustering at the top-ranked AS-FIRE region.</p>
+            </article>
+          </div>
+        </section>
+        <section id="tss-pol2-clustering" aria-labelledby="tss-pol2-heading">
+          <h2 id="tss-pol2-heading">Clustering at TSS with Pol II ChIP peaks</h2>
+          <p class="description">Clustering analysis at transcription start sites (TSS) with Pol II ChIP peaks.</p>
+          <div class="reports">
+            <article>
+              <h3><a href="06_pol2_clustering_report.html">Pol II clustering report</a></h3>
+              <p>Explore clustering results at TSS with Pol II ChIP peaks.</p>
             </article>
           </div>
         </section>

@@ -5,7 +5,7 @@ here <- dirname(normalizePath(script))
 args <- commandArgs(trailingOnly = TRUE)
 opt <- list(config = file.path(here, "pol2_chip_cluster_utils", "config.yaml"), stage = "all", chrom = NULL, gene = NULL)
 if ("--help" %in% args) {
-  cat("00_run.sh [--config YAML] [--stage prepare|count|features|cluster|project|tracks|autocorrelation|nucleosome|expression|observed-sites|motif-inputs|histone-inputs|render|promoter-motifs|motif-bars|report|all] [--chrom chrN] [--gene ARF4]\n")
+  cat("00_run.sh [--config YAML] [--stage prepare|count|features|cluster|project|tracks|autocorrelation|nucleosome|observed-sites|motif-inputs|histone-inputs|render|promoter-motifs|motif-bars|report|all] [--chrom chrN] [--gene ARF4]\n")
   quit(status = 0)
 }
 if (length(args) %% 2) stop("Expected --option value pairs")
@@ -20,7 +20,7 @@ source(file.path(here, "pol2_chip_cluster_utils", "pol2_clustering_plots.R"))
 cfg <- yaml::read_yaml(opt$config)
 pol2_load_helpers(cfg$project)
 source(file.path(here,"pol2_chip_cluster_utils/pol2_observed_profiles.R"))
-if (!opt$stage %in% c("prepare", "count", "features", "cluster", "project", "tracks", "autocorrelation", "nucleosome", "expression", "observed-sites", "motif-inputs", "histone-inputs", "render", "promoter-motifs", "motif-bars", "report", "all")) stop("Invalid stage")
+if (!opt$stage %in% c("prepare", "count", "features", "cluster", "project", "tracks", "autocorrelation", "nucleosome", "observed-sites", "motif-inputs", "histone-inputs", "render", "promoter-motifs", "motif-bars", "report", "all")) stop("Invalid stage")
 if (!is.null(opt$chrom) && opt$stage != "features") stop("--chrom is only for the features stage")
 if (!is.null(opt$gene) && !opt$stage %in% c("promoter-motifs","observed-sites","motif-inputs")) stop("--gene is only for promoter-motifs, observed-sites or motif-inputs")
 dir.create(cfg$output, recursive = TRUE, showWarnings = FALSE)
@@ -55,7 +55,7 @@ if (opt$stage %in% c("cluster", "all")) pol2_cluster(cfg)
 if (opt$stage %in% c("project", "all")) pol2_project(cfg)
 if (opt$stage %in% c("tracks", "all")) pol2_tracks(cfg)
 
-if (opt$stage %in% c("autocorrelation","nucleosome","expression")) {
+if (opt$stage %in% c("autocorrelation","nucleosome")) {
   report <- readLines(file.path(here,"06_pol2_clustering_report.Rmd"))
   label <- paste0(opt$stage,"-analysis")
   start <- grep(paste0("^```\\{r ",label,","),report)
@@ -73,8 +73,9 @@ if (opt$stage == "motif-bars") source(file.path(here,"07_motif_cluster_bars.R"))
 if (opt$stage == "promoter-motifs") {
   report <- readLines(file.path(here,"06_pol2_clustering_report.Rmd"))
   params <- list(output=cfg$output, example_gene=opt$gene)
-  for (label in c("setup","promoter-motif-selection","promoter-motif-analysis")) {
-    start <- grep(paste0("^```\\{r ",label,","),report)
+  for (label in c("setup","promoter-motif-selection","motif-setup","load-motif-data","load-read-data",
+                  "plot-read-motif","count-motif-support","save-motif-tables")) {
+    start <- grep(paste0("^```\\{r ",label,"[,}]"),report)
     stopifnot(length(start)==1L)
     end <- start + which(report[(start+1L):length(report)]=="```")[1L]
     eval(parse(text=report[(start+1L):(end-1L)]))

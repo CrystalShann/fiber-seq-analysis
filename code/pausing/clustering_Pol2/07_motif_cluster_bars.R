@@ -3,7 +3,7 @@
 project <- "/project/spott/cshan/fiber-seq"
 base <- file.path(project,"code/pausing/clustering_Pol2")
 cfg <- yaml::read_yaml(file.path(base,"pol2_chip_cluster_utils/config.yaml"))
-old_tables <- file.path(cfg$output,"tables/motif_puffin_scan")
+old_tables <- file.path(cfg$output,"tables/promoter_motif_cluster_examples/cluster_proportions")
 if (!all(file.exists(file.path(old_tables,c("cohort.tsv.gz","same_molecule_footprints.tsv.gz","assigned_promoters.tsv"))))) {
 # Export only the original saved cohort; recover available footprint quality.
 project <- "/project/spott/cshan/fiber-seq"
@@ -13,7 +13,7 @@ source(file.path(base, "pol2_chip_cluster_utils/pol2_molecule_tables.R"))
 source(file.path(project, "code/parsing_functions/parsing_footprints_functions.r"))
 cfg <- yaml::read_yaml(file.path(base, "pol2_chip_cluster_utils/config.yaml"))
 tables <- file.path(cfg$output, "tables")
-out <- file.path(tables, "motif_puffin_scan")
+out <- file.path(tables, "promoter_motif_cluster_examples", "cluster_proportions")
 dir.create(out, recursive = TRUE, showWarnings = FALSE)
 # Deliberately use saved preparation, not current configuration to regenerate it.
 prep <- readRDS(file.path(tables, "prepared.rds"))
@@ -155,8 +155,8 @@ source(file.path(base, "pol2_chip_cluster_utils/pol2_clustering_functions.R"))
 source(file.path(project, "code/parsing_functions/plotting_functions.r"))
 source(file.path(base, "pol2_chip_cluster_utils/pol2_clustering_plots.R"))
 cfg <- yaml::read_yaml(file.path(base, "pol2_chip_cluster_utils/config.yaml"))
-out <- file.path(cfg$output, "tables/motif_puffin_scan")
-plots <- file.path(cfg$output, "plots/motif_puffin_scan")
+out <- file.path(cfg$output, "tables/promoter_motif_cluster_examples/cluster_proportions")
+plots <- file.path(cfg$output, "plots/promoter_motif_cluster_examples/cluster_proportions")
 dir.create(plots, recursive = TRUE, showWarnings = FALSE)
 save_table <- function(x, name) fwrite(x, file.path(out, name), sep = "\t", na = "NA")
 save_plot <- function(p, name, w = 10, h = 6) {
@@ -176,7 +176,6 @@ stopifnot(nrow(m) == 5000L, !anyDuplicated(m[, .(sample_name, original_RID)]),
 categories <- c("SP", "ETS", "ZNF143", "NRF1", "CREB", "TATA", "YY1", "NFY", "U1")
 available <- unique(manifest[status == "available", category])
 clusters <- pol2_numeric_clusters(m$cluster)
-colors <- cluster_id_palette(clusters)
 m <- merge(m, lookup[, .(tss_id, sequence_id, usable_sequence, sequence_status)], by = "tss_id", sort = FALSE)
 m[, cluster := factor(cluster, levels = clusters)]
 m[, n_detected_tf_footprints := 0L]
@@ -254,18 +253,8 @@ bars <- summary[, .(cluster, category, numerator = footprint_occurrence_numerato
 bars[, label := ifelse(is.na(fraction), "NA", sprintf("%.1f%%", 100*fraction))]
 bars[, cluster := factor(cluster, levels = clusters)]
 save_table(bars, "cluster_footprint_proportions.tsv")
-for (cat in available) {
-  d <- bars[category == cat]
-  p <- plot_stacked_proportion(d, x = "cluster", fill = "cluster", colors = colors,
-        y = "fraction", position = "stack", labels = list(x = "Cluster", y = "Proportion of molecules")) +
-    geom_text(aes(label = label), vjust = -.4, size = 3) +
-    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0,.15))) +
-    labs(title = paste(cat, "motif-associated footprints"),
-         subtitle = "At least one >=50%-supported motif / all original reads; 10-30 bp; no score or FIRE filter") +
-    theme_fiberseq("classic", base_size = 10) +
-    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
-  save_plot(p, paste0(cat, "_cluster_bars"), 7, 4.5)
-}
+# Same plot function as the report's motif-cluster-bars chunk
+for (cat in available) save_plot(pol2_plot_motif_cluster_bars(bars, cat, clusters), paste0(cat, "_cluster_bars"), 7, 4.5)
 
 capture.output(sessionInfo(), file = file.path(out, "R_session_info.txt"))
 provenance <- jsonlite::read_json(file.path(out, "provenance.json"), simplifyVector = FALSE)

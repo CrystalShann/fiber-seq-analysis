@@ -102,7 +102,7 @@ pol2_observed_heatmap <- function(res, sample_colors, profile) {
   top <- do.call(ComplexHeatmap::HeatmapAnnotation,c(top,list(annotation_name_gp=grid::gpar(fontsize=8),gap=grid::unit(1.5,"mm"))))
   plot_read_heatmap(res,pol2_plot_region(),sample_colors,show_cluster_profiles=FALSE,
     heatmap_options=list(top_annotation=top,column_title=paste0(
-      "Pol II clustering: ",nrow(res$assignments)," molecules\nTop: m6A at observed sites; no smoothing\n",POL2_X_LABEL)))
+      "Pol II clustering: ",nrow(res$assignments)," molecules\n",POL2_X_LABEL)))
 }
 
 pol2_observed_loci <- function(cfg,x,annotation,masks) {

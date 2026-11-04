@@ -24,12 +24,7 @@ pi_table: /project/spott/cshan/fiber-seq/LCL_project/pausing/pause_index.tsv
 locus_genes: [GSDME, STING1, CASP4]
 gene_models: /project/spott/cshan/annotations/gencode.v46.annotation.gtf.gz
 eqtl_pairs: /project/spott/cshan/annotations/LCL_public_data/GTEx_Analysis_v8_eQTL/Cells_EBV-transformed_lymphocytes.v8.signif_variant_gene_pairs.txt.gz
-# ENCODE GM12878 RNA-seq ENCSR820PHH (RSEM gene TPM, two replicates), used by the report expression chunk.
-expression:
-- /project/spott/cshan/annotations/LCL_public_data/gene_quan_ENCSR820PHH/ENCFF873VWU.gene_quan.tsv
-- /project/spott/cshan/annotations/LCL_public_data/gene_quan_ENCSR820PHH/ENCFF345SHY.gene_quan.tsv
 
-imprinted_dmrs: /project/spott/cshan/annotations/lcl_dmr_coordinates_Akbari.bed.gz
 pb_cpg_tools: /project/spott/cshan/envs/pb-CpG-tools/bin/aligned_bam_to_cpg_scores
 python: /project/spott/cshan/envs/Jupyter-notebook/bin/python3
 reference: /project/spott/cshan/annotations/hg38.fa

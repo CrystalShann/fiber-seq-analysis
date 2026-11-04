@@ -84,7 +84,7 @@ knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 example_gene <- NULL
 recompute_autocorrelation <- FALSE
 recompute_nucleosome <- FALSE
-# Preserve an explicitly requested single-promoter CLI run.
+
 if (!is.null(params$example_gene)) example_gene <- params$example_gene
 library(data.table)
 library(ggplot2)
@@ -100,7 +100,6 @@ x <- readRDS(file.path(params$output, "tables", "clustering.rds"))
 annotation <- readRDS(file.path(params$output, "tables", "annotations.rds"))
 annotation <- pol2_numeric_annotation(annotation)
 m <- annotation$molecules
-fp <- annotation$footprints
 res <- pol2_heatmap_result(x, annotation, cfg$heatmap_max_reads, cfg$seed)
 sample_colors <- pol2_sample_colors(cfg, res$assignments$sample_name)
 clusters <- levels(res$assignments$cluster)
@@ -143,7 +142,9 @@ clusters individual Fiber-seq molecules by their m6A accessibility patterns arou
 	
 	7. identify clusters. Connect each molecule to its 10 nearest neighbors, giving stronger weights to more similar molecules. Run Leiden clustering with resolution 1 to identify groups with similar profiles
 	
-	8. assign the remaining molecules to the discovered clusters
+	8. **assign the remaining molecules to the discovered clusters**
+	
+	  - *this may not be a good way to assign reads to clusters, but i don't know if it is feasible to do clustering on all the reads?*
 	
 		a. only the sampled 5000 molecules are used to discovered the clusters, the remaining eligible molecules are assigned to the existing clusters
 		b. take one remaining molecule's binned accessibility profile --> find 10 sampled molecules with the most similar profiles by Manhattan distance
@@ -151,260 +152,331 @@ clusters individual Fiber-seq molecules by their m6A accessibility patterns arou
 
 - If there is a tie, compare the closest neighboring belong the 2 clusters, whichever of those clusters has the closet neighbor (by smallest distance) wins
 
-Heatmap showing
 
-```{r heatmap, fig.width=14, fig.height=11 + 0.55 * k}
-pol2_draw_heatmap(pol2_observed_heatmap(res, sample_colors, observed_profile), clusters, profiles = TRUE)
+
+Heatmap of the 5,000 randomly sampled reads used for clustering, grouped by cluster: each row is one read's m6A calls across the TSS +/- 1 kb window. Top panels show cluster's m6A fraction at observed sites
+
+```{r heatmap, fig.width=14, fig.height=11 + 0.55 * get("k", knitr::knit_global())}
+ht <- pol2_observed_heatmap(res, sample_colors, observed_profile)
+save_figure(ht, file.path(cfg$output, "plots", "molecule_heatmap.pdf"), width = 14, height = 11 + 0.55 * k,
+            draw = function(h) pol2_draw_heatmap(h, clusters, profiles = TRUE))
+pol2_draw_heatmap(ht, clusters, profiles = TRUE)
 ```
 
-Heatmap showing
+Clusters ordered by median pausing index (lowest on top): the same reads (left), each cluster's mean m6A profile in 50 bp bins (middle) and Pol II enrichment (right)
 
-```{r pol2-clusters-and-enrichment, fig.width=16, fig.height=max(7, 0.9 * k + 2)}
-pol2_clusters_and_enrichment(res, annotation, sample_colors)
+Pol II enrichment: each TSS gets the mean Pol II ChIP fold-enrichment over input bigwig ( ENCFF328MMS) from −50 to +299 bp, each read takes its TSS's value, and the bar is log2(cluster mean / mean of all 5,000 reads); stars are a Wilcoxon test of the cluster vs. all other reads, BH-adjusted
+
+* < 0.05
+** < 0.01
+*** < 0.001
+
+How pausing index is assigned to each cluster (PI labels and cluster order in this figure):
+
+1. Each gene has one pausing index from `pause_index.tsv` (Day et al. steps, Pol II ChIP), matched to the read's TSS by Ensembl gene ID
+2. For each cluster, take the distinct TSSs of its clustered reads that have a PI. A TSS counts once per cluster, however many of its reads are in that cluster
+3. Cluster PI = median PI of those TSSs, shown as "PI: median (n TSSs)" on each profile
+4. Clusters are ordered by this median, lowest at the top
+
+```{r pol2-clusters-and-enrichment, fig.width=16, fig.height=max(7, 0.9 * get("k", knitr::knit_global()) + 2)}
+p <- pol2_clusters_and_enrichment(res, annotation, sample_colors)
+save_figure(p, file.path(cfg$output, "plots", "pol2_clusters_and_enrichment.pdf"), width = 16, height = max(7, 0.9 * k + 2))
+print(p)
 ```
 
 ```{r summary}
 knitr::kable(annotation$summary, digits = 3)
 ```
 
-```{r footprints, fig.width=10, fig.height=1.4 * k + 2.5}
-pol2_plot_footprints(annotation)
+Where the 30–60 bp footprints sit on the clustered reads: histogram of footprint midpoints relative to the TSS
+
+```{r footprints, fig.width=10, fig.height=1.4 * get("k", knitr::knit_global()) + 2.5}
+p <- pol2_plot_footprints(annotation)
+save_figure(p, file.path(cfg$output, "plots", "footprint_positions.pdf"), width = 10, height = 1.4 * k + 2.5)
+print(p)
 ```
 
 
-```{r footprint-molecules, fig.width=9, fig.height=11 + 0.55 * k}
-pol2_plot_footprint_molecules(res, fread(file.path(params$output, "tables", "tracks", "molecule_footprints.tsv.gz")))
+All nucleosome and FiberHMM TF footprints on the 5,000 clustered reads, one row per read in the same order as the first heatmap, coloured by footprint size class.
+
+```{r footprint-molecules, fig.width=9, fig.height=11 + 0.55 * get("k", knitr::knit_global())}
+p <- pol2_plot_footprint_molecules(res, fread(file.path(params$output, "tables", "tracks", "molecule_footprints.tsv.gz")))
+save_figure(p, file.path(cfg$output, "plots", "footprint_molecules.pdf"), width = 9, height = 11 + 0.55 * k)
+print(p)
 ```
 
-Pol II fold-enrichment is measured over each candidate footprint. The boxplot
-summarizes a molecule's footprints first, to avoid giving molecules with several
-footprints extra weight. Bulk Pol II signal is shared locus evidence, not an independent
-measurement of polymerase binding on each molecule.
+Pausing index of the TSSs in each cluster (one value per TSS per cluster, log scale)
 
-```{r signal, fig.width=9, fig.height=4}
-signal <- fp[, .(signal = if (all(is.na(pol2_mean))) NA_real_ else mean(pol2_mean, na.rm = TRUE)), by = .(cluster, observation_id)]
-ggplot(signal, aes(cluster, signal)) + geom_boxplot(outlier.shape = NA) + theme_bw() +
-  labs(x = "Cluster", y = "Mean Pol II fold-enrichment across candidate footprints")
-```
-
-PI is joined by Ensembl gene ID; the RefSeq TSS of `pause_index.tsv` can differ from the
-FANTOM5 TSS used here.
+PI is joined by Ensembl gene ID. *I used the RefSeq TSS of `pause_index.tsv` to calculate pausing index following Day et al. steps, but used FANTOM5 dominant TSS per gene to annotate the TSS of the reads -> not sure if this is a problem?*
 
 ```{r pi, fig.width=9, fig.height=4}
 pi_sites <- unique(m[, .(cluster, tss_id, pi)])
 if (any(is.finite(pi_sites$pi))) {
-  print(ggplot(pi_sites[is.finite(pi)], aes(cluster, pi)) + geom_boxplot(outlier.shape = NA) +
-          scale_y_log10() + theme_bw() + labs(y = "PI (one value per TSS within each cluster)"))
+  # One box per cluster, filled with the cluster colours
+  p <- ggplot(pi_sites[is.finite(pi)], aes(cluster, pi, fill = cluster)) + geom_boxplot(outlier.shape = NA) +
+    scale_fill_manual(values = cluster_id_palette(levels(pi_sites$cluster)), guide = "none") +
+    scale_y_log10() + theme_bw() + labs(y = "PI (one value per TSS within each cluster)")
+  save_figure(p, file.path(cfg$output, "plots", "pi_by_cluster.pdf"), width = 9, height = 4)
+  print(p)
 } else cat("No matching PI values have been supplied.")
 ```
 
-## Example loci
+## Example loci in cluster 4 (inaccessible cluster)
 
-All eligible molecules at the FANTOM5 TSS of each gene in `locus_genes` (config), drawn
-with `plot_locus_molecules()` from `parsing_functions/plotting_functions.r`. It is the
-HSCA domain/CTCF figure without its CTCF, loop and domain tracks. Clustered molecules
-keep their Leiden cluster. Every other molecule at the TSS takes the majority cluster of
-its 10 nearest clustered molecules (Manhattan distance on the 40 bin features). The bars
-compare the cluster proportions at the TSS with those of all clustered molecules.
-Diamonds mark the gene's GTEx v8 LCL eVariants in the window.
+I chose some loci in cluster4 to look at because they contain the most appearant chromatin states, which is mostly inaccessible
+
+  - reads are grouped by cluster, with gene models, GTEx LCL eQTL variants and each cluster's m6A profile. Reads outside the 5,000 clustered take the majority cluster of their 10 nearest clustered reads
+  
 
 ```{r loci, include=FALSE}
 loci <- pol2_observed_loci(cfg, x, annotation, observed_masks)
 ```
 
-```{r loci-figures, fig.width=12, fig.height=if (length(loci)) max(vapply(loci, function(l) l$height, numeric(1))) else 1}
-for (gene in names(loci)) print(loci[[gene]]$combined)
+```{r loci-figures, fig.width=12, fig.height=if (length(get("loci", knitr::knit_global()))) max(vapply(get("loci", knitr::knit_global()), function(l) l$height, numeric(1))) else 1}
+for (gene in names(loci)) {
+  save_figure(loci[[gene]]$combined, file.path(cfg$output, "plots", "loci", paste0(gene, "_TSS_molecules.pdf")),
+              width = 12, height = loci[[gene]]$height, limitsize = FALSE)
+  print(loci[[gene]]$combined)
+}
 ```
 
 ## Selected promoters: motif and read-level cluster examples
 
-One promoter per cluster: among protein-coding TSSs with at least 100 eligible reads
-present in all 31 samples, the TSS with the highest fraction of its reads in that
-cluster. Reads are all eligible reads at the TSS: clustered reads keep their labels,
-the others use the saved nearest-neighbour projections.
+I want to move beyond cluster4 and to select one promoter representative of each cluster to look at. I just chose the protein coding genes, and that 100 reads in all samples and the TSS with the highest fraction of reads in the cluster
 
 ```{r promoter-motif-selection}
 selected_promoters <- pol2_select_example_promoters(cfg)
 knitr::kable(selected_promoters[, .(cluster, gene_name, n_cluster, n_total, n_samples, fraction)], digits = 3)
 ```
 
-The selected promoters are `r paste(selected_promoters$gene_name, collapse = ", ")`.
-Accessibility profiles use pooled observed m6A-call sites with no smoothing.
-Each figure contains one promoter window and all eight motif families, using all eligible
-reads at that promoter. Original reads retain their clustering labels; additional
-reads use the saved nearest-neighbour cluster projections. These are descriptive
-examples selected for cluster concentration, not tests of motif enrichment.
 
-For each family, only the hit with the highest FIMO score in this window is shown
-(ties: smaller p-value, matrix ID, position, strand). All motif segments are black.
-Yellow shading marks every displayed motif interval. The shading is a reference
-sequence annotation shared by the promoter's reads, not a footprint-support call.
-TF blocks retain the standard 10–30, 30–60 and 60–80-bp colors; 130–160-bp nucleosome
-blocks are retained. No TF score or FIRE-containment filter is applied. Support
-counts use one individual 10–30-bp block covering at least 50% of one full motif
-interval on that same read. U1 is omitted as requested.
 
-```{r promoter-motif-analysis, include=FALSE}
-promoter_motif_examples <- local({
-  tables <- file.path(cfg$output, "tables")
-  tabdir <- file.path(tables, "promoter_motif_cluster_examples")
-  shared_read_cache <- file.path(tabdir,"promoter_read_data.rds")
-  if (!is.null(example_gene)) tabdir <- file.path(tabdir,example_gene)
-  plotdir <- file.path(cfg$output, "plots", "promoter_motif_cluster_examples")
-  dir.create(tabdir, recursive = TRUE, showWarnings = FALSE)
-  dir.create(plotdir, recursive = TRUE, showWarnings = FALSE)
-  selected <- copy(selected_promoters)
-  if (!is.null(example_gene)) {
-    selected <- selected[gene_name==example_gene]
-    if (nrow(selected)!=1L) stop("--gene must be one of the seven selected example promoters")
+Footprint and accessibility profile for each of the example. I also want to see if any of the example would be enriched for any particular promoter TSS as in *Sequence basis of transcription initiation in human genome* paper 
+
+  -> I'm not sure if this is a good way of doing this to just look at single example, because it seems that none of the motifs has a lot of overlap with the footprints. But I don't know how to look at all the promoters in the cluster together as they have different sequence?
+
+  - a motif is supported if one 10-30bp footprint covering at least 50% of one full motif interval on that same read
+  
+  
+The motifs they looked at are:
+
+1. directional motifs
+
+  1) TATA: the most position- and strand-specific effect of any motif
+	2) YY1: highly strand-specific and activates initiation immediately upstream of the motif and about 220 bp upstream.
+
+2. bidirectional motifs
+
+  1) NFY, SP (KLF/SP), ETS, ZNF143, CREB/ATF and NRF1: nearly symmetric effects on both strands
+  
+    - NFY has a distinctive effect curve with about 10.5-bp periodicity, matching DNA helical pitch and possibly reflecting a rigid NF-Y–PIC interaction
+    - SP and NRF1: CG-rich SP motif is the most common promoter motif. NRF1 is the only palindromic motif
+
+```{r motif-setup, include=TRUE}
+# Output folders and the selected promoters with their TSS rows.
+# A single-gene run (--gene, example_gene) keeps one promoter and writes its tables to a subfolder.
+tables <- file.path(cfg$output, "tables")
+tabdir <- file.path(tables, "promoter_motif_cluster_examples", "examples")
+shared_read_cache <- file.path(tabdir,"promoter_read_data.rds")
+if (!is.null(example_gene)) tabdir <- file.path(tabdir,example_gene)
+plotdir <- file.path(cfg$output, "plots", "promoter_motif_cluster_examples", "examples")
+dir.create(tabdir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plotdir, recursive = TRUE, showWarnings = FALSE)
+selected <- copy(selected_promoters)
+if (!is.null(example_gene)) {
+  selected <- selected[gene_name==example_gene]
+  if (nrow(selected)!=1L) stop("--gene must be one of the seven selected example promoters")
+}
+prep <- readRDS(file.path(tables, "prepared.rds"))
+promoters <- prep$tss[match(selected$tss_id, tss_id)]
+stopifnot(identical(promoters$tss_id, selected$tss_id))
+# Motif families, in their top-to-bottom order in the figures
+families <- c("TATA","YY1","NFY","SP","ETS","ZNF143","NRF1","CREB")
+```
+
+```{r load-motif-data, include=TRUE}
+# FIMO motif hits in the selected promoter windows (written by --stage motif-inputs).
+motif_path <- file.path(tables,"promoter_motif_cluster_examples","examples","matrix_motif_hits.tsv.gz")
+if (!is.null(example_gene) && file.exists(file.path(tabdir,"matrix_motif_hits.tsv.gz")))
+  motif_path <- file.path(tabdir,"matrix_motif_hits.tsv.gz")
+if (!file.exists(motif_path)) stop("Run --stage motif-inputs before knitting")
+hits <- fread(motif_path)[tss_id %in% selected$tss_id]
+stopifnot(all(hits$tss_id %in% selected$tss_id), all(hits$category %in% families))
+# Plot interval: widen each hit by half a base so it covers whole bases
+hits[, `:=`(width = end-start, xmin = relative_start-.5, xmax = relative_end+.5)]
+# Record the promoters and motif families used
+fwrite(selected, file.path(tabdir, "selected_promoters.tsv"), sep = "\t")
+fwrite(data.table(category = families, status = "available"),
+       file.path(tabdir,"motif_category_status.tsv"),sep="\t")
+```
+
+```{r load-read-data, include=TRUE}
+# Reads, m6A calls and footprint blocks at each selected promoter, saved by --stage motif-inputs
+# so the report does not query the 31 sample files. The key checks the cache matches current inputs.
+cache_path <- file.path(tabdir,"promoter_read_data.rds")
+input_paths <- c(file.path(tables,c("prepared.rds","clustering.rds","tracks/molecule_projection.tsv.gz")),
+  file.path(tables,"features",paste0(unique(promoters$chrom),".rds")))
+cache_key <- list(tss_id=selected$tss_id, inputs=pol2_stamp(input_paths))
+# A single-gene run can take its promoter from the all-promoter cache
+if (!is.null(example_gene) && !file.exists(cache_path) && file.exists(shared_read_cache)) {
+  shared <- readRDS(shared_read_cache)
+  stopifnot(all(selected$tss_id %in% names(shared$data)),
+    identical(shared$key$inputs,pol2_stamp(shared$key$inputs$path)))
+  saveRDS(list(key=cache_key,data=shared$data[selected$tss_id]),cache_path)
+}
+if (file.exists(cache_path)) {
+  cached <- readRDS(cache_path)
+  stopifnot(identical(cached$key,cache_key))
+  local_data <- cached$data
+} else {
+  stop("Missing promoter read cache: run --stage motif-inputs before knitting")
+}
+```
+
+```{r plot-read-motif, include=TRUE}
+# Draw one figure per selected promoter: m6A profile per cluster (top), highest-scoring
+# motif hits (middle) and every read with its footprints (bottom). Saved as PDF.
+displayed_motifs <- list(); figures <- list(); highlight_rows <- list(); read_rows <- list()
+for (i in seq_len(nrow(promoters))) {
+  site <- promoters[i]; gene <- site$gene_name; tid <- site$tss_id
+  dat <- local_data[[tid]]
+  # Reads ordered by cluster, then by m6A proportion
+  rows <- copy(dat$meta)
+  rows[, cluster := factor(cluster,levels=pol2_numeric_clusters(cluster))]
+  setorder(rows,cluster,m6a_proportion,observation_id)
+  rows[, RID := observation_id]
+  rows <- as.data.table(stack_rows(as.data.frame(rows),"cluster"))
+  stopifnot(nrow(rows)==selected$n_total[i],!anyDuplicated(rows$RID))
+  read_rows[[gene]] <- rows[,.(gene,observation_id,tss_id,sample_name,original_RID,cluster,clustered)]
+  # Cluster colours and labels with read counts
+  cols <- cluster_id_palette(levels(rows$cluster))
+  labels <- rows[,.(n=.N),by=cluster]
+  labels <- setNames(sprintf("%s (n=%d)",labels$cluster,labels$n),labels$cluster)
+  rr <- list(assignments=as.data.frame(rows),region=list(analysis_start=-1000L,analysis_end=999L))
+  # m6A fraction per cluster at observed sites; positions no read observes are dropped from the plot
+  profile <- pol2_observed_profile(dat$calls,rows,observed_masks,rep(tid,nrow(rows)))
+  fwrite(profile,file.path(tabdir,paste0(gene,"_observed_site_profile.tsv.gz")),sep="\t")
+  profile <- profile[n_observed_reads>0]
+  # Footprint blocks per read, sorted by class (linker, FIRE, nucleosome, then TF footprints on top)
+  tracks <- dat$blocks[,.(RID=observation_id,start=rel_start,end=rel_end,class)]
+  tracks[, class := factor(class,levels=names(MOLECULE_TRACK_COLORS))]
+  setorder(tracks,class)
+  # Plot window: TSS -1000 to +1000 bp
+  ex <- data.frame(chrom=site$chrom,start=0,end=0,window_start=-1000,window_end=1000)
+  lim <- molecule_xlim(ex,1L)
+  # Highest FIMO score per motif family (ties: smaller p-value, matrix ID, position, strand)
+  hh <- copy(hits[tss_id==tid])
+  setorderv(hh,c("category","score","p_value","matrix_id","relative_start","motif_strand"),
+    c(1L,-1L,1L,1L,1L,1L))
+  hh <- hh[, .SD[1L], by=category]
+  displayed_motifs[[gene]] <- copy(hh)
+  # Yellow band under each displayed motif, on all three panels
+  band <- lapply(seq_len(nrow(hh)), function(j)
+    list(xmin=hh$xmin[j],xmax=hh$xmax[j],fill="yellow",alpha=.3,position="under"))
+  highlight_rows[[gene]] <- hh[,.(gene,category,matrix_id,matrix_hit_id,tss_id,xmin,xmax,width)]
+  # Top: m6A fraction area plot, one panel per cluster, no smoothing
+  top <- plot_group_profile(profile,group_col="cluster",x_col="pos",y_col="met",style="area",smooth_k=1L,
+    facet_col="cluster",facet_layout="grid",colors=cols,fill_colors=cols,highlight=band,
+    labels=list(x=NULL,y="m6A fraction (observed sites)"),theme=theme_fiberseq("classic",base_size=9)) +
+    coord_cartesian(xlim=lim,expand=FALSE) + theme(legend.position="none")
+  # Middle: one row per motif family with a black segment at its top hit; "(no hit)" if none
+  hh[, label := factor(category,levels=rev(families))]
+  motif_labels <- setNames(paste(families,"(no hit)"),families)
+  motif_labels[hh$category] <- paste(hh$category,hh$matrix_id)
+  motif <- plot_interval_track(hh,lim,start_col="xmin",end_col="xmax",row_col="label",
+    geometry="segment",color="black",linewidth=1.1,highlight=band,
+    scales=list(y=scale_y_discrete(limits=rev(families),labels=motif_labels,drop=FALSE,expand=expansion(add=.55)),
+      coord=coord_cartesian(xlim=lim,expand=FALSE)),labels=list(x=NULL,y="Motif"),
+    theme=theme_fiberseq("classic",base_size=8))
+  # Bottom: one row per read, footprints in the standard colours, cluster colour bar
+  molecules <- plot_molecules(as.data.frame(rows),as.data.frame(tracks),ex,"cluster",labels,
+    bar_cols="cluster",bar_palette=cols,track_colors=MOLECULE_TRACK_COLORS,breaks=seq(-1000,1000,250)) +
+    labs(x="Position relative to this promoter's TSS (bp); oriented by transcription")
+  molecules <- .fiberseq_add_highlights(molecules,band)
+  # Stack the panels; heights grow with the number of clusters and reads
+  heights <- c(.65*uniqueN(rows$cluster),1.8,.025*nrow(rows)+.15*uniqueN(rows$cluster)+.7)
+  name <- paste(gene,"promoter_motif_cluster_examples",sep="_")
+  fig <- patchwork::wrap_plots(top,motif,molecules,ncol=1,heights=heights) +
+    patchwork::plot_annotation(title=paste(gene,"promoter motifs and cluster reads"),
+      theme=theme(plot.title=element_text(size=11)))
+  save_figure(fig,file.path(plotdir,paste0(name,".pdf")),width=12,height=1.5+sum(heights))
+  figures[[name]] <- list(plot=fig,height=1.5+sum(heights),gene=gene)
+  message("Saved promoter motif figures: ",gene)
+}
+```
+
+
+Motif occurrence supported by at least 50% overlap with 10-30 bp TF footprint by percentage for each cluster
+
+```{r count-motif-support, include=TRUE}
+
+overview <- list()
+for (i in seq_len(nrow(promoters))) {
+  site <- promoters[i]; gene <- site$gene_name; tid <- site$tss_id
+  hh <- displayed_motifs[[gene]]; rows <- read_rows[[gene]]
+  eligible <- local_data[[tid]]$blocks[kind=="tf" & length>=10 & length<=30]
+  for (family in families) {
+    hit <- hh[category==family]
+    ov <- findOverlaps(pol2_gr(rep(site$chrom,nrow(hit)),hit$start,hit$end),
+                       pol2_gr(eligible$chrom,eligible$start,eligible$end),ignore.strand=TRUE)
+    q <- queryHits(ov); u <- subjectHits(ov)
+    frac <- (pmin(hit$end[q],eligible$end[u])-pmax(hit$start[q],eligible$start[u]))/hit$width[q]
+    supported <- unique(eligible$observation_id[u[frac>=.5]])
+    counts <- rows[,.(n_reads=.N,n_supported=sum(observation_id %in% supported)),by=cluster]
+    counts[, `:=`(gene=gene,tss_id=tid,category=family,n_hits=nrow(hit),
+      n_scan_hits=nrow(hits[tss_id==tid & category==family]))]
+    overview[[paste(gene,family)]] <- counts
   }
-  prep <- readRDS(file.path(tables, "prepared.rds"))
-  promoters <- prep$tss[match(selected$tss_id, tss_id)]
-  stopifnot(identical(promoters$tss_id, selected$tss_id))
-  families <- c("TATA","YY1","NFY","SP","ETS","ZNF143","NRF1","CREB")
-  # Scan and BED extraction run in the motif-inputs preparation job.
-  motif_path <- file.path(tables,"promoter_motif_cluster_examples","matrix_motif_hits.tsv.gz")
-  if (!is.null(example_gene) && file.exists(file.path(tabdir,"matrix_motif_hits.tsv.gz")))
-    motif_path <- file.path(tabdir,"matrix_motif_hits.tsv.gz")
-  if (!file.exists(motif_path)) stop("Run --stage motif-inputs before knitting")
-  hits <- fread(motif_path)[tss_id %in% selected$tss_id]
-  stopifnot(all(hits$tss_id %in% selected$tss_id), all(hits$category %in% families))
-  hits[, `:=`(width = end-start, xmin = relative_start-.5, xmax = relative_end+.5)]
-  fwrite(selected, file.path(tabdir, "selected_promoters.tsv"), sep = "\t")
-  fwrite(data.table(category = families, status = "available"),
-         file.path(tabdir,"motif_category_status.tsv"),sep="\t")
-  # Saved local data avoids repeatedly querying 31 sample files on report renders.
-  cache_path <- file.path(tabdir,"promoter_read_data.rds")
-  input_paths <- c(file.path(tables,c("prepared.rds","clustering.rds","tracks/molecule_projection.tsv.gz")),
-    file.path(tables,"features",paste0(unique(promoters$chrom),".rds")))
-  cache_key <- list(tss_id=selected$tss_id, inputs=pol2_stamp(input_paths))
-  if (!is.null(example_gene) && !file.exists(cache_path) && file.exists(shared_read_cache)) {
-    shared <- readRDS(shared_read_cache)
-    stopifnot(all(selected$tss_id %in% names(shared$data)),
-      identical(shared$key$inputs,pol2_stamp(shared$key$inputs$path)))
-    saveRDS(list(key=cache_key,data=shared$data[selected$tss_id]),cache_path)
-  }
-  if (file.exists(cache_path)) {
-    cached <- readRDS(cache_path)
-    stopifnot(identical(cached$key,cache_key))
-    local_data <- cached$data
-  } else {
-    stop("Missing promoter read cache: run --stage motif-inputs before knitting")
-  }
-  displayed_motifs <- list(); figures <- list(); overview <- list(); highlight_rows <- list(); read_rows <- list()
-  for (i in seq_len(nrow(promoters))) {
-    site <- promoters[i]; gene <- site$gene_name; tid <- site$tss_id
-    dat <- local_data[[tid]]; rows <- copy(dat$meta)
-    rows[, cluster := factor(cluster,levels=pol2_numeric_clusters(cluster))]
-    setorder(rows,cluster,m6a_proportion,observation_id)
-    rows[, RID := observation_id]
-    rows <- as.data.table(stack_rows(as.data.frame(rows),"cluster"))
-    stopifnot(nrow(rows)==selected$n_total[i],!anyDuplicated(rows$RID))
-    cols <- cluster_id_palette(levels(rows$cluster))
-    labels <- rows[,.(n=.N),by=cluster]
-    labels <- setNames(sprintf("%s (n=%d)",labels$cluster,labels$n),labels$cluster)
-    rr <- list(assignments=as.data.frame(rows),region=list(analysis_start=-1000L,analysis_end=999L))
-    profile <- pol2_observed_profile(dat$calls,rows,observed_masks,rep(tid,nrow(rows)))
-    fwrite(profile,file.path(tabdir,paste0(gene,"_observed_site_profile.tsv.gz")),sep="\t")
-    profile <- profile[n_observed_reads>0]
-    tracks <- dat$blocks[,.(RID=observation_id,start=rel_start,end=rel_end,class)]
-    tracks[, class := factor(class,levels=names(MOLECULE_TRACK_COLORS))]
-    setorder(tracks,class)
-    ex <- data.frame(chrom=site$chrom,start=0,end=0,window_start=-1000,window_end=1000)
-    lim <- molecule_xlim(ex,1L)
-    read_rows[[gene]] <- rows[,.(gene,observation_id,tss_id,sample_name,original_RID,cluster,clustered)]
-    hh <- copy(hits[tss_id==tid])
-    setorderv(hh,c("category","score","p_value","matrix_id","relative_start","motif_strand"),
-      c(1L,-1L,1L,1L,1L,1L))
-    hh <- hh[, .SD[1L], by=category]
-    displayed_motifs[[gene]] <- copy(hh)
-    band <- lapply(seq_len(nrow(hh)), function(j)
-      list(xmin=hh$xmin[j],xmax=hh$xmax[j],fill="yellow",alpha=.3,position="under"))
-    highlight_rows[[gene]] <- hh[,.(gene,category,matrix_id,matrix_hit_id,tss_id,xmin,xmax,width)]
-      top <- plot_group_profile(profile,group_col="cluster",x_col="pos",y_col="met",style="area",smooth_k=1L,
-        facet_col="cluster",facet_layout="grid",colors=cols,fill_colors=cols,highlight=band,
-        labels=list(x=NULL,y="m6A fraction (observed sites)"),theme=theme_fiberseq("classic",base_size=9)) +
-        coord_cartesian(xlim=lim,expand=FALSE) + theme(legend.position="none")
-      hh[, label := factor(category,levels=rev(families))]
-      motif_labels <- setNames(paste(families,"(no hit)"),families)
-      motif_labels[hh$category] <- paste(hh$category,hh$matrix_id)
-      motif <- plot_interval_track(hh,lim,start_col="xmin",end_col="xmax",row_col="label",
-        geometry="segment",color="black",linewidth=1.1,highlight=band,
-        scales=list(y=scale_y_discrete(limits=rev(families),labels=motif_labels,drop=FALSE,expand=expansion(add=.55)),
-          coord=coord_cartesian(xlim=lim,expand=FALSE)),labels=list(x=NULL,y="Motif"),
-        theme=theme_fiberseq("classic",base_size=8))
-      molecules <- plot_molecules(as.data.frame(rows),as.data.frame(tracks),ex,"cluster",labels,
-        bar_cols="cluster",bar_palette=cols,track_colors=MOLECULE_TRACK_COLORS,breaks=seq(-1000,1000,250)) +
-        labs(x="Position relative to this promoter's TSS (bp); oriented by transcription")
-      molecules <- .fiberseq_add_highlights(molecules,band)
-      # Support refers to the displayed highest-score hit, using full genomic intervals.
-      eligible <- dat$blocks[kind=="tf" & length>=10 & length<=30]
-      for (family in families) {
-        hit <- hh[category==family]
-        ov <- findOverlaps(pol2_gr(rep(site$chrom,nrow(hit)),hit$start,hit$end),
-                           pol2_gr(eligible$chrom,eligible$start,eligible$end),ignore.strand=TRUE)
-        q <- queryHits(ov); u <- subjectHits(ov)
-        frac <- (pmin(hit$end[q],eligible$end[u])-pmax(hit$start[q],eligible$start[u]))/hit$width[q]
-        supported <- unique(eligible$observation_id[u[frac>=.5]])
-        counts <- rows[,.(n_reads=.N,n_supported=sum(observation_id %in% supported)),by=cluster]
-        counts[, `:=`(gene=gene,tss_id=tid,category=family,n_hits=nrow(hit),
-          n_scan_hits=nrow(hits[tss_id==tid & category==family]))]
-        overview[[paste(gene,family)]] <- counts
-      }
-      heights <- c(.65*uniqueN(rows$cluster),1.8,.025*nrow(rows)+.15*uniqueN(rows$cluster)+.7)
-      name <- paste(gene,"promoter_motif_cluster_examples",sep="_")
-      fig <- patchwork::wrap_plots(top,motif,molecules,ncol=1,heights=heights) +
-        patchwork::plot_annotation(title=paste(gene,"promoter motifs and cluster reads"),
-          subtitle=sprintf("%s:%s (%s), hg38; %d eligible reads, %d samples; target %s.\nBlack: highest FIMO score per family. Yellow: each displayed motif. Standard footprint colors.",
-            site$chrom,site$tss,site$strand,nrow(rows),uniqueN(rows$sample_name),selected$cluster[i]),
-          theme=theme(plot.title=element_text(size=11),plot.subtitle=element_text(size=8)))
-      save_figure(fig,file.path(plotdir,paste0(name,".pdf")),width=12,height=1.5+sum(heights))
-      figures[[name]] <- list(plot=fig,height=1.5+sum(heights),gene=gene)
-    message("Saved promoter motif figures: ",gene)
-  }
-  fwrite(rbindlist(displayed_motifs),file.path(tabdir,"displayed_motifs.tsv"),sep="\t")
-  fwrite(rbindlist(overview),file.path(tabdir,"promoter_cluster_motif_support.tsv"),sep="\t")
-  fwrite(rbindlist(highlight_rows),file.path(tabdir,"highlighted_motifs.tsv"),sep="\t")
-  fwrite(rbindlist(read_rows),file.path(tabdir,"displayed_reads.tsv.gz"),sep="\t")
-  list(figures=figures,selected=selected,summary=rbindlist(overview))
-})
+}
+```
+
+```{r save-motif-tables, include=FALSE}
+# Save the displayed motifs, support counts, motif bands and reads; keep the figures for the next chunk.
+fwrite(rbindlist(displayed_motifs),file.path(tabdir,"displayed_motifs.tsv"),sep="\t")
+fwrite(rbindlist(overview),file.path(tabdir,"promoter_cluster_motif_support.tsv"),sep="\t")
+fwrite(rbindlist(highlight_rows),file.path(tabdir,"highlighted_motifs.tsv"),sep="\t")
+fwrite(rbindlist(read_rows),file.path(tabdir,"displayed_reads.tsv.gz"),sep="\t")
+promoter_motif_examples <- list(figures=figures,selected=selected,summary=rbindlist(overview))
 ```
 
 ```{r promoter-motif-figures, fig.width=12, fig.height=20}
 for (example in promoter_motif_examples$figures) print(example$plot)
 ```
 
-## Imprinted loci
-
-Counts use all projected eligible physical molecules, deduplicated by RID within
-cluster. Molecules seen at both imprinted and other TSSs appear only in the
-imprinted composition bar. These comparisons are descriptive; no test is applied.
-
-```{r imprinting, fig.width=11, fig.height=4.5}
-imprinting <- pol2_imprinting(cfg,
-  fread(file.path(params$output,"tables","tracks","molecule_projection.tsv.gz")),
-  readRDS(file.path(params$output,"tables/prepared.rds"))$tss, clusters)
-pol2_plot_imprinting(imprinting, clusters)
-knitr::kable(imprinting$loci, digits = 3)
-```
-
 ## Features of the 5,000 clustered molecules
 
-m6A uses the stored calls and observed-site denominators from all full-span reads
-at each TSS; its pooled fraction is sum(calls) / sum(positions). CpG uses
-pb-CpG-tools count mode on these molecules, restricted to their cluster's TSS
-windows. CpG boxplots assign each molecule its cluster/TSS fraction; the pooled
-fraction counts each genomic CpG once per cluster. GRO-cap is the sense-strand
-read sum over the full 2 kb window; DNase is the mean over that window.
-Diamonds show pooled methylation fractions or molecule-weighted mean signal.
-GRO-cap and DNase are plotted as log10(x + 1). Saved result tables permit
-re-plotting without extracting CpG again.
+m6A, CpG methylation, GRO-cap and DNase of the 5,000 clustered reads, one box per cluster. Diamonds show each cluster's pooled value. The values are computed by `--stage report`; this chunk only re-plots the saved tables, so CpG is not extracted again.
+
+1. m6A fraction
+
+  - observed sites: every position in the TSS +/- 1 kb window where any full-span read at that TSS (all 31 samples, with or without a footprint) has an m6A call
+  - read value = the read's m6A calls in the window / observed sites at its TSS
+  - diamond = sum of calls / sum of observed sites over the cluster's reads
+
+2. CpG methylation fraction 
+
+  - pb-CpG-tools (count mode) on each cluster's reads gives, at every CpG, the reads covering it and the reads calling it methylated
+  - keep the CpGs inside the cluster's TSS windows (TSS +/- 1 kb)
+  - value = methylated reads / covering reads, summed over the CpGs of one TSS window; every read at that TSS in that cluster gets this value
+  - diamond = the same ratio over all CpGs in all the cluster's windows, each CpG counted once
+
+3. GRO-cap 
+
+  - sense-strand GRO-cap signal (plus-strand bigWig for "+" genes, minus-strand bigWig for "−" genes) summed over the 2 kb window
+  - every read at that TSS gets this value, plotted as log10(x + 1); diamond = mean over the cluster's reads
+
+4. DNase 
+
+  - mean DNase-seq signal (ENCFF743ULW) over the 2 kb window
+  - every read at that TSS gets this value; plotted as log10(x + 1), diamond = mean over the cluster's reads
 
 ```{r cluster-features, fig.width=12, fig.height=8}
 features <- list(
   molecules = fread(file.path(params$output, "tables", "cluster_features", "cluster_feature_molecules.tsv.gz")),
   summary = fread(file.path(params$output, "tables", "cluster_features", "cluster_features.tsv")))
-pol2_plot_cluster_features(features, clusters)
+p <- pol2_plot_cluster_features(features, clusters)
+save_figure(p, file.path(cfg$output, "plots", "cluster_features.pdf"), width = 12, height = 8)
+print(p)
 knitr::kable(features$summary, digits = 3)
 ```
 
@@ -413,10 +485,10 @@ knitr::kable(features$summary, digits = 3)
 
 Computed by `--stage autocorrelation`
 
-```{r autocorrelation-analysis, include=FALSE}
+```{r autocorrelation-analysis, include=TRUE}
 local({
-# Shared R functions compute ACFs, peaks and cluster summaries.
-# Source with cfg and optionally acf_action="plot" to load plots without computing.
+# Tables go to tables/autocorrelation. A plain knit only reads them; --stage autocorrelation
+# (recompute_autocorrelation = TRUE) recomputes them.
 tables <- file.path(cfg$output, "tables")
 acf_tables <- file.path(tables,"autocorrelation")
 dir.create(acf_tables,recursive=TRUE,showWarnings=FALSE)
@@ -424,6 +496,7 @@ if (!file.exists(file.path(acf_tables,"autocorrelation_cluster_summary.tsv.gz"))
     !isTRUE(get0("recompute_autocorrelation",ifnotfound=FALSE))) stop("Run --stage autocorrelation before knitting")
 acf_action <- if (isTRUE(get0("recompute_autocorrelation",ifnotfound=FALSE)) || !file.exists(file.path(acf_tables,"autocorrelation_cluster_summary.tsv.gz"))) "compute" else "plot"
 if (acf_action == "compute") {
+  # Saved clustering (1-bp m6A calls per read) and each read's cluster; check both list the same reads
   x <- readRDS(file.path(tables,"clustering.rds"))
   m <- data.table::fread(file.path(tables,"molecule_assignments.tsv.gz"))
   stopifnot(!anyDuplicated(m$observation_id),nrow(m)==nrow(x$molecules))
@@ -431,11 +504,15 @@ if (acf_action == "compute") {
   for (field in c("sample_name","original_RID","tss_id","cluster"))
     stopifnot(identical(as.character(m[[field]]),as.character(x$molecules[[field]][index])))
   stopifnot(identical(colnames(x$sites),as.character(-1000:999)))
+  # Reads x positions (-1000..+999) matrix of 0/1 m6A calls, rows in assignment order
   sites <- as.matrix(x$sites[match(m$observation_id,rownames(x$sites)),,drop=FALSE])
+  # pol2_observed_masks(): per TSS, the positions where any full-window read has an m6A call
+  # (observed sites); counted per read in each window as the m6A-fraction denominator
   if (!exists("pol2_observed_masks")) source(file.path(cfg$project,"code/pausing/clustering_Pol2/pol2_chip_cluster_utils/pol2_observed_profiles.R"))
   masks <- pol2_observed_masks(cfg,x)[m$tss_id,,drop=FALSE]
   m[, upstream_observed_sites := rowSums(masks[,as.character(-500:-25),drop=FALSE])]
   m[, downstream_observed_sites := rowSums(masks[,as.character(25:500),drop=FALSE])]
+  # Shared ACF functions: autocorrelations(), summarize_autocorrelations(), repeat_peak()
   shared <- file.path(cfg$project, "code/clustering_methods/auto_correlation")
   source(file.path(shared, "02_compute_autocorrelations.R"), local = TRUE)
   source(file.path(shared, "04_summarize_autocorrelations.R"), local = TRUE)
@@ -443,9 +520,12 @@ if (acf_action == "compute") {
   curves <- stats <- molecule_tables <- list()
   for (window_name in names(windows)) {
     bounds <- windows[[window_name]]
+    # autocorrelations(): each read's ACF of its 0/1 m6A calls inside the window (lag 0-475 bp);
+    # reads with all-0 or all-1 calls have no ACF (valid = FALSE)
     result <- autocorrelations(sites, positions = -1000:999, window = bounds)
     profiles <- result$profiles
     selected <- sites[, as.character(seq.int(bounds[1L], bounds[2L])), drop = FALSE]
+    # Per-read table: cluster number, ACF status, observed sites and m6A call fraction in the window
     records <- as.data.frame(m)
     records$cluster <- as.integer(sub("cluster", "", records$cluster, fixed = TRUE))
     stopifnot(!anyNA(records$cluster))
@@ -454,7 +534,10 @@ if (acf_action == "compute") {
     records$n_observed_sites <- records[[paste0(window_name, "_observed_sites")]]
     records$m6a_call_fraction <- rowSums(selected) / ifelse(
       records$n_observed_sites > 0, records$n_observed_sites, NA_real_)
+    # summarize_autocorrelations(): mean ACF curve per cluster over reads with a valid ACF (averages)
+    # and the 140-250 bp peak of each cluster's mean curve (summaries)
     summary <- summarize_autocorrelations(profiles, records)
+    # annotate(): add the cluster label and the window name/bounds to a table
     annotate <- function(table) {
       table$cluster <- if (nrow(table)) paste0("cluster", table$cluster) else character()
       table$window <- rep(window_name, nrow(table))
@@ -470,15 +553,18 @@ if (acf_action == "compute") {
       "window_end_bp", "positive_local_peak_140_250_bp", "peak_acf")]
     records <- annotate(records)
     records$cluster <- m$cluster
+    # repeat_peak(): lag and height of the highest positive local ACF peak at 140-250 bp, per read
     peaks <- t(vapply(seq_len(nrow(profiles)), function(i) repeat_peak(profiles[i, ]), numeric(2L)))
     records$positive_local_peak_140_250_bp <- peaks[, 1L]
     records$peak_acf <- peaks[, 2L]
     molecule_tables[[window_name]] <- records
+    # Per-read ACF curves of this window
     saveRDS(list(acf = profiles, lag_bp = seq_len(ncol(selected)) - 1L,
       relative_bp = seq.int(bounds[1L], bounds[2L]), observation_id = m$observation_id,
       window = window_name), file.path(acf_tables,
         paste0("autocorrelation_per_molecule_", window_name, ".rds")))
   }
+  # Both windows together: cluster mean curves, cluster peaks, per-read table, provenance
   data.table::fwrite(data.table::rbindlist(curves),
     file.path(acf_tables, "autocorrelation_cluster_summary.tsv.gz"), sep = "\t")
   data.table::fwrite(data.table::rbindlist(stats),
@@ -492,6 +578,8 @@ if (acf_action == "compute") {
     file.path(acf_tables,"autocorrelation_provenance.rds"))
 }
 
+# Older per-read tables lack n_observed_sites: add it and the observed-site m6A fraction
+# without recomputing the ACF
 audit_path <- file.path(acf_tables,"autocorrelation_molecules.tsv.gz")
 audit <- fread(audit_path)
 if (!"n_observed_sites" %in% names(audit)) {
@@ -513,17 +601,24 @@ if (!"n_observed_sites" %in% names(audit)) {
 
 
 ```{r autocorrelation-plots, include=FALSE}
-acf_plots <- pol2_autocorrelation_plots(cfg)
+# save = TRUE also writes the PDFs to plots/autocorrelation
+acf_plots <- pol2_autocorrelation_plots(cfg, save = TRUE)
 ```
+
+Autocorrelation of each read's 1 bp m6A calls upstream (−500 to −25 bp) and downstream (+25 to +500 bp) of the TSS, averaged per cluster; a peak at 140–250 bp lag suggests regularly spaced nucleosomes.
 
 ```{r autocorrelation-overlay, fig.width=10, fig.height=5}
 for (window in c("upstream", "downstream")) print(acf_plots[[paste0(window,"_overlay")]])
 ```
 
+The same curves, one panel per cluster; the table gives each cluster's peak lag (140–250 bp) and its autocorrelation.
+
 ```{r autocorrelation-panels, fig.width=10, fig.height=10}
 for (window in c("upstream", "downstream")) print(acf_plots[[paste0(window,"_panels")]])
 knitr::kable(fread(file.path(params$output, "tables", "autocorrelation", "autocorrelation_cluster_peaks.tsv")), digits = 4)
 ```
+
+The same mean autocorrelation as a heatmap: clusters by lag, colour = autocorrelation.
 
 ```{r autocorrelation-heatmap, fig.width=10, fig.height=5}
 for (window in c("upstream", "downstream")) print(acf_plots[[paste0(window,"_heatmap")]])
@@ -532,21 +627,23 @@ for (window in c("upstream", "downstream")) print(acf_plots[[paste0(window,"_hea
 
 ## Nucleosome positioning at TSS of each cluster
 
-
-
 Computed by `--stage nucleosome`
 
-```{r nucleosome-analysis, include=FALSE}
+```{r nucleosome-analysis, include=TRUE}
+# Tables go to tables/nuc. A plain knit only reads them; --stage nucleosome
+# (recompute_nucleosome = TRUE) recomputes them.
 if (!file.exists(file.path(cfg$output,"tables","nuc","nucleosome_cluster_summary.tsv.gz")) &&
     !isTRUE(get0("recompute_nucleosome",ifnotfound=FALSE))) stop("Run --stage nucleosome before knitting")
 if (isTRUE(get0("recompute_nucleosome",ifnotfound=FALSE)) ||
     !file.exists(file.path(cfg$output,"tables","nuc","nucleosome_cluster_summary.tsv.gz"))) local({
 
-      
+
+# Shared nucleosome-positioning functions (build_region_anchors, extract_region_footprints, ...)
 source(file.path(cfg$project,"code/nucleosome_positioning/process_nuc_pos.R"),local=TRUE)
 tables <- file.path(cfg$output,"tables")
 nuc_tables <- file.path(tables,"nuc")
 dir.create(nuc_tables,recursive=TRUE,showWarnings=FALSE)
+# TSS table, saved clustering and each read's cluster; check they list the same reads
 prep <- readRDS(file.path(tables,"prepared.rds"))
 x <- readRDS(file.path(tables,"clustering.rds"))
 m <- fread(file.path(tables,"molecule_assignments.tsv.gz"))
@@ -557,28 +654,44 @@ for (field in c("sample_name","original_RID","tss_id","cluster","tss","strand"))
 clusters <- pol2_numeric_clusters(m$cluster)
 m[, cluster:=factor(cluster,levels=clusters)]
 site <- prep$tss[match(unique(m$tss_id),tss_id)]
+# build_region_anchors(): one row per TSS with its anchor (TSS base), strand and the -1000..+999 window
 anchors <- build_region_anchors(NULL,NULL,NULL,relative_window=c(-1000L,999L),
   anchor_table=site[,.(region_id=tss_id,chr=chrom,anchor=tss,strand,region_type="promoter",gene=gene_name,ensg=gene_id)])
 stopifnot(all(anchors$view_start==site$window_start+1L),all(anchors$view_end==site$window_end))
+# build_read_table(): each read with its span relative to its TSS (oriented by transcription);
+# clipped to the window, every read must span all of it
 reads <- build_read_table(m[,.(region_id=tss_id,RID=observation_id,sample_name,original_RID,
   biological_sample=cell_line,cluster,read_start,read_end)],anchors)
 reads[,`:=`(rel_read_start=pmax(rel_read_start,-1000L),rel_read_end=pmin(rel_read_end,999L))]
 stopifnot(all(reads$rel_read_start == -1000L),all(reads$rel_read_end == 999L))
+# Per-sample FiberHMM v2 recalled_footprint BED files
 paths <- setNames(file.path(cfg$footprint_dir,prep$samples$sample_name,
   paste0(prep$samples$sample_name,".recalled_footprint.bed.gz")),prep$samples$sample_name)
+# extract_region_footprints(): every footprint block of each read inside its TSS window, in genomic
+# and TSS-relative coordinates; all blocks are labelled nucleosome (no size filter)
 footprints <- extract_region_footprints(reads,anchors,input_paths=paths,include_tf=FALSE,original_id_col="original_RID")
+# Attach each read's sample, cell line and cluster to its footprints
 footprints <- merge(footprints,reads[,.(region_id,RID,sample_name,original_RID,biological_sample,cluster)],
   by=c("region_id","RID","sample_name"))
+# read_position_summary(): per read, midpoints of the -1 and +1 nucleosomes, whether a nucleosome
+# covers the TSS, and the number of nucleosomes
 pos <- read_position_summary(footprints,reads,include_gap=FALSE)
+# position_summary_by_group(): median -1/+1 positions and fraction of reads with the TSS occupied,
+# per TSS x cluster x sample (strata) and per cluster (summary; 95% interval for TSS occupancy from
+# 500 promoter x cell-line bootstrap draws)
 strata <- position_summary_by_group(pos,by=c("region_id","cluster","sample_name"),include_gap=FALSE)
 summary <- position_summary_by_group(pos,by="cluster",include_gap=FALSE,bootstrap=500L,sample_col="biological_sample")
+# occupancy_profile(): every 10 bp, reads with a nucleosome covering the position / reads spanning it
 occupancy <- occupancy_profile(footprints,reads,anchors,by=c("region_id","cluster","sample_name"))
+# Same function with metric = "centers": nucleosome midpoints counted in 25-bp bins
 centers <- occupancy_profile(footprints,reads,anchors,by=c("region_id","cluster","sample_name"),bin_size=25L,metric="centers")
 
+# Pool the TSS x sample strata into one profile per cluster (occupancy fraction, midpoint counts)
 occ_profile <- occupancy[,.(value=sum(n_occupied)/sum(n_reads),
   raw_count=sum(n_occupied),denominator=sum(n_reads)),by=.(cluster,pos)]
 center_profile <- centers[,.(value=sum(n_centers),raw_count=sum(n_centers)),
   by=.(cluster,pos,bin_start,bin_end_exclusive,bin_width_bp)]
+# Save every table as tables/nuc/nucleosome_<name>.tsv.gz, plus provenance
 objects <- list(molecules=pos,footprints=footprints,occupancy_profiles=occ_profile,center_counts_profiles=center_profile,
   cluster_summary=summary,positional_strata=strata,occupancy_strata=occupancy,center_counts_strata=centers[,!"density"],
   centers=footprints[,.(region_id,RID,sample_name,original_RID,biological_sample,cluster,fp_start,fp_end,rel_mid)])
@@ -591,101 +704,57 @@ saveRDS(list(window=c(-1000L,999L),input_paths=paths,source="FiberHMM recalled_f
 })
 ```
 
-### Plots
 
-```{r nucleosome-plots, include=FALSE}
-nuc_plots <- pol2_nucleosome_plots(cfg)
+```{r nucleosome-plots, include=TRUE}
+
+nuc_plots <- pol2_nucleosome_plots(cfg, save = TRUE)
 ```
+
+Per cluster: fraction of reads with a nucleosome covering each position (first plot, 10 bp grid) and number of nucleosome centres in 25 bp bins (second plot).
 
 ```{r nucleosome-profiles, fig.width=10, fig.height=10}
 print(nuc_plots$occupancy)
 print(nuc_plots$center_counts)
 ```
 
+How the −1 and +1 nucleosome positions are found:
+
+1. Reads: the 5,000 clustered reads; each spans the whole TSS +/- 1 kb window
+2. Nucleosomes: every footprint block on the read from its sample's FiberHMM `recalled_footprint.bed.gz` that overlaps the window (no size filter)
+3. Each footprint is placed at its midpoint, relative to the TSS and oriented by the gene's strand (upstream < 0)
+4. −1 = the footprint whose midpoint is closest to the TSS on the upstream side (< 0); +1 = the closest midpoint at or downstream of the TSS (>= 0)
+5. A read with no footprint on one side has no value for that side
+6. Boxes show these midpoints over the reads of each cluster, one panel for −1 and one for +1
+
 ```{r nucleosome-positions, fig.width=11, fig.height=5}
 print(nuc_plots$positions)
 ```
+
+Fraction of reads with a nucleosome covering the TSS in each cluster, with 95% bootstrap intervals (resampling promoters and samples).
 
 ```{r nucleosome-tss, fig.width=9, fig.height=5}
 print(nuc_plots$tss_occupancy)
 knitr::kable(fread(file.path(cfg$output,"tables","nuc","nucleosome_cluster_summary.tsv.gz")),digits=3)
 ```
 
-## Expression and pausing index
-
-Expression is mean ENCSR820PHH gene TPM across the two configured replicates,
-joined by version-stripped Ensembl gene ID. Each TSS is represented once per
-cluster; the summaries are descriptive and TSSs shared between clusters are not
-independent biological replicates.
-
-```{r expression-analysis, include=FALSE}
-expression_result <- local({
-tables <- file.path(cfg$output, "tables")
-
-expr <- rbindlist(lapply(cfg$expression, function(f) fread(f, select = c("gene_id", "TPM"))))
-expr <- expr[grepl("^ENSG", gene_id) & !grepl("_PAR_Y$", gene_id),
-             .(tpm = mean(TPM), n_rep = .N), by = .(gene_key = sub("\\..*$", "", gene_id))]
-stopifnot(all(expr$n_rep == length(cfg$expression)))
-
-summary <- fread(file.path(tables, "cluster_summary.tsv"))
-m <- fread(file.path(tables, "molecule_assignments.tsv.gz"))
-tss <- unique(m[, .(cluster, tss_id, gene_id, gene_name, pi)])
-tss[, tpm := expr$tpm[match(sub("\\..*$", "", gene_id), expr$gene_key)]]
-tss[, cluster := factor(cluster, levels = pol2_numeric_clusters(summary$cluster))]
-message(sum(is.na(tss$tpm)), " of ", nrow(tss), " cluster/TSS pairs have no TPM")
-
-d <- tss[is.finite(tpm)]
-out <- d[, {
-  ok <- is.finite(pi) & is.finite(tpm)
-  correlation <- if(sum(ok)>=3L) suppressWarnings(stats::cor.test(pi[ok],tpm[ok],method="spearman")) else NULL
-  list(n_tss=.N,median_tpm=median(tpm),frac_tpm_ge1=mean(tpm>=1),median_pi=median(pi,na.rm=TRUE),
-    rho_pi_tpm=if(is.null(correlation)) NA_real_ else unname(correlation$estimate),
-    p_rho=if(is.null(correlation)) NA_real_ else correlation$p.value,n_pi_tpm=sum(ok))
-},by=cluster]
-# TPM of each cluster's TSSs against all other clusters' TSSs.
-out[, p_tpm_vs_rest := vapply(as.character(cluster), function(cl)
-  stats::wilcox.test(d[cluster == cl, tpm], d[cluster != cl, tpm])$p.value, numeric(1))]
-out[, `:=`(fdr_rho = adjust_bh(p_rho), fdr_tpm_vs_rest = adjust_bh(p_tpm_vs_rest))]
-setorder(out, cluster)
-kw <- stats::kruskal.test(tpm ~ cluster, data = d)
-print(out)
-
-colors <- cluster_id_palette(levels(d$cluster))
-boxes <- ggplot(d, aes(cluster, log10(tpm + 1), fill = cluster)) +
-  geom_boxplot(outlier.size = 0.3) + scale_fill_manual(values = colors, guide = "none") +
-  labs(x = "Cluster (numeric order)", y = "log10(TPM + 1)", title = "Expression of each cluster's TSSs",
-       subtitle = sprintf("ENCSR820PHH, mean of 2 replicates; Kruskal-Wallis p = %.2g", kw$p.value)) +
-  theme_fiberseq("classic", base_size = 10)
-labels <- out[, .(cluster, label = sprintf("rho = %.2f\nn = %d", rho_pi_tpm, n_pi_tpm))]
-scatter <- ggplot(d[is.finite(pi) & pi > 0], aes(log10(pi), log10(tpm + 1), colour = cluster)) +
-  geom_point(size = 0.5, alpha = 0.5) + facet_wrap(~cluster, nrow = 1) +
-  geom_text(data = labels, aes(x = -Inf, y = Inf, label = label), inherit.aes = FALSE,
-            hjust = -0.1, vjust = 1.2, size = 2.8) +
-  scale_colour_manual(values = colors, guide = "none") +
-  labs(x = "log10(pausing index)", y = "log10(TPM + 1)", title = "Pausing index vs expression within each cluster (Spearman)") +
-  theme_fiberseq("bw", base_size = 10)
-combined <- cowplot::plot_grid(boxes, scatter, ncol=1,rel_heights=c(1,.9))
-save_figure(combined,file.path(cfg$output,"plots","pi_expression_by_cluster.pdf"),width=14,height=8)
-list(plot=combined,summary=out)
-})
-```
-
-```{r expression-figure, fig.width=14, fig.height=8}
-print(expression_result$plot)
-knitr::kable(expression_result$summary,digits=3)
-```
-
 ## Histone marks at the TSS
 
-Bulk GM12878 histone ChIP-seq fold change over control (`histone_marks` in config:
-ENCODE4 GRCh38 reprocessing of the Broad ENCODE2 experiments, pooled replicates) around
-each clustered molecule's FANTOM5 TSS, strand-oriented. Each 50-bp bin is the
-coverage-weighted mean signal. A cluster's curve is the mean over its molecules, so a
-TSS weighs in proportion to its molecules. Each panel shows one histone mark, with
-all cluster curves overlaid in numeric order and no all-molecule reference. The ChIP is GM12878 locus-level evidence, not a measurement on each molecule
-or donor, and molecules at the same TSS share its signal. Descriptive only.
+Bulk GM12878 histone ChIP-seq fold change over control around each clustered molecule's FANTOM5 TSS, strand-oriented. Each 50-bp bin is the coverage weighted mean signal
 
-```{r histone-analysis, include=FALSE}
+
+How the histone profiles are calculated:
+
+1. Marks: GM12878 ChIP-seq fold change over control 
+
+2. Window: TSS −2,000 to +2,000 bp, oriented by the gene's strand, split into 50 bp bins
+
+3. Per TSS and bin: mean ChIP signal over the bin, each bigWig value weighted by the bases it covers
+
+4. Per cluster: each of the 5,000 clustered reads takes its TSS's values, and the cluster's curve is the mean over its reads, so a TSS counts once per read it has in the cluster. Bins without ChIP signal are left out of the mean
+
+
+
+```{r histone-analysis, include=TRUE}
 histone_result <- local({
   profile_path <- file.path(cfg$output,"tables","histone_cluster_profiles.tsv.gz")
   if (!file.exists(profile_path)) stop("Run --stage histone-inputs before knitting")
@@ -701,11 +770,6 @@ histone_result <- local({
 ```{r histone-figure, fig.width=16, fig.height=4.5}
 print(histone_result$overlay)
 ```
-
-
-The second view stacks clusters 1–7 vertically, with one histone mark per column.
-Each mark uses the same y-axis range across clusters; the all-molecule reference
-is omitted.
 
 ```{r histone-stacked-figure, fig.width=16, fig.height=12}
 print(histone_result$stacked)

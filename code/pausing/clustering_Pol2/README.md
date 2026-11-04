@@ -35,7 +35,7 @@ its `output` folder (`LCL_project/pausing/clustering_Pol2`). Slurm logs are writ
 `01_run_pol2_clustering.R` with:
 
 ```
---stage prepare|count|features|cluster|project|tracks|autocorrelation|nucleosome|expression|promoter-motifs|motif-bars|report|all
+--stage prepare|count|features|cluster|project|tracks|autocorrelation|nucleosome|promoter-motifs|motif-bars|report|all
 --config YAML     (default: pol2_chip_cluster_utils/config.yaml)
 ```
 
@@ -109,7 +109,7 @@ Run the stages in this order; each stage reads the outputs of the earlier ones
    sbatch code/pausing/clustering_Pol2/00_run.sh --stage report
    ```
 
-8. **autocorrelation / nucleosome / expression** (optional): recompute one report
+8. **autocorrelation / nucleosome** (optional): recompute one report
    section on its own, e.g. after changing its settings or inputs. Needs a finished
    report (reads `tables/molecule_assignments.tsv.gz`). Run `report` again afterwards
    to show the new results in the HTML.
@@ -117,7 +117,6 @@ Run the stages in this order; each stage reads the outputs of the earlier ones
    ```bash
    sbatch code/pausing/clustering_Pol2/00_run.sh --stage autocorrelation
    sbatch code/pausing/clustering_Pol2/00_run.sh --stage nucleosome
-   sbatch code/pausing/clustering_Pol2/00_run.sh --stage expression
    ```
 
 ## Rerunning
@@ -129,7 +128,7 @@ Saved tables record the inputs and code they were built from. If a stage stops w
 
 `05_motif_scan.py` scans explicit promoter windows using local JASPAR models and
 FIMO. `06_pol2_clustering_report.Rmd` produces one PDF per selected promoter in
-`plots/promoter_motif_cluster_examples`. Its single motif panel shows the highest
+`plots/promoter_motif_cluster_examples/examples`. Its single motif panel shows the highest
 FIMO-score hit per family (TATA, YY1, NFY, SP, ETS, ZNF143, NRF1, CREB), all black.
 Yellow shading marks every displayed motif; families without hits are labeled.
 The accessibility profiles and individual reads reuse the existing plotting
@@ -143,8 +142,10 @@ bash code/pausing/clustering_Pol2/00_run.sh --stage motif-bars
 
 The first command scans the seven selected windows and regenerates their PDFs
 without rendering the full report. The second runs `07_motif_cluster_bars.R`,
-preserving the original 5,000-read cluster bars and their existing data/output
-folders named `motif_puffin_scan`. The former code folder of that name is removed.
+preserving the original 5,000-read cluster bars. Its tables go to
+`tables/promoter_motif_cluster_examples/cluster_proportions` (formerly `tables/motif_puffin_scan`); its PDFs go to `plots/promoter_motif_cluster_examples/cluster_proportions`. The former `motif_puffin_scan` code folder is removed.
+The selected-promoter tables (FIMO hits, read cache, support tables) are in
+`tables/promoter_motif_cluster_examples/examples`.
 All raw FIMO hits remain in the tables; selection affects the promoter display
 and its support table, not the original cohort cluster bars.
 
@@ -180,8 +181,8 @@ bash code/pausing/clustering_Pol2/00_run.sh --stage promoter-motifs --gene ARF4
 ```
 
 This prepares only ARF4's mask if needed, reuses the saved promoter read cache,
-scans its window, and writes its PDF to `plots/promoter_motif_cluster_examples`.
-Its supporting tables go into `tables/promoter_motif_cluster_examples/ARF4`,
+scans its window, and writes its PDF to `plots/promoter_motif_cluster_examples/examples`.
+Its supporting tables go into `tables/promoter_motif_cluster_examples/examples/ARF4`,
 leaving the seven-promoter tables intact. Replace ARF4 with MCOLN1, PSMC1, GAS2,
 FNTB, TPK1 or EIF2S1. Without `--gene`, `promoter-motifs` uses the complete cache.
 

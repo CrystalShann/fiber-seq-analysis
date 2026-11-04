@@ -72,7 +72,7 @@ def family_sites(hits):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    default = PROJECT / 'LCL_project/pausing/clustering_Pol2/tables/promoter_motif_cluster_examples'
+    default = PROJECT / 'LCL_project/pausing/clustering_Pol2/tables/promoter_motif_cluster_examples/examples'
     parser.add_argument('--promoters', type=Path, default=default/'selected_promoter_windows.tsv')
     parser.add_argument('--output', type=Path, default=default)
     parser.add_argument('--reference', type=Path, default=Path('/project/spott/cshan/annotations/hg38.fa'))

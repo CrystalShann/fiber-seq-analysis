@@ -267,9 +267,7 @@ pol2_plot_footprint_molecules <- function(res, footprints) {
     facet_labels = setNames(paste0(names(n), "\n(n=", n, ")"), names(n)),
     bar_cols = "cluster", bar_palette = cluster_id_palette(levels(rows$cluster)),
     track_colors = MOLECULE_TRACK_COLORS[classes],
-    title = paste0("Nucleosome and FiberHMM TF footprints of ", nrow(rows), " clustered molecules"),
-    subtitle = paste("Rows in molecule_heatmap.pdf order; clusters in numeric order;",
-                     "nucleosomes: fibertools nuc calls, TF footprints: FiberHMM v2 recalled_tf")) +
+    title = paste0("Nucleosome and FiberHMM TF footprints of ", nrow(rows), " clustered molecules")) +
     ggplot2::labs(x = POL2_X_LABEL)
 }
 
@@ -432,10 +430,7 @@ pol2_locus_figure <- function(cfg, x, annotation, gene, models, eqtl = NULL) {
     strip_label = "GTEx LCL\neVariants", group_labels = labels, show_proportions = TRUE,
     reference_counts = setNames(s$n, s$cluster), region_label = paste(gene, "TSS"),
     reference_label = "All clustered molecules",
-    subtitle = paste0("Top: canonical genes, TSS window shaded | bottom: TSS window, dashed line at the TSS",
-      if (!is.null(marks)) paste0("; diamonds: GTEx v8 LCL eVariants of ", gene) else "",
-      " | clusters in numeric order"),
-    caption = sprintf(paste("Left bars: cluster, sample. %d of %d molecules were clustered and keep their",
+    caption =sprintf(paste("Left bars: cluster, sample. %d of %d molecules were clustered and keep their",
       "Leiden cluster; the others take the majority cluster of their %d nearest clustered molecules",
       "(Manhattan distance, 40 bins of 50 bp)."), sum(a$clustered), nrow(a), cfg$k_neighbors),
     x_label = POL2_X_LABEL)
@@ -465,7 +460,7 @@ pol2_locus_figures <- function(cfg, x, annotation) {
 # Save the main figures
 ############################
 # 1. Input: Saved clustering, annotations and workflow settings.
-# 2. Output: Main clustering, footprint, imprinting, feature and locus figures.
+# 2. Output: Main clustering, footprint, feature and locus figures.
 #
 # 3. Steps:
 #    - Prepare shared colors and row ordering
@@ -493,8 +488,6 @@ pol2_save_figures <- function(x, annotation, cfg) {
   save_figure(pol2_clusters_and_enrichment(res, annotation, colors), file.path(plots, "pol2_clusters_and_enrichment.pdf"),
               width = 16, height = max(7, 0.9 * k + 2))
   prep <- pol2_read_prepared(cfg)
-  imprinting <- pol2_imprinting(cfg, fread(file.path(tables, "tracks", "molecule_projection.tsv.gz")), prep$tss, clusters)
-  save_figure(pol2_plot_imprinting(imprinting, clusters), file.path(plots, "imprinting_by_cluster.pdf"), width = 11, height = 4.5)
   features <- pol2_cluster_features(cfg, x, annotation, prep)
   dir.create(file.path(tables,"cluster_features"),recursive=TRUE,showWarnings=FALSE)
   fwrite(features$summary, file.path(tables, "cluster_features", "cluster_features.tsv"), sep = "\t")
@@ -506,84 +499,6 @@ pol2_save_figures <- function(x, annotation, cfg) {
   for (gene in names(loci))
     save_figure(loci[[gene]]$combined, file.path(plots, "loci", paste0(gene, "_TSS_molecules.pdf")),
                 width = 12, height = loci[[gene]]$height, limitsize = FALSE)
-}
-
-# Descriptive physical-molecule counts; no inferential tests.
-###########################
-# Summarize imprinted promoters
-############################
-# 1. Input: Workflow settings, projected molecules, TSSs and cluster order.
-# 2. Output: Imprinting summaries and a promoter table held in memory.
-#
-# 3. Steps:
-#    - Find promoters overlapping imprinted regions
-#    - Count distinct molecules and cluster proportions
-#    - Add expression, pausing and signal information.
-pol2_imprinting <- function(cfg, projection, tss, clusters) {
-  dmr <- fread(cfg$imprinted_dmrs, header = FALSE, select = 1:4,
-               col.names = c("chrom", "start", "end", "dmr_name"))
-  hits <- findOverlaps(pol2_gr(tss$chrom, tss$window_start, tss$window_end),
-                       pol2_gr(dmr$chrom, dmr$start, dmr$end), ignore.strand = TRUE)
-  sites <- unique(tss$tss_id[queryHits(hits)])
-  p <- copy(projection)
-  p[, imprinted := tss_id %in% sites]
-  per_cluster <- p[, .(n = uniqueN(RID[imprinted]), N = uniqueN(RID)), by = cluster]
-  per_cluster[, fraction := n / N]
-  # A physical molecule observed at both types of TSS belongs only to imprinted.
-  imprinted_rids <- unique(p[imprinted == TRUE, RID])
-  pairs <- unique(p[, .(RID, cluster)])
-  pairs[, set := fifelse(RID %in% imprinted_rids, "Imprinted TSSs", "Other TSSs")]
-  composition <- pairs[, .(n = .N), by = .(set, cluster)]
-  composition[, fraction := n / sum(n), by = set]
-  overall <- pairs[, mean(cluster == "cluster4")]
-  loci <- p[imprinted == TRUE, {
-    u <- unique(.SD[, .(RID, cluster)])
-    counts <- u[, .N, by = cluster][order(-N, cluster)]
-    list(molecules = uniqueN(RID), samples = uniqueN(sample_name),
-         cluster4_fraction = uniqueN(RID[cluster == "cluster4"]) / uniqueN(RID),
-         dominant_cluster = counts$cluster[1L])
-  }, by = tss_id]
-  names <- data.table(tss_id = tss$tss_id[queryHits(hits)], dmr_name = dmr$dmr_name[subjectHits(hits)])
-  names <- names[, .(dmr_name = paste(sort(unique(dmr_name)), collapse = ";")), by = tss_id]
-  loci <- merge(merge(loci, names, by = "tss_id"), pol2_attach_pi(tss, cfg$pi_table), by = "tss_id")
-  expr <- rbindlist(lapply(cfg$expression, function(f) fread(f, select = c("gene_id", "TPM"))))
-  expr <- expr[grepl("^ENSG", gene_id) & !grepl("_PAR_Y$", gene_id),
-               .(tpm = mean(TPM)), by = .(key = sub("\\..*$", "", gene_id))]
-  loci[, `:=`(tpm = expr$tpm[match(sub("\\..*$", "", gene_id), expr$key)],
-               fold_overall_cluster4 = cluster4_fraction / overall,
-               overall_cluster4_fraction = overall,
-               locus = paste0(chrom, ":", window_start + 1L, "-", window_end))]
-  for (d in list(per_cluster, composition)) d[, cluster := factor(cluster, levels = clusters)]
-  list(per_cluster = per_cluster, composition = composition,
-       loci = loci[, .(tss_id, gene = gene_name, locus, dmr_name, molecules, samples,
-         cluster4_fraction, overall_cluster4_fraction, fold_overall_cluster4, dominant_cluster,
-         tpm, pi, pol2_tss_signal)])
-}
-
-###########################
-# Compare imprinting patterns
-############################
-# 1. Input: Imprinting summaries and cluster order.
-# 2. Output: A two-panel imprinting figure.
-#
-# 3. Steps:
-#    - Show the imprinted fraction within each cluster
-#    - Compare cluster composition between promoter groups.
-pol2_plot_imprinting <- function(imprinting, clusters) {
-  colors <- cluster_id_palette(clusters)
-  a <- ggplot(imprinting$per_cluster, aes(cluster, fraction, fill = cluster)) +
-    geom_col() + geom_text(aes(label = paste(n, N, sep = " / ")), vjust = -0.4, size = 3) +
-    scale_fill_manual(values = colors, guide = "none") +
-    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, .18))) +
-    labs(x = NULL, y = "Molecules at imprinted TSSs", title = "Imprinted fraction per cluster") +
-    theme_fiberseq("classic", base_size = 10)
-  composition <- copy(imprinting$composition)
-  b <- ggplot(composition, aes(set, fraction, fill = cluster)) + geom_col() +
-    geom_text(aes(label = sprintf("%.1f%%", 100 * fraction)), colour = "white",
-              position = position_stack(vjust = .5), size = 3) +
-    scale_fill_manual(values = colors) + scale_y_continuous(labels = scales::percent) +
-    labs(x = NULL, y = "Cluster composition", fill = NULL) + theme_fiberseq("classic", base_size = 10)
-  cowplot::plot_grid(a, b, nrow = 1, labels = c("A", "B"))
 }
 
 ###########################
@@ -747,6 +662,10 @@ for (window in c("upstream","downstream")) {
     acf_plots[[paste(window,kind,sep="_")]] <- plot_report_cluster_acf(entry,lower=15,upper=475,title=title,
       groups=clusters,colors=cluster_id_palette(clusters),panels=kind=="panels",
       display=if(kind=="heatmap") "heatmap" else "curves",show_counts=FALSE,frame=FALSE)
+    # Heatmap: strip of cluster colours left of the rows (lags start at 15 bp)
+    if (kind=="heatmap") acf_plots[[paste(window,kind,sep="_")]] <- acf_plots[[paste(window,kind,sep="_")]] +
+      ggplot2::geom_tile(data=data.frame(cluster=factor(clusters,levels=clusters)),ggplot2::aes(x=5,y=cluster),
+        width=8,fill=cluster_id_palette(clusters),inherit.aes=FALSE)
     if (save) {
       suffix <- if(window=="upstream") "upstream_-500_to_-25_bp" else "downstream_+25_to_+500_bp"
       prefix <- if(kind=="heatmap") "autocorrelation_heatmap_" else paste0("autocorrelation_curves_",kind,"_")
@@ -796,8 +715,9 @@ pol2_nucleosome_plots <- function(cfg, save = FALSE) {
   summary <- data.table::fread(file.path(tables,"nucleosome_cluster_summary.tsv.gz"))
   summary[,cluster:=factor(cluster,levels=clusters)]
   meta$title <- "TSS nucleosome occupancy"
+  # The shared plot adds a bootstrap/labels caption; drop it here
   plots$tss_occupancy <- nuc_env$plot_position_summary(positions,positions,meta,include_gap=FALSE,
-    colors=cluster_id_palette(clusters),profile=summary,profile_y="tss_occupancy")
+    colors=cluster_id_palette(clusters),profile=summary,profile_y="tss_occupancy") + ggplot2::labs(caption=NULL)
   if (save) {
     output <- file.path(cfg$output,"plots","nuc")
     dir.create(output,recursive=TRUE,showWarnings=FALSE)
@@ -876,7 +796,28 @@ pol2_plot_histone_profiles <- function(profiles, clusters, stacked = FALSE) {
     facet_wrap(~mark, nrow = 1, scales = "free_y") +
     scale_colour_manual(values = cluster_id_palette(clusters)) +
     labs(x = POL2_X_LABEL, y = "Mean fold enrichment over control", colour = "Cluster",
-         title = "GM12878 histone ChIP around the TSS",
-         subtitle = "Mean over each cluster's molecules; 50-bp bins; shaded: clustering window") +
+         title = "GM12878 histone ChIP around the TSS") +
     theme_fiberseq("bw", base_size = 10)
+}
+
+###########################
+# Show motif cluster bars
+############################
+# 1. Input: The cluster_footprint_proportions table (07_motif_cluster_bars.R), one motif family
+#    and the cluster order.
+# 2. Output: One bar per cluster: share of its reads with a footprint-supported motif of the family.
+#
+# 3. Steps:
+#    - Keep the family's rows
+#    - Draw cluster-coloured bars with percentage labels.
+pol2_plot_motif_cluster_bars <- function(bars, family, clusters) {
+  d <- bars[category == family]
+  d[, cluster := factor(cluster, levels = clusters)]
+  plot_stacked_proportion(d, x = "cluster", fill = "cluster", colors = cluster_id_palette(clusters),
+      y = "fraction", position = "stack", labels = list(x = "Cluster", y = "Proportion of molecules")) +
+    geom_text(aes(label = label), vjust = -.4, size = 3) +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, .15))) +
+    labs(title = paste(family, "motif-associated footprints")) +
+    theme_fiberseq("classic", base_size = 10) +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
 }
