@@ -27,6 +27,7 @@ PLOTTING     <- file.path(PROJECT, "code/parsing_functions/plotting_functions.r"
 PARSING      <- file.path(PROJECT, "code/parsing_functions/parsing_footprints_functions.r")
 LEIDEN_DIR   <- file.path(PROJECT, "code/clustering_methods/Leiden_Manhattan")
 PI_TABLE     <- file.path(PROJECT, "LCL_project/pausing/pause_index.tsv")   # code/pausing/cal_pausing_index/pause_index.R
+EXAMPLE_GENES <- file.path(PROJECT, "code/pausing/PolII/example_gene_list.tsv")
 OUT_DIR      <- file.path(PROJECT, "LCL_project/pausing/PolII")
 DOMINANT_TSS <- file.path(ANN, "fantom5_LCL/fantom5.hg38.LCL.dominant_TSS.bed.gz")
 CANONICAL_TSS <- file.path(ANN, "gencodev46_Ensembl_canonical_TSS.bed")
@@ -315,20 +316,10 @@ tss_tracks <- function(g) {
   out
 }
 
-# User-supplied groups; aliases and HLA component expansion remain explicit in the manifest.
-curated_example_genes <- function() {
-  hk <- strsplit("ACTB ACTG1 GAPDH B2M HPRT1 SDHA TFRC TBP EEF2 EIF2S3 GDI1 MYH9 SF3B1 SPCS3 RPS18 RPS27 POM121 AHSP HBS1L CYC1 PGK1 GUSB TUBB RPL13A ATP5B", " ")[[1]]
-  ct <- strsplit("CD19 CD21 CD22 FCGR2B MS4A1 CD24 CD38 CD72 CD74 CD79A CD79B CD83 CD86 CD5 CD9 CD58 CD81 CD123 SYK LYN BTK BLNK BLK EBF PAX5 POU2AF1 SPIB SPI1 IRF4 IRF8 CEBPB BCL6 PRDM1 XBP1 MYC HLA-DM HLA-DO HLA-DP HLA-DQ HLA-DR IGHM IGHD IGHA1 IGKC IGLC2 LMO2 MYBL1 SERPINA9 MME HMCES ZFAND4 NLRP4 MUC4 SPP1 LAMB3 MERTK IKZF1", " ")[[1]]
-  aliases <- list(ATP5B = "ATP5F1B", CD21 = "CR2", CD123 = "IL3RA", EBF = "EBF1",
-    `HLA-DM` = c("HLA-DMA", "HLA-DMB"), `HLA-DO` = c("HLA-DOA", "HLA-DOB"),
-    `HLA-DP` = c("HLA-DPA1", "HLA-DPB1"), `HLA-DQ` = c("HLA-DQA1", "HLA-DQB1"),
-    `HLA-DR` = c("HLA-DRA", "HLA-DRB1", "HLA-DRB5"))
-  rbindlist(lapply(c("housekeeping", "cell_type_specific"), function(group) {
-    genes <- if (group == "housekeeping") hk else ct
-    rbindlist(lapply(genes, function(g) data.table(group = group, requested_gene = g,
-      gene_name = if (is.null(aliases[[g]])) g else aliases[[g]])))
-  }))
-}
+# EXAMPLE_GENES: 50 housekeeping, 50 cell type specific and 50 not expressed genes, all autosomal
+# and protein coding, with their GM12878 TPM (ENCODE ENCSR820PHH, the two replicates and their
+# mean). Expressed genes have TPM >= 1 in both replicates, not expressed ones TPM < 1 in both.
+curated_example_genes <- function() fread(EXAMPLE_GENES)
 
 # Prefer the output of code/pausing/dominant_tss/write_dominant_tss.R;
 # fall back only when absent, using the canonical GENCODE v46 one-base BED.
@@ -348,14 +339,9 @@ resolve_example_tss <- function(gene, group, dominant = fread(DOMINANT_TSS)) {
            tss_source = "GENCODE v46 canonical TSS")]
 }
 
-gene_plot_label <- function(g) {
-  if (!is.null(g$requested_gene) && g$requested_gene != g$gene_name)
-    paste0(g$gene_name, " (", g$requested_gene, ")") else g$gene_name
-}
-
 # Title and subtitle of every figure: gene, group, view, TSS, read count and window
 example_labels <- function(g, view, n) c(
-  title = sprintf("%s | %s | %s", gene_plot_label(g), g$group, view),
+  title = sprintf("%s | %s | %s", g$gene_name, g$group, view),
   subtitle = sprintf("TSS %s:%d (%s) | %s\n%d full-span reads | TSS %d to +%d bp",
                      g$chrom, g$tss, g$strand, g$tss_source, n, EXAMPLE_RANGE[1], EXAMPLE_RANGE[2]))
 
@@ -631,7 +617,6 @@ run_curated_examples <- function(genes = curated_example_genes(), workers = 1L) 
     message("Gene ", i, "/", nrow(manifest), ": ", row$gene_name)
     tryCatch({
       g <- resolve_example_tss(row$gene_name, row$group, dominant)
-      g[, requested_gene := row$requested_gene]
       row[, `:=`(chrom = g$chrom, tss = g$tss, strand = g$strand, tss_source = g$tss_source)]
       stats <- plot_curated_gene(g)
       row[, `:=`(status = "complete", n_reads = stats$n_reads, n_clusters = stats$n_clusters)]
