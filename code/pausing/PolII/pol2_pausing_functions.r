@@ -26,7 +26,6 @@ SHARED  <- "/project/spott/1_Shared_projects/LCL_Fiber_seq"
 PLOTTING     <- file.path(PROJECT, "code/parsing_functions/plotting_functions.r")
 PARSING      <- file.path(PROJECT, "code/parsing_functions/parsing_footprints_functions.r")
 LEIDEN_DIR   <- file.path(PROJECT, "code/clustering_methods/Leiden_Manhattan")
-PI_TABLE     <- file.path(PROJECT, "LCL_project/pausing/pause_index.tsv")   # code/pausing/cal_pausing_index/pause_index.R
 EXAMPLE_GENES <- file.path(PROJECT, "code/pausing/PolII/example_gene_list.tsv")
 OUT_DIR      <- file.path(PROJECT, "LCL_project/pausing/PolII")
 DOMINANT_TSS <- file.path(ANN, "fantom5_LCL/fantom5.hg38.LCL.dominant_TSS.bed.gz")
@@ -53,12 +52,6 @@ DNASE  <- file.path(LCL_PUB, "DNase.ENCFF743ULW.bigWig")    # GM12878 ENCSR000EM
 
 AUTOSOMES    <- paste0("chr", 1:22)   # FiberHMM covers chr1-22 only
 FLANK        <- 1000L                 # read window = TSS +/- FLANK
-MIN_READS    <- 50L                   # example genes: fibers with a nucleosome record in the window
-OTHER_TSS_BP <- 1000L                 # example genes: no other dominant TSS this close
-N_EXAMPLES   <- 5L                    # example genes per PI bin
-PI_BINS      <- c("low", "mid", "high")
-CONTROL_GENES <- c("GADD45B", "HSPA1A", "HSPA1B", "HSPA8", "HSP90AA1", "DNAJB1",
-                   "FOS", "JUNB", "EGR1", "IER2", "MYC")   # textbook paused genes
 PLUS1_OFFSETS <- 0:299                # +1 nucleosome = first nucleosome-call base in here
 
 # FiberHMM footprint size classes: assign_size_class() bins of parsing_footprints_functions.r
@@ -109,28 +102,6 @@ lift_groseq <- function(chrom, chain) {
   })
 }
 
-# fibertools nucleosome calls of every LCL sample in chrom:start..end (1-based), pooled. One
-# alignment per read (longest; palindromic pairs collapse), sentinel blocks dropped; a read in
-# several samples is kept in the first.
-# Output: list(reads = RID, sample, start0, end0 (read span); nucs = RID, start0, end0)
-window_nucleosomes <- function(chrom, start, end) {
-  region <- GRanges(chrom, IRanges(start, end))
-  per_sample <- lapply(fread(SAMPLES)$sample_name, function(s) {
-    f <- nuc_file(s, chrom)
-    d <- read_tabix_region(f, region)
-    if (!nrow(d)) return(NULL)
-    names(d)[seq_along(FT_BED12_COLS)] <- FT_BED12_COLS
-    d <- keep_longest_alignment(d)
-    b <- convert_ft_bed12_to_bed6(d, format = "bed12_fibertools", source = f)
-    list(reads = data.table(RID = d$RID, sample = s, start0 = d$start, end0 = d$end),
-         nucs = data.table(RID = b$RID, sample = s, start0 = b$start, end0 = b$end))
-  })
-  reads <- rbindlist(lapply(per_sample, `[[`, "reads"))
-  reads <- reads[!duplicated(RID)]
-  nucs <- rbindlist(lapply(per_sample, `[[`, "nucs"))[reads[, .(RID, sample)], on = .(RID, sample), nomatch = 0L]
-  list(reads = reads, nucs = nucs[, .(RID, start0, end0)])
-}
-
 # FiberHMM combined footprints (COMBINED_BINS, 10-80 bp) overlapping chrom:start..end (1-based).
 # The files have no index, so each is streamed until its records start past `end`, in parallel.
 # Output: RID, start0, end0 (unique)
@@ -173,112 +144,6 @@ plus1_offset <- function(m) {
 }
 
 
-# --- example genes chosen by pausing index (not used by run_gene_examples.R) ----------
-
-# Nearest other gene's CAGE dominant TSS (DOMINANT_TSS, any biotype, either strand) to each gene's
-# TSS; the gene itself is matched by ENSG or symbol.
-#   genes - gene_id, ensg, gene_name, chrom, tss, strand
-# Output: gene_id, nearest_tss_bp, nearest_tss_gene, nearest_tss_orientation
-nearest_other_tss <- function(genes) {
-  dom <- fread(DOMINANT_TSS)[, .(dom_ensg = sub("\\..*", "", gene_id), dom_gene = gene_name,
-                                 chrom = `#chrom`, pos = end, dom_strand = strand)]
-  near <- merge(genes[, .(gene_id, ensg, gene_name, chrom, tss, strand)], dom, by = "chrom",
-                allow.cartesian = TRUE)
-  near <- near[(is.na(ensg) | dom_ensg != ensg) & dom_gene != gene_name]
-  near[, dist := abs(pos - tss)]
-  setorder(near, gene_id, dist)
-  near[!duplicated(gene_id), .(gene_id, nearest_tss_bp = dist, nearest_tss_gene = dom_gene,
-                               nearest_tss_orientation = fifelse(dom_strand == strand,
-                                                                 "same strand", "opposite strand"))]
-}
-
-# Fibers (31 samples pooled, one alignment each) with an ft nucleosome record overlapping the
-# gene's TSS +/- FLANK; g = one pause_index.tsv row
-window_fiber_count <- function(g) {
-  nrow(window_nucleosomes(g$chrom, g$tss - FLANK, g$tss + FLANK)$reads)
-}
-
-# Analysis-set genes with their nearest other TSS and matching scores:
-#   candidate     no other gene's dominant TSS within OTHER_TSS_BP
-#   in_fpkm_band  FPKM in the middle 50% of the analysis set
-#   distance      |PI percentile - percentile of the tertile median| + |FPKM percentile - 0.5|
-#   pi_tab - pause_index.tsv
-example_candidates <- function(pi_tab) {
-  an <- pi_tab[analysis_set == TRUE]
-  an <- merge(an, nearest_other_tss(an), by = "gene_id", all.x = TRUE)
-  an[, candidate := is.na(nearest_tss_bp) | nearest_tss_bp > OTHER_TSS_BP]
-  band <- an[, quantile(fpkm, c(0.25, 0.75))]
-  an[, in_fpkm_band := fpkm >= band[1] & fpkm <= band[2]]
-  pi_ecdf <- ecdf(an$pi)
-  an[, `:=`(pct_pi = frank(pi) / .N, pct_fpkm = frank(fpkm) / .N)]
-  an[, target_pct_pi := pi_ecdf(median(pi)), by = pi_bin]
-  an[, distance := abs(pct_pi - target_pct_pi) + abs(pct_fpkm - 0.5)]
-  an[, pi_bin := factor(pi_bin, levels = PI_BINS)]
-  setorder(an, pi_bin, distance)
-  an[]
-}
-
-# Per PI tertile, walk the candidates in the FPKM band from the nearest to the matching target and
-# keep the first N_EXAMPLES with >= MIN_READS fibers (window_fiber_count(), counted only for the
-# genes looked at); adds n_reads
-pick_examples <- function(an) {
-  pool <- an[candidate & in_fpkm_band]
-  picks <- rbindlist(lapply(PI_BINS, function(b) {
-    kept <- list()
-    for (i in which(pool$pi_bin == b)) {
-      n <- window_fiber_count(pool[i])
-      if (n >= MIN_READS) kept[[length(kept) + 1L]] <- pool[i][, n_reads := n]
-      if (length(kept) == N_EXAMPLES) break
-    }
-    rbindlist(kept)
-  }))
-  picks[, group := as.character(pi_bin)][]
-}
-
-# Status of each CONTROL_GENES gene; the highest-PI one that "passes" (high tertile, no other TSS
-# within OTHER_TSS_BP, >= MIN_READS fibers; FPKM band not required) is the positive control.
-# Fibers are counted only for genes that pass the other rules.
-control_status <- function(pi_tab, an) {
-  controls <- merge(data.table(gene_name = CONTROL_GENES),
-                    pi_tab[, .(gene_name, gene_id, chrom, tss, pi, fpkm, near_other_gene, short,
-                               analysis_set, pi_bin)],
-                    by = "gene_name", all.x = TRUE)
-  controls <- merge(controls, an[, .(gene_id, nearest_tss_bp, candidate)], by = "gene_id", all.x = TRUE)
-  controls[, status := fcase(is.na(gene_id), "not a RefSeq gene in pause_index.tsv",
-                             !analysis_set & near_other_gene, "another gene within 3 kb",
-                             !analysis_set & short, "shorter than 1 kb",
-                             !analysis_set, "not in analysis set (expression, biotype, chrom or PI)",
-                             pi_bin != "high", paste(pi_bin, "PI"),
-                             !candidate, "other dominant TSS within 1 kb",
-                             default = "passes")]
-  controls[, n_reads := NA_integer_]
-  for (i in which(controls$status == "passes")) controls[i, n_reads := window_fiber_count(controls[i])]
-  controls[status == "passes" & n_reads < MIN_READS, status := paste("fewer than", MIN_READS, "fibers")]
-  setorder(controls, -pi)
-  controls[]
-}
-
-# picks plus the positive control (first "passes" row of control_status()), if any
-add_control <- function(picks, an, controls) {
-  control <- controls[status == "passes"]
-  if (!nrow(control)) return(picks)
-  row <- an[gene_id == control$gene_id[1]][, `:=`(n_reads = control$n_reads[1], group = "control")]
-  rbind(picks, row, fill = TRUE)
-}
-
-# Write the chosen genes to tables/example_genes.tsv
-write_example_table <- function(picks) {
-  cols <- c("group", "gene_id", "gene_name", "chrom", "tss", "strand", "tes", "tx_id", "pi", "pi_bin",
-            "fpkm", "tssr_dens", "body_dens", "n_reads",
-            "nearest_tss_bp", "nearest_tss_gene", "nearest_tss_orientation",
-            "candidate", "in_fpkm_band", "pct_pi", "pct_fpkm", "distance")
-  path <- file.path(OUT_DIR, "tables/example_genes.tsv")
-  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
-  fwrite(picks[, ..cols], path, sep = "\t")
-  invisible(path)
-}
-
-
 # --- curated housekeeping / cell type specific genes (run_gene_examples.R) ------------------
 
 # Per-base summed score at `offsets` around gene g's TSS (direction of transcription) from
@@ -316,6 +181,7 @@ tss_tracks <- function(g) {
   out
 }
 
+# Read the existing input list; this workflow does not generate or overwrite it.
 # EXAMPLE_GENES: 50 housekeeping, 50 cell type specific and 50 not expressed genes, all autosomal
 # and protein coding, with their GM12878 TPM (ENCODE ENCSR820PHH, the two replicates and their
 # mean). Expressed genes have TPM >= 1 in both replicates, not expressed ones TPM < 1 in both.
@@ -454,6 +320,8 @@ plot_example_m6a <- function(g, dat, rows, output, clustered) {
 # sample bars (sample bar only when unclustered), nucleosomes and TF footprints in
 # MOLECULE_TRACK_COLORS; top: m6A fraction at observed sites per cluster (plot_group_profile()),
 # as in plot_read_heatmap(show_cluster_profiles = TRUE)
+
+
 plot_example_footprints <- function(g, dat, bundle, rows, output, clustered) {
   region <- example_region(g)
   rows$sample <- sub("_.*$", "", rows$sample_name)
@@ -497,11 +365,17 @@ plot_example_footprints <- function(g, dat, bundle, rows, output, clustered) {
   save_figure(fig, output, width = 10, height = 1.6 + sum(heights), limitsize = FALSE)
 }
 
-# Tullius et al. Figure 1F (Data S1 cell 54) for one gene. Above: DNase and sense GRO-seq, each
+# Top panel: DNase and sense GRO-seq, each
 # scaled to its window maximum. Middle: FiberHMM combined 30-60 / 60-80 bp footprint coverage
 # bigWigs. Below: every full-span read with its nucleosomes and TF footprints in
-# MOLECULE_TRACK_COLORS, ordered by +1 nucleosome (plus1_offset()); Tullius drops reads without
-# one, here they are kept in a second facet, in read_order.
+# MOLECULE_TRACK_COLORS, ordered by +1 nucleosome (plus1_offset())
+
+# # 1. choose the gene's TSS centered window, choose fantom5 dominant TSS, if absent use GENCODE canonical TSS
+# # 2. assemble_region_m6a() to get the full-span reads and their m6A sites, nucleosome calls and TF footprints
+# # 3. extract DNAse and GRO-seq signal bigWigs, and FiberHMM footprint coverage bigWigs
+# # 4. collect footprings for each read
+# # 5. order reads by +1 nucleosome (first nucleosome base in +0..+299 bp), reads tied at the same position are ordered by sample, then start poisiton, then read ID
+
 plot_read_level <- function(g, bundle, read_order, output) {
   rows <- data.table(RID = read_order)
   rows[, plus1 := plus1_offset(footprint_matrix(rows, bundle$nucs))]
@@ -556,9 +430,9 @@ plot_read_level <- function(g, bundle, read_order, output) {
   fig <- (p_signal / p_cover / molecules) + plot_layout(heights = c(1.1, 1.1, reads_height)) +
     plot_annotation(title = labels[["title"]], subtitle = labels[["subtitle"]],
       caption = paste0(
-        "Above: DNase (ENCFF743ULW) and sense GRO-seq (GSM1480326, lifted hg19 -> hg38), each scaled to its window maximum.\n",
+        "Top panel: DNase (ENCFF743ULW) and sense GRO-seq (GSM1480326, lifted hg19 -> hg38), each scaled to its window maximum.\n",
         "Middle: FiberHMM combined footprint coverage bigWigs (joint_trained_tracks).\n",
-        "Below: reads ordered by +1 nucleosome (first nucleosome base in +", min(PLUS1_OFFSETS), "..+",
+        "Bottom panel: reads ordered by +1 nucleosome (first nucleosome base in +", min(PLUS1_OFFSETS), "..+",
         max(PLUS1_OFFSETS), " bp), as in Tullius et al. Fig 1F; reads without one are shown below.\n",
         footprint_caption(g)),
       theme = theme_fiberseq())
