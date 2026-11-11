@@ -650,8 +650,7 @@ allele_m6a = function(cre_id, chrom, start, end, lead_variant) {
   stopifnot(length(snv) == 4L, nchar(snv[3]) == 1L, nchar(snv[4]) == 1L)
   region = data.frame(region_id = cre_id, chr = chrom, start = start, end = end,
     focal_pos = as.integer(snv[2]), ref = snv[3], alt = snv[4])
-  genotypes = pair_genotype_calls(region, hsca_manifest, "/project/spott/cshan/envs/Jupyter-notebook/bin/python3",
-    file.path(params$code_root, "co-accessibility/LCL/hsca/hsca_functions.py"))
+  genotypes = pair_genotype_calls(region, hsca_manifest)
   het = genotypes$calls[genotype == "het", sample_name]
   out = data.table(n_het_samples = length(het), ref_m6a_prop = NA_real_, alt_m6a_prop = NA_real_,
                    n_ref_fibers = 0L, n_alt_fibers = 0L)

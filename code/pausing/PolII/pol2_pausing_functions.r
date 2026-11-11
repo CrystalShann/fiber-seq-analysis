@@ -1,4 +1,4 @@
-# Paths, parameters, helpers and plots for the PolII example genes (run_gene_examples.R);
+# Paths, parameters, helpers and plots for the PolII example genes (01_run_gene_examples.R);
 # pol2_functions.R and polII_pausing_plots.r merged. The shared parsing / plotting functions
 # (code/parsing_functions) and the Leiden_Manhattan functions are sourced and used unchanged.
 #
@@ -12,7 +12,7 @@
 #   read_level_plots/  <gene>_read_level.pdf: Tullius et al. Figure 1F, an R port of Data S1
 #                      cell 54 (mmc3.zip)
 # rtracklayer needs /project/spott/cshan/envs/dimelo/lib/libcurl.so.4 loaded first
-# (dyn.load(..., local = FALSE), as in run_gene_examples.R).
+# (dyn.load(..., local = FALSE), as in 01_run_gene_examples.R).
 
 suppressPackageStartupMessages({
   library(GenomicRanges); library(data.table)   # data.table last: its shift() masks IRanges'
@@ -36,8 +36,8 @@ SAMPLES      <- file.path(SHARED, "Data/LCL_sample_metatable_merged_samples_31sa
 # tracks are not usable here: one row per read (record span), not per footprint.
 COMBINED_ROOT <- file.path(SHARED, "FiberHMM/merged/combined/joint_trained_tracks")
 COMBINED_BINS <- c("10-30bp", "30-60bp", "60-80bp")
-# per-base footprint coverage bigWigs of two of those bins, same folder (chr1-22)
-COVERAGE_BINS <- c("30-60bp", "60-80bp")
+# per-base footprint coverage bigWigs of those bins, same folder (chr1-22)
+COVERAGE_BINS <- c("10-30bp", "30-60bp", "60-80bp")
 coverage_file <- function(chrom, bin)
   file.path(COMBINED_ROOT, chrom, sprintf("combined_%s_%s_fp_cov.bw", chrom, bin))
 # fibertools nucleosome calls per sample (ft extract --nuc, BED12 with 1-bp sentinel blocks, tabix)
@@ -49,6 +49,7 @@ CHAIN  <- file.path(ANN, "hg19ToHg38.over.chain")
 GROSEQ <- c(`+` = file.path(LCL_PUB, "GRO-seq/GSM1480326_GM12878_GROseq_plus.bigWig"),     # hg19
             `-` = file.path(LCL_PUB, "GRO-seq/GSM1480326_GM12878_GROseq_minus.bigWig"))
 DNASE  <- file.path(LCL_PUB, "DNase.ENCFF743ULW.bigWig")    # GM12878 ENCSR000EMT, GRCh38
+POL2_CHIP <- file.path(LCL_PUB, "Pol2_chip/ENCFF328MMS.bigWig")   # GM12878 Pol II ChIP fold enrichment, GRCh38
 
 AUTOSOMES    <- paste0("chr", 1:22)   # FiberHMM covers chr1-22 only
 FLANK        <- 1000L                 # read window = TSS +/- FLANK
@@ -84,14 +85,21 @@ SIGNAL_TRACKS   <- c("DNase", "GRO-seq")
 
 
 # TSS-relative first (lo) and last (hi) base of BED intervals [start0, end0)
+#
+# 1. move the 0-based half-open BED interval onto 1-based inclusive bases
+# 2. subtract the TSS on the plus strand; mirror around it on the minus strand, so lo is
+#    always the first base in the direction of transcription
 to_relative <- function(start0, end0, tss, strand) {
   plus <- strand == "+"
   list(lo = as.integer(ifelse(plus, start0 + 1 - tss, tss - end0)),
        hi = as.integer(ifelse(plus, end0 - tss, tss - start0 - 1)))
 }
 
-# GM12878 GRO-seq of one chromosome lifted hg19 -> hg38:
-# list(`+`, `-`) of GRanges with per-base read counts (minus stored negative)
+# One chromosome of GM12878 GRO-seq, lifted hg19 -> hg38, as list(`+`, `-`)
+#
+# 1. read the whole chromosome out of each strand's hg19 bigWig
+# 2. take the absolute score (the minus bigWig stores counts as negative)
+# 3. liftOver to hg38 and drop intervals that land on another chromosome
 lift_groseq <- function(chrom, chain) {
   lapply(GROSEQ, function(f) {
     len <- GenomeInfoDb::seqlengths(rtracklayer::BigWigFile(f))[[chrom]]
@@ -102,9 +110,12 @@ lift_groseq <- function(chrom, chain) {
   })
 }
 
-# FiberHMM combined footprints (COMBINED_BINS, 10-80 bp) overlapping chrom:start..end (1-based).
-# The files have no index, so each is streamed until its records start past `end`, in parallel.
-# Output: RID, start0, end0 (unique)
+# FiberHMM combined 10-80 bp footprints overlapping chrom:start..end, as RID, start0, end0
+#
+# 1. one zcat | awk stream per COMBINED_BINS size file of this chromosome
+# 2. awk keeps records overlapping the window and exits at the first start past `end`
+#    (the files are sorted by start), so no file is read to its end
+# 3. run the streams in parallel and drop the footprints that the bin edges duplicate
 window_tf_footprints <- function(chrom, start, end) {
   files <- file.path(COMBINED_ROOT, chrom, sprintf("combined_%s_%s_fps.bed.gz", chrom, COMBINED_BINS))
   cmds <- sprintf("zcat %s 2>/dev/null | awk -F'\\t' -v s=%d -v e=%d '$2 >= e {exit} $3 >= s'",
@@ -116,10 +127,11 @@ window_tf_footprints <- function(chrom, start, end) {
   unique(rbindlist(out))
 }
 
-# Per-read matrix in the Tullius format: one row per read (the order of `reads`),
-# one column per offset -FLANK..FLANK. A footprint base holds the footprint's
-# length, any other base 0.
-#   reads - RID; fps - RID, lo, hi, size (one gene)
+# Reads x offsets matrix, Tullius format: a footprint base holds its length, every other 0
+#
+# 1. allocate a reads x (2 * FLANK + 1) matrix of zeros, rows named by RID
+# 2. clip each footprint to the window and drop the ones that fall outside it
+# 3. write the footprint's length into every base it covers
 footprint_matrix <- function(reads, fps) {
   m <- matrix(0L, nrow(reads), 2L * FLANK + 1L,
               dimnames = list(reads$RID, as.character(-FLANK:FLANK)))
@@ -135,8 +147,11 @@ footprint_matrix <- function(reads, fps) {
   m
 }
 
-# +1 nucleosome: first offset in PLUS1_OFFSETS covered by a nucleosome call (m = footprint_matrix()
-# of the nucleosome calls), NA when there is none
+# +1 nucleosome offset of each read, NA when it has none
+#
+# 1. keep the PLUS1_OFFSETS columns of the nucleosome footprint matrix
+# 2. take the first covered column of each read
+# 3. return NA for reads with no nucleosome call in that interval
 plus1_offset <- function(m) {
   sub <- (m[, as.character(PLUS1_OFFSETS), drop = FALSE] > 0) * 1L
   first <- max.col(sub, ties.method = "first")
@@ -144,10 +159,13 @@ plus1_offset <- function(m) {
 }
 
 
-# --- curated housekeeping / cell type specific genes (run_gene_examples.R) ------------------
+# --- curated housekeeping / cell type specific genes (01_run_gene_examples.R) ------------------
 
-# Per-base summed score at `offsets` around gene g's TSS (direction of transcription) from
-# intervals [start0, end0)
+# Per-base summed interval score on the gene's TSS-relative axis
+#
+# 1. put the interval ends on the TSS-relative axis with to_relative()
+# 2. clip them to `offsets` and drop the intervals that fall outside
+# 3. add each interval's score to every base it covers; bases with no interval stay 0
 signal_at <- function(start0, end0, score, g, offsets) {
   out <- numeric(length(offsets))
   r <- to_relative(start0, end0, g$tss, rep(g$strand, length(start0)))
@@ -160,8 +178,13 @@ signal_at <- function(start0, end0, score, g, offsets) {
   out
 }
 
-# DNase, GRO-seq (sense, lifted to hg38) and the FiberHMM combined COVERAGE_BINS footprint
-# coverage (COVERAGE_LABELS columns; NA off chr1-22) at TSS -FLANK..FLANK
+# DNase, sense GRO-seq and FiberHMM footprint coverage at TSS +/- FLANK
+#
+# 1. build the TSS +/- FLANK window
+# 2. lift this chromosome's GRO-seq and keep the gene's own strand (sense transcription)
+# 3. read the DNase bigWig over the window
+# 4. project both onto the TSS-relative axis with signal_at()
+# 5. add the FiberHMM COVERAGE_BINS footprint coverage bigWigs, NA off chr1-22
 tss_tracks <- function(g) {
   offsets <- -FLANK:FLANK
   win <- GRanges(g$chrom, IRanges(g$tss - FLANK, g$tss + FLANK))
@@ -181,14 +204,16 @@ tss_tracks <- function(g) {
   out
 }
 
-# Read the existing input list; this workflow does not generate or overwrite it.
-# EXAMPLE_GENES: 50 housekeeping, 50 cell type specific and 50 not expressed genes, all autosomal
-# and protein coding, with their GM12878 TPM (ENCODE ENCSR820PHH, the two replicates and their
-# mean). Expressed genes have TPM >= 1 in both replicates, not expressed ones TPM < 1 in both.
+# The curated gene list, read only: 50 housekeeping, 50 cell type specific, 50 not expressed,
+# autosomal and protein coding; expressed means GM12878 TPM >= 1 in both ENCSR820PHH replicates.
 curated_example_genes <- function() fread(EXAMPLE_GENES)
 
-# Prefer the output of code/pausing/dominant_tss/write_dominant_tss.R;
-# fall back only when absent, using the canonical GENCODE v46 one-base BED.
+# The gene's TSS: FANTOM5 LCL dominant, else GENCODE v46 canonical
+#
+# 1. look the gene up in the FANTOM5 LCL dominant TSS BED; more than one hit is an error
+# 2. only when it is absent, parse the GENCODE v46 canonical one-base BED and require
+#    exactly one hit there
+# 3. return group, gene, chromosome, 1-based TSS, strand and which source supplied it
 resolve_example_tss <- function(gene, group, dominant = fread(DOMINANT_TSS)) {
   hit <- dominant[gene_name == gene]
   if (nrow(hit) > 1L) stop("multiple dominant tss found for ", gene, call. = FALSE)
@@ -211,9 +236,15 @@ example_labels <- function(g, view, n) c(
   subtitle = sprintf("TSS %s:%d (%s) | %s\n%d full-span reads | TSS %d to +%d bp",
                      g$chrom, g$tss, g$strand, g$tss_source, n, EXAMPLE_RANGE[1], EXAMPLE_RANGE[2]))
 
-# All panels use the same full-span m6A-read cohort, including reads without nucleosomes.
-# Namespace IDs by sample to match assemble_region_m6a(), including footprint joins.
-# Nucleosomes are the 130-160 bp (NUC_BREAKS) fibertools calls, as in load_region_results().
+# Nucleosome and TF footprint intervals plus signal tracks for one gene's read cohort
+#
+# 1. per sample, read the fibertools nucleosome BED12 over the window, keep the longest
+#    alignment of each read and expand its blocks to BED6 intervals
+# 2. keep the NUC_BREAKS (130-160 bp) nucleosomes of reads that are in the m6A cohort
+# 3. stream the FiberHMM combined TF footprints of the window (autosomes only) and map
+#    their read names onto the sample-namespaced RIDs
+# 4. put reads, nucleosomes and TF footprints on the TSS-relative axis (to_relative())
+# 5. attach the DNase / GRO-seq / footprint coverage tracks from tss_tracks()
 example_footprints <- function(g, dat) {
   region <- GRanges(g$chrom, IRanges(g$tss + EXAMPLE_RANGE[1], g$tss + EXAMPLE_RANGE[2]))
   meta <- as.data.table(dat$rids_df)
@@ -241,8 +272,7 @@ example_footprints <- function(g, dat) {
        nucs = relative(nucs), fp = relative(tf), tracks = tss_tracks(g))
 }
 
-# Region row of plot_read_heatmap(), cluster_site_profiles() and plot_positions(): the
-# EXAMPLE_RANGE window, TSS-anchored and flipped on the minus strand (plot_anchor())
+# The EXAMPLE_RANGE window as a region row, TSS-anchored and flipped on the minus strand
 example_region <- function(g) {
   data.frame(chr = g$chrom, analysis_start = g$tss + EXAMPLE_RANGE[1],
              analysis_end = g$tss + EXAMPLE_RANGE[2], width = diff(EXAMPLE_RANGE) + 1L,
@@ -261,15 +291,18 @@ example_sample_colors <- function(sample_names) {
   colors[names(colors) %in% sub("_.*$", "", sample_names)]
 }
 
-# Display rows in plot order: RID, cluster (factor; one "all reads" level when unclustered),
-# start = row rank (the within-cluster sort key of plot_read_heatmap()), sample_name
+# Display rows in plot order: RID, cluster, row rank and sample_name
 example_rows <- function(read_order, meta, cluster = factor(rep("all reads", length(read_order)))) {
   data.frame(RID = read_order, cluster = cluster, start = seq_along(read_order),
              sample_name = as.character(meta$sample_name[match(read_order, meta$RID)]))
 }
 
-# Nucleosome and TF footprint intervals for plot_molecules(): TSS-relative, widened by 0.5 bp,
-# classes named as in MOLECULE_TRACK_COLORS, nucleosomes first so TF footprints are drawn on top
+# Nucleosome and TF footprint intervals as plot_molecules() tracks
+#
+# 1. label the nucleosomes with the single nucleosome class
+# 2. label the TF footprints by assign_size_class(TF_BREAKS); a size outside 10-80 bp is an error
+# 3. order the rows by class so TF footprints are drawn over nucleosomes, and widen every
+#    interval by 0.5 bp at each end so single-base footprints stay visible
 footprint_tracks <- function(bundle) {
   tr <- rbind(bundle$nucs[, .(RID, lo, hi, class = rep(FOOTPRINT_CLASSES[1], .N))],
               bundle$fp[, .(RID, lo, hi, class = sprintf("TF footprint %s",
@@ -280,16 +313,23 @@ footprint_tracks <- function(bundle) {
   data.frame(RID = tr$RID, start = tr$lo - 0.5, end = tr$hi + 0.5, class = tr$class)
 }
 
+# Dashed vertical line on the TSS, shared by every ggplot panel
 tss_vline <- function() geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3)
 
+# Figure caption naming both footprint sources
 footprint_caption <- function(g) paste0(
   "Nucleosomes: fibertools ft nucleosome calls, 130-160 bp; TF footprints: FiberHMM combined 10-80 bp.",
   if (!g$chrom %in% AUTOSOMES) "\nFiberHMM TF footprints are unavailable on non-autosomal chromosomes." else "")
 
-# m6A heatmap with plot_read_heatmap() (genomic layout): one slice per cluster with cluster and
-# sample bars (sample bar only when unclustered), m6A fraction at observed sites per cluster on
-# top, TSS dashed. rows = example_rows()
-plot_example_m6a <- function(g, dat, rows, output, clustered) {
+# m6A heatmap of the rows, one slice per cluster
+#
+# 1. take the rows in plot order and the sample colours of the samples they come from
+# 2. choose the row annotation: cluster bar when clustered, sample bar when not
+# 3. plot_read_heatmap() draws the m6A matrix in genomic layout, one slice per cluster,
+#    with the per-cluster m6A fraction at observed sites above it
+# 4. decorate every slice and every profile with the TSS line
+# 5. save a PDF whose height grows with the number of clusters
+plot_example_m6a <- function(g, dat, rows, output, clustered, show_samples = TRUE) {
   clusters <- levels(rows$cluster)
   sample_colors <- example_sample_colors(rows$sample_name)
   labels <- example_labels(g, if (clustered) "Manhattan / Leiden" else "unclustered", nrow(rows))
@@ -299,8 +339,12 @@ plot_example_m6a <- function(g, dat, rows, output, clustered) {
   if (!clustered) options$left_annotation <- ComplexHeatmap::rowAnnotation(
     sample = factor(sub("_.*$", "", rows$sample_name), levels = names(sample_colors)),
     col = list(sample = sample_colors))
+  if (!show_samples) options$left_annotation <- ComplexHeatmap::rowAnnotation(
+    cluster = rows$cluster, col = list(cluster = cluster_id_palette(levels(rows$cluster))))
+  # unclustered: the single all-reads accessibility track is filled black
   ht <- plot_read_heatmap(list(assignments = rows, site_met_mat = dat$met_mat), example_region(g),
-                          sample_colors, show_cluster_profiles = TRUE, heatmap_options = options)
+                          sample_colors, show_cluster_profiles = TRUE, heatmap_options = options,
+                          cluster_colors = if (clustered) NULL else setNames("black", clusters))
   # offset 0 is column 1 - EXAMPLE_RANGE[1] in transcription order
   tss_x <- (0.5 - EXAMPLE_RANGE[1]) / (diff(EXAMPLE_RANGE) + 1)
   tss_line <- function() grid::grid.lines(x = c(tss_x, tss_x), y = c(0, 1),
@@ -316,19 +360,20 @@ plot_example_m6a <- function(g, dat, rows, output, clustered) {
   })
 }
 
-# Footprints of the same rows with plot_molecules(): one facet per cluster with cluster and
-# sample bars (sample bar only when unclustered), nucleosomes and TF footprints in
-# MOLECULE_TRACK_COLORS; top: m6A fraction at observed sites per cluster (plot_group_profile()),
-# as in plot_read_heatmap(show_cluster_profiles = TRUE)
-
-
-plot_example_footprints <- function(g, dat, bundle, rows, output, clustered) {
+# Footprint molecule panels of the same rows, one facet per cluster
+#
+# 1. stack the rows per cluster and choose the cluster / sample bars of this view
+# 2. cluster_site_profiles() for the per-cluster m6A fraction, restricted to the sites
+#    observed anywhere in the cohort, drawn as the top panel
+# 3. plot_molecules() draws one facet per cluster with the footprint_tracks() intervals
+# 4. stack the two panels, size the figure by the read count and save a PDF
+plot_example_footprints <- function(g, dat, bundle, rows, output, clustered, show_samples = TRUE) {
   region <- example_region(g)
   rows$sample <- sub("_.*$", "", rows$sample_name)
   rows <- stack_rows(rows, "cluster")
   cluster_colors <- cluster_id_palette(levels(rows$cluster))
   sample_colors <- example_sample_colors(rows$sample_name)
-  bars <- if (clustered) c("cluster", "sample") else "sample"
+  bars <- if (!show_samples) "cluster" else if (clustered) c("cluster", "sample") else "sample"
   ex <- example_window()
   lim <- molecule_xlim(ex, length(bars))
   breaks <- seq(EXAMPLE_RANGE[1], EXAMPLE_RANGE[2], 250)
@@ -337,9 +382,11 @@ plot_example_footprints <- function(g, dat, bundle, rows, output, clustered) {
   observed <- as.numeric(colnames(dat$met_mat))[Matrix::colSums(dat$met_mat) > 0]
   profile <- profile[profile$pos %in% observed, , drop = FALSE]
   profile$cluster <- factor(profile$cluster, levels = levels(rows$cluster))
+  # unclustered: the single all-reads accessibility track is filled black
+  profile_colors <- if (clustered) cluster_colors else setNames("black", levels(rows$cluster))
   top <- plot_group_profile(profile, group_col = "cluster", x_col = "pos", y_col = "met",
       style = "area", facet_col = "cluster", facet_layout = "grid",
-      colors = cluster_colors, fill_colors = cluster_colors, coordinates = "relative", region = region,
+      colors = profile_colors, fill_colors = profile_colors, coordinates = "relative", region = region,
       labels = list(x = NULL, y = "m6A fraction\n(observed sites)"),
       theme = theme_fiberseq("classic", base_size = 9)) +
     tss_vline() + scale_x_continuous(breaks = breaks) +
@@ -352,7 +399,8 @@ plot_example_footprints <- function(g, dat, bundle, rows, output, clustered) {
   molecules <- plot_molecules(rows, footprint_tracks(bundle), ex, "cluster",
       setNames(sprintf("%s\n(n=%d)", names(n), as.integer(n)), names(n)),
       bar_cols = bars, bar_palette = c(cluster_colors, sample_colors),
-      legend_extra = names(sample_colors), track_colors = MOLECULE_TRACK_COLORS[FOOTPRINT_CLASSES],
+      legend_extra = if (show_samples) names(sample_colors) else NULL,
+      track_colors = MOLECULE_TRACK_COLORS[FOOTPRINT_CLASSES],
       breaks = breaks, theme_overrides = list(legend.position = "bottom")) +
     guides(fill = guide_legend(ncol = 9, byrow = TRUE)) + labs(x = X_LABEL)
 
@@ -365,18 +413,19 @@ plot_example_footprints <- function(g, dat, bundle, rows, output, clustered) {
   save_figure(fig, output, width = 10, height = 1.6 + sum(heights), limitsize = FALSE)
 }
 
-# Top panel: DNase and sense GRO-seq, each
-# scaled to its window maximum. Middle: FiberHMM combined 30-60 / 60-80 bp footprint coverage
-# bigWigs. Below: every full-span read with its nucleosomes and TF footprints in
-# MOLECULE_TRACK_COLORS, ordered by +1 nucleosome (plus1_offset())
-
-# # 1. choose the gene's TSS centered window, choose fantom5 dominant TSS, if absent use GENCODE canonical TSS
-# # 2. assemble_region_m6a() to get the full-span reads and their m6A sites, nucleosome calls and TF footprints
-# # 3. extract DNAse and GRO-seq signal bigWigs, and FiberHMM footprint coverage bigWigs
-# # 4. collect footprings for each read
-# # 5. order reads by +1 nucleosome (first nucleosome base in +0..+299 bp), reads tied at the same position are ordered by sample, then start poisiton, then read ID
-
-plot_read_level <- function(g, bundle, read_order, output) {
+# Read level figure: signal tracks, footprint coverage and every full-span read
+#
+# 1. choose the gene's TSS centered window, choose fantom5 dominant TSS, if absent use GENCODE canonical TSS
+# 2. assemble_region_m6a() to get the full-span reads and their m6A sites, nucleosome calls and TF footprints
+# 3. extract DNAse and GRO-seq signal bigWigs, and FiberHMM footprint coverage bigWigs
+# 4. collect footprints for each read
+# 5. order reads by +1 nucleosome (first nucleosome base in +0..+299 bp), reads tied at the same position are ordered by sample, then start position, then read ID
+# Optional: met_mat (reads x positions m6A matrix of assemble_region_m6a()) adds the m6A fraction of
+# all reads as a black panel; tata_center (TSS-relative TATA box centre, Puffin) adds a TATA box
+# panel on top, the Pol II ChIP track to the signal panel and shades the TATA box +/- tata_half bp
+# yellow in every panel.
+plot_read_level <- function(g, bundle, read_order, output, met_mat = NULL, tata_center = NULL,
+                            tata_half = 4L) {
   rows <- data.table(RID = read_order)
   rows[, plus1 := plus1_offset(footprint_matrix(rows, bundle$nucs))]
   rows[, `:=`(group = factor(fifelse(is.na(plus1), "none", "plus1"), levels = c("plus1", "none")),
@@ -396,24 +445,66 @@ plot_read_level <- function(g, bundle, read_order, output) {
     axis.text.x = element_blank(), axis.ticks.x = element_blank(),
     axis.title.x = element_blank(), axis.line.x = element_blank()))
 
-  tr <- bundle$tracks
-  signal <- melt(tr[, c("pos", SIGNAL_TRACKS), with = FALSE], id.vars = "pos", variable.name = "track")
+  # TATA box: yellow band under every panel and a labelled strip on top
+  shade <- function(p) p
+  p_tata <- NULL
+  if (!is.null(tata_center)) {
+    box <- c(tata_center - tata_half - 0.5, tata_center + tata_half + 0.5)
+    shade <- function(p) {
+      p$layers <- c(list(annotate("rect", xmin = box[1], xmax = box[2], ymin = -Inf, ymax = Inf,
+                                  fill = "#FFFF00", alpha = 0.6)), p$layers)
+      p
+    }
+    p_tata <- ggplot() + tss_vline() +
+      annotate("rect", xmin = box[1], xmax = box[2], ymin = 0.2, ymax = 0.8, fill = "#FFFF00",
+               colour = "grey30", linewidth = 0.2) +
+      annotate("text", x = box[2] + 15, y = 0.5, hjust = 0, size = 3,
+               label = sprintf("TATA box (Puffin centre %d bp)", as.integer(tata_center))) +
+      scale_y_continuous(limits = c(0, 1)) + xs + labs(y = "TATA box") + theme_rows +
+      theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+  }
+
+  tr <- copy(bundle$tracks)
+  tracks <- SIGNAL_TRACKS
+  track_labels <- c(DNase = "DNase", `GRO-seq` = "GRO-seq (sense)", `Pol II ChIP` = "Pol II ChIP")
+  if (!is.null(tata_center)) {
+    win <- GRanges(g$chrom, IRanges(g$tss - FLANK, g$tss + FLANK))
+    pol2 <- import(POL2_CHIP, which = win)
+    tr[, `Pol II ChIP` := signal_at(start(pol2) - 1L, end(pol2), pol2$score, g, pos)]
+    tracks <- c(tracks, "Pol II ChIP")
+  }
+  signal <- melt(tr[, c("pos", tracks), with = FALSE], id.vars = "pos", variable.name = "track")
   signal[, value := if (max(value) > 0) value / max(value) else value, by = track]
-  p_signal <- ggplot(signal, aes(pos, value)) + tss_vline() +
+  p_signal <- shade(ggplot(signal, aes(pos, value)) + tss_vline() +
     geom_line(colour = "grey20", linewidth = 0.4) +
-    facet_grid(track ~ ., switch = "y",
-               labeller = as_labeller(c(DNase = "DNase", `GRO-seq` = "GRO-seq (sense)"))) +
+    facet_grid(track ~ ., switch = "y", labeller = as_labeller(track_labels)) +
     scale_y_continuous(breaks = c(0, 1), position = "right") + xs +
-    labs(y = "scaled to max") + theme_rows
+    labs(y = "scaled to max") + theme_rows)
+
+  p_m6a <- NULL
+  if (!is.null(met_mat)) {
+    all_reads <- data.frame(RID = read_order, cluster = factor("all reads"))
+    profile <- cluster_site_profiles(list(region = example_region(g), assignments = all_reads), met_mat)
+    observed <- as.numeric(colnames(met_mat))[Matrix::colSums(met_mat) > 0]
+    profile <- profile[profile$pos %in% observed, , drop = FALSE]
+    profile$track <- "m6A fraction"
+    p_m6a <- shade(plot_group_profile(profile, group_col = "track", x_col = "pos", y_col = "met",
+        style = "area", facet_col = "track", facet_layout = "grid",
+        colors = c(`m6A fraction` = "black"), fill_colors = c(`m6A fraction` = "black"),
+        coordinates = "relative", region = example_region(g), labels = list(x = NULL, y = NULL))) +
+      tss_vline() + facet_grid(track ~ ., switch = "y") +
+      scale_y_continuous(limits = c(0, 1), breaks = c(0, 1), position = "right") + xs +
+      theme_rows + theme(legend.position = "none")
+  }
 
   p_cover <- if (g$chrom %in% AUTOSOMES) {
     cover <- melt(tr[, c("pos", unname(COVERAGE_LABELS)), with = FALSE], id.vars = "pos",
                   variable.name = "track")
-    ggplot(cover, aes(pos, value, colour = track)) + tss_vline() + geom_line(linewidth = 0.4) +
+    shade(ggplot(cover, aes(pos, value, colour = track)) + tss_vline() + geom_line(linewidth = 0.4) +
       facet_grid(track ~ ., switch = "y", scales = "free_y") +
       scale_colour_manual(values = MOLECULE_TRACK_COLORS, guide = "none") +
       scale_y_continuous(n.breaks = 3, position = "right") + xs +
-      labs(y = "footprint coverage") + theme_rows
+      labs(y = "footprint coverage") + theme_rows)
   } else {
     ggplot() + annotate("text", x = 0, y = 0.5, size = 3,
                         label = "FiberHMM footprint coverage bigWigs cover chr1-22 only") +
@@ -421,24 +512,39 @@ plot_read_level <- function(g, bundle, read_order, output) {
       theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
   }
 
-  molecules <- plot_molecules(rows, footprint_tracks(bundle), ex, "group", facet_labels,
-      track_colors = MOLECULE_TRACK_COLORS[FOOTPRINT_CLASSES], breaks = breaks) +
+  molecules <- shade(plot_molecules(rows, footprint_tracks(bundle), ex, "group", facet_labels,
+      track_colors = MOLECULE_TRACK_COLORS[FOOTPRINT_CLASSES], breaks = breaks)) +
     labs(x = X_LABEL) + theme(legend.position = "top")
 
   reads_height <- READ_ROW_IN * nrow(rows) + 1.1
+  panels <- list(p_tata, p_signal, p_m6a, p_cover, molecules)
+  heights <- c(0.35, 0.37 * length(tracks), 0.5, 0.37 * length(COVERAGE_BINS), reads_height)
+  keep <- !vapply(panels, is.null, logical(1))
   labels <- example_labels(g, "read level", nrow(rows))
-  fig <- (p_signal / p_cover / molecules) + plot_layout(heights = c(1.1, 1.1, reads_height)) +
+  fig <- wrap_plots(panels[keep], ncol = 1, heights = heights[keep]) +
     plot_annotation(title = labels[["title"]], subtitle = labels[["subtitle"]],
       caption = paste0(
-        "Top panel: DNase (ENCFF743ULW) and sense GRO-seq (GSM1480326, lifted hg19 -> hg38), each scaled to its window maximum.\n",
+        "Top panel: DNase (ENCFF743ULW) and sense GRO-seq (GSM1480326, lifted hg19 -> hg38)",
+        if (!is.null(tata_center)) ", Pol II ChIP fold enrichment (ENCFF328MMS)", ", each scaled to its window maximum.\n",
+        if (!is.null(met_mat)) "m6A fraction: all reads, observed sites.\n",
         "Middle: FiberHMM combined footprint coverage bigWigs (joint_trained_tracks).\n",
         "Bottom panel: reads ordered by +1 nucleosome (first nucleosome base in +", min(PLUS1_OFFSETS), "..+",
-        max(PLUS1_OFFSETS), " bp), as in Tullius et al. Fig 1F; reads without one are shown below.\n",
+        max(PLUS1_OFFSETS), " bp); reads without one are shown below.\n",
         footprint_caption(g)),
       theme = theme_fiberseq())
-  save_figure(fig, output, width = 10, height = 3.8 + reads_height, limitsize = FALSE)
+  save_figure(fig, output, width = 10, height = 1.6 + sum(heights[keep]), limitsize = FALSE)
+  invisible(output)
 }
 
+# Every figure and table of one gene
+#
+# 1. TSS +/- EXAMPLE_RANGE window; assemble_region_m6a() for the full-span m6A reads
+# 2. unclustered order = sample, then start, then read ID; draw its m6A heatmap
+# 3. leiden_manhattan_cluster() on the same matrix; draw the clustered m6A heatmap
+# 4. write <gene>_read_clusters.tsv, <gene>_read_qc.tsv and <gene>_clustering.rds under
+#    recurrent_patterns/tables/<group>
+# 5. example_footprints() once, then the unclustered, clustered and read level figures
+# 6. return the read and cluster counts for the manifest row
 plot_curated_gene <- function(g, gene_dir = file.path(OUT_DIR, "plots/example_reads", g$group, g$gene_name)) {
   region <- data.frame(region_id = g$gene_name, chr = g$chrom,
     start = g$tss + EXAMPLE_RANGE[1] - 1L, end = g$tss + EXAMPLE_RANGE[2],
@@ -459,7 +565,7 @@ plot_curated_gene <- function(g, gene_dir = file.path(OUT_DIR, "plots/example_re
   clustered <- a$RID[order(a$cluster, match(a$RID, plain))]
   clustered_rows <- example_rows(clustered, meta, a$cluster[match(clustered, a$RID)])
   plot_example_m6a(g, dat, clustered_rows, path("clustered", "clustered_m6a"), clustered = TRUE)
-  tables <- file.path(OUT_DIR, "tables", g$group)
+  tables <- file.path(OUT_DIR, "recurrent_patterns/tables", g$group)
   dir.create(tables, recursive = TRUE, showWarnings = FALSE)
   a$unclustered_row <- match(a$RID, plain)
   a$clustered_row <- match(a$RID, clustered)
@@ -478,13 +584,18 @@ plot_curated_gene <- function(g, gene_dir = file.path(OUT_DIR, "plots/example_re
 }
 
 # Record failures, process remaining genes, then raise collected errors.
+#
+# 1. write the manifest with every gene pending
+# 2. per gene: resolve the TSS, run plot_curated_gene(), record status and counts, or the error
+# 3. write that gene's row to tables/status/<gene>.tsv as soon as it finishes
+# 4. run the genes in parallel, rewrite the manifest, then raise the collected errors
 run_curated_examples <- function(genes = curated_example_genes(), workers = 1L) {
-  dir.create(file.path(OUT_DIR, "tables/status"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(OUT_DIR, "recurrent_patterns/tables/status"), recursive = TRUE, showWarnings = FALSE)
   dominant <- fread(DOMINANT_TSS)
   manifest <- copy(genes)
   manifest[, `:=`(status = "pending", error = "", chrom = NA_character_, tss = NA_integer_,
                  strand = NA_character_, tss_source = NA_character_, n_reads = NA_integer_, n_clusters = NA_integer_)]
-  path <- file.path(OUT_DIR, "tables/example_genes.tsv")
+  path <- file.path(OUT_DIR, "recurrent_patterns/tables/example_genes.tsv")
   fwrite(manifest, path, sep = "\t")
   run_one <- function(i) {
     row <- copy(manifest[i])
@@ -498,12 +609,12 @@ run_curated_examples <- function(genes = curated_example_genes(), workers = 1L) 
       row[, `:=`(status = "error", error = conditionMessage(e))]
       message("ERROR: ", conditionMessage(e))
     })
-    fwrite(row, file.path(OUT_DIR, "tables/status", paste0(row$gene_name, ".tsv")), sep = "\t")
+    fwrite(row, file.path(OUT_DIR, "recurrent_patterns/tables/status", paste0(row$gene_name, ".tsv")), sep = "\t")
     row
   }
   results <- parallel::mclapply(seq_len(nrow(manifest)), run_one,
     mc.cores = workers, mc.preschedule = FALSE)
-  if (any(vapply(results, inherits, logical(1), "try-error"))) stop("A gene worker failed; see tables/status")
+  if (any(vapply(results, inherits, logical(1), "try-error"))) stop("A gene worker failed; see recurrent_patterns/tables/status")
   manifest <- rbindlist(results)
   fwrite(manifest, path, sep = "\t")
   if (any(manifest$status == "error")) stop(paste(manifest[status == "error", paste(gene_name, error, sep = ": ")], collapse = "\n"), call. = FALSE)

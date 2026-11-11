@@ -16,6 +16,9 @@ suppressPackageStartupMessages({
   library(ggrepel)
   library(glue)
 })
+# Shared plotting and molecule helpers (plot_locus_molecules(), plot_snp_domain_ctcf(),
+# hsca_sample_manifest(), pair_genotype_calls(), ...): defined once, there.
+source("/project/spott/cshan/fiber-seq/code/parsing_functions/plotting_functions.r")
 
 FONT_SIZE=6
 #################################################
@@ -141,34 +144,6 @@ save_pdf = function(p, file, ...){
 }
 
 
-#################################################
-# load the 27 phased samples for molecule plots
-#################################################
-# Read donor and phasing paths directly from the phased CSV, then derive the
-# per-sample file paths required by the shared molecule readers.
-# Reject another cohort rather than silently including unphased samples.
-hsca_sample_manifest = function(config) {
-  canonical_path = "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_phased_27samples.csv"
-  path = if (is.null(config$sample_metatable)) canonical_path else config$sample_metatable
-  samples = fread(path, colClasses = "character", na.strings = "")
-  required = c("sample_name", "cell_line", "fire_dir", "phasing_dir", "phased_vcf_file")
-  if (!all(required %in% names(samples)) || nrow(samples) != 27L ||
-      anyDuplicated(samples$sample_name) || anyNA(samples[, ..required]))
-    stop("HSCA requires exactly 27 unique phased samples with complete paths.")
-  canonical = fread(canonical_path, colClasses = "character")
-  if (!setequal(samples$sample_name, canonical$sample_name))
-    stop("HSCA sample names must match the canonical 27 phased samples.")
-  canonical = canonical[match(samples$sample_name, sample_name)]
-  if (!identical(as.data.frame(samples[, ..required]), as.data.frame(canonical[, ..required])))
-    stop("HSCA donor and phasing paths must match the phased sheet.")
-  samples[, `:=`(donor = cell_line,
-    cram_path = file.path(fire_dir, paste0(sample_name, "-fire-v0.1-filtered.cram")),
-    peaks_path = file.path(fire_dir, paste0(sample_name, "-fire-v0.1-peaks.bed.gz")),
-    elements_path = file.path(fire_dir, "additional-outputs-v0.1/fire-peaks", paste0(sample_name, "-v0.1-fire-elements.bed.gz")),
-    spans_path = file.path(config$root, sample_name, paste0(sample_name, ".read_spans.bed.gz")),
-    blocks_path = file.path(config$root, sample_name, paste0(sample_name, ".aligned_blocks.bed.gz")))]
-  samples
-}
 
 #################################################
 # draw aligned molecule and footprint tracks
@@ -630,53 +605,12 @@ plot_cre_pair = function(cre_pair, label = NULL, output_prefix = NULL,
 # Gene models, Rao 2014 loops/domains, their tracks and the domain/CTCF figure
 # (plot_locus_molecules()) are in parsing_functions/plotting_functions.r.
 
-# Call donor genotypes from the exact PASS biallelic SNV in each donor's VCF.
-# Read counts are diagnostics only; read bases still assign individual REF/ALT molecules.
-# Missing or ineligible VCF records remain uncalled, with no read-count fallback.
-pair_genotype_calls = function(region, manifest, python, hsca_functions) {
-  work = tempfile("pair_genotypes_")
-  dir.create(work)
-  on.exit(unlink(work, recursive = TRUE), add = TRUE)
-  fwrite(manifest[, .(sample_name, cell_line, phased_vcf_file, cram_path)], file.path(work, "manifest.tsv"), sep = "\t")
-  runner = r"---(
-import importlib.util, sys
-import pandas as pd
-source, manifest, chrom, pos, ref, alt, out, calls_out = sys.argv[1:9]
-spec = importlib.util.spec_from_file_location("hsca_functions", source)
-hsca = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(hsca)
-variant = pd.DataFrame(dict(variant_id=["focal"], pos=[int(pos)], ref=[ref], alt=[alt]))
-samples = pd.read_csv(manifest, sep="\t")
-calls = [(s.sample_name, hsca.focal_vcf_genotype(
-    s.phased_vcf_file, s.cell_line, chrom, int(pos), ref, alt))
-    for s in samples.itertuples(index=False)]
-pd.DataFrame(calls, columns=["sample_name", "genotype"]).to_csv(calls_out, sep="\t", index=False)
-rows = [(s.sample_name, read, allele)
-        for s in samples.itertuples(index=False)
-        for read, allele in hsca.read_alleles(s.cram_path, chrom, variant)["focal"].items()]
-pd.DataFrame(rows, columns=["sample_name", "read_name", "allele"]).to_csv(out, sep="\t", index=False)
-)---"
-  writeLines(runner, file.path(work, "run.py"))
-  log = file.path(work, "run.log")
-  args = c(file.path(work, "run.py"), hsca_functions, file.path(work, "manifest.tsv"), region$chr,
-    region$focal_pos, region$ref, region$alt, file.path(work, "alleles.tsv"), file.path(work, "calls.tsv"))
-  status = system2(python, shQuote(args), stdout = log, stderr = log, env = "PYTHONDONTWRITEBYTECODE=1")
-  if (status != 0L) stop("Focal SNV VCF/pileup query failed:\n", paste(readLines(log), collapse = "\n"))
-  alleles = fread(file.path(work, "alleles.tsv"))
-  calls = merge(manifest[, .(sample_name, donor)],
-    alleles[, .(n_ref = sum(allele == "ref"), n_alt = sum(allele == "alt")), by = sample_name],
-    by = "sample_name", all.x = TRUE)
-  calls[is.na(n_ref), `:=`(n_ref = 0L, n_alt = 0L)]
-  calls[, alt_fraction := n_alt / (n_ref + n_alt)]
-  calls = merge(calls, fread(file.path(work, "calls.tsv")), by = "sample_name", all.x = TRUE)
-  list(calls = calls[order(as.integer(sub("^AL-?([0-9]+).*$", "\\1", sample_name)))], alleles = alleles)
-}
 
-# One PDF per pair: context (genes, HiCCUPS loops with CTCF motifs, Arrowhead domains) over the pair
-# window (genes, Rao features, cCREs, per-base m6A by genotype group, m6A molecules). Reads: the
-# full-span molecules of the 27 phased samples that are primary alignments covering both cCREs
-# (plot_cre_pair()'s molecule-track universe without its phasing requirement). Groups: hom-REF
-# donors, het donors' REF-base and ALT-base reads, hom-ALT donors. No clustering.
+
+# One PDF per pair: plot_snp_domain_ctcf() (parsing_functions/plotting_functions.r) over the pair window at the pair's focal SNV, with
+# both cCREs as bands and the Rao tracks. Reads: the full-span molecules of the 27 phased samples
+# that are primary alignments covering both cCREs (plot_cre_pair()'s molecule-track universe
+# without its phasing requirement).
 #################################################
 # combine locus context with genotype-grouped molecules
 #################################################
@@ -685,8 +619,7 @@ pd.DataFrame(rows, columns=["sample_name", "read_name", "allele"]).to_csv(out, s
 # Combine gene, loop, domain, motif, cCRE, and m6A tracks into a PDF and return its data.
 plot_cre_pair_domain_ctcf = function(cre_pair, label, region_description = NULL,
     context_flank_bp = 250000, output_dir = file.path(hsca_dir, "CRE_domain_CTCF_anno"),
-    config = params, models = gene_models, rao = rao_hg38,
-    python = "/project/spott/cshan/envs/Jupyter-notebook/bin/python3") {
+    config = params, models = gene_models, rao = rao_hg38) {
   candidates = if (length(cre_pair) == 1L) cre_pair else
     c(paste(cre_pair, collapse = "-"), paste(rev(cre_pair), collapse = "-"))
   pair = pooled[CRE_pair %in% candidates]
@@ -716,59 +649,18 @@ plot_cre_pair_domain_ctcf = function(cre_pair, label, region_description = NULL,
   counts = coaccess_2x2(labels_all)
   stopifnot(identical(as.numeric(unlist(counts[c("neither", "cre1_only", "cre2_only", "both", "n_shared")])),
     as.numeric(unlist(pair[, .(co_closed, CRE1_access, CRE2_access, co_access, n_shared_reads)]))))
-  m6a = assemble_region_m6a(as.data.frame(manifest), region, full_span = TRUE, matrix_dir = NULL, reuse = FALSE)
-  a = as.data.table(m6a$rids_df)
-  a[, key := paste(sample_name, original_RID)]
-  a = a[key %in% spans$spans[start <= window$start & end >= window$end, key] &
-    key %in% labels_all[shared == TRUE, key]]
-  a[, donor := manifest$donor[match(sample_name, manifest$sample_name)]]
+  keys = intersect(spans$spans[start <= window$start & end >= window$end, key],
+    labels_all[shared == TRUE, key])
 
-  # genotype groups
-  genotypes = pair_genotype_calls(region, manifest, python,
-    file.path(config$code_root, "co-accessibility/LCL/hsca/hsca_functions.py"))
-  group_labels = c(hom_ref = paste0(region$ref, region$ref),
-    het_ref = paste0(region$ref, region$alt, ": ", region$ref, " reads"),
-    het_alt = paste0(region$ref, region$alt, ": ", region$alt, " reads"),
-    hom_alt = paste0(region$alt, region$alt))
-  group_colors = setNames(c("#E6550D", "#FDBE85", "#9ECAE1", "#3182BD"), group_labels)
-  bases = genotypes$alleles[, setNames(allele, paste(sample_name, read_name))]
-  a[, genotype := genotypes$calls$genotype[match(sample_name, genotypes$calls$sample_name)]]
-  a[, base := unname(bases[key])]
-  a[, group := fcase(genotype == "hom_ref", "hom_ref", genotype == "hom_alt", "hom_alt",
-    genotype == "het" & base == "ref", "het_ref", genotype == "het" & base == "alt", "het_alt")]
-  het_base_rate = a[genotype == "het", mean(!is.na(base))]
-  n_excluded = a[is.na(group), .N]
-  a = a[!is.na(group)]
-  a[, cluster := droplevels(factor(group_labels[group], levels = group_labels))]
-  group_sizes = a[, .(molecules = .N, samples = uniqueN(sample_name), donors = uniqueN(donor)),
-    by = cluster][order(cluster)]
-  missing = setdiff(group_labels, levels(a$cluster))
-  result = list(region = region, assignments = as.data.frame(a),
-    site_met_mat = m6a$met_mat[a$RID, , drop = FALSE])
-
-  # figure: plot_locus_molecules() (parsing_functions/plotting_functions.r)
   classes = sub(".*\\.", "", c(pair$CRE1, pair$CRE2))
   bands = data.frame(start = c(pair$cre1_start, pair$cre2_start), end = c(pair$cre1_end, pair$cre2_end),
     label = paste0(c("CRE1 (", "CRE2 ("), classes, ")"),
     color = ifelse(is.na(CCRE_COLORS[classes]), "grey40", CCRE_COLORS[classes]))
-  strip_labels = group_sizes[, setNames(sprintf("%s\n%d molecules\n%d donors", cluster, molecules, donors),
-    as.character(cluster))]
-  figure = plot_locus_molecules(result, models, group_colors, rao = rao, bands = bands,
-    marks = data.frame(pos = region$focal_pos), group_labels = strip_labels,
-    context_flank_bp = context_flank_bp, title = region$annotation, subtitle = sprintf(
-      "SNP %s %s>%s | top: context, yellow band = pair window | bottom: pair window, dashed line at the SNP%s",
-      format(region$focal_pos, big.mark = ","), region$ref, region$alt,
-      if (length(missing)) paste0(" | no molecules: ", paste(missing, collapse = ", ")) else ""),
-    caption = paste0(
-      "Left bars: genotype group, sample. Genotype from donor VCF GT at the exact PASS biallelic SNV. ",
-      "Phased or unphased 0/1 and 1/0 are het; read bases assign REF/ALT molecules. ",
-      n_excluded, " molecules without a group excluded."))
-  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
   file = file.path(output_dir, paste0("LCL_hsca_", gsub("[^A-Za-z0-9_.-]+", "_", label), "_",
     paste(short_ids, collapse = "__"), "_domain_CTCF.pdf"))
-  ggsave(file, figure$combined, width = 12, height = figure$height, limitsize = FALSE)
-  invisible(list(pair = pair, allele = allele_row, region = region, genotypes = genotypes$calls,
-    group_sizes = group_sizes, het_base_rate = het_base_rate, n_excluded = n_excluded,
-    assignments = a, result = result, profile = figure$profile, context = figure$context,
-    combined = figure$combined, file = file))
+  out = plot_snp_domain_ctcf(region, file, loops = TRUE, domains = TRUE, ctcf = TRUE, cre_bands = TRUE,
+    bands = bands, keys = keys, window_name = "pair window", context_flank_bp = context_flank_bp,
+    config = config, models = models, rao = rao)
+  invisible(c(list(pair = pair, allele = allele_row), out))
 }
+

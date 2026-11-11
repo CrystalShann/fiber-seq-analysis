@@ -806,7 +806,8 @@ plot_region_panels <- function(res,
 #                           RID (= rownames of site_met_mat), cluster, time
 #   window                - "fire": one-row table with chrom, window_start,
 #                           window_end and the tested region start, end
-#   cluster_colors        - "fire": cluster colours named by level
+#   cluster_colors        - "fire": cluster colours named by level; "genomic": optional
+#                           profile colours (default cluster_id_palette())
 #   ticks                 - "fire": genomic positions to label on the x axis
 #   use_raster            - optional override of ComplexHeatmap rasterising
 #   heatmap_options       - named list overriding any ComplexHeatmap::Heatmap()
@@ -972,7 +973,7 @@ plot_read_heatmap <- function(res, region = res$region, sample_colors = NULL,
     legend_name <- "m6A"
     top <- NULL
     if (show_cluster_profiles) {
-      cluster_colors <- cluster_id_palette(levels(assignments$cluster))
+      if (is.null(cluster_colors)) cluster_colors <- cluster_id_palette(levels(assignments$cluster))
       profile_annotations <- lapply(levels(assignments$cluster), function(cluster) {
         selected <- assignments$cluster == cluster
         # The matrix is for display; profile opportunities are separate.
@@ -1842,7 +1843,10 @@ plot_gene_track = function(models, win_chrom, win_start, win_end, xlim, region =
 #################################################
 # Display overlapping loops and domains around the pair window.
 # Highlight relevant anchors and mark the zoomed CRE-pair interval.
-plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
+# tracks: any of "loops" (arcs and anchors), "ctcf" (motif arrows at loop anchors) and "domains";
+# returns loops (drawn for loops or ctcf) and domains, each only when requested.
+plot_rao_context = function(rao, win_chrom, win_start, win_end, focus,
+                            tracks = c("loops", "domains", "ctcf")) {
   xlim = c(win_start, win_end) / 1e6
   band = annotate("rect", xmin = (focus[1] + 1) / 1e6, xmax = focus[2] / 1e6, ymin = -Inf, ymax = Inf,
     fill = "#FFFF00", alpha = .35)
@@ -1860,22 +1864,32 @@ plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
     label = sprintf("%s (%.0f kb%s)", loop_id, (y1 - x1) / 1e3,
       fifelse(is.na(convergent), "", fifelse(convergent, ", convergent CTCF", ", not convergent"))))]
   colors = c("TRUE" = "#B2182B", "FALSE" = "grey70")
-  p_loops = ggplot() + band +
+  show_loops = "loops" %in% tracks
+  show_ctcf = "ctcf" %in% tracks
+  p_loops = ggplot() + band
+  if (show_loops) p_loops = p_loops +
     geom_path(data = arcs, aes(x, y, group = loop_id, color = as.character(focal)), linewidth = .4) +
     geom_rect(data = anchors, aes(xmin = (start + 1) / 1e6, xmax = end / 1e6, ymin = -.12, ymax = -.02,
-      fill = as.character(focal))) +
+      fill = as.character(focal)))
+  if (show_ctcf) p_loops = p_loops +
     geom_segment(data = motifs, aes(x = (motif_start + motif_end) / 2e6,
       xend = ((motif_start + motif_end) / 2 + fifelse(motif_strand == "+", arrow_bp, -arrow_bp)) / 1e6,
       y = -.22, yend = -.22, color = motif_strand), linewidth = .5,
-      arrow = arrow(length = unit(1.3, "mm"), type = "closed")) +
-    geom_text(data = labels, aes(x, y, label = label), size = 2.5, color = colors[["TRUE"]]) +
+      arrow = arrow(length = unit(1.3, "mm"), type = "closed"))
+  if (show_loops) p_loops = p_loops +
+    geom_text(data = labels, aes(x, y, label = label), size = 2.5, color = colors[["TRUE"]])
+  loops_label = if (show_loops && show_ctcf) "HiCCUPS\nloops\n(CTCF motif\narrows)" else
+    if (show_loops) "HiCCUPS\nloops" else "CTCF motifs\n(loop\nanchors)"
+  p_loops = p_loops +
     scale_color_manual(values = c(colors, "+" = "#D6604D", "-" = "#4393C3"), guide = "none") +
     scale_fill_manual(values = colors, guide = "none") +
     scale_x_continuous(expand = c(0, 0)) + scale_y_continuous(limits = c(-.3, 1.25)) +
-    coord_cartesian(xlim = xlim) + labs(x = NULL, y = "HiCCUPS\nloops\n(CTCF motif\narrows)") +
+    coord_cartesian(xlim = xlim) + labs(x = NULL, y = loops_label) +
     domain_ctcf_theme()
-  if (!nrow(loops)) p_loops = p_loops + annotate("text", x = mean(xlim), y = .5, size = 3,
+  if (show_loops && !nrow(loops)) p_loops = p_loops + annotate("text", x = mean(xlim), y = .5, size = 3,
     label = "No HiCCUPS loop with both anchors in this window")
+  if (!show_loops && show_ctcf && !nrow(motifs)) p_loops = p_loops + annotate("text", x = mean(xlim),
+    y = .5, size = 3, label = "No CTCF motif at a HiCCUPS loop anchor in this window")
   domains = rao$domains[chrom == win_chrom & start < win_end & end > win_start]
   widest = max(c(domains$end - domains$start, 1))
   triangles = domains[, .(x = c(start, (start + end) / 2, end) / 1e6, y = c(0, (end - start) / widest, 0)),
@@ -1889,7 +1903,10 @@ plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
     scale_x_continuous(expand = c(0, 0)) + scale_y_continuous(limits = c(-.15, 1.05)) +
     coord_cartesian(xlim = xlim) +
     labs(x = paste0(win_chrom, " position (Mb, hg38)"), y = "Arrowhead\ndomains") + domain_ctcf_theme()
-  list(loops = p_loops, domains = p_domains)
+  out = list()
+  if (show_loops || show_ctcf) out$loops = p_loops
+  if ("domains" %in% tracks) out$domains = p_domains
+  out
 }
 
 # Zoom track over the pair window: loop anchors overlapping it (clipped, one row per anchor interval,
@@ -1900,7 +1917,8 @@ plot_rao_context = function(rao, win_chrom, win_start, win_end, focus) {
 #################################################
 # Place loop anchors, motif directions, and domain edges in focal-SNP-relative coordinates.
 # Return the local annotation plot and row count for layout.
-plot_rao_zoom = function(rao, region, xlim) {
+# tracks: any of "loops" (anchor rows), "ctcf" (motif arrows) and "domains" (domain edges).
+plot_rao_zoom = function(rao, region, xlim, tracks = c("loops", "domains", "ctcf")) {
   s = region$start
   e = region$end
   to_x = function(pos) plot_positions(pos, region)
@@ -1912,14 +1930,21 @@ plot_rao_zoom = function(rao, region, xlim) {
   motifs = unique(anchors[!is.na(motif_start) & motif_start < e & motif_end > s,
     .(motif_start, motif_end, motif_strand)])
   edges = rao$edges[chrom == region$chr & pos > s & pos <= e]
+  if (!"loops" %in% tracks) rows = rows[0]
+  if (!"ctcf" %in% tracks) motifs = motifs[0]
+  if (!"domains" %in% tracks) edges = edges[0]
   p = ggplot() + scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = xlim) +
     labs(x = NULL, y = "Rao 2014") + domain_ctcf_theme()
-  if (!nrow(rows) && !nrow(edges)) {
+  if (!nrow(rows) && !nrow(edges) && !nrow(motifs)) {
     distance = function(pos) min(abs(pos - region$focal_pos)) / 1e3
     others = rao$anchors[chrom == region$chr]
+    label = if (all(c("loops", "domains") %in% tracks)) sprintf(
+      "No loop anchor or domain edge in window; nearest anchor %.0f kb, nearest domain edge %.0f kb from SNP",
+      distance(c(others$start, others$end)), distance(rao$edges[chrom == region$chr, pos])) else
+      paste0("No ", paste(c(loops = "loop anchor", ctcf = "CTCF motif", domains = "domain edge")[
+        intersect(c("loops", "ctcf", "domains"), tracks)], collapse = ", "), " in window")
     return(list(plot = p + scale_y_continuous(limits = c(-1, 1)) + annotate("text", x = mean(xlim), y = 0,
-      size = 3, label = sprintf("No loop anchor or domain edge in window; nearest anchor %.0f kb, nearest domain edge %.0f kb from SNP",
-        distance(c(others$start, others$end)), distance(rao$edges[chrom == region$chr, pos]))), rows = 1L))
+      size = 3, label = label), rows = 1L))
   }
   if (nrow(edges)) p = p + geom_vline(xintercept = to_x(edges$pos), linetype = "dashed",
     color = "grey20", linewidth = .4) +
@@ -1969,6 +1994,8 @@ plot_rao_zoom = function(rao, region, xlim) {
 #                      assignments$cluster)
 #   rao              - optional load_rao_hg38() result; NULL drops the loop,
 #                      domain and anchor/CTCF motif tracks
+#   rao_tracks       - with rao, which of "loops", "domains" and "ctcf" to draw
+#                      (default all three)
 #   bands            - optional data.frame start (0-based), end, label, color:
 #                      intervals boxed in the strip and shaded yellow over the
 #                      profile and molecule tracks
@@ -1991,7 +2018,8 @@ plot_rao_zoom = function(rao, region, xlim) {
 #   wide, context = context window c(start, end), profile = per-base profile
 #   table, panels = named list of the stacked plots)
 # ---------------------------------------------------------------------------
-plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands = NULL,
+plot_locus_molecules <- function(result, models, group_colors, rao = NULL,
+                                 rao_tracks = c("loops", "domains", "ctcf"), bands = NULL,
                                  marks = NULL, strip_label = "cCREs", group_labels = NULL,
                                  show_proportions = FALSE, reference_counts = NULL,
                                  region_label = "This window", reference_label = "Reference",
@@ -2033,7 +2061,7 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands
 
   # context: region midpoint +- flank, widened to whole loops with an anchor in the region
   mid <- (region$start + region$end) %/% 2
-  touching <- if (is.null(rao)) NULL else rao$loops[chr1 == region$chr &
+  touching <- if (is.null(rao) || !"loops" %in% rao_tracks) NULL else rao$loops[chr1 == region$chr &
     ((x1 < region$end & x2 > region$start) | (y1 < region$end & y2 > region$start))]
   context <- c(max(0, min(mid - context_flank_bp, touching$x1 - 20000)),
     max(mid + context_flank_bp, touching$y2 + 20000))
@@ -2042,10 +2070,15 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands
   panels <- list(context_genes = context_genes$plot + labs(title = title, subtitle = subtitle))
   heights <- c(context_genes = .9 + .3 * context_genes$rows)
   if (!is.null(rao)) {
-    context_rao <- plot_rao_context(rao, region$chr, context[1], context[2], focus)
-    panels$loops <- context_rao$loops
-    panels$domains <- context_rao$domains
-    heights[c("loops", "domains")] <- c(1.8, 1.1)
+    context_rao <- plot_rao_context(rao, region$chr, context[1], context[2], focus, tracks = rao_tracks)
+    if (!is.null(context_rao$loops)) {
+      panels$loops <- context_rao$loops
+      heights["loops"] <- 1.8
+    }
+    if (!is.null(context_rao$domains)) {
+      panels$domains <- context_rao$domains
+      heights["domains"] <- 1.1
+    }
   }
 
   # zoom tracks
@@ -2053,7 +2086,7 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands
   panels$zoom_genes <- zoom_x(zoom_genes$plot)
   heights["zoom_genes"] <- .5 + .3 * zoom_genes$rows
   if (!is.null(rao)) {
-    zoom_rao <- plot_rao_zoom(rao, region, bounds)
+    zoom_rao <- plot_rao_zoom(rao, region, bounds, tracks = rao_tracks)
     panels$zoom_rao <- zoom_x(zoom_rao$plot)
     heights["zoom_rao"] <- .6 + .35 * zoom_rao$rows
   }
@@ -2137,4 +2170,231 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL, bands
   combined <- cowplot::plot_grid(plotlist = unname(panels), ncol = 1, align = "v", axis = "lr",
     rel_heights = unname(heights))
   list(combined = combined, height = sum(heights), context = context, profile = profile, panels = panels)
+}
+
+
+# ===========================================================================
+# Genotype-split molecules at a focal SNP (27 phased LCL samples): sample
+# manifest, donor VCF genotypes, and the SNP / CRE-pair locus figure drawn with
+# plot_locus_molecules(). Moved from co-accessibility/LCL/hsca/hap_sele_access_plots.r.
+# Need data.table, ggplot2, parsing_footprints_functions.r (load_region(),
+# assemble_region_m6a()) and leiden_manhattan_plots.r sourced.
+# ===========================================================================
+#################################################
+# load the 27 phased samples for molecule plots
+#################################################
+# Read donor and phasing paths directly from the phased CSV, then derive the
+# per-sample file paths required by the shared molecule readers.
+# Reject another cohort rather than silently including unphased samples.
+hsca_sample_manifest = function(config) {
+  canonical_path = "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_phased_27samples.csv"
+  path = if (is.null(config$sample_metatable)) canonical_path else config$sample_metatable
+  samples = fread(path, colClasses = "character", na.strings = "")
+  required = c("sample_name", "cell_line", "fire_dir", "phasing_dir", "phased_vcf_file")
+  if (!all(required %in% names(samples)) || nrow(samples) != 27L ||
+      anyDuplicated(samples$sample_name) || anyNA(samples[, ..required]))
+    stop("phasing requires exactly 27 unique phased samples with complete paths.")
+  canonical = fread(canonical_path, colClasses = "character")
+  if (!setequal(samples$sample_name, canonical$sample_name))
+    stop("phased sample names must match the canonical 27 phased samples.")
+  canonical = canonical[match(samples$sample_name, sample_name)]
+  if (!identical(as.data.frame(samples[, ..required]), as.data.frame(canonical[, ..required])))
+    stop("phased donor and phasing paths must match the phased sheet.")
+  samples[, `:=`(donor = cell_line,
+    cram_path = file.path(fire_dir, paste0(sample_name, "-fire-v0.1-filtered.cram")),
+    peaks_path = file.path(fire_dir, paste0(sample_name, "-fire-v0.1-peaks.bed.gz")),
+    elements_path = file.path(fire_dir, "additional-outputs-v0.1/fire-peaks", paste0(sample_name, "-v0.1-fire-elements.bed.gz")),
+    spans_path = file.path(config$root, sample_name, paste0(sample_name, ".read_spans.bed.gz")),
+    blocks_path = file.path(config$root, sample_name, paste0(sample_name, ".aligned_blocks.bed.gz")))]
+  samples
+}
+
+# Donor genotype at the exact PASS biallelic SNV chrom:pos ref>alt from the donor's (cell_line)
+# GT column: "hom_ref", "het" (phased or unphased 0/1, 1/0), "hom_alt" or "uncalled" (missing,
+# filtered, non-SNV or allele-mismatched records). An absent donor column or conflicting records
+# stop; there is no read-count fallback. Pure R (Rsamtools tabix).
+focal_vcf_genotype = function(vcf, cell_line, chrom, pos, ref, alt) {
+  if (nchar(ref) != 1L || nchar(alt) != 1L || ref == alt) return("uncalled")
+  header = Rsamtools::headerTabix(vcf)$header
+  column = match(cell_line, strsplit(header[length(header)], "\t", fixed = TRUE)[[1]])
+  if (is.na(column) || column <= 9L) stop("Donor ", cell_line, " is absent from VCF ", vcf)
+  lines = Rsamtools::scanTabix(vcf, param = GenomicRanges::GRanges(chrom, IRanges::IRanges(pos, pos)))[[1]]
+  calls = character()
+  for (line in lines) {
+    f = strsplit(line, "\t", fixed = TRUE)[[1]]
+    if (as.integer(f[2]) != pos || f[4] != ref || f[5] != alt ||
+        !"PASS" %in% strsplit(f[7], ";", fixed = TRUE)[[1]]) next
+    gt = strsplit(f[column], ":", fixed = TRUE)[[1]][match("GT", strsplit(f[9], ":", fixed = TRUE)[[1]])]
+    a = if (is.na(gt)) NA_character_ else strsplit(gt, "[/|]")[[1]]
+    calls = c(calls, if (identical(a, c("0", "0"))) "hom_ref" else if (identical(a, c("1", "1"))) "hom_alt" else
+      if (identical(sort(a), c("0", "1"))) "het" else "uncalled")
+  }
+  calls = unique(calls)
+  if (length(calls) > 1L) stop("Conflicting GTs for ", cell_line, " at ", chrom, ":", pos, ":", ref, ":", alt)
+  if (length(calls)) calls else "uncalled"
+}
+
+# Base each primary alignment of `bam` carries at chrom:pos (1-based): data.table(read_name, allele =
+# "ref" | "alt"). Reads with a deletion or reference skip at the SNV, or a base matching neither
+# allele, are dropped; secondary and supplementary alignments are skipped. Pure R
+# (Rsamtools/GenomicAlignments; BAM, since Rsamtools cannot read CRAM).
+focal_read_alleles = function(bam, chrom, pos, ref, alt) {
+  param = Rsamtools::ScanBamParam(which = GenomicRanges::GRanges(chrom, IRanges::IRanges(pos, pos)),
+    what = c("qname", "seq"), flag = Rsamtools::scanBamFlag(isSecondaryAlignment = FALSE,
+      isSupplementaryAlignment = FALSE))
+  g = GenomicAlignments::readGAlignments(bam, param = param)
+  if (!length(g)) return(data.table(read_name = character(), allele = character()))
+  # reference-space read sequence: deletions "-", skips ".", insertions and soft clips removed
+  layer = GenomicAlignments::sequenceLayer(S4Vectors::mcols(g)$seq, GenomicAlignments::cigar(g),
+    from = "query", to = "reference")
+  base = as.character(Biostrings::subseq(layer, start = pos - GenomicAlignments::start(g) + 1L, width = 1L))
+  out = data.table(read_name = S4Vectors::mcols(g)$qname,
+    allele = fifelse(base == ref, "ref", fifelse(base == alt, "alt", NA_character_)))[!is.na(allele)]
+  unique(out, by = "read_name", fromLast = TRUE)
+}
+
+# Donor genotypes (focal_vcf_genotype(), from each donor's phased_vcf_file) and per-read alleles
+# (focal_read_alleles(), from each sample's bam_file) at region$chr:region$focal_pos
+# region$ref>region$alt for every sample in `manifest` (hsca_sample_manifest()). Read counts are
+# diagnostics only; read bases assign individual REF/ALT molecules. Output: list(calls =
+# sample_name, donor, n_ref, n_alt, alt_fraction, genotype; alleles = sample_name, read_name, allele).
+pair_genotype_calls = function(region, manifest) {
+  stopifnot(all(c("sample_name", "donor", "cell_line", "phased_vcf_file", "bam_file") %in% names(manifest)))
+  genotype = vapply(seq_len(nrow(manifest)), function(i) focal_vcf_genotype(manifest$phased_vcf_file[i],
+    manifest$cell_line[i], region$chr, region$focal_pos, region$ref, region$alt), character(1))
+  alleles = rbindlist(lapply(seq_len(nrow(manifest)), function(i) {
+    x = focal_read_alleles(manifest$bam_file[i], region$chr, region$focal_pos, region$ref, region$alt)
+    x[, sample_name := rep(manifest$sample_name[i], .N)][, .(sample_name, read_name, allele)]
+  }))
+  calls = merge(manifest[, .(sample_name, donor)],
+    alleles[, .(n_ref = sum(allele == "ref"), n_alt = sum(allele == "alt")), by = sample_name],
+    by = "sample_name", all.x = TRUE)
+  calls[is.na(n_ref), `:=`(n_ref = 0L, n_alt = 0L)]
+  calls[, alt_fraction := n_alt / (n_ref + n_alt)]
+  calls = merge(calls, data.table(sample_name = manifest$sample_name, genotype = genotype),
+    by = "sample_name", all.x = TRUE)
+  list(calls = calls[order(as.integer(sub("^AL-?([0-9]+).*$", "\\1", sample_name)))], alleles = alleles)
+}
+
+# One PDF per SNP locus: 
+# (genes; HiCCUPS loops, CTCF motifs and Arrowhead domains only when requested) over the region
+# window (genes, the requested Rao features, cCRE bands when requested, the SNP mark, per-base m6A
+# by genotype group, m6A molecules). Reads: full-span molecules of the 27 phased
+# samples that are primary alignments covering the whole window (optionally restricted to `keys`,
+# "<sample_name> <read>"). Groups: hom-REF donors, het donors' REF-base and ALT-base reads, hom-ALT
+# donors. No clustering.
+
+#################################################
+# plot genotype-grouped molecules around a focal SNP
+#################################################
+# region: one-row data.frame with region_id, chr, start (0-based), end, focal_pos, focal_snp, ref,
+# alt, analysis_start, analysis_end, width, annotation. Optional tracks, drawn only when TRUE:
+# loops (HiCCUPS loop arcs and anchors), domains (Arrowhead domains and edges), ctcf (CTCF motif
+# arrows at loop anchors), cre_bands (cCRE boxes: `bands` (start 0-based, end, label, color), or
+# every cCRE overlapping the window from config$root/universe/cre_universe.bed). rao: a
+# load_rao_hg38() result, loaded from rao_dir when NULL and a Rao track is requested.
+# config: list with root, fire_root, tabix, code_root (sample_metatable optional).
+# snp_label labels the SNP diamond.
+plot_snp_domain_ctcf = function(region, file, loops = FALSE, domains = FALSE, ctcf = FALSE,
+    cre_bands = FALSE, bands = NULL, keys = NULL, snp_label = NULL, window_name = "window",
+    context_flank_bp = 250000, config = params, models = gene_models, rao = NULL,
+    rao_dir = "/project/spott/cshan/annotations/LCL_public_data/rao2014_GM12878/hg38",
+    title = region$annotation) {
+  stopifnot(is.null(bands) || cre_bands)
+  rao_tracks = c("loops", "domains", "ctcf")[c(loops, domains, ctcf)]
+  if (length(rao_tracks) && is.null(rao)) rao = load_rao_hg38(rao_dir)
+  if (!length(rao_tracks)) rao = NULL
+  if (cre_bands && is.null(bands)) {
+    cres = fread(file.path(config$root, "universe", "cre_universe.bed"),
+      col.names = c("chrom", "start", "end", "CRE_ID", "CRE_label"))[
+      chrom == region$chr & start < region$end & end > region$start]
+    classes = sub("-.*", "", cres$CRE_label)
+    bands = data.frame(start = cres$start, end = cres$end, label = cres$CRE_label,
+      color = ifelse(is.na(CCRE_COLORS[classes]), "grey40", CCRE_COLORS[classes]))
+  }
+  if (!cre_bands) bands = NULL
+  manifest = hsca_sample_manifest(config)
+  if (is.null(keys)) {
+    window = list(chrom = region$chr, start = region$start, end = region$end)
+    spans = load_region(window, manifest$sample_name, config$root, config$fire_root,
+      tabix_bin = config$tabix, span_source = "aligned_blocks")
+    keys = spans$spans[start <= window$start & end >= window$end, key]
+  }
+  m6a = assemble_region_m6a(as.data.frame(manifest), region, full_span = TRUE, matrix_dir = NULL, reuse = FALSE)
+  a = as.data.table(m6a$rids_df)
+  a[, key := paste(sample_name, original_RID)]
+  a = a[key %in% keys]
+  a[, donor := manifest$donor[match(sample_name, manifest$sample_name)]]
+
+  # genotype groups
+  genotypes = pair_genotype_calls(region, manifest)
+  group_labels = c(hom_ref = paste0(region$ref, region$ref),
+    het_ref = paste0(region$ref, region$alt, ": ", region$ref, " reads"),
+    het_alt = paste0(region$ref, region$alt, ": ", region$alt, " reads"),
+    hom_alt = paste0(region$alt, region$alt))
+  group_colors = setNames(c("#E6550D", "#FDBE85", "#9ECAE1", "#3182BD"), group_labels)
+  bases = genotypes$alleles[, setNames(allele, paste(sample_name, read_name))]
+  a[, genotype := genotypes$calls$genotype[match(sample_name, genotypes$calls$sample_name)]]
+  a[, base := unname(bases[key])]
+  a[, group := fcase(genotype == "hom_ref", "hom_ref", genotype == "hom_alt", "hom_alt",
+    genotype == "het" & base == "ref", "het_ref", genotype == "het" & base == "alt", "het_alt")]
+  het_base_rate = a[genotype == "het", mean(!is.na(base))]
+  n_excluded = a[is.na(group), .N]
+  a = a[!is.na(group)]
+  a[, cluster := droplevels(factor(group_labels[group], levels = group_labels))]
+  group_sizes = a[, .(molecules = .N, samples = uniqueN(sample_name), donors = uniqueN(donor)),
+    by = cluster][order(cluster)]
+  missing = setdiff(group_labels, levels(a$cluster))
+  result = list(region = region, assignments = as.data.frame(a),
+    site_met_mat = m6a$met_mat[a$RID, , drop = FALSE])
+
+  # figure: plot_locus_molecules() (parsing_functions/plotting_functions.r)
+  strip_labels = group_sizes[, setNames(sprintf("%s\n%d molecules\n%d donors", cluster, molecules, donors),
+    as.character(cluster))]
+  figure = plot_locus_molecules(result, models, group_colors, rao = rao, rao_tracks = rao_tracks, bands = bands,
+    marks = data.frame(pos = region$focal_pos, label = if (is.null(snp_label)) NA_character_ else snp_label),
+    strip_label = if (cre_bands) "cCREs" else "SNP", group_labels = strip_labels,
+    context_flank_bp = context_flank_bp, title = title, subtitle = sprintf(
+      "SNP %s %s>%s | top: context, yellow band = %s | bottom: %s, dashed line at the SNP%s",
+      format(region$focal_pos, big.mark = ","), region$ref, region$alt, window_name, window_name,
+      if (length(missing)) paste0(" | no molecules: ", paste(missing, collapse = ", ")) else ""),
+    caption = paste0(
+      "Left bars: genotype group, sample. Genotype from donor VCF GT at the exact PASS biallelic SNV. ",
+      "Phased or unphased 0/1 and 1/0 are het; read bases assign REF/ALT molecules. ",
+      n_excluded, " molecules without a group excluded."))
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  ggsave(file, figure$combined, width = 12, height = figure$height, limitsize = FALSE)
+  invisible(list(region = region, genotypes = genotypes$calls,
+    group_sizes = group_sizes, het_base_rate = het_base_rate, n_excluded = n_excluded,
+    assignments = a, result = result, profile = figure$profile, context = figure$context,
+    combined = figure$combined, file = file))
+}
+
+# One PDF per SNP: plot_snp_domain_ctcf() over SNP +/- flank_bp, titled with the gene, SNP name and
+# alleles; molecules split by donor genotype and read allele. loops, domains, ctcf and cre_bands are
+# drawn only when TRUE (see plot_snp_domain_ctcf()). Writes
+# <output_dir>/LCL_<gene>_<snp_id>_genotype_molecules.pdf.
+#################################################
+# genotype-split molecules at a named SNP
+#################################################
+plot_snp_genotype_molecules = function(chrom, pos, ref, alt, snp_id, gene, output_dir,
+    flank_bp = config$locus_flank_bp, loops = FALSE, domains = FALSE, ctcf = FALSE,
+    cre_bands = FALSE, bands = NULL, context_flank_bp = 250000, config = params,
+    models = gene_models, rao = NULL) {
+  region = data.frame(region_id = paste0(gene, "_", snp_id), region_type = "snp",
+    chr = chrom, start = pos - 1L - flank_bp, end = pos + flank_bp,
+    focal_pos = as.integer(pos), focal_snp = snp_id, ref = ref, alt = alt)
+  region$analysis_start = region$start + 1L
+  region$analysis_end = region$end
+  region$width = region$end - region$start
+  region$annotation = sprintf("%s | %s (%s:%s %s/%s)\n%s:%s-%s (hg38), SNP +/- %s bp",
+    gene, snp_id, chrom, format(pos, big.mark = ","), ref, alt, chrom,
+    format(region$analysis_start, big.mark = ","), format(region$analysis_end, big.mark = ","),
+    format(flank_bp, big.mark = ","))
+  file = file.path(output_dir, paste0("LCL_", gsub("[^A-Za-z0-9_.-]+", "_", gene), "_", snp_id,
+    "_genotype_molecules.pdf"))
+  plot_snp_domain_ctcf(region, file, loops = loops, domains = domains, ctcf = ctcf,
+    cre_bands = cre_bands, bands = bands, snp_label = sprintf("%s %s/%s", snp_id, ref, alt),
+    window_name = "SNP window", context_flank_bp = context_flank_bp, config = config,
+    models = models, rao = rao)
 }
