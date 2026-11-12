@@ -8,7 +8,8 @@
 #
 # The summed motif / initiator / trinucleotide effects get the same TSS weighting, and their
 # per-position values over TSS -500..+499 are kept for the effect profiles. tata_center is the
-# TSS-relative position of the peak TATA+ motif activation within TATA_SEARCH.
+# TSS-relative position of the peak TATA+ motif activation within TATA_SEARCH, yy1_center the same
+# for the YY1+ motif activation within YY1_SEARCH (YY1 sits downstream of the TSS).
 #
 # Outputs under LCL_project/pausing/PolII/promoter_annotation/tables/
 #   04a_puffin_motif_scores.tsv        one row per gene
@@ -42,6 +43,7 @@ PAD = 825      # 500 bp output each side + Puffin's 325 bp padding
 WINDOW = slice(490, 510)  # TSS -10..+9 of the 1000 bp output, TSS at index 500
 # Puffin rows of the summed effects (initiator and trinucleotide are centred over the 1 kb output)
 TATA_SEARCH = (-60, -10)  # TATA box = peak TATA+ motif activation (motif centre) in this TSS-relative range
+YY1_SEARCH = (0, 50)      # YY1 site = peak YY1+ motif activation (motif centre) in this TSS-relative range
 SUMS = {"total": "Sum of total effect", "motif": "Sum of motif effect",
         "initiator": "Sum of initiator effect", "trinucleotide": "Sum of trinucleotide effect"}
 
@@ -50,6 +52,8 @@ os.chdir(PUFFIN_SRC)  # Puffin loads ./resources/puffin.pth
 from puffin import Puffin  
 
 
+# hg38 sequence of 2 x PAD bp centred on the 0-based TSS, in transcription orientation
+# (minus-strand genes are reverse-complemented), so index PAD is the TSS base
 def tss_sequence(fa, chrom, tss0, strand):
     # same window as the manuscript: [TSS - 825, TSS + 825) shifted by 1 on the minus strand
     off = 1 if strand == "-" else 0
@@ -59,6 +63,12 @@ def tss_sequence(fa, chrom, tss0, strand):
     return s
 
 
+# Run Puffin (FANTOM_CAGE track) on one TSS sequence. Returns
+# 1. scores: per motif in MOTIFS, its motif effect averaged over TSS -10..+9 (WINDOW) weighted by
+#    Puffin's predicted initiation there; the same for the summed total / motif / initiator /
+#    trinucleotide effects (*_effect_tss); tata_center / yy1_center = TSS-relative position of the
+#    peak TATA+ / YY1+ motif activation inside TATA_SEARCH / YY1_SEARCH, *_activation = that peak
+# 2. profile: the four summed effects at every position -500..+499
 def tss_effects(net, seq):
     # returns the TSS-weighted scores and the per-position summed effects
     df = net.interpret(seq, "FANTOM_CAGE")
@@ -66,13 +76,19 @@ def tss_effects(net, seq):
     row = lambda name: df.loc[name].astype(float).values
     scores = {m: float((w * row(m[:-2] + m[-1] + " motif effect")[WINDOW]).sum() / w.sum()) for m in MOTIFS}
     scores.update({f"{k}_effect_tss": float((w * row(v)[WINDOW]).sum() / w.sum()) for k, v in SUMS.items()})
-    act = row("TATA+ motif activation")[500 + TATA_SEARCH[0]:500 + TATA_SEARCH[1] + 1]
-    scores["tata_center"] = int(TATA_SEARCH[0] + np.argmax(act))
-    scores["tata_activation"] = float(act.max())
+    for key, track, (lo, hi) in [("tata", "TATA+", TATA_SEARCH), ("yy1", "YY1+", YY1_SEARCH)]:
+        act = row(track + " motif activation")[500 + lo:500 + hi + 1]
+        scores[f"{key}_center"] = int(lo + np.argmax(act))
+        scores[f"{key}_activation"] = float(act.max())
     profile = pd.DataFrame({"position": np.arange(-500, 500), **{k: row(v) for k, v in SUMS.items()}})
     return scores, profile
 
 
+# 1. read the curated genes with a fiber TSS from gene_features.tsv
+# 2. per gene: score the TSS with tss_effects()
+# 3. dominant motif = motif with the largest contribution, U1 snRNP excluded; group_excl_U1 is
+#    its family name (SP -> SP1)
+# 4. write one row per gene (OUT) and one row per gene x position (PROFILE_OUT)
 def main():
     torch.set_num_threads(int(os.environ.get("SLURM_CPUS_PER_TASK", 4)))
     genes = pd.read_csv(GENES, sep="\t")

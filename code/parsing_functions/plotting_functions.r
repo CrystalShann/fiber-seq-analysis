@@ -2013,6 +2013,9 @@ plot_rao_zoom = function(rao, region, xlim, tracks = c("loops", "domains", "ctcf
 #   title, subtitle  - shown on the first track
 #   caption          - shown under the molecule track
 #   x_label          - optional x axis title of the molecule track
+#   profile_bars     - TRUE draws the m6A fraction of every base of the
+#                      region as an unconnected 1 bp bar (0 where no molecule
+#                      has a call); FALSE = area + line over observed positions
 # Output:
 #   list(combined = cowplot figure, height = its height in inches at 12 in
 #   wide, context = context window c(start, end), profile = per-base profile
@@ -2025,7 +2028,7 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL,
                                  region_label = "This window", reference_label = "Reference",
                                  sample_colors = NULL, context_flank_bp = 250000,
                                  title = result$region$annotation, subtitle = NULL,
-                                 caption = NULL, x_label = NULL) {
+                                 caption = NULL, x_label = NULL, profile_bars = FALSE) {
   region <- result$region
   a <- result$assignments
   stopifnot(is.factor(a$cluster), !anyNA(a$cluster), all(levels(a$cluster) %in% names(group_colors)))
@@ -2135,13 +2138,14 @@ plot_locus_molecules <- function(result, models, group_colors, rao = NULL,
   profile <- as.data.table(cluster_site_profiles(result, result$site_met_mat))
   observed <- if (!is.null(result$observed_positions)) as.numeric(result$observed_positions) else
     as.numeric(colnames(result$site_met_mat)[Matrix::colSums(result$site_met_mat,na.rm=TRUE)>0])
-  profile <- profile[pos %in% observed]
+  if (!profile_bars) profile <- profile[pos %in% observed]
   profile[, strip := factor(group_labels[cluster], levels = group_labels)]
   profiles <- plot_group_profile(profile, group_col = "strip", style = "area", x_col = "pos", y_col = "met",
     facet_col = "strip", facet_layout = "grid", facet_scales = "fixed",
     colors = setNames(group_colors[names(group_labels)], group_labels), coordinates = "relative",
     region = region, fill_colors = setNames(group_colors[names(group_labels)], group_labels),
-    layers = list(list(geom = "area", position = "identity", alpha = .65), list(geom = "line", linewidth = .3)))
+    layers = if (profile_bars) list(list(geom = "col", position = "identity", width = 1, alpha = .65)) else
+      list(list(geom = "area", position = "identity", alpha = .65), list(geom = "line", linewidth = .3)))
   profiles <- shade(profiles) + anchor_line() + scale_x_continuous(expand = c(0, 0)) +
     coord_cartesian(xlim = bounds) + scale_y_continuous(limits = c(0, 1), breaks = c(0, .5, 1)) +
     labs(x = NULL, y = "m6A fraction") + domain_ctcf_theme() +
@@ -2299,7 +2303,7 @@ plot_snp_domain_ctcf = function(region, file, loops = FALSE, domains = FALSE, ct
     cre_bands = FALSE, bands = NULL, keys = NULL, snp_label = NULL, window_name = "window",
     context_flank_bp = 250000, config = params, models = gene_models, rao = NULL,
     rao_dir = "/project/spott/cshan/annotations/LCL_public_data/rao2014_GM12878/hg38",
-    title = region$annotation) {
+    title = region$annotation, profile_bars = FALSE) {
   stopifnot(is.null(bands) || cre_bands)
   rao_tracks = c("loops", "domains", "ctcf")[c(loops, domains, ctcf)]
   if (length(rao_tracks) && is.null(rao)) rao = load_rao_hg38(rao_dir)
@@ -2354,7 +2358,7 @@ plot_snp_domain_ctcf = function(region, file, loops = FALSE, domains = FALSE, ct
   figure = plot_locus_molecules(result, models, group_colors, rao = rao, rao_tracks = rao_tracks, bands = bands,
     marks = data.frame(pos = region$focal_pos, label = if (is.null(snp_label)) NA_character_ else snp_label),
     strip_label = if (cre_bands) "cCREs" else "SNP", group_labels = strip_labels,
-    context_flank_bp = context_flank_bp, title = title, subtitle = sprintf(
+    context_flank_bp = context_flank_bp, profile_bars = profile_bars, title = title, subtitle = sprintf(
       "SNP %s %s>%s | top: context, yellow band = %s | bottom: %s, dashed line at the SNP%s",
       format(region$focal_pos, big.mark = ","), region$ref, region$alt, window_name, window_name,
       if (length(missing)) paste0(" | no molecules: ", paste(missing, collapse = ", ")) else ""),
@@ -2380,7 +2384,7 @@ plot_snp_domain_ctcf = function(region, file, loops = FALSE, domains = FALSE, ct
 plot_snp_genotype_molecules = function(chrom, pos, ref, alt, snp_id, gene, output_dir,
     flank_bp = config$locus_flank_bp, loops = FALSE, domains = FALSE, ctcf = FALSE,
     cre_bands = FALSE, bands = NULL, context_flank_bp = 250000, config = params,
-    models = gene_models, rao = NULL) {
+    models = gene_models, rao = NULL, profile_bars = FALSE) {
   region = data.frame(region_id = paste0(gene, "_", snp_id), region_type = "snp",
     chr = chrom, start = pos - 1L - flank_bp, end = pos + flank_bp,
     focal_pos = as.integer(pos), focal_snp = snp_id, ref = ref, alt = alt)
@@ -2396,5 +2400,5 @@ plot_snp_genotype_molecules = function(chrom, pos, ref, alt, snp_id, gene, outpu
   plot_snp_domain_ctcf(region, file, loops = loops, domains = domains, ctcf = ctcf,
     cre_bands = cre_bands, bands = bands, snp_label = sprintf("%s %s/%s", snp_id, ref, alt),
     window_name = "SNP window", context_flank_bp = context_flank_bp, config = config,
-    models = models, rao = rao)
+    models = models, rao = rao, profile_bars = profile_bars)
 }

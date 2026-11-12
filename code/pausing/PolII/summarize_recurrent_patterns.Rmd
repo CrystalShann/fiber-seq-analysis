@@ -431,6 +431,9 @@ This gives one number per motif per gene. Bases where Puffin predicts initiation
 
 
 one row per gene, with every motif score, the summed effects, the TATA position and activation, and the dominant-motif label
+
+  - the position of the motif is inferred from puffin predicted motif center, and I chose the motif span based on the length of the consensus sequence (TATA box: TATAWAWR - 8bp, YY1 - AAGTAGGCGG - 10bp)
+
 ```{r puffin-motif-score}
 puffin_root <- "/project/spott/cshan/fiber-seq/LCL_project/pausing/PolII/promoter_annotation/tables"
 motif_score <- read.delim(file.path(puffin_root, "04a_puffin_motif_scores.tsv"))
@@ -451,16 +454,18 @@ TATA-class genes with the strongest drop in m6A and the strongest 10-30 bp footp
 TATA_GENES <- c("SRSF3", "NFKBIA", "CR2", "SPIB")
 TATA_MOLECULE_DIR <- file.path(OUT_DIR, "promoter_annotation/plots/TATA_motif_read_examples")
 
-# TSS, strand and Puffin TATA box centre of one gene
+# TSS, strand and Puffin TATA box and YY1 site centres of one gene
 tata_gene <- function(gene) {
   gf <- fread(file.path(OUT_DIR, "read_features/tables/gene_features.tsv"))[gene_name == gene]
   pf <- fread(file.path(OUT_DIR, "promoter_annotation/tables/04a_puffin_motif_scores.tsv"))[gene_name == gene]
   stopifnot(nrow(gf) == 1L, nrow(pf) == 1L)
-  cbind(gf[, .(group, gene_name, chrom, tss, strand, tss_source)], pf[, .(tata_center)])
+  cbind(gf[, .(group, gene_name, chrom, tss, strand, tss_source)], pf[, .(tata_center, yy1_center)])
 }
 
-# read level figure of one TATA gene: the reads, footprints and read order of plot_curated_gene()
-plot_tata_read_level <- function(gene) {
+# read level figure of one gene: the reads, footprints and read order of plot_curated_gene(), with
+# the Puffin motif centre `center` (column of tata_gene()) shaded and labelled `label`
+plot_tata_read_level <- function(gene, center = "tata_center", label = "TATA box",
+                                 out_dir = TATA_MOLECULE_DIR, suffix = "tata") {
   g <- tata_gene(gene)
   region <- data.frame(region_id = g$gene_name, chr = g$chrom,
     start = g$tss + EXAMPLE_RANGE[1] - 1L, end = g$tss + EXAMPLE_RANGE[2],
@@ -471,8 +476,8 @@ plot_tata_read_level <- function(gene) {
   meta <- dat$rids_df
   plain <- meta$RID[order(match(meta$sample_name, samples$sample_name), meta$start, meta$RID)]
   plot_read_level(g, example_footprints(g, dat), plain,
-                  file.path(TATA_MOLECULE_DIR, paste0(gene, "_tata_read_level.pdf")),
-                  met_mat = dat$met_mat, tata_center = g$tata_center)
+                  file.path(out_dir, paste0(gene, "_", suffix, "_read_level.pdf")),
+                  met_mat = dat$met_mat, tata_center = g[[center]], motif_label = label)
 }
 ```
 
@@ -481,12 +486,48 @@ tata_pdfs <- vapply(TATA_GENES, plot_tata_read_level, character(1))
 knitr::include_graphics(unlist(lapply(tata_pdfs, show_pdf_pages)))
 ```
 
-### Promoter QTLs from Einarsson et al., 2022
+### Motif and nucleosome and footprint occupancy features
+
+Genes are grouped by their Puffin dominant motif (`group_excl_U1` of 04a)
+
+`puffin_motif_class_plus1_density.pdf`: the +1 start of every read with an accessible TSS (`plus1_start`, the first nucleosome start within +0..+299 bp), for motifs with >= 5 genes and genes with >= 10 such reads. Each gene gets the same total weight, so deeply covered genes do not dominate a motif's density. The dashed line is the median of the motif's per-gene median +1 start
+
+
+Each line is the mean (+/- se) of the per-gene 10 bp bin profiles of over the motif's genes (TSS +/- 500 bp, oriented by strand), and the grey line is the mean over all other genes
+
+the examples for TATA and YY1 are selected based on top contribution score predicted by puffin
+
+```{r motif-smf-figures, out.width = "100%"}
+motif_plot_dir <- file.path(OUT_DIR, "promoter_annotation/plots")
+knitr::include_graphics(unlist(lapply(
+  file.path(motif_plot_dir, c("puffin_motif_class_plus1_density.pdf", "puffin_motif_smf_features.pdf")),
+  show_pdf_pages)))
+```
+
+YY1 seems to have the most strongly positioned +1 nucleosome and is depleted of 10-30 bp footprints upstream of TSS, while TATA has the weakest +1 nucleosome and is enriched in 10-30 bp footprints
+
+TSS used for puffin is fantom5 dominant TSS for each gene, it this is not present for the selected gene, then the gencode canonical TSS is used
+
+## YY1 promoters on single molecules: SPCS2, NDUFA9, EIF3E, RPS11, ATP5PO
+
+
+```{r yy1-molecules, out.width = "100%"}
+YY1_GENES <- c("SPCS2", "NDUFA9", "EIF3E", "RPS11", "ATP5PO")
+YY1_MOLECULE_DIR <- file.path(OUT_DIR, "promoter_annotation/plots/YY1_motif_read_examples")
+dir.create(YY1_MOLECULE_DIR, recursive = TRUE, showWarnings = FALSE)
+yy1_pdfs <- vapply(YY1_GENES, plot_tata_read_level, character(1), center = "yy1_center",
+                   label = "YY1 site", out_dir = YY1_MOLECULE_DIR, suffix = "yy1")
+knitr::include_graphics(unlist(lapply(yy1_pdfs, show_pdf_pages)))
+```
+
+
+
+# Promoter QTLs from Einarsson et al., 2022
 
 **they proposed that "Alternative TSSs of low variability promoters indicate a novel mechanism of mutational robustness"**
 
 
-eQTLs are rarely found at housekeeping or ubiquitous genes and have limited effects when present, possibly due to selection or **robustness mechanisms**; flexible TSS architecture could mask variant effects on individual core promoters.
+eQTLs are rarely found at housekeeping or ubiquitous genes and have limited effects when present, possibly due to selection or robustness mechanisms - flexible TSS architecture could mask variant effects on individual core promoters.
 
 1. **Promoter eQTLs (prQTLs)**
     Testing common SNPs (MAF ≥ 10%, within 25 kb) found 2,457 promoters with >= 1 prQTL (5% FDR), more often at highly variable promoters. Fewer common variants lie near low-variable promoters, suggesting negative selection, and lead-SNP effect size correlates with variability 
@@ -495,7 +536,7 @@ eQTLs are rarely found at housekeeping or ubiquitous genes and have limited effe
     dprQTLs show similar prevalence and maximum effect sizes across variability classes, indicating that flexible TSS architecture limits how variant effects on individual core promoters propagate to total promoter output
 
 3. **Fraction QTLs (frQTLs)**
-    Testing association with each decomposed promoter's fractional contribution to its parent found 1,230 promoters with ≥1 frQTL. Unlike prQTLs and dprQTLs, frQTLs are **more common in low-variable promoters**.
+    Testing association with each decomposed promoter's fractional contribution to its parent found 1,230 promoters with >=1 frQTL. Unlike prQTLs and dprQTLs, frQTLs are more common in low-variable promoters
 
 
 #### Single molecules at the RGS14 and GGNBP2 promoter QTLs
@@ -509,7 +550,7 @@ eQTLs are rarely found at housekeeping or ubiquitous genes and have limited effe
     - SNP rs9906189 (chr17:36549567 G/A) shifts the two decomposed promoters in opposite directions, yet total output is essentially unchanged
 
 
-m6A molecules of the 27 phased LCL samples spanning SNP +/- 1 kb, split by donor VCF genotype and, in heterozygous donors, by the base each read carries at the SNP (`plot_snp_genotype_molecules()` in `parsing_functions/plotting_functions.r`). Loop, domain, CTCF and cCRE tracks are off (`loops`, `domains`, `ctcf`, `cre_bands` = `FALSE`). PDFs are saved under `promoter_annotation/plots/promoter_qtl_examples_Einarsson/`.
+m6A molecules of the 27 phased LCL samples spanning SNP +/- 1 kb, split by donor VCF genotype and, in heterozygous donors, by the base each read carries at the SNP
 
 ```{r promoter-qtl-examples, out.width = "100%"}
 QTL_DIR <- file.path(OUT_DIR, "promoter_annotation/plots/promoter_qtl_examples_Einarsson")
@@ -521,7 +562,7 @@ qtl_snps <- data.frame(gene = c("RGS14", "GGNBP2"), snp_id = c("rs56235845", "rs
   chrom = c("chr5", "chr17"), pos = c(177371039L, 36549567L), ref = c("T", "G"), alt = c("G", "A"))
 qtl_examples <- lapply(seq_len(nrow(qtl_snps)), function(i) with(qtl_snps[i, ],
   plot_snp_genotype_molecules(chrom, pos, ref, alt, snp_id, gene, QTL_DIR,
-    config = qtl_config, models = qtl_gene_models)))
+    config = qtl_config, models = qtl_gene_models, profile_bars = TRUE)))
 knitr::kable(rbindlist(lapply(qtl_examples, function(x)
   x$group_sizes[, .(SNP = x$region$focal_snp, group = cluster, molecules, samples, donors)])))
 knitr::include_graphics(unlist(lapply(qtl_examples, function(x) show_pdf_pages(x$file))))

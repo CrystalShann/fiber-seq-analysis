@@ -96,21 +96,3 @@ down.
 | `position` | bp relative to the TSS, −500..+499, in the gene's orientation (negative = upstream) |
 | `total`, `motif`, `initiator`, `trinucleotide` | Puffin's per-base summed effects (not weighted), on the same log scale |
 
-### Caveats
-
-- **Weak TSSs give noisy scores.** The weights are Puffin's prediction, so if Puffin predicts
-  little at the fiber TSS, Σ w is small. Then a few bases decide the score, and the class says
-  little.
-- **`tata_center` is always filled in, even when there is no TATA box.** It is the highest point
-  of the TATA+ activation, however weak. Read it together with `tata_activation`. For example,
-  CD74 has activation 1.38 at −28, while HLA-DRA has 0.16 at −42.
-- **The sums don't add up exactly.** `total_effect_tss` ≠ motif + initiator + trinucleotide,
-  because total also includes a centred Long Inr− term. The initiator and trinucleotide sums are
-  centred, the motif effects are not, and `interpret` leaves out the bias terms of the layers
-  that apply the effect curves. Compare these values across genes and positions, not as
-  Puffin's actual output before softplus.
-- **A score is a contribution, not a measure of motif quality.** A motif sitting right on the
-  TSS can score negative, because the effect curves suppress initiation close to the motif.
-  The class is simply the largest of these signed contributions.
-- **Most of the runtime goes to unused work.** `interpret` also computes per-base importance
-  scores by gradients, for all 10 outputs × 20 motifs. The script does not use them.

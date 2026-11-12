@@ -22,14 +22,23 @@
 #                                           x 10 bp bin x signal
 #   tables/puffin_motif_smf_motif_tests.tsv each motif's genes vs all other genes, Wilcoxon per SMF
 #                                           feature, BH over motif x feature
-#   tables/puffin_motif_smf_motif_correlations.tsv
-#                                           Spearman of each Puffin motif contribution vs core occupancy
 #   tables/puffin_motif_smf_box_state.tsv   +1 fraction / position per TATA box state
 #   tables/puffin_motif_smf_variability_predictors.tsv
 #                                           Spearman of each sequence predictor vs adjusted log10 CV2
-#   plots/puffin_motif_smf_features.pdf     one mean gene profile page per motif (motif genes vs all
-#                                           other genes), motif contribution x occupancy heatmap, CpG o/e
-#                                           and TATA box vs expression variability
+#   plots/puffin_motif_smf_features.pdf     mean gene profiles of every motif (motif genes vs all other
+#                                           genes) x signal in one figure
+#   plots/tata_features.pdf                 CpG o/e and TATA box vs expression variability, sequence
+#                                           predictors ranked by |rho|
+#   tables/puffin_motif_smf_class_plot_tests.tsv
+#                                           tests annotated on the motif class figures below: Kruskal-Wallis
+#                                           over motif classes (BH over features) and each motif vs all
+#                                           other genes (Wilcoxon, BH over motifs within a feature)
+#   plots/puffin_motif_class_gene_dots.pdf  +1 start median and 10-30 bp core occupancy per gene by motif,
+#                                           dots coloured by gene group
+#   plots/puffin_motif_class_plus1_density.pdf
+#                                           per read +1 start density per motif, every gene weighted equally
+#   plots/puffin_motif_class_scatter.pdf    +1 start median vs 10-30 bp core occupancy per gene, motif medians
+# Motif class figures: classes with >= MIN_CLASS_GENES genes, no adjustment for gene group or expression.
 #
 # Motif class = Puffin group_excl_U1 of 04a (dominant motif, U1 snRNP excluded); each motif's
 # genes are compared with all other genes.
@@ -60,13 +69,14 @@ PROMOTER_COLORS <- c(TATA = "#E41A1C", other = "#5b6b7a")  # TATA = Puffin's TAT
 MOTIF_COLORS <- c(TATA = "#E41A1C", SP1 = "#377EB8", ETS = "#4DAF4A", NFY = "#984EA3", NRF1 = "#FF7F00",
                   CREB = "#A65628", YY1 = "#F781BF", ZNF143 = "#1B9E77")
 OTHER_GENES <- "all other genes"
+MIN_CLASS_GENES <- 5L
+GROUP_COLORS <- c(housekeeping = "#1B9E77", cell_type_specific = "#D95F02", not_expressed = "#7570B3")
+CLASS_FEATURES <- c(plus1_start_median = "+1 start, median (bp)", plus1_fraction = "+1 fraction",
+                    tf_10_30_core = "10-30 bp footprints", tf_30_60_core = "30-60 bp footprints",
+                    tf_60_80_core = "60-80 bp footprints", tf_10_80_core = "10-80 bp footprints")
 OTHER_COLOR <- "#5b6b7a"
 MOTIF_FEATURES <- c("m6a_core", "m6a_upstream", "m6a_downstream", "nuc_core", "tf_10_30_core", "tf_30_60_core",
                     "tf_60_80_core", "occluded_fraction", "plus1_fraction", "plus1_start_median", "plus1_start_iqr")
-CONTRIBUTIONS <- c(paste0(c("TATA", "SP", "ETS", "NFY", "NRF1", "CREB", "YY1", "ZNF143"), "_contribution"),
-                   "tata_activation")
-CORE_OCCUPANCY <- c(m6a_core = "m6A", nuc_core = "nucleosome", tf_10_30_core = "10-30 bp footprints",
-                    tf_30_60_core = "30-60 bp footprints", tf_60_80_core = "60-80 bp footprints")
 STATES <- c(nucleosome = "TATA box under a nucleosome", footprint = "TATA box footprinted (10-60 bp)",
             open = "TATA box accessible")
 SIGNALS <- c(m6a = "m6A fraction", nuc = "nucleosome occupancy", tf_10_30 = "10-30 bp footprint occupancy",
@@ -85,6 +95,9 @@ FEATURES <- c(m6a_core = "m6A, core (-200..200)", m6a_upstream = "m6A, upstream 
 ############################################################
 # genes and reads
 ############################################################
+# one row per gene with complete fiber features: Puffin dominant motif (motif), TATA score and
+# centre from 04a, gene group and the gene-level fiber features of 02; promoter = TATA / other;
+# tata_box = tata_center for TATA promoters, CONTROL_POSITION for all others
 load_genes <- function() {
   pf <- fread(file.path(PUFFIN_OUT, "tables/04a_puffin_motif_scores.tsv"), check.names = FALSE)
   gf <- fread(file.path(BASE, "read_features/tables/gene_features.tsv"))[status == "complete"]
@@ -120,6 +133,9 @@ load_profiles <- function(genes) {
   merge(p, genes[, .(gene = gene_name, promoter, motif, tata_box)], by = "gene")
 }
 
+# per gene: +1 fraction, +1 start median / IQR (NA with < MIN_PLUS1_READS +1 reads), fraction of
+# reads with the TATA box bin under a nucleosome / footprinted / open, m6A in the TATA box bin, and
+# TATA box -> +1 distance, added to the load_genes() columns
 gene_summary <- function(genes, reads, prof) {
   s <- reads[, .(plus1_fraction = mean(!is.na(plus1_start)), n_plus1_reads = sum(!is.na(plus1_start)),
                  plus1_start_median = as.numeric(median(plus1_start, na.rm = TRUE)),
@@ -134,6 +150,7 @@ gene_summary <- function(genes, reads, prof) {
   g[order(promoter, gene_name)]
 }
 
+# TATA vs other promoters for every feature in FEATURES: medians, Wilcoxon p, BH over features
 tata_tests <- function(g) {
   res <- rbindlist(lapply(names(FEATURES), function(f) {
     t <- g[promoter == "TATA", get(f)]; o <- g[promoter == "other", get(f)]
@@ -157,6 +174,8 @@ motif_profiles <- function(prof) {
   }))[, .(motif, set, signal, position, mean, se, n_genes)][order(motif, signal, set, position)]
 }
 
+# each motif's genes vs all other genes for every feature in MOTIF_FEATURES: medians, Wilcoxon
+# p, BH over motif x feature
 motif_class_tests <- function(g) {
   res <- rbindlist(lapply(names(MOTIF_COLORS), function(m) rbindlist(lapply(MOTIF_FEATURES, function(f) {
     a <- g[motif == m, get(f)]; o <- g[motif != m, get(f)]
@@ -169,20 +188,8 @@ motif_class_tests <- function(g) {
   res[]
 }
 
-# continuous Puffin motif contributions vs core occupancy, every gene with fiber data
-motif_correlations <- function(g) {
-  a <- fread(file.path(PUFFIN_OUT, "tables/gene_annotations.tsv"))[, c("gene_name", CONTRIBUTIONS), with = FALSE]
-  x <- merge(g[, c("gene_name", names(CORE_OCCUPANCY)), with = FALSE], a, by = "gene_name")
-  stopifnot(nrow(x) == nrow(g))
-  res <- rbindlist(lapply(CONTRIBUTIONS, function(cc) rbindlist(lapply(names(CORE_OCCUPANCY), function(f) {
-    ok <- is.finite(x[[cc]]) & is.finite(x[[f]])
-    ct <- suppressWarnings(cor.test(x[[cc]][ok], x[[f]][ok], method = "spearman", exact = FALSE))
-    list(contribution = cc, occupancy = f, n = sum(ok), rho = unname(ct$estimate), p = ct$p.value)
-  }))))
-  res[, fdr := p.adjust(p, "BH")]
-  res[]
-}
-
+# per promoter type x TATA box state: reads, genes, +1 fraction, TSS occluded fraction and
+# median +1 start, pooling reads across genes
 box_state_summary <- function(reads) {
   reads[, .(n_reads = .N, n_genes = uniqueN(gene), plus1_fraction = mean(!is.na(plus1_start)),
             tss_occluded_fraction = mean(nuc_at_tss),
@@ -194,6 +201,8 @@ box_state_summary <- function(reads) {
 ############################################################
 # sequence predictors of expression variability
 ############################################################
+# observed / expected CpG ratio over TSS +/- CPG_FLANK bp of hg38 (vectorised over genes):
+# CpG count x window length / (C count x G count)
 cpg_oe <- function(chrom, tss) {
   seqs <- toupper(as.character(scanFa(FaFile(GENOME),
     GenomicRanges::GRanges(chrom, IRanges::IRanges(tss - CPG_FLANK, tss + CPG_FLANK)))))
@@ -203,6 +212,9 @@ cpg_oe <- function(chrom, tss) {
   cg * width(dna) / (base[, "C"] * base[, "G"])
 }
 
+# genes matched to a published promoter (gene_annotations.tsv of expression_variability.R) with
+# their published variability and Puffin contributions, plus Puffin class, initiator and
+# trinucleotide effects, CpG o/e and a 0/1 TATA class
 load_variability <- function() {
   a <- fread(file.path(PUFFIN_OUT, "tables/gene_annotations.tsv"))[match_status == "matched"]
   pf <- fread(file.path(PUFFIN_OUT, "tables/04a_puffin_motif_scores.tsv"), check.names = FALSE)
@@ -219,6 +231,8 @@ PREDICTORS <- c(cpg_oe = "CpG o/e (TSS +/- 200 bp)", tata_activation = "TATA box
                 setNames(paste(c("TATA", "YY1", "ETS", "SP", "NFY", "CREB", "NRF1", "ZNF143"), "contribution (Puffin)"),
                          paste0(c("TATA", "YY1", "ETS", "SP", "NFY", "CREB", "NRF1", "ZNF143"), "_contribution")))
 
+# Spearman rho of every sequence predictor in PREDICTORS with the published adjusted log10 CV2,
+# BH over predictors, ranked by |rho|
 variability_predictors <- function(v) {
   res <- rbindlist(lapply(names(PREDICTORS), function(f) {
     ct <- suppressWarnings(cor.test(v[[f]], v$elife_adjusted_log10_CV2, method = "spearman", exact = FALSE))
@@ -228,6 +242,8 @@ variability_predictors <- function(v) {
   res[order(-abs(rho))][, rank := .I][]
 }
 
+# the three tata_features.pdf pages: CpG o/e vs variability (dots coloured by TATA / other),
+# variability of TATA vs other promoters (box + dots), and every predictor's rho as a ranked bar
 variability_plots <- function(v, pred) {
   lab <- function(f) with(pred[predictor == f], sprintf("Spearman rho = %.2f, p = %.2g, n = %d", rho, p, n))
   n <- v[, .N, by = promoter]
@@ -261,48 +277,124 @@ variability_plots <- function(v, pred) {
 
 
 ############################################################
-# figures
+# motif class figures (no adjustment for gene group or expression)
 ############################################################
-motif_profile_plot <- function(mp, g, m) {
-  d <- mp[motif == m & position >= PROFILE_XLIM[1] & position <= PROFILE_XLIM[2]]
-  d[, signal := factor(SIGNALS[as.character(signal)], SIGNALS)]
-  d[, set := factor(set, c(m, OTHER_GENES))]
-  cols <- setNames(c(MOTIF_COLORS[[m]], OTHER_COLOR), c(m, OTHER_GENES))
-  n_m <- g[motif == m, .N]
-  labels <- setNames(c(sprintf("%s (n=%d)", m, n_m), sprintf("%s (n=%d)", OTHER_GENES, nrow(g) - n_m)), names(cols))
-  p <- ggplot(d, aes(position, mean, colour = set, fill = set)) +
-    geom_vline(xintercept = 0, linetype = 2, colour = "grey50")
-  xlab <- "Position relative to TSS (bp, 10 bp bins)"
-  if (m == "TATA") {
-    p <- p + geom_vline(xintercept = g[motif == "TATA", median(tata_box)], linetype = 3, colour = cols[["TATA"]])
-    xlab <- paste0(xlab, "; dotted red line = median TATA box")
-  }
-  p + geom_ribbon(aes(ymin = mean - se, ymax = mean + se), colour = NA, alpha = 0.2) +
-    geom_line(linewidth = 0.5) +
-    facet_wrap(~ signal, scales = "free_y", ncol = 1, strip.position = "left") +
-    scale_colour_manual(values = cols, labels = labels, name = NULL) +
-    scale_fill_manual(values = cols, labels = labels, name = NULL) +
-    labs(x = xlab, y = NULL, title = sprintf("Mean gene profiles (+/- se), %s promoters (n = %d genes) vs all other genes (n = %d)", m, n_m, nrow(g) - n_m)) +
+# genes of motif classes with >= MIN_CLASS_GENES genes, motifs ordered by median +1 start;
+# tf_10_80_core = sum of the three size classes
+class_genes <- function(g) {
+  x <- copy(g)[, tf_10_80_core := tf_10_30_core + tf_30_60_core + tf_60_80_core]
+  keep <- x[, .N, by = motif][N >= MIN_CLASS_GENES, motif]
+  ord <- x[motif %in% keep, .(m = median(plus1_start_median, na.rm = TRUE)), by = motif][order(m), motif]
+  list(all = x, genes = x[motif %in% keep][, motif := factor(motif, ord)][])
+}
+
+# Kruskal-Wallis over classes (BH over features); each motif vs all other genes of g
+# (Wilcoxon, BH over motifs within a feature)
+class_plot_tests <- function(cg) {
+  x <- cg$genes; all <- cg$all
+  kw <- rbindlist(lapply(names(CLASS_FEATURES), function(f) {
+    y <- x[!is.na(get(f))]
+    list(test = "kruskal_wallis", feature = f, motif = NA_character_, n_motif = nrow(y), n_other = NA_integer_,
+         median_motif = NA_real_, median_other = NA_real_, p = kruskal.test(y[[f]], droplevels(y$motif))$p.value)
+  }))[, fdr := p.adjust(p, "BH")]
+  vs <- rbindlist(lapply(names(CLASS_FEATURES), function(f) rbindlist(lapply(levels(x$motif), function(m) {
+    a <- all[motif == m & !is.na(get(f))][[f]]; o <- all[motif != m & !is.na(get(f))][[f]]
+    list(test = "motif_vs_rest", feature = f, motif = m, n_motif = length(a), n_other = length(o),
+         median_motif = median(a), median_other = median(o), p = suppressWarnings(wilcox.test(a, o))$p.value)
+  }))))[, fdr := p.adjust(p, "BH"), by = feature]
+  rbind(kw, vs)
+}
+
+# 1. one dot per gene (coloured by gene group) over a box per motif
+class_gene_dots <- function(cg, tests) {
+  f <- c("plus1_start_median", "tf_10_30_core")
+  d <- melt(cg$genes, id.vars = c("gene_name", "motif", "group"), measure.vars = f, variable.name = "feature")[!is.na(value)]
+  d[, feature := factor(CLASS_FEATURES[as.character(feature)], CLASS_FEATURES[f])]
+  n <- cg$genes[, .N, by = motif]
+  xl <- setNames(sprintf("%s
+n=%d", n$motif, n$N), as.character(n$motif))
+  top <- d[, .(y = max(value)), by = feature]
+  lab <- merge(tests[test == "motif_vs_rest" & feature %in% f], data.table(feature = f), by = "feature")
+  lab[, `:=`(motif = factor(motif, levels(cg$genes$motif)), feature = factor(CLASS_FEATURES[feature], CLASS_FEATURES[f]))]
+  lab <- merge(lab, top, by = "feature")[, txt := sprintf("q=%.2g", fdr)]
+  kw <- tests[test == "kruskal_wallis" & feature %in% f]
+  ggplot(d, aes(motif, value)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, colour = "grey55", fill = "grey95") +
+    geom_jitter(aes(colour = group), width = 0.18, height = 0, size = 1.6, alpha = 0.8) +
+    geom_text(data = lab, aes(motif, y * 1.08, label = txt), size = 2.8) +
+    facet_wrap(~ feature, scales = "free_y", nrow = 1) +
+    scale_x_discrete(labels = xl) +
+    scale_colour_manual(values = GROUP_COLORS, name = "gene group") +
+    labs(x = "Puffin dominant motif (ordered by median +1 start)", y = NULL,
+         title = "Promoter features by Puffin dominant motif (one dot per gene, not adjusted for gene group)",
+         subtitle = sprintf("Kruskal-Wallis: +1 start FDR = %.2g, 10-30 bp footprints (TSS +/- 200) FDR = %.2g; q = each motif vs all other genes, Wilcoxon BH",
+                            kw[feature == f[1], fdr], kw[feature == f[2], fdr])) +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+}
+
+# mean gene profile per motif (columns, in `motifs` order) vs all other genes (grey) for each of
+# `signals` (rows), from motif_profiles(); dotted red line in the TATA column = median TATA box
+motif_profile_grid <- function(mp, g, motifs, signals, title) {
+  d <- mp[motif %in% motifs & signal %in% signals & position >= PROFILE_XLIM[1] & position <= PROFILE_XLIM[2]]
+  d[, signal := factor(SIGNALS[as.character(signal)], SIGNALS[signals])]
+  d[, motif := factor(motif, motifs)]
+  d[, line := factor(fifelse(set == OTHER_GENES, OTHER_GENES, "motif genes"), c("motif genes", OTHER_GENES))]
+  n <- g[motif %in% motifs, .N, by = motif]
+  ml <- setNames(sprintf("%s (n=%d)", n$motif, n$N), as.character(n$motif))
+  box <- if ("TATA" %in% motifs) data.table(motif = factor("TATA", motifs), x = g[motif == "TATA", median(tata_box)]) else NULL
+  ggplot(d[line == OTHER_GENES], aes(position, mean)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+    (if (!is.null(box)) geom_vline(data = box, aes(xintercept = x), linetype = 3, colour = MOTIF_COLORS[["TATA"]])) +
+    geom_line(colour = "grey60", linewidth = 0.4) +
+    geom_ribbon(data = d[line != OTHER_GENES], aes(ymin = mean - se, ymax = mean + se, fill = motif), alpha = 0.25) +
+    geom_line(data = d[line != OTHER_GENES], aes(colour = motif), linewidth = 0.6) +
+    facet_grid(signal ~ motif, scales = "free_y", switch = "y", labeller = labeller(motif = ml)) +
+    scale_colour_manual(values = MOTIF_COLORS, guide = "none") + scale_fill_manual(values = MOTIF_COLORS, guide = "none") +
+    scale_x_continuous(breaks = c(-500, 0, 500)) +
+    labs(x = "Position relative to TSS (bp, 10 bp bins)", y = NULL, title = title) +
+    theme_bw(base_size = 10) + theme(strip.background = element_blank(), strip.placement = "outside")
+}
+
+# 3. per read +1 start density per motif; genes with >= MIN_PLUS1_READS +1 reads, each gene weight 1
+class_plus1_density <- function(reads, cg) {
+  x <- merge(reads[!is.na(plus1_start), .(gene, plus1_start)], cg$genes[, .(gene = gene_name, motif)], by = "gene")
+  x[, n := .N, by = gene]
+  x <- x[n >= MIN_PLUS1_READS][, w := 1 / n][, w := w / sum(w), by = motif]
+  med <- cg$genes[, .(m = median(plus1_start_median, na.rm = TRUE), N = sum(!is.na(plus1_start_median))), by = motif]
+  ml <- setNames(sprintf("%s (n=%d genes)", med$motif, med$N), as.character(med$motif))
+  ggplot(x, aes(plus1_start, weight = w, fill = motif, colour = motif)) +
+    geom_density(alpha = 0.35, adjust = 0.6, linewidth = 0.4) +
+    geom_vline(data = med, aes(xintercept = m, colour = motif), linetype = 2) +
+    facet_wrap(~ motif, ncol = 1, strip.position = "left", labeller = labeller(motif = ml)) +
+    scale_colour_manual(values = MOTIF_COLORS, guide = "none") + scale_fill_manual(values = MOTIF_COLORS, guide = "none") +
+    labs(x = "+1 nucleosome start (bp from TSS; reads with an open TSS)", y = NULL,
+         title = "Per read +1 start by Puffin dominant motif") +
     theme_bw(base_size = 10) +
-    theme(legend.position = "bottom", strip.background = element_blank(), strip.placement = "outside")
+    theme(strip.background = element_blank(), strip.placement = "outside", strip.text.y.left = element_text(angle = 0),
+          axis.text.y = element_blank(), axis.ticks.y = element_blank())
 }
 
-correlation_heatmap <- function(cr) {
-  d <- copy(cr)
-  d[, contribution := factor(sub("_contribution$", "", contribution),
-                             rev(sub("_contribution$", "", CONTRIBUTIONS)))]
-  d[, occupancy := factor(CORE_OCCUPANCY[occupancy], CORE_OCCUPANCY)]
-  d[, cell := sprintf("%.2f%s", rho, fifelse(fdr < 0.05, "*", ""))]
-  lim <- max(abs(d$rho), na.rm = TRUE)
-  ggplot(d, aes(occupancy, contribution, fill = rho)) +
-    geom_tile(colour = "white") + geom_text(aes(label = cell), size = 3.5) +
-    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-lim, lim), name = "Spearman rho") +
-    labs(x = "Core occupancy (TSS +/- 200 bp)", y = "Puffin motif contribution",
-         title = sprintf("Puffin motif contributions vs single-molecule occupancy (n = %d genes)", max(d$n)),
-         subtitle = "* BH FDR < 0.05 over all contribution x occupancy pairs") +
-    theme_bw(base_size = 11) + theme(panel.grid = element_blank())
+# 5. +1 start median vs 10-30 bp core occupancy, one dot per gene, large point = motif median
+class_scatter <- function(cg) {
+  x <- cg$genes[!is.na(plus1_start_median)]
+  med <- x[, .(plus1_start_median = median(plus1_start_median), tf_10_30_core = median(tf_10_30_core), N = .N), by = motif]
+  ggplot(x, aes(plus1_start_median, tf_10_30_core, colour = motif)) +
+    geom_point(size = 1.4, alpha = 0.45) +
+    geom_point(data = med, size = 5, shape = 21, fill = "white", stroke = 1.4) +
+    ggrepel::geom_text_repel(data = med, aes(label = sprintf("%s (n=%d)", motif, N)), size = 3.5,
+                             box.padding = 1, point.padding = 0.8, min.segment.length = 0,
+                             show.legend = FALSE, seed = 1) +
+    scale_colour_manual(values = MOTIF_COLORS, name = NULL) +
+    labs(x = CLASS_FEATURES[["plus1_start_median"]], y = "10-30 bp footprint occupancy (TSS +/- 200 bp)",
+         title = "+1 start vs 10-30 bp footprint occupancy per gene; large circles = motif medians") +
+    theme_bw(base_size = 11)
 }
 
+# 1. load genes, reads and gene profiles; summarise per gene; run the TATA and motif tests
+# 2. load the published variability and test the sequence predictors
+# 3. write the tables, then tata_features.pdf
+# 4. motif classes with >= MIN_CLASS_GENES genes: class tests, the all-motif profile grid
+#    (puffin_motif_smf_features.pdf), gene dots, +1 density and scatter PDFs
 main <- function() {
   genes <- load_genes()
   reads <- load_reads(genes)
@@ -311,7 +403,6 @@ main <- function() {
   tests <- tata_tests(g)
   mp <- motif_profiles(prof)
   motif_tests <- motif_class_tests(g)
-  cr <- motif_correlations(g)
   states <- box_state_summary(reads)
   v <- load_variability()
   pred <- variability_predictors(v)
@@ -323,14 +414,25 @@ main <- function() {
   fwrite(tests, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_tests.tsv"), sep = "\t", na = "NA")
   fwrite(mp, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_profiles.tsv"), sep = "\t", na = "NA")
   fwrite(motif_tests, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_motif_tests.tsv"), sep = "\t", na = "NA")
-  fwrite(cr, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_motif_correlations.tsv"), sep = "\t", na = "NA")
   fwrite(states, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_box_state.tsv"), sep = "\t", na = "NA")
   fwrite(pred, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_variability_predictors.tsv"), sep = "\t", na = "NA")
-  grDevices::pdf(file.path(PUFFIN_OUT, "plots/puffin_motif_smf_features.pdf"), width = 13, height = 9, onefile = TRUE)
-  on.exit(grDevices::dev.off())
-  for (m in names(MOTIF_COLORS)) print(motif_profile_plot(mp, g, m))
-  print(correlation_heatmap(cr))
+  grDevices::pdf(file.path(PUFFIN_OUT, "plots/tata_features.pdf"), width = 13, height = 9, onefile = TRUE)
   for (p in variability_plots(v, pred)) print(p)
+  grDevices::dev.off()
+
+  cg <- class_genes(g)
+  ct <- class_plot_tests(cg)
+  fwrite(ct, file.path(PUFFIN_OUT, "tables/puffin_motif_smf_class_plot_tests.tsv"), sep = "\t", na = "NA")
+  nm <- nlevels(cg$genes$motif)
+  all_motifs <- c(levels(cg$genes$motif), setdiff(names(MOTIF_COLORS), levels(cg$genes$motif)))
+  ggsave(file.path(PUFFIN_OUT, "plots/puffin_motif_smf_features.pdf"),
+         motif_profile_grid(mp, g, all_motifs, names(SIGNALS),
+           "Mean gene profile per Puffin dominant motif (+/- se); grey = all other genes; dotted red = median TATA box"),
+         width = 16, height = 10)
+  ggsave(file.path(PUFFIN_OUT, "plots/puffin_motif_class_gene_dots.pdf"), class_gene_dots(cg, ct), width = 12, height = 5.5)
+  ggsave(file.path(PUFFIN_OUT, "plots/puffin_motif_class_plus1_density.pdf"), class_plus1_density(reads, cg),
+         width = 7, height = 1 + 1.1 * nm)
+  ggsave(file.path(PUFFIN_OUT, "plots/puffin_motif_class_scatter.pdf"), class_scatter(cg), width = 8, height = 6.5)
 }
 
 if (sys.nframe() == 0L) main()

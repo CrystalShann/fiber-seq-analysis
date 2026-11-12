@@ -423,9 +423,10 @@ plot_example_footprints <- function(g, dat, bundle, rows, output, clustered, sho
 # Optional: met_mat (reads x positions m6A matrix of assemble_region_m6a()) adds the m6A fraction of
 # all reads as a black panel; tata_center (TSS-relative TATA box centre, Puffin) adds a TATA box
 # panel on top, the Pol II ChIP track to the signal panel and shades the TATA box +/- tata_half bp
-# yellow in every panel.
+# yellow in every panel. motif_label names that motif in the panel (e.g. "YY1 site" for a
+# Puffin YY1 centre passed as tata_center).
 plot_read_level <- function(g, bundle, read_order, output, met_mat = NULL, tata_center = NULL,
-                            tata_half = 4L) {
+                            tata_half = 4L, motif_label = "TATA box") {
   rows <- data.table(RID = read_order)
   rows[, plus1 := plus1_offset(footprint_matrix(rows, bundle$nucs))]
   rows[, `:=`(group = factor(fifelse(is.na(plus1), "none", "plus1"), levels = c("plus1", "none")),
@@ -459,8 +460,8 @@ plot_read_level <- function(g, bundle, read_order, output, met_mat = NULL, tata_
       annotate("rect", xmin = box[1], xmax = box[2], ymin = 0.2, ymax = 0.8, fill = "#FFFF00",
                colour = "grey30", linewidth = 0.2) +
       annotate("text", x = box[2] + 15, y = 0.5, hjust = 0, size = 3,
-               label = sprintf("TATA box (Puffin centre %d bp)", as.integer(tata_center))) +
-      scale_y_continuous(limits = c(0, 1)) + xs + labs(y = "TATA box") + theme_rows +
+               label = sprintf("%s (Puffin centre %d bp)", motif_label, as.integer(tata_center))) +
+      scale_y_continuous(limits = c(0, 1)) + xs + labs(y = motif_label) + theme_rows +
       theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
   }
 

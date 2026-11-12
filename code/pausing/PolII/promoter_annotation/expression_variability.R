@@ -1,7 +1,6 @@
 #!/usr/bin/env Rscript
 # Run: bash code/pausing/PolII/run_gene_examples.sh code/pausing/PolII/promoter_annotation/expression_variability.R
-# Set FETCH_SOURCE=1 to download/verify the public source (requires annotation-directory access).
-suppressPackageStartupMessages({library(data.table); library(digest)})
+suppressPackageStartupMessages(library(data.table))
 setDTthreads(1L)
 BASE <- '/project/spott/cshan/fiber-seq/LCL_project/pausing/PolII'
 SOURCE_DIR <- '/project/spott/cshan/annotations/LCL_public_data/Einarsson_2022_eLife_80943'
@@ -10,37 +9,15 @@ OUT <- file.path(BASE, 'promoter_annotation')
 TABLES <- file.path(OUT, 'tables')
 PLOTS <- file.path(OUT, 'plots')
 FAMILIES <- c('ETS', 'SP', 'NFY', 'CREB', 'NRF1', 'ZNF143')
-URL <- 'https://cdn.elifesciences.org/articles/80943/elife-80943-supp2-v2.zip'
-sha256 <- function(p) digest(file = p, algo = 'sha256')
 
-download_source <- function() {
-  dir.create(SOURCE_DIR, recursive = TRUE, showWarnings = FALSE)
-  tmp <- tempfile(fileext = '.zip')
-  on.exit(unlink(tmp))
-  download.file(URL, tmp, mode = 'wb', method = 'libcurl', quiet = TRUE)
-  target <- file.path(SOURCE_DIR, basename(URL))
-  if (file.exists(target)) stopifnot(sha256(target) == sha256(tmp)) else
-    stopifnot(file.copy(tmp, target))
-  td <- tempfile(); dir.create(td)
-  on.exit(unlink(td, recursive = TRUE), add = TRUE)
-  unzip(tmp, files = 'supplementary_file_2.tsv', exdir = td)
-  extracted <- file.path(td, 'supplementary_file_2.tsv')
-  if (file.exists(SOURCE)) stopifnot(sha256(SOURCE) == sha256(extracted)) else
-    stopifnot(file.copy(extracted, SOURCE))
-  readme <- file.path(SOURCE_DIR, 'README.md')
-  if (!file.exists(readme)) writeLines(c(
-    '# Einarsson et al., 2022, eLife 11:e80943', '',
-    'Promoter sequence and architecture determine expression variability and confer robustness to genetic variants.',
-    'Authors: Hjörleifur Einarsson, Marco Salvatore, Christian Vaagensø, Nicolas Alcaraz, Jette Bornholdt, Sarah Rennie, Robin Andersson.',
-    'DOI: https://doi.org/10.7554/eLife.80943', paste('Source:', URL),
-    paste('Downloaded UTC:', format(Sys.time(), tz = 'UTC', usetz = TRUE)),
-    'Original ZIP and extracted TSV preserved. First data field is an unnamed promoter-coordinate row identifier.',
-    paste(basename(target), 'SHA256:', sha256(target)),
-    paste(basename(SOURCE), 'SHA256:', sha256(SOURCE))), readme)
-}
-
+# TRUE where point lies in the closed interval [start, end] (vectorised over start/end)
 contains <- function(start, end, point) start <= point & point <= end
 
+# Figures for the genes matched to a published Einarsson promoter:
+# 1. feature_boxplots.pdf: TATA activation, nucleosome occupancy and m6A fraction (TSS +/-200 bp)
+#    per published adjusted-variability quartile, box + one jittered dot per gene
+# 2. expression_m6a_nucleosome_variability.pdf: m6A fraction and nucleosome occupancy vs the
+#    published adjusted log10(CV2), one dot per gene
 comparison_figures <- function(d) {
   blue <- '#2166AC'
   d <- d[match_status == 'matched']
@@ -85,8 +62,18 @@ comparison_figures <- function(d) {
   dev.off()
 }
 
+# 1. read the fiber gene features and the Puffin 04a scores, check they describe the same genes
+#    at the same TSS (fiber tss = puffin_tss0 + 1)
+# 2. per gene: keep the fiber features and Puffin contributions, summing + and - orientations
+#    into one contribution per motif family
+# 3. read the published table (Einarsson et al., 2022 supplementary file 2) and parse its promoter
+#    IDs (chr:start-end;strand)
+# 4. match each gene to the published promoter on the same chromosome and strand whose interval
+#    holds the fiber TSS and whose Ensembl gene ID agrees; exactly one hit = matched (variability
+#    columns copied as elife_*), more = ambiguous, none = unmatched
+# 5. write gene_annotations.tsv (one row per gene) and gene_variability_qc.tsv (the candidate
+#    promoters behind every match), then the figures unless ANNOTATION_TABLES_ONLY=1
 main <- function() {
-  if (Sys.getenv('FETCH_SOURCE') == '1') download_source()
   stopifnot(file.exists(SOURCE))
   dir.create(TABLES, recursive = TRUE, showWarnings = FALSE)
   dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
