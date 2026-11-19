@@ -21,21 +21,18 @@ import argparse
 import gzip
 import os
 import sys
-import subprocess
 import tempfile
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "parsing_functions"))
 from count_and_test_pairs import bh, count_pairs, test_counts, summarize_coaccess_counts
+import fiber_regions as fr
 
 ROOT = Path(os.environ.get("LCL_COACCESS_ROOT", "/project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE"))
 METATABLE = os.environ.get("LCL_SAMPLE_METATABLE", "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv")
-BEDTOOLS = "/project/spott/cshan/envs/bedtools/bin/bedtools"
-TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
-CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
+CHROMS = fr.CHROMS
 CELLS = ["co_closed", "CRE1_access", "CRE2_access", "co_access"]
 COVERAGE_MODE = "aligned_blocks_v1"
 # coverage filter: only pairs with >= 20 fibers spanning both cCREs enter the BH family
@@ -67,13 +64,7 @@ def sample_manifest(path, root):
     for name in samples.sample_name:
         if any(c in name for c in "/\\\t\n\r"):
             raise ValueError(f"Invalid sample identifier: {name!r}")
-    samples["donor"] = samples.cell_line
-    samples["cram_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-filtered.cram") for r in samples.itertuples()]
-    samples["peaks_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-peaks.bed.gz") for r in samples.itertuples()]
-    samples["elements_path"] = [str(Path(r.fire_dir) / "additional-outputs-v0.1/fire-peaks" / f"{r.sample_name}-v0.1-fire-elements.bed.gz") for r in samples.itertuples()]
-    samples["spans_path"] = [str(root / s / f"{s}.read_spans.bed.gz") for s in samples.sample_name]
-    samples["blocks_path"] = [str(root / s / f"{s}.aligned_blocks.bed.gz") for s in samples.sample_name]
-    return samples
+    return fr.add_lcl_fire_paths(samples, root)
 
 #################################################
 # check every file exists in sample meta table
@@ -131,115 +122,15 @@ def build_pairs(cre, membership, min_dist, max_dist):
     return pairs, gm
 
 #################################################
-# run bedtools and outputs error message
+# spanning reads and accessible reads for every CRE
 #################################################
-def command_lines(command):
-    """Stream bedtools output; do not hold every overlap line in memory."""
-    with tempfile.TemporaryFile(mode="w+t") as err:
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=err, text=True)
-        try:
-            for line in proc.stdout:
-                yield line.rstrip("\n").split("\t")
-        finally:
-            proc.stdout.close()
-            code = proc.wait()
-        if code:
-            err.seek(0)
-            raise RuntimeError(f"{command[0]} failed: {err.read()[:4000]}")
-          
-#################################################
-# Convert bed12 to bed3
-#################################################
-# /project/spott/cshan/fiber-seq/LCL_project/co-accessibility/CRE_co-accessibility_FIRE/<sample>/<sample>.aligned_blocks.bed.gz
-def aligned_blocks(fields):
-    """Decode BED12 (without zeros at the end and beginning) from bamtobed -bed12 -splitD to a list of genomic coordinates"""
-    # read the read's outer start and end, and the number of blocks from bed12
-    start, end, count = int(fields[1]), int(fields[2]), int(fields[9])
-    # size = size of the block
-    # offsets = distance to the start 
-    sizes = [int(x) for x in fields[10].rstrip(",").split(",")]
-    offsets = [int(x) for x in fields[11].rstrip(",").split(",")]
-    # block start = read start + offset
-    # block end - block start + size
-    blocks = [(start + offset, start + offset + size) for offset, size in zip(offsets, sizes)]
-    if len(sizes) != count or len(offsets) != count or not blocks or any(
-            s < start or e > end or e < s or (i and s < blocks[i-1][1])
-            for i, (s, e) in enumerate(blocks)):
-        raise ValueError(f"Invalid aligned BED12 blocks for {fields[3]}")
-    return [(s, e) for s, e in blocks if e > s]
+# fr.region_reads (parsing_functions/fiber_regions.py). With rule="aligned" the read's
+# aligned blocks must cover every base of the cCRE, and ONE FIRE element must cover
+# >= fraction of the cCRE after clipping to aligned blocks.
 
-#################################################
-# counts how many bases of an interval [start, end) are covered by a read’s aligned blocks
-#################################################
-
-# Example: A read has blocks (1000, 1200) and (1300, 1500), and the cCRE is (1150, 1350).
-# Block 1: min(1200, 1350) − max(1000, 1150) = 1200 − 1150 = 50
-# Block 2: min(1500, 1350) − max(1300, 1150) = 1350 − 1300 = 50
-# Total = 100 bp
-
-def aligned_overlap(blocks, start, end):
-    # overlap length between the block and the interval
-    return sum(max(0, min(e, end) - max(s, start)) for s, e in blocks)
-
-#################################################
-# get spanning reads, and accessible reads for every CRE
-#################################################
-def incidence_for_chrom(chrom, cre_bed, blocks_path, elements_path, fire_fraction, tmpdir):
-    """Intersect each FIRE with aligned blocks."""
-    # pull only chrom out of the sample's aligned blocks file and its FIRE elements file
-    spans = tmpdir / "spans.bed"
-    elements = tmpdir / "elements.bed"
-    for source, destination in ((blocks_path, spans), (elements_path, elements)):
-        with destination.open("w") as output:
-            subprocess.run([TABIX, str(source), chrom], stdout=output, check=True)
-    # maps cCRE ID to read ID
-    coverage = defaultdict(set)
-    blocks_by_read = {}
-    # which read covers every base of the CRE (bedtools pulls reads touching the CRE by >=1bp, then the check below keeps only full coverage)
-    #################################################
-    # find every read that has outer span overlaps a cCRE, holds CRE and read side by side
-    # -wa -wb prints both the cCRE record and the read record on one line
-    command = [BEDTOOLS, "intersect", "-a", str(cre_bed), "-b", str(spans), "-wa", "-wb"]
-    # pull out the read ID, and take the CRE end and start, 
-    # count how many bases of CRE fall inside the read's aligned block
-    for fields in command_lines(command):
-        rid = fields[8]  # BED5 cCRE followed by BED12 primary alignment
-        if rid not in blocks_by_read:
-            blocks_by_read[rid] = aligned_blocks(fields[5:17])
-        start, end = int(fields[1]), int(fields[2])
-        overlap = aligned_overlap(blocks_by_read[rid], start, end)
-        # the read's aligned blocks must cover every base of the CRE
-        if overlap == end - start:
-          # if the read pass, write the read ID in CRE coverage
-            coverage[fields[3]].add(rid)
-            
-    # For the reads that cover every base of the CRE, on which read is each CRE accessible (one FIRE element covers >=50% of the CRE)?
-    #################################################
-    # accessible = FIRE element overlap with 50% of the CRE length
-    
-    # Example. The cCRE is 200 bp, so the threshold is 100 bp. One FIRE element covers 160 bp of it, 
-    # but a deletion removes 70 bp of that stretch, leaving 90 aligned bp. That is below 100, 
-    # so the read is not accessible. If the aligned part were 110 bp, it would be
-    
-    accessible = defaultdict(set)
-    
-    for fields in command_lines([BEDTOOLS, "intersect", "-a", str(cre_bed), "-b", str(elements),
-                                  "-f", str(fire_fraction), "-wa", "-wb"]):
-        rid = fields[8]
-        # take only FIRE element that sits inside the CRE
-        start, end = max(int(fields[1]), int(fields[6])), min(int(fields[2]), int(fields[7]))
-        # count the # of aligned blocks, using the read's aligned blocks from coverage step
-        overlap = aligned_overlap(blocks_by_read.get(rid, ()), start, end)
-        if overlap > 0 and overlap >= fire_fraction * (int(fields[2]) - int(fields[1])):
-            accessible[fields[3]].add(rid)
-    # For each cCRE, only keep accessible regions that apear in CRE coverage read     
-    orphan_hits = 0
-    for cre_id in accessible:
-        before = len(accessible[cre_id])
-        accessible[cre_id] &= coverage.get(cre_id, set())
-        orphan_hits += before - len(accessible[cre_id])
-    spans.unlink(); elements.unlink()
-    return coverage, accessible, orphan_hits
+# Example. The cCRE is 200 bp, so the threshold is 100 bp. One FIRE element covers 160 bp of it,
+# but a deletion removes 70 bp of that stretch, leaving 90 aligned bp. That is below 100,
+# so the read is not accessible. If the aligned part were 110 bp, it would be
 
 #################################################
 # build 2x2 table for every CRE pair, for one sample and on one chr
@@ -296,6 +187,8 @@ def main():
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--prepare-manifest", action="store_true", help="Validate all31 source inputs and write universe/sample_manifest.tsv only")
     ap.add_argument("--fire-overlap-fraction", type=float, default=0.5, help="Fraction of cCRE covered by ONE same-read FIRE element")
+    ap.add_argument("--read-rule", choices=fr.READ_RULES, default="aligned",
+                    help="aligned (default): aligned blocks cover every cCRE base; span: read span contains the cCRE")
     ap.add_argument("--min-dist", type=int, default=500)
     ap.add_argument("--max-dist", type=int, default=20000)
     ap.add_argument("--pseudocount", type=int, default=1)
@@ -325,9 +218,11 @@ def main():
     compare = ["sample_name", "fire_dir", "donor", "spans_path", "elements_path"]
     if not saved_manifest[compare].equals(samples[compare]):
         raise ValueError("Manifest differs from current sample CSV/root; rebuild LCL_fire_universe.sh")
-    require_files([p for col in ("blocks_path", "elements_path") for p in samples[col]] +
-                  [p + ".tbi" for col in ("blocks_path", "elements_path") for p in samples[col]])
-    for sample in samples.itertuples(index=False):
+    reads_col = "blocks_path" if args.read_rule == "aligned" else "spans_path"
+    coverage_mode = COVERAGE_MODE if args.read_rule == "aligned" else "read_spans"
+    require_files([p for col in (reads_col, "elements_path") for p in samples[col]] +
+                  [p + ".tbi" for col in (reads_col, "elements_path") for p in samples[col]])
+    for sample in (samples.itertuples(index=False) if args.read_rule == "aligned" else ()):
         marker = Path(sample.blocks_path + ".source.tsv")
         if not marker.exists() or marker.read_text().splitlines()[:2] != [sample.cram_path, COVERAGE_MODE]:
             raise ValueError(f"Rebuild aligned blocks for {sample.sample_name}: missing/current provenance required")
@@ -364,8 +259,8 @@ def main():
             involved = set(chrom_pairs.CRE1) | set(chrom_pairs.CRE2)
             cre[cre.CRE_ID.isin(involved)].to_csv(cre_bed, sep="\t", index=False, header=False)
             for sample in samples.itertuples(index=False):
-                cov, acc, orphans = incidence_for_chrom(chrom, cre_bed, sample.blocks_path, sample.elements_path,
-                                                       args.fire_overlap_fraction, temp)
+                cov, acc, orphans = fr.region_reads(chrom, cre_bed, getattr(sample, reads_col), sample.elements_path,
+                                                    temp, args.read_rule, args.fire_overlap_fraction)
                 cells = count_pairs(chrom_pairs, cov, acc)
                 pooled[idx] += cells
                 shared = cells.sum(axis=1)
@@ -392,7 +287,7 @@ def main():
     result["dataset"] = "LCL"
     result["analysis_scope"] = args.chrom or "genome-wide"
     result["n_samples"] = len(samples)
-    result["coverage_mode"] = COVERAGE_MODE
+    result["coverage_mode"] = coverage_mode
     result["read_rule"] = "contain"
     for field in ("fire_overlap_fraction", "min_dist", "max_dist", "pseudocount"):
         result[field] = getattr(args, field)

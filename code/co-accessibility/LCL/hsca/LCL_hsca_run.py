@@ -20,9 +20,10 @@ import pandas as pd
 
 from hsca_functions import (AUTOSOMES, CELLS, MIN_READS, ROOT, allele_counts,
                             call_status, choose_cre_variants, choose_pair_variants, count_pairs, fisher_bh,
-                            het_snvs, incidence_for_chrom, phased_samples,
+                            het_snvs, phased_samples,
                             read_alleles)
 from hsca_functions import PHASED_METATABLE
+import fiber_regions as fr
 
 SHARED = {}  # pairs and cCREs, inherited by the forked workers
 ALLELE_COUNTS = ["ref_open", "ref_closed", "alt_open", "alt_closed"]
@@ -51,7 +52,10 @@ def process_sample(sample, reference, variants, pair_variants):
             cre_bed = tmp / "cre.bed"
             cres[cres.CRE_ID.isin(set(chrom_pairs.CRE1) | set(chrom_pairs.CRE2))].to_csv(
                 cre_bed, sep="\t", index=False, header=False)
-            cov, acc, _ = incidence_for_chrom(chrom, cre_bed, sample.blocks_path, sample.elements_path, 0.5, tmp)
+            rule = SHARED["read_rule"]
+            reads = sample.blocks_path if rule == "aligned" else sample.spans_path
+            cov, acc, _ = fr.region_reads(chrom, cre_bed, reads, sample.elements_path, tmp,
+                                          rule, SHARED["fire_overlap_fraction"])
             cells = count_pairs(chrom_pairs, cov, acc)
             if not np.array_equal(cells, reference.loc[chrom_pairs.CRE_pair, CELLS].to_numpy()):
                 raise ValueError(f"{sample.sample_name} {chrom}: counts differ from LCL_pair_sample_counts")
@@ -126,6 +130,10 @@ def main():
     ap.add_argument("--sample-metatable", default=PHASED_METATABLE)
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--chrom", choices=AUTOSOMES, help="Smoke test: this chromosome only (BH within it)")
+    ap.add_argument("--read-rule", choices=fr.READ_RULES, default="aligned",
+                    help="must match the LCL_coaccess_cres.py run that wrote LCL_pair_sample_counts")
+    ap.add_argument("--fire-overlap-fraction", type=float, default=0.5,
+                    help="must match the LCL_coaccess_cres.py run that wrote LCL_pair_sample_counts")
     ap.add_argument("--workers", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)))
     args = ap.parse_args()
     out_dir = args.out_dir or args.root.parent / "hsca" / "outputs"
@@ -138,7 +146,8 @@ def main():
     cres = pd.read_csv(args.root / "universe" / "cre_universe.bed", sep="\t", header=None,
                        names=["chrom", "start", "end", "CRE_ID", "CRE_label"])
     cres = cres[cres.CRE_ID.isin(set(pairs.CRE1) | set(pairs.CRE2))].reset_index(drop=True)
-    SHARED.update(pairs=pairs, cres=cres)
+    SHARED.update(pairs=pairs, cres=cres, read_rule=args.read_rule,
+                  fire_overlap_fraction=args.fire_overlap_fraction)
     print(f"{len(samples)} phased samples, {len(pairs)} pairs, {len(cres)} cCREs on {len(chroms)} autosomes", flush=True)
 
     reference = pd.read_csv(args.root / "coaccess" / "LCL_pair_sample_counts.tsv.gz", sep="\t",

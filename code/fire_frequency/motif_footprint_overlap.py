@@ -3,8 +3,11 @@ from pathlib import Path
 from collections import defaultdict
 import hashlib
 import json
+import sys
 import numpy as np
 import pysam
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'parsing_functions'))
+import fiber_regions as fr
 
 
 def build_footprint_index(project_root, chromosomes, cache_dir, timepoints=(0, 15)):
@@ -15,7 +18,7 @@ def build_footprint_index(project_root, chromosomes, cache_dir, timepoints=(0, 1
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    fire_root = Path('/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE')
+    fire_root = fr.MACROPHAGE_FIRE_ROOT
     tf_root = Path(project_root) / 'macrophage_project/FiberHMM/extract/firehmm_tf'
     result = {}
     for chrom in sorted(chromosomes):
@@ -23,7 +26,7 @@ def build_footprint_index(project_root, chromosomes, cache_dir, timepoints=(0, 1
         for time in timepoints:
             sample = f'LPS_{time}'
             sources.append((
-                fire_root / sample / f'additional-outputs-v0.1/fire-peaks/{sample}-v0.1-fire-elements.bed.gz',
+                fr.macrophage_elements_path(sample, fire_root),
                 tf_root / f'LPS{time}' / f'LPS{time}_hmm_extracted_tf_{chrom}.bed.gz'))
         signature = hashlib.sha256(json.dumps({
             'version': 1, 'score': 50, 'size': [10, 80], 'same_read_fire': True,
@@ -50,17 +53,7 @@ def build_footprint_index(project_root, chromosomes, cache_dir, timepoints=(0, 1
                     segments = fires.get(fields[3])
                     if not segments:
                         continue
-                    sizes = fields[10].rstrip(',').split(',')
-                    offsets = fields[11].rstrip(',').split(',')
-                    scores = fields[12].rstrip(',').split(',')
-                    assert len(sizes) == len(offsets) == len(scores) == int(fields[9])
-                    base = int(fields[1])
-                    for size, offset, score in zip(sizes, offsets, scores):
-                        size = int(size)
-                        if not 10 <= size <= 80 or float(score) < 50:
-                            continue
-                        start = base + int(offset)
-                        end = start + size
+                    for start, end, _ in fr.expand_blocks(fields, sizes=(10, 80), min_score=50):
                         if any(a <= start and end <= b for a, b in segments):
                             intervals.add((start, end))
             del fires

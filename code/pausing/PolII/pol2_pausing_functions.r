@@ -456,12 +456,14 @@ plot_read_level <- function(g, bundle, read_order, output, met_mat = NULL, tata_
                                   fill = "#FFFF00", alpha = 0.6)), p$layers)
       p
     }
-    p_tata <- ggplot() + tss_vline() +
+    # motif named in a horizontal left strip like the signal tracks (a y title overflows this short panel)
+    p_tata <- ggplot(data.frame(track = motif_label)) + geom_blank() + tss_vline() +
       annotate("rect", xmin = box[1], xmax = box[2], ymin = 0.2, ymax = 0.8, fill = "#FFFF00",
                colour = "grey30", linewidth = 0.2) +
       annotate("text", x = box[2] + 15, y = 0.5, hjust = 0, size = 3,
                label = sprintf("%s (Puffin centre %d bp)", motif_label, as.integer(tata_center))) +
-      scale_y_continuous(limits = c(0, 1)) + xs + labs(y = motif_label) + theme_rows +
+      facet_grid(track ~ ., switch = "y") +
+      scale_y_continuous(limits = c(0, 1)) + xs + labs(y = NULL) + theme_rows +
       theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
   }
 

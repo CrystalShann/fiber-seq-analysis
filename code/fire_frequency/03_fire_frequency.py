@@ -23,115 +23,18 @@ Outputs in --out-dir:
 """
 
 import argparse
-import subprocess
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "parsing_functions"))
+import fiber_regions as fr
 
 SAMPLES = ["LPS_0", "LPS_5", "LPS_10", "LPS_15"]
-CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
-
-BEDTOOLS = "/project/spott/cshan/envs/bedtools/bin/bedtools"
-TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
-READ_MIN_REGION_FRACTION = 1.0
-FIRE_MIN_REGION_FRACTION = 0.5
 # Per-read FIRE element calls (FDR <= 0.05) from the FIRE pipeline, same numerator
 # source as ../co-accessibility/macrophage/03_coaccess_cres.py; see the note there on why NOT FiberHMM/ft_result_dir.
-FIRE_ROOT = "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE"
-
-###############################
-# function for running bedtools intersect
-
-# BEDTOOLS, "intersect",
-#     "-a", "regions.bed",
-#     "-b", "reads.bed",
-#     "-wa", "-wb"
-
-
-###############################
-def run_intersect(args_list, desc):
-    p = subprocess.run(args_list, capture_output=True, text=True)
-    if p.returncode != 0:
-        sys.exit(f"ERROR: {desc} failed:\n{p.stderr[:2000]}")
-    return p.stdout
-
-
-###############################
-# Count n_reads and n_fire for one chromosome, returning a dictionary of region_id -> (n_reads, n_fire)
-###############################
-# for one chr at one timepoint, it asks for every shared FIRE region
-    # 1. how many unique reads fully cover this region
-    # 2. how many of those reads have a FIRE element covering >= 50% of this region
-
-def counts_for_chrom(chrom, regions, spans_path, fe_path, tmpdir):
-    """{region_id: (n_reads, n_fire)} for one chromosome
-    """
-    # subet to a single chr
-    sub = regions[regions["chrom"] == chrom]
-    if sub.empty:
-        return {}, 0
-    reg_chr = tmpdir / f"regions.{chrom}.bed"
-    # write the regions bed for this chromosome, 4 columns (chrom, start, end, region_id)
-    sub[["chrom", "start", "end", "region_id"]].to_csv(
-        reg_chr, sep="\t", header=False, index=False)
-
-    # extract the read spans and read levelfire elements for this chr
-    spans_chr = tmpdir / f"spans.{chrom}.bed"
-    with open(spans_chr, "w") as fh:
-        # tabix fire-elements.bed.gz chr1
-        p = subprocess.run([TABIX, str(spans_path), chrom], stdout=fh, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        sys.exit(f"ERROR: tabix on spans for {chrom} failed:\n{p.stderr[:2000]}")
-
-    fe_chr = tmpdir / f"fe.{chrom}.bed"
-    with open(fe_chr, "w") as fh:
-        p = subprocess.run([TABIX, str(fe_path), chrom], stdout=fh, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        sys.exit(f"ERROR: tabix on fire elements for {chrom} failed:\n{p.stderr[:2000]}")
-
-    # Denominator: reads spanning the full union region. Since regions are input A,
-    # bedtools -f 1.0 requires 100% of each region to be covered by one read span.
-    cov = defaultdict(set)
-    # run bedtools intersect -a regions.bed -b spans.bed -wa -wb
-    for line in run_intersect(
-            [BEDTOOLS, "intersect", "-a", str(reg_chr), "-b", str(spans_chr),
-             "-f", str(READ_MIN_REGION_FRACTION), "-wa", "-wb"],
-            f"read intersect {chrom}").splitlines():
-        f = line.split("\t")
-        cov[f[3]].add(f[7])          # region_id, read name
-
-    # Numerator candidates: FIRE elements covering at least 50% of the union region.
-    # These read names are subsequently restricted to the full-coverage denominator.
-    acc = defaultdict(set)
-    for line in run_intersect(
-            [BEDTOOLS, "intersect", "-a", str(reg_chr), "-b", str(fe_chr),
-             "-f", str(FIRE_MIN_REGION_FRACTION), "-wa", "-wb"],
-            f"fire element intersect {chrom}").splitlines():
-        f = line.split("\t")
-        acc[f[3]].add(f[7])          # region_id, read name
-
-    # restrict FIRE reads to reads that exist in the read spans (cov)
-    n_orphan = 0 # count reads that are FIRE positive but not in the read spans (cov)
-    counts = {}
-
-    # loop over each region that has least one covering read
-    for r, reads in cov.items():
-        # get the set of FIRE positive reads for this region, if any
-        fire = acc.get(r, set())
-        before = len(fire)
-        fire &= reads
-        n_orphan += before - len(fire)
-        counts[r] = (len(reads), len(fire))
-    for r in acc:
-        if r not in cov:
-            n_orphan += len(acc[r])
-
-    for f in (reg_chr, spans_chr, fe_chr):
-        f.unlink(missing_ok=True)
-    return counts, n_orphan
+FIRE_ROOT = fr.MACROPHAGE_FIRE_ROOT
 
 
 def main():
@@ -145,6 +48,11 @@ def main():
     ap.add_argument("--out-dir",
                     default="/project/spott/cshan/fiber-seq/macrophage_project/fire_frequency")
     ap.add_argument("--timepoints", nargs="+", default=SAMPLES)
+    ap.add_argument("--read-rule", choices=fr.READ_RULES, default="span",
+                    help="span: read span contains the region; aligned: aligned blocks "
+                         "cover every base (needs <s>.aligned_blocks.bed.gz)")
+    ap.add_argument("--fire-overlap-fraction", type=float, default=0.5,
+                    help="minimum fraction of the region covered by ONE FIRE element")
     ap.add_argument("--chrom", default=None, help="restrict to one chromosome (testing)")
     args = ap.parse_args()
 
@@ -156,7 +64,7 @@ def main():
     regions = pd.read_csv(args.union_bed, sep="\t", header=None,
                           names=["chrom", "start", "end"])
     n_union_regions = len(regions)  # rows in fire_peaks_union.bed
-    chroms = [args.chrom] if args.chrom else CHROMS
+    chroms = [args.chrom] if args.chrom else fr.CHROMS
     regions = regions[regions["chrom"].isin(chroms)].reset_index(drop=True)
     regions["region_id"] = (regions["chrom"] + ":" + regions["start"].astype(str)
                             + "-" + regions["end"].astype(str))
@@ -164,26 +72,32 @@ def main():
     print(f"union regions: {len(regions)} of {n_union_regions} in {args.union_bed} "
           f"on {regions['chrom'].nunique()} chromosomes", flush=True)
 
+    regions_bed = tmpdir / "regions.bed"
+    regions[["chrom", "start", "end", "region_id"]].to_csv(
+        regions_bed, sep="\t", header=False, index=False)
+
     long_parts = []
     for s in args.timepoints:
-        spans = Path(args.spans_root) / s / f"{s}.read_spans.bed.gz"
-        fe = Path(FIRE_ROOT) / s / "additional-outputs-v0.1" / "fire-peaks" / \
-            f"{s}-v0.1-fire-elements.bed.gz"
+        spans = fr.reads_path(args.spans_root, s, args.read_rule)
+        fe = fr.macrophage_elements_path(s, FIRE_ROOT)
         for f in (spans, fe):
             if not f.is_file():
                 sys.exit(f"ERROR: missing input {f}")
 
+        # n_reads = reads covering the whole region; n_fire = those with ONE FIRE
+        # element covering >= --fire-overlap-fraction of the region
         n_reads = np.zeros(len(regions), dtype=np.int64)
         n_fire = np.zeros(len(regions), dtype=np.int64)
         row_of = {rid: i for i, rid in enumerate(regions["region_id"])}
         orphans = 0
         for chrom in chroms:
-            counts, n_orph = counts_for_chrom(chrom, regions, spans, fe, tmpdir)
+            cov, acc, n_orph = fr.region_reads(chrom, regions_bed, spans, fe, tmpdir,
+                                               args.read_rule, args.fire_overlap_fraction)
+            # same orphan tally as before: FIRE hits on reads that do not cover the region
             orphans += n_orph
-            for rid, (nr, nf) in counts.items():
-                i = row_of[rid]
-                n_reads[i] = nr
-                n_fire[i] = nf
+            for rid, reads in cov.items():
+                n_reads[row_of[rid]] = len(reads)
+                n_fire[row_of[rid]] = len(acc.get(rid, ()))
 
         assert (n_fire <= n_reads).all()
         part = regions.copy()
@@ -196,6 +110,7 @@ def main():
               f"n_reads quartiles {q[0]:.0f}/{q[1]:.0f}/{q[2]:.0f}; "
               f"zero-coverage regions {(n_reads == 0).sum()}", flush=True)
 
+    regions_bed.unlink()
     long_df = pd.concat(long_parts, ignore_index=True)
     # NaN where n_reads == 0 (Series.where masks the zero denominators)
     long_df["freq"] = long_df["n_fire"] / long_df["n_reads"].where(long_df["n_reads"] > 0)

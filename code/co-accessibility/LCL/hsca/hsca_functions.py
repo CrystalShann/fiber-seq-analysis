@@ -11,8 +11,10 @@ import pysam
 from scipy.stats import fisher_exact
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "CRE_co-accessibility_FIRE"))
-from LCL_coaccess_cres import BEDTOOLS, CELLS, CHROMS, ROOT, incidence_for_chrom
+from LCL_coaccess_cres import CELLS, ROOT
 from count_and_test_pairs import bh, count_pairs
+import fiber_regions as fr
+from fiber_regions import BEDTOOLS, CHROMS
 
 BCFTOOLS = "/project/spott/cshan/envs/bedtools/bin/bcftools"
 PHASED_METATABLE = "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_phased_27samples.csv"
@@ -280,11 +282,4 @@ def phased_samples(sample_metatable=PHASED_METATABLE, root=ROOT):
     expected = canonical.set_index("sample_name").loc[samples.sample_name, required[1:]]
     if not np.array_equal(samples[required[1:]].to_numpy(), expected.to_numpy()):
         raise ValueError("HSCA donor and phasing paths must match the phased sheet")
-    root = Path(root)
-    samples["donor"] = samples.cell_line
-    samples["cram_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-filtered.cram") for r in samples.itertuples()]
-    samples["peaks_path"] = [str(Path(r.fire_dir) / f"{r.sample_name}-fire-v0.1-peaks.bed.gz") for r in samples.itertuples()]
-    samples["elements_path"] = [str(Path(r.fire_dir) / "additional-outputs-v0.1/fire-peaks" / f"{r.sample_name}-v0.1-fire-elements.bed.gz") for r in samples.itertuples()]
-    samples["spans_path"] = [str(root / s / f"{s}.read_spans.bed.gz") for s in samples.sample_name]
-    samples["blocks_path"] = [str(root / s / f"{s}.aligned_blocks.bed.gz") for s in samples.sample_name]
-    return samples
+    return fr.add_lcl_fire_paths(samples, root)

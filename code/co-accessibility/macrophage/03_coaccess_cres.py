@@ -31,22 +31,17 @@ Outputs in --out-dir:
 """
 
 import argparse
-import subprocess
 import sys
 import tempfile
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "parsing_functions"))
 from count_and_test_pairs import count_pairs, test_counts, bh
+import fiber_regions as fr
 
 SAMPLES = ["LPS_0", "LPS_5", "LPS_10", "LPS_15"]
-CHROMS = [f"chr{c}" for c in list(range(1, 23)) + ["X", "Y"]]
-
-BEDTOOLS = "/project/spott/cshan/envs/bedtools/bin/bedtools"
-TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
 # The accessibility numerator. This is the FIRE pipeline's own per-read element call
 # (FDR <= 0.05), genome-wide and tabix-indexed - the same information Kevin reads out
 # of fire.bed's FIRE-class segments, already computed. Symlinked as `lizarraga_FIRE`
@@ -56,7 +51,7 @@ TABIX = "/project/spott/cshan/envs/dimelo/bin/tabix"
 # m6A / CpG / nucleosome calls with no FIRE scoring, and was extracted from the
 # unfiltered BAM, so it covers ~8% more fibers than the -filtered FIRE CRAM. It is
 # used for display only, by load_ft_tracks() in parsing_functions/parsing_footprints_functions.r.
-FIRE_ROOT = "/project/spott/lizarraga/pacbio_analysis/macrophage_project/merged_hifi_bams/FIRE"
+FIRE_ROOT = fr.MACROPHAGE_FIRE_ROOT
 
 
 def gr_distance(s1, e1, s2, e2):
@@ -106,69 +101,6 @@ def build_pairs(cre, cre_gene, min_dist, max_dist):
                                        "CRE1", "CRE2", "dist"])
 
 
-def run_intersect(args_list, desc):
-    p = subprocess.run(args_list, capture_output=True, text=True)
-    if p.returncode != 0:
-        sys.exit(f"ERROR: {desc} failed:\n{p.stderr[:2000]}")
-    return p.stdout
-
-
-def incidence_for_chrom(chrom, cre_bed_path, spans_path, fe_path, tmpdir,
-                        fire_overlap_fraction=0.5):
-    """{CRE_ID: set(read_id)} for covered and for accessible, on one chromosome."""
-    cre_chr = tmpdir / f"cre.{chrom}.bed"
-    with open(cre_chr, "w") as fh:
-        n = 0
-        for line in open(cre_bed_path):
-            if line.split("\t", 1)[0] == chrom:
-                fh.write(line)
-                n += 1
-    if n == 0:
-        return {}, {}, 0
-
-    spans_chr = tmpdir / f"spans.{chrom}.bed"
-    with open(spans_chr, "w") as fh:
-        p = subprocess.run([TABIX, str(spans_path), chrom], stdout=fh, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        sys.exit(f"ERROR: tabix on spans for {chrom} failed:\n{p.stderr[:2000]}")
-
-    fe_chr = tmpdir / f"fe.{chrom}.bed"
-    with open(fe_chr, "w") as fh:
-        p = subprocess.run([TABIX, str(fe_path), chrom], stdout=fh, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        sys.exit(f"ERROR: tabix on fire elements for {chrom} failed:\n{p.stderr[:2000]}")
-
-    # reads covering each cCRE: the read span must contain the whole cCRE (-f 1.0 of
-    # the cCRE). There is no any-overlap option.
-    cmd = [BEDTOOLS, "intersect", "-a", str(cre_chr), "-b", str(spans_chr), "-f", "1.0", "-wa", "-wb"]
-    cov = defaultdict(set)
-    for line in run_intersect(cmd, f"read intersect {chrom}").splitlines():
-        f = line.split("\t")
-        cov[f[3]].add(f[8])          # CRE_ID, read name
-
-    # A single FIRE interval on this read must cover the configured fraction of
-    # the cCRE (BED A). This is neither reciprocal nor the sum of disjoint FIREs.
-    acc = defaultdict(set)
-    for line in run_intersect(
-            [BEDTOOLS, "intersect", "-a", str(cre_chr), "-b", str(fe_chr),
-             "-f", str(fire_overlap_fraction), "-wa", "-wb"],
-            f"fire element intersect {chrom}").splitlines():
-        f = line.split("\t")
-        acc[f[3]].add(f[8])          # CRE_ID, read name
-
-    # A FIRE element can overlap the cCRE on a read that does
-    # not span all of it, so accessibility is not automatically a subset of coverage.
-    n_orphan = 0
-    for c in list(acc):
-        before = len(acc[c])
-        acc[c] &= cov.get(c, set())
-        n_orphan += before - len(acc[c])
-
-    for f in (cre_chr, spans_chr, fe_chr):
-        f.unlink(missing_ok=True)
-    return cov, acc, n_orphan
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -185,6 +117,9 @@ def main():
     ap.add_argument("--fire-overlap-fraction", type=float, default=0.5,
                     help="minimum fraction of the cCRE overlapped by ONE FIRE "
                          "element on the same read (default: 0.5)")
+    ap.add_argument("--read-rule", choices=fr.READ_RULES, default="span",
+                    help="span: read span contains the cCRE; aligned: aligned blocks cover "
+                         "every base (needs <root>/<s>/<s>.aligned_blocks.bed.gz)")
     ap.add_argument("--kevin-compat", action="store_true",
                     help="drop pairs where either cCRE is never accessible among the "
                          "shared reads, as Kevin's NA path silently does")
@@ -210,7 +145,7 @@ def main():
     cre_gene = pd.read_csv(uni / "cre_gene_map.tsv.gz", sep="\t")
     flags = pd.read_csv(uni / "cre_in_timepoint_peaks.tsv.gz", sep="\t").set_index("CRE_ID")
 
-    chroms = [args.chrom] if args.chrom else CHROMS
+    chroms = [args.chrom] if args.chrom else fr.CHROMS
     cre = cre[cre["chrom"].isin(chroms)].reset_index(drop=True)
     cre_gene = cre_gene[cre_gene["chrom"].isin(chroms)]
     print(f"cCRE universe: {len(cre)} elements on {cre['chrom'].nunique()} chromosomes",
@@ -226,9 +161,8 @@ def main():
           f"with {args.min_dist} < gap < {args.max_dist}", flush=True)
 
     for s in args.timepoints:
-        spans = root / s / f"{s}.read_spans.bed.gz"
-        fe = Path(FIRE_ROOT) / s / "additional-outputs-v0.1" / "fire-peaks" / \
-            f"{s}-v0.1-fire-elements.bed.gz"
+        spans = fr.reads_path(root, s, args.read_rule)
+        fe = fr.macrophage_elements_path(s, FIRE_ROOT)
         for f in (spans, fe):
             if not f.is_file():
                 sys.exit(f"ERROR: missing input {f}")
@@ -244,8 +178,8 @@ def main():
             idx = rows_by_chrom.get(chrom)
             if idx is None or len(idx) == 0:
                 continue
-            cov, acc, n_orph = incidence_for_chrom(chrom, cre_bed, spans, fe, tmpdir,
-                                                   args.fire_overlap_fraction)
+            cov, acc, n_orph = fr.region_reads(chrom, cre_bed, spans, fe, tmpdir,
+                                               args.read_rule, args.fire_overlap_fraction)
             orphans += n_orph
             n_cre_seen += len(cov)
             counts[idx] = count_pairs(pairs.iloc[idx], cov, acc)
