@@ -2,6 +2,9 @@
 # Run with the existing project R environment:
 # bash code/pausing/PolII/run_gene_examples.sh code/entropy/diversity/run_diversity.R
 suppressPackageStartupMessages({library(data.table); library(Matrix); library(ggplot2)})
+# Genes need > MIN_READS assigned fibers and > MIN_CLUSTERS Leiden clusters for Rao diversity
+MIN_READS <- 20L
+MIN_CLUSTERS <- 1L
 main <- function() {
   setDTthreads(1L)
   project <- '/project/spott/cshan/fiber-seq'
@@ -46,7 +49,7 @@ main <- function() {
       return(data.frame(gene_id = gene$gene_id, gene_name = gene$gene_name,
         gene_group = gene$group, n_fibers = NA_integer_, n_clusters = NA_integer_,
         rao_total = NA_real_, rao_between = NA_real_,
-        between_cluster_share = NA_real_, q_over_g = NA_real_))
+        between_cluster_share = NA_real_, q_over_g = NA_real_, status = 'upstream_failure'))
     }
     saved <- readRDS(paste0(prefix, '_clustering.rds'))
     region <- saved$region
@@ -59,6 +62,13 @@ main <- function() {
       saved$params$region_end == region$analysis_end,
       !anyDuplicated(a$RID), !anyDuplicated(tab$RID), setequal(a$RID, tab$RID),
       identical(as.character(a$cluster), as.character(tab$cluster[match(a$RID, tab$RID)])))
+    if (nrow(a) <= MIN_READS || length(unique(a$cluster)) <= MIN_CLUSTERS) {
+      message(gene$gene_name, ': NA; below read/cluster filter')
+      return(data.frame(gene_id = gene$gene_id, gene_name = gene$gene_name,
+        gene_group = gene$group, n_fibers = nrow(a), n_clusters = length(unique(a$cluster)),
+        rao_total = NA_real_, rao_between = NA_real_,
+        between_cluster_share = NA_real_, q_over_g = NA_real_, status = 'below_min_reads_or_clusters'))
+    }
     dat <- assemble_region_m6a(samples, region, full_span = TRUE,
       positions = seq.int(region$analysis_start, region$analysis_end),
       matrix_dir = NULL, reuse = FALSE)
@@ -71,7 +81,7 @@ main <- function() {
     stopifnot(ncol(mat) == 2001L, saved$params$n_features == ncol(mat))
     r <- rao_diversity(mat, a$cluster[match(rownames(mat), a$RID)])
     row <- cbind(data.frame(gene_id = gene$gene_id, gene_name = gene$gene_name,
-      gene_group = gene$group), r)
+      gene_group = gene$group), r, status = 'valid')
     message(sprintf('[%d/150] %s: %d fibers, %d clusters, total=%.5f',
       i, gene$gene_name, r$n_fibers, r$n_clusters, r$rao_total))
     row
@@ -84,17 +94,19 @@ main <- function() {
   if (any(vapply(rows, inherits, logical(1), 'try-error'))) stop('Gene analysis failed; no outputs written')
   d <- do.call(rbind, rows)
   metrics <- c('rao_total', 'rao_between', 'between_cluster_share', 'q_over_g', 'n_clusters')
-  tests <- compare_diversity_groups(d, metrics, groups)
-  summary <- summarize_diversity(d, metrics, groups, tests$omnibus)
+  # Group tests, summaries and plots use valid genes only
+  valid <- d[d$status == 'valid', ]
+  tests <- compare_diversity_groups(valid, metrics, groups)
+  summary <- summarize_diversity(valid, metrics, groups, tests$omnibus)
   for (subdir in c('tables', 'plots')) dir.create(file.path(out, subdir), recursive = TRUE, showWarnings = FALSE)
   fwrite(d, file.path(out, 'tables/gene_diversity.tsv'), sep = '\t', na = 'NA')
   fwrite(summary, file.path(out, 'tables/group_diversity_summary.tsv'), sep = '\t', na = 'NA')
-  plot_diversity(d, file.path(out, 'plots'), groups)
+  plot_diversity(valid, file.path(out, 'plots'), groups)
   print(summary, row.names = FALSE)
   cat('\nExploratory gene-level tests: BH across five omnibus tests and across 15 pairwise tests.\n')
   print(tests$pairwise, row.names = FALSE)
-  cat('\nExact cohort and decomposition checks passed for', sum(is.finite(d$rao_total)),
-    'genes;', sum(!is.finite(d$rao_total)), 'upstream failures retained as NA.\n')
+  cat('\nExact cohort and decomposition checks passed for', nrow(valid),
+    'genes;', sum(d$status != 'valid'), 'upstream failures or filtered genes retained as NA.\n')
   invisible(d)
 }
 if (sys.nframe() == 0L) main()

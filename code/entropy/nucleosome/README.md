@@ -31,7 +31,7 @@ ENTROPY_OUT="$PWD/LCL_project/entropy/CD74_gene_only" \
   bash code/entropy/nucleosome/run_entropy.sh --gene-only CD74
 ```
 
-`ENTROPY_OUT` overrides the default output directory, `LCL_project/entropy`.
+`ENTROPY_OUT` overrides the default output directory, `LCL_project/entropy/nucleosome_entropy`.
 `ENTROPY_WORKERS` overrides the allocated Slurm CPU count; local execution defaults
 to one worker. Optional trailing gene names select a subset. The runner uses the
 same R installation and libraries as the existing PolII workflow.
@@ -119,8 +119,8 @@ An absent label file leaves gene entropy available and sets
 
 ## Outputs
 
-All tabular outputs are in `LCL_project/entropy/tables/`; all figures are PDF files
-in `LCL_project/entropy/nucleosome_entropy_plots/`.
+All tabular outputs are in `LCL_project/entropy/nucleosome_entropy/tables/`; all figures are PDF files
+in `LCL_project/entropy/nucleosome_entropy/plots/`.
 
 - `gene_entropy.tsv`: exactly one row per requested gene.
 - `nucleosome_entropy.tsv`: gene and original cluster rows, identified

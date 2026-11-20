@@ -98,19 +98,6 @@ representative_promoters <- function(d) {
   representatives
 }
 
-# Mean within-promoter fraction per abundance rank and gene group; ranks a promoter
-# lacks count as zero. Abundance ranks are not shared biological states.
-ranked_group_composition <- function(d, counts) {
-  dd <- d[is.finite(gini_simpson)]
-  complete <- CJ(promoter_id=dd$promoter_id,abundance_rank=sort(unique(counts$abundance_rank)))
-  complete <- merge(complete,counts[,.(promoter_id,abundance_rank,proportion)],by=c('promoter_id','abundance_rank'),all.x=TRUE)
-  complete[is.na(proportion),proportion:=0]
-  complete <- merge(complete,dd[,.(promoter_id,gene_group)],by='promoter_id')
-  means <- complete[,.(mean_proportion=mean(proportion),median_proportion=median(proportion),n_promoters=.N),by=.(gene_group,abundance_rank)]
-  stopifnot(all(abs(means[,sum(mean_proportion),by=gene_group]$V1-1)<1e-12))
-  means
-}
-
 main <- function() {
   dir.create(file.path(OUT,'tables'),recursive=TRUE,showWarnings=FALSE)
   mode <- Sys.getenv('GINI_MODE','full')
@@ -155,8 +142,9 @@ main <- function() {
     # 5/6. Raw, normalized and inverse Simpson; preserve original cluster labels.
     n <- sum(old$n_reads); k <- nrow(old)
     dominant <- if(k) old[order(-n_reads,cluster)][1] else NULL
-    indices <- simpson_indices(old$n_reads)
     sh <- summary[gene_name==g$gene_name]
+    # Genes failing the molecule-cluster read/cluster filter (status != valid) get no diversity
+    indices <- if(sh$status=='valid') simpson_indices(old$n_reads) else simpson_indices(integer())
     stopifnot(nrow(sh)==1L,n==sh$n_assigned_reads,k==sh$n_clusters)
     if(k) stopifnot(abs(-sum(old$proportion*log2(old$proportion))-sh$shannon_entropy_bits)<1e-10)
     rows[[i]] <- cbind(g,data.table(n_fibers_assigned=n,n_clusters=k,
@@ -195,8 +183,7 @@ main <- function() {
     if(nrow(r)) stopifnot(all(r$chrom==g$chrom),all(r$tss==g$tss),all(r$strand==g$strand))
     data.table(promoter_id=g$promoter_id,n_feature_fibers=nrow(r),n_plus1_fibers=length(pos),
       plus1_fraction=if(nrow(r)) length(pos)/nrow(r) else NA_real_,
-      plus1_start_sd=if(length(pos)>=2) sd(pos) else NA_real_,
-      plus1_start_iqr=if(length(pos)>=2) IQR(pos) else NA_real_,
+      plus1_start_mean=if(length(pos)) mean(pos) else NA_real_,
       tss_occlusion_fraction=finite_mean(as.numeric(r$nuc_at_tss)),
       m6a_promoter_proximal=finite_mean(r$m6a_upstream),m6a_tss_centered=finite_mean(r$m6a_core),
       m6a_downstream=finite_mean(r$m6a_downstream),n_m6a_proximal=sum(is.finite(r$m6a_upstream)),
@@ -230,16 +217,15 @@ main <- function() {
   d <- merge(d,features,by='promoter_id',all.x=TRUE)
   d <- merge(d,wide,by='promoter_id',all.x=TRUE)
   stopifnot(nrow(d)==nrow(genes),!anyDuplicated(d$promoter_id))
-  feature_names <- c('plus1_fraction','plus1_start_sd','plus1_start_iqr','tss_occlusion_fraction',
+  feature_names <- c('plus1_fraction','plus1_start_mean','tss_occlusion_fraction',
     'm6a_promoter_proximal','m6a_tss_centered','m6a_downstream',
     'fp40_60_tss','fp60_80_tss','fp10_80_tss','fp40_60_downstream','fp60_80_downstream','fp10_80_downstream')
   for(f in setdiff(feature_names,names(d))) d[,(f):=NA_real_]
   save_analysis_table(d,'chromatin_features.tsv')
   associations <- feature_associations(d,feature_names)
   save_analysis_table(associations,'simpson_feature_associations.tsv')
-  # 12-13. Tables for the composition figures and representative promoters (figures are drawn in entropy_features.rmd).
+  # 12. Representative promoters (figures are drawn in entropy_features.rmd).
   save_analysis_table(representative_promoters(d),'representative_promoters.tsv')
-  save_analysis_table(ranked_group_composition(d,counts),'ranked_cluster_group_composition.tsv')
   if(any(fp$status=='error')) warning('Some footprint inputs failed; see short_footprint_features.tsv; missing values were not zero-filled.')
   message('Completed Gini-Simpson analysis in ',OUT)
 }

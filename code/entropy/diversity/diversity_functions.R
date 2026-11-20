@@ -94,11 +94,13 @@ rao_go_enrichment <- function(d) {
   d <- as.data.frame(d)
   d <- d[is.finite(d$rao_total), , drop = FALSE]
   d <- d[order(d$rao_total, d$gene_id), , drop = FALSE]
-  stopifnot(nrow(d) == 149L, !anyDuplicated(d$gene_id))
-  # Fixed pooled thirds: 50 low, 49 intermediate, 50 high. No gene-group split.
-  d$rao_category <- rep(c('low', 'intermediate', 'high'), c(50L, 49L, 50L))
+  stopifnot(nrow(d) >= 3L, !anyDuplicated(d$gene_id))
+  # Fixed pooled thirds (148 genes: 49 low, 50 intermediate, 49 high). No gene-group split.
+  n_end <- round(nrow(d) / 3)
+  d$rao_category <- rep(c('low', 'intermediate', 'high'), c(n_end, nrow(d) - 2L * n_end, n_end))
   d$rao_rank <- seq_len(nrow(d))
-  stopifnot(d$rao_total[50] < d$rao_total[51], d$rao_total[99] < d$rao_total[100])
+  stopifnot(d$rao_total[n_end] < d$rao_total[n_end + 1L],
+            d$rao_total[nrow(d) - n_end] < d$rao_total[nrow(d) - n_end + 1L])
   org <- org.Hs.eg.db::org.Hs.eg.db
   known <- intersect(d$gene_id, AnnotationDbi::keys(org, keytype = 'ENSEMBL'))
   ann <- AnnotationDbi::select(org, keys = known, keytype = 'ENSEMBL',
@@ -164,8 +166,8 @@ rao_go_enrichment <- function(d) {
       org_Hs_eg_db_version = as.character(utils::packageVersion('org.Hs.eg.db')),
       GO_db_version = as.character(utils::packageVersion('GO.db')), go_source_date = go_date,
       method = 'One-sided exact hypergeometric; BH across all three categories',
-      universe = 'All 149 scored genes, including genes without BP annotations',
-      term_filter = 'At least 3 and fewer than 149 background genes; GOALL BP ancestors',
+      universe = sprintf('All %d scored genes, including genes without BP annotations', nrow(d)),
+      term_filter = sprintf('At least 3 and fewer than %d background genes; GOALL BP ancestors', nrow(d)),
       interpretation = 'Exploratory within the preselected gene panel; no genome-wide inference')
   }))
   list(assignments = d[, c('gene_id','gene_name','rao_total','rao_rank','rao_category','has_bp_annotation')],

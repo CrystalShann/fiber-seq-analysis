@@ -4,6 +4,9 @@ suppressPackageStartupMessages({library(data.table)})
 PROJECT <- '/project/spott/cshan/fiber-seq'
 BASE <- file.path(PROJECT, 'LCL_project/pausing/PolII')
 OUT <- file.path(PROJECT, 'LCL_project/entropy/molecule_cluster_entropy')
+# Genes need > MIN_READS assigned reads and > MIN_CLUSTERS clusters to be valid
+MIN_READS <- 20L
+MIN_CLUSTERS <- 1L
 
 entropy_from_counts <- function(n) {
   stopifnot(all(is.finite(n)), all(n >= 0))
@@ -71,7 +74,8 @@ main <- function() {
     r <- analyze_assignments(a, cohort[gene == g$gene_name, .(RID, sample_name)])
     for (nm in names(r)) r[[nm]][, `:=`(gene_name = g$gene_name, gene_id = g$gene_id, group = g$group)]
     r$summary[, `:=`(assignment_file = path,
-      status = if(n_assigned_reads > 0) 'valid' else 'no_valid_assignments')]
+      status = if(n_assigned_reads == 0) 'no_valid_assignments' else
+        if(n_assigned_reads <= MIN_READS || n_clusters <= MIN_CLUSTERS) 'below_min_reads_or_clusters' else 'valid')]
     r
   })
   write <- function(x,n) fwrite(x,file.path(td,n),sep='\t',na='NA')

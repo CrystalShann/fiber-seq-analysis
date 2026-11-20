@@ -655,7 +655,7 @@ lcl_region_samples <- function(region, sample_table) {
 #   phase_cache  - per-sample haplotags from cache_lcl_haplotags()
 # Output:
 #   character vector of clustering.rds paths named by region_id. Writes
-#     <output_dir>/<region_id>/bin<W>/k<K>/resolution<R>/tables/clustering.rds
+#     <output_dir>/AS_FIRE/<region_id>/bin<W>/k<K>/resolution<R>/tables/clustering.rds
 #     <output_dir>/summary tables/run_summary.tsv
 #     <output_dir>/summary tables/result_paths.rds
 #     <matrix_dir>/<region_id>/<region_id>_m6a_matrix.rds and _read_qc.tsv
@@ -680,7 +680,7 @@ run_lcl_clustering <- function(regions, sample_table, matrix_dir, output_dir,
     signature <- list(version = "top10_asfire_het_2kb_v1", region = region,
       matrix = dat$signature, retained_reads = dat$rids_df,
       params = list(window_size, k_neighbors, leiden_resolution, leiden_seed, kernel_sigma))
-    out <- lcl_output_path(file.path(output_dir, region$region_id, paste0("bin", window_size),
+    out <- lcl_output_path(file.path(output_dir, "AS_FIRE", region$region_id, paste0("bin", window_size),
       paste0("k", k_neighbors), paste0("resolution", leiden_resolution), "tables"))
     dir.create(out, recursive = TRUE, showWarnings = FALSE)
     result_paths[i] <- file.path(out, "clustering.rds")

@@ -1,20 +1,20 @@
 ---
 title: "nucleosome and molecule-cluster entropy"
-output: pdf_document
+output: html_document
 ---
 
 This analysis calculates nucleosome entropy (first 500 bp downstream of the TSS) and per gene entropy (1kb around the TSS using cluster proportions)
 
 
 ```{r setup, include=TRUE}
-knitr::opts_chunk$set(echo = FALSE, error = FALSE, message = FALSE, warning = TRUE)
-suppressPackageStartupMessages({library(data.table); library(ggplot2)})
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = TRUE)
+suppressPackageStartupMessages({library(data.table); library(ggplot2); library(patchwork)})
 setDTthreads(1L)
 
 PROJECT <- "/project/spott/cshan/fiber-seq"
-OUT <- Sys.getenv("ENTROPY_OUT", file.path(PROJECT, "LCL_project/entropy"))
+OUT <- Sys.getenv("ENTROPY_OUT", file.path(PROJECT, "LCL_project/entropy/nucleosome_entropy"))
 TABLES <- file.path(OUT, "tables")
-PLOTS <- file.path(OUT, "nucleosome_entropy_plots")
+PLOTS <- file.path(OUT, "plots")
 
 dir.create(PLOTS, recursive = TRUE, showWarnings = FALSE)
 
@@ -32,6 +32,95 @@ save_pdf <- function(p, name, width = 10, height = 7) {
   save_figure(p, file.path(PLOTS, name), width = width, height = height, device = "pdf",
               useDingbats = FALSE)
 }
+ranking_height <- function(d) max(10, nrow(d) * .13 + 2)
+# One metric by category (x = factor column), one jittered point per gene, black diamond =
+# median; same style as 01_gene_group_entropy.pdf. labels maps x levels to axis names
+plot_box_by_group <- function(d, metric, x, colors, ylab, title, labels = NULL, hline = NULL) {
+  z <- d[is.finite(get(metric))]
+  s <- z[, .(n_genes = .N, median_value = median(get(metric))), by = x]
+  names_x <- if (is.null(labels)) as.character(s[[x]]) else labels[as.character(s[[x]])]
+  labs_x <- setNames(sprintf("%s\nn = %d genes", names_x, s$n_genes), as.character(s[[x]]))
+  y_range <- range(c(z[[metric]], hline))
+  label_y <- y_range[2] + .05 * diff(y_range)
+  p <- ggplot(z, aes(.data[[x]], .data[[metric]], colour = .data[[x]]))
+  if (!is.null(hline)) p <- p + geom_hline(yintercept = hline, linetype = 2, colour = "#888888")
+  p + geom_boxplot(aes(fill = .data[[x]]), width = .46, outlier.shape = NA, alpha = .15, show.legend = FALSE) +
+    geom_point(position = position_jitter(width = .13, seed = 12), size = 1.8, alpha = .65, show.legend = FALSE) +
+    geom_point(data = s, aes(.data[[x]], median_value), inherit.aes = FALSE, shape = 18, size = 4) +
+    geom_text(data = s, aes(.data[[x]], label_y, label = sprintf("Median %.4f", median_value)),
+              inherit.aes = FALSE, size = 3.6) +
+    scale_colour_manual(values = colors) + scale_fill_manual(values = colors) +
+    scale_x_discrete(labels = labs_x) +
+    labs(x = NULL, y = ylab, title = title)
+}
+
+# Raw (left) and normalized (right) versions of every figure. A spec names the two columns,
+# their axis labels, their maxima (dashed line, NULL = none) and the subtitle
+MOTIF_COLORS <- c(TATA = "#E41A1C", SP1 = "#377EB8", ETS = "#4DAF4A", NFY = "#984EA3",
+                  NRF1 = "#FF7F00", CREB = "#A65628", YY1 = "#F781BF", ZNF143 = "#1B9E77")
+FP_CLASSES <- c("10-30 bp", "30-60 bp", "60-80 bp")
+FP_CLASS_NAMES <- c("10-<30 bp", "30-<60 bp", "60-80 bp")
+pair_panels <- function(raw, normalized, spec, title) {
+  (raw + labs(title = "Raw")) + (normalized + labs(title = "Normalized")) +
+    plot_layout(guides = "collect") +
+    plot_annotation(title = title, subtitle = spec$subtitle,
+                    theme = theme(plot.title = element_text(face = "bold"))) &
+    theme(legend.position = "bottom")
+}
+pair_of <- function(panel, spec, title)
+  pair_panels(panel(spec$raw, spec$raw_label, spec$raw_max),
+              panel(spec$normalized, spec$normalized_label, spec$normalized_max), spec, title)
+group_colour <- scale_colour_manual(values = GROUP_COLORS, breaks = GROUPS, labels = GROUP_LABELS,
+                                    name = "Gene group")
+
+# d: one row per gene with group, puffin_motif, plus1_start_mean_bp and the spec columns
+plot_group_pair <- function(d, spec) {
+  z <- copy(d)[, group := factor(group, GROUPS)]
+  pair_of(function(m, lab, hl) plot_box_by_group(z, m, "group", GROUP_COLORS, lab, NULL,
+            labels = GROUP_LABELS, hline = hl), spec, paste(spec$name, "by gene group"))
+}
+# Motifs ordered by the median of the raw metric in both panels
+plot_motif_pair <- function(d, spec) {
+  motif_order <- d[, .(m = median(get(spec$raw))), by = puffin_motif][order(m), puffin_motif]
+  z <- copy(d)[, puffin_motif := factor(puffin_motif, motif_order)]
+  pair_of(function(m, lab, hl) plot_box_by_group(z, m, "puffin_motif", MOTIF_COLORS, lab, NULL, hline = hl) +
+            labs(x = "Puffin dominant motif (U1 excluded from class assignment)"),
+          spec, paste(spec$name, "by Puffin promoter motif"))
+}
+plot_plus1_pair <- function(d, spec) {
+  z <- d[is.finite(plus1_start_mean_bp)]
+  pair_of(function(m, lab, hl) ggplot(z, aes(.data[[m]], plus1_start_mean_bp, colour = group)) +
+            geom_point(size = 2, alpha = .75) + group_colour +
+            labs(x = lab, y = "Mean +1 nucleosome start position (bp downstream of TSS)"),
+          spec, paste(spec$name, "and +1 nucleosome start position"))
+}
+# fp: one row per gene and footprint class, with fraction_with_footprint and the spec columns
+plot_footprint_pair <- function(fp, spec) {
+  z <- copy(fp)[, footprint_class := factor(footprint_class, FP_CLASSES)]
+  n <- z[, .(n_genes = uniqueN(gene_name)), by = footprint_class]
+  strip <- setNames(sprintf("%s\nn = %d genes", FP_CLASS_NAMES,
+                            n$n_genes[match(FP_CLASSES, n$footprint_class)]), FP_CLASSES)
+  pair_of(function(m, lab, hl) ggplot(z, aes(.data[[m]], fraction_with_footprint, colour = group)) +
+            geom_point(size = 1.8, alpha = .7) +
+            facet_wrap(~ footprint_class, ncol = 1, labeller = labeller(footprint_class = strip)) +
+            group_colour + scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .25)) +
+            labs(x = lab, y = "Fraction of fibers with a short footprint\noverlapping TSS -100 to +100 bp"),
+          spec, paste(spec$name, "and short-footprint presence near the TSS"))
+}
+# Each panel has its own gene order, highest at the top
+plot_ranking_pair <- function(d, spec) {
+  pair_of(function(m, lab, hl) {
+    z <- d[is.finite(get(m))][order(get(m), gene_name)]
+    z[, gene := factor(gene_name, levels = gene_name)]
+    ggplot(z, aes(.data[[m]], gene, colour = group)) + geom_point(size = 1.6) + group_colour +
+      labs(x = lab, y = NULL) + theme(axis.text.y = element_text(size = 6))
+  }, spec, paste0(spec$name, ": gene ranking"))
+}
+NUCLEOSOME_SPEC <- list(name = "Nucleosome entropy",
+  raw = "nucleosome_entropy_bits", raw_label = "Nucleosome entropy (bits)", raw_max = HMAX,
+  normalized = "normalized_nucleosome_entropy", normalized_label = "Normalized nucleosome entropy",
+  normalized_max = 1,
+  subtitle = "Left: raw entropy H (bits, TSS +1 to +500 bp)  |  Right: normalized entropy H / log2(500)")
 
 all_genes <- fread(file.path(TABLES, "gene_entropy.tsv"))
 all_levels <- fread(file.path(TABLES, "nucleosome_entropy.tsv"))
@@ -80,14 +169,14 @@ Nucleosome entropy measures how evenly nucleosome occupancy is spread over the f
 
 
 
-1. For each gene, take the saved reads
+1. For each gene, take the saved reads. A gene is analysed only if it has $>$ 20 saved reads and $>$ 1 Leiden cluster; otherwise its status is `below_min_reads_or_clusters` and $H$ is NA
 
 2. Query each sample's nucleosome BED12 at TSS +/-1000 bp , and keep nucleosomes of 130-160 bp
 
 3. Convert coordinates to transcription-oriented offsets from the TSS (minus-strand genes are reversed), so that $x = 1, \dots, 500$ are the bases downstream of the TSS
 
 
-4. At each base $x$, count the fibers covering it, $c_x$, and the fibers with a retained nucleosome over it, $n_x$. Each fiber counts at most once per base. The occupancy is $$o_x = \frac{n_x}{c_x}.$$
+4. At each base $x$, count the fibers covering it, $c_x$, and the fibers with a retained nucleosome over it, $n_x$. Each fiber counts at most once per base. A saved read with no fibertools nucleosome record counts as covering with no nucleosomes. The occupancy is $$o_x = \frac{n_x}{c_x}.$$
 
 
 5. The occupancy profile is turned into a probability distribution over positions, $$p_x = \frac{o_x}{\sum_{y=1}^{500} o_y},$$ and its Shannon entropy in bits is $$H = -\sum_{x=1}^{500} p_x \log_2 p_x, \qquad 0 \log_2 0 = 0.$$
@@ -97,6 +186,8 @@ Nucleosome entropy measures how evenly nucleosome occupancy is spread over the f
    - the maximum entropy is $\log_2 500 = 8.966$ bits, reached when occupancy is identical at every base
    
    - lower $H$ means occupancy is concentrated in fewer positions (well-positioned nucleosomes)
+
+   - normalized entropy $H_{\text{norm}} = H / \log_2 500$ runs from 0 to 1 (1 = identical occupancy at every base)
    
    - A result is `complete` only if all 500 bases are covered ($c_x > 0$) and $\sum_x o_x > 0$. Otherwise its status is `incomplete_coverage`, `no_fibers` or `zero_nucleosome_occupancy`, and $H$ is NA
    
@@ -116,7 +207,7 @@ Nucleosome entropy measures how evenly nucleosome occupancy is spread over the f
 $$f = \frac{\#\{\text{fibers spanning all 201 bases with }\ge 1\text{ qualifying footprint}\}}
              {\#\{\text{fibers spanning all 201 bases}\}}.$$
 
-**Output tables** (`LCL_project/entropy/tables/`)
+**Output tables** (`LCL_project/entropy/nucleosome_entropy/tables/`)
 
 1. `gene_entropy.tsv` (gene level)
 
@@ -129,7 +220,7 @@ $$f = \frac{\#\{\text{fibers spanning all 201 bases with }\ge 1\text{ qualifying
 
   - One row per gene (150 genes)
   
-  - `n_fibers` is the number of reads and `total_nucleosome_occupancy_signal` is $\sum_x o_x$. `nucleosome_entropy_bits` is $H$
+  - `n_fibers` is the number of reads and `total_nucleosome_occupancy_signal` is $\sum_x o_x$. `nucleosome_entropy_bits` is $H$ and `normalized_nucleosome_entropy` is $H_{\text{norm}}$
   
   - `plus1_start_mean_bp` / `plus1_start_sd_bp` (+1 nucleosome start average across all reads contain +1 nucleosome for the gene)
   
@@ -192,11 +283,13 @@ knitr::kable(head(short_fp[, .(gene_name, footprint_class, n_fibers, n_evaluable
 
 Genes are ranked across all gene groups using entropy, without an additional filter for read coverage
 
-Two genes have no entropy and are not included:
+Two genes have no entropy and are not included in any entropy analysis (148 genes remain):
 
   - SLC44A4 (`no_fibers`): only 6 reads overlap TSS -1000..+1000 bp across all 31 samples and none spans the full window, so the PolII read-feature step (which needs at least 3 full-span reads) saved no reads for this gene
 
-  - CLEC12B: one of its 683 saved reads (sample AL28) has almost no m6A (2 calls over 8.9 kb), so fibertools wrote no nucleosome record for it; the entropy script requires a nucleosome record for every saved read and stops for the gene
+  - HLA-DMA (`below_min_reads_or_clusters`): only 5 saved reads, all in one Leiden cluster
+
+CLEC12B is included: one of its 683 saved reads (sample AL28) has almost no m6A (2 calls over 8.9 kb), so fibertools wrote no nucleosome record for it; this read counts as covering the window with no nucleosomes
 
 
 ```{r extreme-gene-table, results='asis'}
@@ -215,28 +308,16 @@ knitr::kable(extreme_table, row.names = FALSE, digits = 4,
 
 ### 1. nucleosome entropy by gene group
 
-Each point is one gene. black diamond marks the median
+Each point is one gene. black diamond marks the median. Left: raw entropy, right: normalized entropy
 
-```{r gene-groups}
+```{r gene-groups, out.width="100%", fig.width=15, fig.height=6.5}
 group_summary <- genes[, .(n_genes = .N, n_fibers = sum(n_fibers),
   median_entropy = median(nucleosome_entropy_bits), q25 = quantile(nucleosome_entropy_bits, .25),
   q75 = quantile(nucleosome_entropy_bits, .75), min_entropy = min(nucleosome_entropy_bits),
   max_entropy = max(nucleosome_entropy_bits)), by = group]
 write_table(group_summary, "gene_group_summary.tsv")
-group_summary[, group := factor(group, GROUPS)]
-group_labs <- setNames(sprintf("%s\nn = %d genes", GROUP_LABELS[as.character(group_summary$group)],
-                               group_summary$n_genes), as.character(group_summary$group))
-p <- ggplot(genes, aes(factor(group, GROUPS), nucleosome_entropy_bits, colour = group)) +
-  geom_hline(yintercept = HMAX, linetype = 2, colour = "#888888") +
-  geom_boxplot(width = .46, outlier.shape = NA, alpha = .15, aes(fill = group), show.legend = FALSE) +
-  geom_point(position = position_jitter(width = .13, seed = 12), size = 1.8, alpha = .65, show.legend = FALSE) +
-  geom_point(data = group_summary, aes(group, median_entropy), inherit.aes = FALSE, shape = 18, size = 4) +
-  geom_text(data = group_summary, aes(group, HMAX + .018, label = sprintf("Median %.4f", median_entropy)),
-            inherit.aes = FALSE, size = 3.6) +
-  scale_colour_manual(values = GROUP_COLORS) + scale_fill_manual(values = GROUP_COLORS) +
-  scale_x_discrete(labels = group_labs) +
-  labs(x = NULL, y = "Nucleosome entropy (bits)", title = "Nucleosome entropy by gene group")
-save_pdf(p, "01_gene_group_entropy.pdf", 8.5, 6.5)
+p <- plot_group_pair(genes, NUCLEOSOME_SPEC)
+save_pdf(p, "01_gene_group_entropy.pdf", 15, 6.5)
 
 p
 ```
@@ -244,28 +325,14 @@ p
 
 ### 2. nucleosome entropy by puffin dominant motif
 
-Each point is one gene, grouped by its Puffin dominant motif. Motifs are ordered by median gene entropy
-```{r motifs}
+Each point is one gene, grouped by its Puffin dominant motif. Motifs are ordered by median raw gene entropy. Left: raw entropy, right: normalized entropy
+```{r motifs, out.width="100%", fig.width=22, fig.height=6.5}
 motif_summary <- genes[, .(n_genes = .N, median_entropy = median(nucleosome_entropy_bits),
   q25 = quantile(nucleosome_entropy_bits, .25), q75 = quantile(nucleosome_entropy_bits, .75)),
   by = puffin_motif][order(median_entropy)]
 write_table(motif_summary, "puffin_motif_entropy_summary.tsv")
-motif_order <- motif_summary$puffin_motif
-motif_genes <- copy(genes)[, puffin_motif := factor(puffin_motif, motif_order)]
-ms <- copy(motif_summary)[, puffin_motif := factor(puffin_motif, motif_order)]
-motif_labs <- setNames(sprintf("%s\nn=%d genes", ms$puffin_motif, ms$n_genes), as.character(ms$puffin_motif))
-MOTIF_COLORS <- c(TATA = "#E41A1C", SP1 = "#377EB8", ETS = "#4DAF4A", NFY = "#984EA3",
-                  NRF1 = "#FF7F00", CREB = "#A65628", YY1 = "#F781BF", ZNF143 = "#1B9E77")
-p <- ggplot(motif_genes, aes(puffin_motif, nucleosome_entropy_bits, fill = puffin_motif)) +
-  geom_hline(yintercept = HMAX, colour = "#999999", linetype = 2) +
-  geom_violin(trim = TRUE, scale = "width", alpha = .35, linewidth = .4, show.legend = FALSE) +
-  geom_boxplot(width = .12, outlier.shape = NA, fill = "white", linewidth = .4, show.legend = FALSE) +
-  geom_point(position = position_jitter(width = .10, seed = 12), alpha = .55, size = 1.5, show.legend = FALSE) +
-  geom_point(data = ms, aes(puffin_motif, median_entropy), inherit.aes = FALSE, shape = 18, size = 3) +
-  scale_fill_manual(values = MOTIF_COLORS) + scale_x_discrete(labels = motif_labs) +
-  labs(x = "Puffin dominant motif (U1 excluded from class assignment)", y = "Gene nucleosome entropy (bits)",
-       title = "Nucleosome entropy by Puffin promoter motif")
-save_pdf(p, "02_entropy_by_puffin_motif.pdf", 10, 7)
+p <- plot_motif_pair(genes, NUCLEOSOME_SPEC)
+save_pdf(p, "02_entropy_by_puffin_motif.pdf", 22, 6.5)
 
 p
 ```
@@ -275,19 +342,14 @@ p
 
 ### 3. nucleosome entropy and +1 nucleosome start position
 
-Each point is one gene. The +1 coordinate is the mean of the per-fiber first nucleosome starts at +1..+299 bp, excluding nucleosomes covering the TSS
+Each point is one gene. The +1 coordinate is the mean of the per-fiber first nucleosome starts at +1..+299 bp, excluding nucleosomes covering the TSS. Left: raw entropy, right: normalized entropy
 
-```{r entropy-plus1-start}
+```{r entropy-plus1-start, out.width="100%", fig.width=14, fig.height=7}
 plus1_genes <- genes[is.finite(plus1_start_mean_bp), .(gene_name, group, n_fibers,
   n_plus1_fibers, nucleosome_entropy_bits, plus1_start_mean_bp)]
 write_table(plus1_genes, "entropy_vs_plus1_start.tsv")
-p <- ggplot(plus1_genes, aes(nucleosome_entropy_bits, plus1_start_mean_bp, colour = group)) +
-  geom_point(size = 2, alpha = .75) +
-  scale_colour_manual(values = GROUP_COLORS, breaks = GROUPS, labels = GROUP_LABELS, name = "Gene group") +
-  labs(x = "Gene-level nucleosome entropy (bits; TSS +1 to +500 bp)",
-       y = "Mean +1 nucleosome start position (bp downstream of TSS)",
-       title = "Nucleosome entropy and +1 nucleosome start position")
-save_pdf(p, "03_entropy_vs_plus1_start.pdf", 10, 7)
+p <- plot_plus1_pair(genes, NUCLEOSOME_SPEC)
+save_pdf(p, "03_entropy_vs_plus1_start.pdf", 14, 7)
 
 p
 ```
@@ -297,9 +359,9 @@ p
 
 The footprint window is -100..+100 bp, the entropy window remains +1..+500 bp 
 
-The y-axis measures the fraction of fully spanning reads with at least one footprint overlapping the promoter window. It does not measure the fraction of bases covered or the number of calls
+The y-axis measures the fraction of fully spanning reads with at least one footprint overlapping the promoter window. It does not measure the fraction of bases covered or the number of calls. Left: raw entropy, right: normalized entropy
 
-```{r entropy-short-footprints}
+```{r entropy-short-footprints, out.width="100%", fig.width=12, fig.height=11}
 fp_path <- file.path(TABLES, "short_footprint_fractions.tsv")
 if (!file.exists(fp_path)) stop("Generate footprint fractions first: bash code/entropy/nucleosome/run_entropy.sh --footprints-only")
 fp_all <- fread(fp_path)
@@ -315,21 +377,9 @@ fp_genes <- fp_genes[footprint_status == "complete" & is.finite(fraction_with_fo
 stopifnot(all(fp_genes$fraction_with_footprint >= 0 & fp_genes$fraction_with_footprint <= 1))
 fp_genes[, c("expected_entropy", "expected_fibers") := NULL]
 write_table(fp_genes, "entropy_vs_short_footprints.tsv")
-classes <- c("10-30 bp", "30-60 bp", "60-80 bp")
-class_names <- c("10-<30 bp", "30-<60 bp", "60-80 bp")
-fp_genes[, footprint_class := factor(footprint_class, classes)]
-counts <- fp_genes[, .(n_genes = uniqueN(gene_name)), by = footprint_class]
-panel_labels <- setNames(sprintf("%s\nn = %d genes", class_names,
-                                counts$n_genes[match(classes, counts$footprint_class)]), classes)
-p <- ggplot(fp_genes, aes(nucleosome_entropy_bits, fraction_with_footprint, colour = group)) +
-  geom_point(size = 1.8, alpha = .7) +
-  facet_wrap(~ footprint_class, nrow = 1, labeller = labeller(footprint_class = panel_labels)) +
-  scale_colour_manual(values = GROUP_COLORS, breaks = GROUPS, labels = GROUP_LABELS, name = "Gene group") +
-  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .25)) +
-  labs(x = "Gene-level nucleosome entropy (bits; TSS +1 to +500 bp)",
-       y = "Fraction of fibers with a short footprint\noverlapping TSS -100 to +100 bp",
-       title = "Nucleosome entropy and short-footprint presence near the TSS")
-save_pdf(p, "04_entropy_vs_short_footprints.pdf", 12, 6.5)
+fp_genes <- merge(fp_genes, genes[, .(gene_name, normalized_nucleosome_entropy)], by = "gene_name")
+p <- plot_footprint_pair(fp_genes, NUCLEOSOME_SPEC)
+save_pdf(p, "04_entropy_vs_short_footprints.pdf", 12, 11)
 message("Generated PDF figures in ", PLOTS, "; supporting tables in ", TABLES)
 
 p
@@ -346,8 +396,8 @@ footprint columns are percentages of fibers with at least one overlapping footpr
 ```{r promoter-class-table, results='asis'}
 class_order <- c("TATA", "SP1", "CREB", "NFY", "NRF1", "ETS", "YY1", "ZNF143")
 fp_wide <- dcast(fp_genes, gene_name ~ footprint_class, value.var = "fraction_with_footprint")
-stopifnot(all(classes %in% names(fp_wide)))
-setnames(fp_wide, classes, c("fp10", "fp30", "fp60"))
+stopifnot(all(FP_CLASSES %in% names(fp_wide)))
+setnames(fp_wide, FP_CLASSES, c("fp10", "fp30", "fp60"))
 promoter_features <- merge(genes[, .(gene_name, group, puffin_motif,
   nucleosome_entropy_bits, plus1_start_mean_bp)], fp_wide, by = "gene_name", all.x = TRUE)
 stopifnot(nrow(promoter_features) == nrow(genes),
@@ -372,11 +422,11 @@ knitr::kable(promoter_summary[, .(puffin_motif, n_genes, median_entropy_bits,
   caption = "Median gene-level features by Puffin promoter class.")
 ```
 
-### 5. Individual Leiden-cluster nucleosome entropy distribution
+### 5. Individual Leiden-cluster nucleosome entropy examples
 
 
 
-```{r individual-cluster-distribution-and-examples}
+```{r individual-cluster-examples}
 cluster_out <- Sys.getenv("CLUSTER_ENTROPY_OUT",
   file.path(PROJECT, "LCL_project/entropy/leiden_clusters_all_genes"))
 cluster_results <- fread(file.path(cluster_out, "tables/nucleosome_entropy.tsv"))
@@ -384,18 +434,6 @@ individual_clusters <- cluster_results[level == "cluster" & status == "complete"
   is.finite(nucleosome_entropy_bits)]
 stopifnot(nrow(individual_clusters) > 0L,
           !anyDuplicated(individual_clusters[, .(gene_name, cluster)]))
-cluster_distribution <- individual_clusters[, .(n_clusters = .N,
-  n_genes = uniqueN(gene_name), minimum = min(nucleosome_entropy_bits),
-  q05 = quantile(nucleosome_entropy_bits, .05), q25 = quantile(nucleosome_entropy_bits, .25),
-  median = median(nucleosome_entropy_bits), q75 = quantile(nucleosome_entropy_bits, .75),
-  q95 = quantile(nucleosome_entropy_bits, .95), maximum = max(nucleosome_entropy_bits))]
-write_table(cluster_distribution, "individual_cluster_entropy_distribution.tsv")
-p <- ggplot(individual_clusters, aes(nucleosome_entropy_bits)) +
-  geom_histogram(binwidth = .025, boundary = 0, fill = "#547AA5", colour = "white", linewidth = .2) +
-  labs(x = "Cluster nucleosome entropy (bits)", y = "Number of Leiden clusters",
-       title = "Distribution of individual-cluster nucleosome entropy")
-save_pdf(p, "05_individual_cluster_entropy_distribution.pdf", 10, 6)
-
 selected_keys <- data.table(gene_name = c("IL21R", "CTCF", "TNFRSF13B"),
                            cluster = c("cluster5", "cluster4", "cluster1"), display_order = 1:3)
 selected_clusters <- merge(selected_keys, individual_clusters, by = c("gene_name", "cluster"))
@@ -418,8 +456,6 @@ stopifnot(all(checks$positions == 500L), all(checks$unique_positions == 500L),
   all(abs(checks$probability_sum - 1) < 1e-10), all(checks$probability_matches < 1e-10))
 write_table(selected_clusters, "selected_cluster_entropy_examples.tsv")
 write_table(profiles, "selected_cluster_occupancy_profiles.tsv")
-
-p
 ```
 
 IL21R cluster5 has the lowest and TNFRSF13B cluster1 the highest entropy 
@@ -482,7 +518,10 @@ load_selected_cluster <- function(g, samples, cohort) {
   title_g <- copy(g)
   title_g[, gene_name := sprintf("%s %s | H=%.3f bits | entropy +1..+500 bp",
     g$gene_name, g$cluster, g$nucleosome_entropy_bits)]
-  list(g = title_g, gene = g$gene_name, cluster = g$cluster, dat = dat, rows = rows, bundle = bundle)
+  # figure heights (in) used by plot_example_m6a() / plot_example_footprints() for one cluster
+  heights <- c(m6a = 6 + 0.55, footprints = 1.6 + 0.65 + pol2$READ_ROW_IN * nrow(rows) + 0.15 + 1.2)
+  list(g = title_g, gene = g$gene_name, cluster = g$cluster, dat = dat, rows = rows, bundle = bundle,
+       heights = heights)
 }
 
 samples <- fread(pol2$SAMPLES)[, .(sample_name, fire_dir)]
@@ -498,8 +537,13 @@ pol2$save_figure <- function(plot, path, ..., draw = NULL) {
   # Footprint figures: more space between the title and the top m6A track
   if (inherits(plot, "patchwork"))
     plot <- plot + patchwork::plot_annotation(theme = theme(plot.title = element_text(margin = margin(b = 12))))
+  # m6A heatmaps: hide the "cluster" row-annotation name, which overlaps the -1000 tick (the legend names it)
+  if (inherits(plot, "Heatmap") && !is.null(plot@left_annotation))
+    for (a in names(plot@left_annotation@anno_list))
+      plot@left_annotation@anno_list[[a]]@name_param$show <- FALSE
   save_figure(plot, path, ..., draw = draw)
-  if (!isTRUE(getOption("knitr.in.progress"))) if (is.null(draw)) print(plot) else draw(plot)
+  # also draw on the current device: inline in RStudio, captured as the chunk figure when knitting
+  if (is.null(draw)) print(plot) else draw(plot)
   invisible(path)
 }
 
@@ -513,34 +557,44 @@ plot_selected_cluster <- function(x, panel, figure_number) {
     pol2$example_labels <- function(g, view, n) list(title = title(g, view), subtitle = NULL)
     pol2$plot_example_footprints(x$g, x$dat, x$bundle, x$rows, path, clustered = TRUE, show_samples = FALSE)
   }
-  if (isTRUE(getOption("knitr.in.progress"))) knitr::include_graphics(path) else invisible(path)
+  invisible(path)
 }
 ```
 
 
 
-```{r il21r-cluster5-m6a, out.width="100%"}
-plot_selected_cluster(selected_data$IL21R, "m6a", 6L)
+```{r il21r-cluster5-m6a, out.width="100%", fig.width=10, fig.height=selected_data$IL21R$heights[["m6a"]]}
+plot_selected_cluster(selected_data$IL21R, "m6a", 5L)
 ```
 
-```{r il21r-cluster5-footprints, out.width="100%"}
-plot_selected_cluster(selected_data$IL21R, "footprints", 7L)
+```{r il21r-cluster5-footprints, out.width="100%", fig.width=10, fig.height=selected_data$IL21R$heights[["footprints"]]}
+plot_selected_cluster(selected_data$IL21R, "footprints", 6L)
 ```
 
-```{r ctcf-cluster4-m6a, out.width="100%"}
-plot_selected_cluster(selected_data$CTCF, "m6a", 8L)
+```{r ctcf-cluster4-m6a, out.width="100%", fig.width=10, fig.height=selected_data$CTCF$heights[["m6a"]]}
+plot_selected_cluster(selected_data$CTCF, "m6a", 7L)
 ```
 
-```{r ctcf-cluster4-footprints, out.width="100%"}
-plot_selected_cluster(selected_data$CTCF, "footprints", 9L)
+```{r ctcf-cluster4-footprints, out.width="100%", fig.width=10, fig.height=selected_data$CTCF$heights[["footprints"]]}
+plot_selected_cluster(selected_data$CTCF, "footprints", 8L)
 ```
 
-```{r tnfrsf13b-cluster1-m6a, out.width="100%"}
-plot_selected_cluster(selected_data$TNFRSF13B, "m6a", 10L)
+```{r tnfrsf13b-cluster1-m6a, out.width="100%", fig.width=10, fig.height=selected_data$TNFRSF13B$heights[["m6a"]]}
+plot_selected_cluster(selected_data$TNFRSF13B, "m6a", 9L)
 ```
 
-```{r tnfrsf13b-cluster1-footprints, out.width="100%"}
-plot_selected_cluster(selected_data$TNFRSF13B, "footprints", 11L)
+```{r tnfrsf13b-cluster1-footprints, out.width="100%", fig.width=10, fig.height=selected_data$TNFRSF13B$heights[["footprints"]]}
+plot_selected_cluster(selected_data$TNFRSF13B, "footprints", 10L)
+```
+
+### 6. gene ranking by raw and normalized nucleosome entropy
+
+Each row is one gene, ranked from highest entropy at the top to lowest at the bottom. Left: raw entropy in bits, right: normalized entropy $H / \log_2 500$. The two panels have the same gene order, because every gene uses the same 500 bases
+
+```{r nucleosome-entropy-ranking, out.width="100%", fig.width=12, fig.height=ranking_height(genes)}
+p <- plot_ranking_pair(genes, NUCLEOSOME_SPEC)
+save_pdf(p, "11_nucleosome_entropy_ranking.pdf", 12, ranking_height(genes))
+p
 ```
 
 # Molecule-cluster entropy
@@ -561,7 +615,7 @@ Input files:
 
 **Steps**
 
-1. For gene $g$ with $K$ observed clusters, let $n_k$ be the number of assigned fibers in cluster $k$ and $N = \sum_k n_k$. The cluster proportions are  $$p_k = \frac{n_k}{N}.$$
+1. A gene is valid only if it has $>$ 20 assigned reads and $>$ 1 cluster. For gene $g$ with $K$ observed clusters, let $n_k$ be the number of assigned fibers in cluster $k$ and $N = \sum_k n_k$. The cluster proportions are  $$p_k = \frac{n_k}{N}.$$
 
 2. Shannon entropy (bits), normalized entropy and effective number of states:
    
@@ -603,7 +657,7 @@ dir.create(MOLECULE_FIGURES, recursive = TRUE, showWarnings = FALSE)
 
   - One row per gene (150 genes): `n_clusters` is $K$, `n_assigned_reads` is $N$, and `shannon_entropy_bits`, `normalized_entropy` and `effective_states` are $H$, $H_{\text{norm}}$ and $D$
   
-  - `status` is `valid` for 149 genes; SLC44A4 is `no_valid_assignments` because it has no saved reads
+  - `status` is `valid` for 148 genes; SLC44A4 is `no_valid_assignments` because it has no saved reads, and HLA-DMA is `below_min_reads_or_clusters` (5 reads, one cluster). Only valid genes are used in the summaries, tests and figures
 
 ```{r table-molecule-gene-entropy, results='asis'}
 molecule_genes <- fread(file.path(MOLECULE_TABLES, "gene_molecule_cluster_entropy.tsv"))
@@ -640,7 +694,7 @@ knitr::kable(molecule_group_tests, digits = 4)
 ```
 
 
-```{r molecule-cluster-plot-data, include=FALSE}
+```{r molecule-cluster-plot-data}
 stopifnot(!anyDuplicated(molecule_genes$gene_name))
 molecule_valid <- molecule_genes[status == "valid" & is.finite(shannon_entropy_bits)]
 stopifnot(nrow(molecule_valid) > 0L, all(molecule_valid$group %in% GROUPS))
@@ -648,57 +702,92 @@ molecule_valid[, group := factor(group, GROUPS)]
 save_molecule_pdf <- function(p, name, width = 9, height = 6)
   save_figure(p, file.path(MOLECULE_FIGURES, name), width = width, height = height,
               device = "pdf", useDingbats = FALSE)
+# Promoter features (motif, +1 start, short footprints) are the nucleosome-section ones
+MOLECULE_SPEC <- list(name = "Molecule-cluster entropy",
+  raw = "shannon_entropy_bits", raw_label = "Molecule-cluster Shannon entropy (bits)", raw_max = NULL,
+  normalized = "normalized_entropy", normalized_label = "Normalized molecule-cluster entropy",
+  normalized_max = 1,
+  subtitle = "Left: raw Shannon entropy H (bits)  |  Right: normalized entropy H / log2(K), K = number of clusters")
+molecule_metrics <- molecule_valid[, .(gene_name, shannon_entropy_bits, normalized_entropy)]
+molecule_plot <- merge(molecule_metrics, genes[, .(gene_name, group, puffin_motif, plus1_start_mean_bp)],
+                       by = "gene_name")
+stopifnot(setequal(molecule_plot$gene_name, molecule_valid$gene_name),
+          setequal(molecule_plot$gene_name, genes$gene_name))
+molecule_fp <- merge(fp_genes[, .(gene_name, group, footprint_class, fraction_with_footprint)],
+                     molecule_metrics, by = "gene_name")
 ```
 
 
-### 1. cluster level shannon entropy by group
+### 1. molecule-cluster entropy by gene group
 
-Distribution of raw molecule-cluster Shannon entropy in each gene group. Shannon entropy (bits) is the "how unpredictable is a fiber's cluster" score: 0 means all of a gene's fibers are in one cluster; higher means more clusters and/or more even clusters
+Each point is one gene, black diamond marks the median. Shannon entropy (bits) is the "how unpredictable is a fiber's cluster" score: 0 means all of a gene's fibers are in one cluster; higher means more clusters and/or more even clusters. Normalized entropy divides it by the maximum for the gene's number of clusters, $\log_2 K$, and runs from 0 to 1 (1 = every cluster holds the same share). Left: raw entropy, right: normalized entropy
 
-```{r molecule-shannon-by-group}
-plot_shannon_by_group <- function(d) {
-  d <- d[is.finite(shannon_entropy_bits)]
-  n <- d[, .N, by = group]
-  lab <- setNames(paste0(GROUP_LABELS[as.character(n$group)], "\nn=", n$N), as.character(n$group))
-  ggplot(d, aes(group, shannon_entropy_bits, fill = group)) +
-    geom_violin(trim = TRUE, alpha = .3) + geom_boxplot(width = .14, outlier.shape = NA, fill = "white") +
-    geom_point(position = position_jitter(width = .12, seed = 12), size = 1.5, alpha = .6) +
-    scale_fill_manual(values = GROUP_COLORS) + scale_x_discrete(labels = lab) +
-    labs(x = NULL, y = "Molecule-cluster Shannon entropy (bits)") +
-    theme_fiberseq(base_size = 11) + theme(legend.position = "none")
-}
-p <- plot_shannon_by_group(molecule_valid)
-save_molecule_pdf(p, "01_shannon_entropy_by_group.pdf")
+```{r molecule-entropy-by-group, out.width="100%", fig.width=15, fig.height=6.5}
+p <- plot_group_pair(molecule_plot, MOLECULE_SPEC)
+save_molecule_pdf(p, "01_gene_group_entropy.pdf", 15, 6.5)
 p
 ```
 
+### 2. molecule-cluster entropy by Puffin dominant motif
 
-### 2. normalized shannon entropy per gene group
+Each point is one gene, grouped by its Puffin dominant motif. Motifs are ordered by median raw entropy. Left: raw entropy, right: normalized entropy
 
-Each gene's entropy divided by the maximum possible for its number of clusters. Normalized entropy runs from 0 to 1; 1 means every cluster holds the same share of reads
-
-```{r molecule-normalized-by-group}
-plot_normalized_by_group <- function(d) {
-  d <- d[is.finite(normalized_entropy)]
-  n <- d[, .N, by = group]
-  lab <- setNames(paste0(GROUP_LABELS[as.character(n$group)], "\nn=", n$N), as.character(n$group))
-  ggplot(d, aes(group, normalized_entropy, fill = group)) +
-    geom_violin(trim = TRUE, alpha = .3) + geom_boxplot(width = .14, outlier.shape = NA, fill = "white") +
-    geom_point(position = position_jitter(width = .12, seed = 12), size = 1.5, alpha = .6) +
-    scale_fill_manual(values = GROUP_COLORS) + scale_x_discrete(labels = lab) +
-    labs(x = NULL, y = "Normalized molecule-cluster entropy") +
-    theme_fiberseq(base_size = 11) + theme(legend.position = "none")
-}
-p <- plot_normalized_by_group(molecule_valid)
-save_molecule_pdf(p, "02_normalized_entropy_by_group.pdf")
+```{r molecule-entropy-by-motif, out.width="100%", fig.width=22, fig.height=6.5}
+p <- plot_motif_pair(molecule_plot, MOLECULE_SPEC)
+save_molecule_pdf(p, "02_entropy_by_puffin_motif.pdf", 22, 6.5)
 p
 ```
 
-### 3. cluster entropy by the number of clusters
+### 3. molecule-cluster entropy and +1 nucleosome start position
+
+Each point is one gene. The +1 coordinate is the same as in the nucleosome section (mean of the per-fiber first nucleosome starts at +1..+299 bp). Left: raw entropy, right: normalized entropy
+
+```{r molecule-entropy-plus1-start, out.width="100%", fig.width=14, fig.height=7}
+p <- plot_plus1_pair(molecule_plot, MOLECULE_SPEC)
+save_molecule_pdf(p, "03_entropy_vs_plus1_start.pdf", 14, 7)
+p
+```
+
+### 4. molecule-cluster entropy and footprint presence at promoters
+
+Footprint fractions are the nucleosome-section ones (fibers with a 10-<30, 30-<60 or 60-80 bp footprint overlapping TSS -100..+100 bp). Left: raw entropy, right: normalized entropy
+
+```{r molecule-entropy-short-footprints, out.width="100%", fig.width=12, fig.height=11}
+p <- plot_footprint_pair(molecule_fp, MOLECULE_SPEC)
+save_molecule_pdf(p, "04_entropy_vs_short_footprints.pdf", 12, 11)
+p
+```
+
+### 5. gene ranking by raw and normalized molecule-cluster entropy
+
+Each row is one gene, ranked from highest entropy at the top to lowest at the bottom; each panel has its own gene order. Left: raw Shannon entropy (number of clusters and evenness), right: normalized entropy (evenness only)
+
+```{r molecule-entropy-ranking, out.width="100%", fig.width=12, fig.height=ranking_height(molecule_plot)}
+p <- plot_ranking_pair(molecule_plot, MOLECULE_SPEC)
+save_molecule_pdf(p, "05_entropy_ranking.pdf", 12, ranking_height(molecule_plot))
+p
+```
+
+Full ranking by normalized molecule-cluster entropy, highest first. `Largest cluster` is the share of the gene's fibers in its largest cluster
+
+```{r table-molecule-normalized-ranking, results='asis'}
+largest_cluster <- molecule_proportions[, .(largest_cluster = max(proportion)), by = gene_name]
+normalized_ranking <- merge(molecule_valid, largest_cluster, by = "gene_name")[
+  order(-normalized_entropy, gene_name)]
+normalized_ranking[, rank := seq_len(.N)]
+knitr::kable(normalized_ranking[, .(rank, gene_name, group = GROUP_LABELS[as.character(group)], n_clusters,
+  n_assigned_reads, normalized_entropy, shannon_entropy_bits, largest_cluster)],
+  digits = c(0, 0, 0, 0, 0, 3, 2, 2), row.names = FALSE,
+  col.names = c("Rank", "Gene", "Gene group", "Clusters", "Assigned fibers", "Normalized entropy",
+                "Shannon entropy (bits)", "Largest cluster"),
+  caption = "Genes ranked by normalized molecule-cluster entropy.")
+```
+
+### 6. cluster entropy by the number of clusters
 
 entropy is mostly determined by the total number of clusters
 
-```{r molecule-entropy-vs-cluster-number}
+```{r molecule-entropy-vs-cluster-number, out.width="100%", fig.width=11, fig.height=6}
 plot_entropy_vs_cluster_number <- function(d) {
   long <- melt(d, id.vars = c("gene_name", "group", "n_clusters", "n_assigned_reads"),
                measure.vars = c("shannon_entropy_bits", "normalized_entropy"),
@@ -712,7 +801,38 @@ plot_entropy_vs_cluster_number <- function(d) {
     theme_fiberseq(base_size = 11) + theme(legend.position = "bottom")
 }
 p <- plot_entropy_vs_cluster_number(molecule_valid)
-save_molecule_pdf(p, "03_entropy_vs_cluster_number.pdf", 11, 6)
+save_molecule_pdf(p, "06_entropy_vs_cluster_number.pdf", 11, 6)
+p
+```
+
+Distribution of molecule-cluster Shannon entropy over all valid genes, all gene groups pooled; bin width 0.05 bits
+
+```{r molecule-shannon-histogram, fig.width=9, fig.height=6}
+plot_shannon_histogram <- function(d) {
+  ggplot(d[is.finite(shannon_entropy_bits)], aes(shannon_entropy_bits)) +
+    geom_histogram(binwidth = .05, boundary = 0, fill = "#547AA5", colour = "white", linewidth = .2) +
+    labs(x = "Molecule-cluster Shannon entropy (bits)", y = "Number of genes") +
+    theme_fiberseq(base_size = 11)
+}
+p <- plot_shannon_histogram(molecule_valid)
+save_molecule_pdf(p, "07_shannon_entropy_histogram.pdf")
+p
+```
+
+Number of original Leiden clusters per gene in each gene group, one gene per count
+
+```{r molecule-cluster-number-by-group, fig.width=8.5, fig.height=6.5}
+plot_cluster_number_by_group <- function(d) {
+  z <- d[, .N, by = .(group, n_clusters)]
+  ggplot(z, aes(factor(n_clusters, levels = seq_len(max(n_clusters))), N, fill = group)) +
+    geom_col(position = position_dodge(preserve = "single"), width = .8) +
+    scale_x_discrete(drop = FALSE) +
+    scale_fill_manual(values = GROUP_COLORS, breaks = GROUPS, labels = GROUP_LABELS, name = "Gene group") +
+    labs(x = "Number of clusters", y = "Number of genes", title = "Number of clusters by gene group") +
+    theme(legend.position = "bottom")
+}
+p <- plot_cluster_number_by_group(molecule_valid)
+save_molecule_pdf(p, "08_cluster_number_by_group.pdf", 8.5, 6.5)
 p
 ```
 
@@ -740,7 +860,7 @@ Input:
 
 **Steps**
 
-1. Take each gene's cluster counts $n_k$ and proportions $p_k = n_k / N$ 
+1. Take each gene's cluster counts $n_k$ and proportions $p_k = n_k / N$. Only genes valid for molecule-cluster entropy ($>$ 20 assigned reads and $>$ 1 cluster) get a diversity value; the others are NA
 
 2. Gini-Simpson diversity, normalized diversity and inverse Simpson:
 
@@ -757,11 +877,11 @@ Input:
    - $D_2$ is the number of equally sized clusters that would give the same $G$
    
    
-4. For each read, compute promoter chromatin features: the fraction of fibers with a +1 nucleosome and the SD and IQR of its start (+1..+299 bp), the fraction of fibers with a nucleosome over the TSS, the mean m6A rate in -500..-201, -200..+200 and +201..+500 bp, and footprint fractions
+4. For each read, compute promoter chromatin features: the fraction of fibers with a +1 nucleosome and its mean start position (+1..+299 bp), the fraction of fibers with a nucleosome over the TSS, the mean m6A rate in -500..-201, -200..+200 and +201..+500 bp, and footprint fractions
 
   - a read has a footprint of a size class ([40,60), [60,80] or [10,80] bp) in a window (-100..+100 or 0..+300 bp) if at least 50% of the footprint's length lies in the window, the denominator is the reads spanning the whole window
   
-5. Correlate $G$ with each of the 13 features (Spearman), pooled and within each group
+5. Correlate $G$ with each of the 12 features (Spearman), pooled and within each group
 
 
 Outputs
@@ -787,7 +907,7 @@ knitr::kable(head(gini_genes[, .(gene_name, gene_group, n_fibers_assigned, n_clu
 
   - One row per promoter and cluster: `n_reads` ($n_k$) and `proportion` ($p_k$), the same counts as the molecule-cluster table, re-checked against the assignment files
   
-  - `abundance_rank` orders a promoter's clusters by size (1 = largest); it is used for the composition figures and is not a shared cluster identity across genes
+  - `abundance_rank` orders a promoter's clusters by size (1 = largest); it is not a shared cluster identity across genes
 
 ```{r table-gini-proportions, results='asis'}
 gini_proportions <- fread(file.path(GINI_TABLES, "cluster_proportions.tsv"))
@@ -816,13 +936,13 @@ knitr::kable(gini_tests, digits = 4)
 
 5. `chromatin_features.tsv`
 
-  - One row per promoter: the diversity columns of table 1 joined to the 13 chromatin features of the steps below (+1 nucleosome, TSS occlusion, three m6A windows, six short-footprint fractions), all from the same assigned fibers
+  - One row per promoter: the diversity columns of table 1 joined to the 12 chromatin features of the steps below (+1 nucleosome fraction and mean start, TSS occlusion, three m6A windows, six short-footprint fractions), all from the same assigned fibers
   
   - The `n_*` columns are the fibers each feature is based on
 
 ```{r table-gini-chromatin-features, results='asis'}
 gini_features <- fread(file.path(GINI_TABLES, "chromatin_features.tsv"))
-knitr::kable(head(gini_features[, .(gene_name, gene_group, gini_simpson, plus1_fraction, plus1_start_sd,
+knitr::kable(head(gini_features[, .(gene_name, gene_group, gini_simpson, plus1_fraction, plus1_start_mean,
   tss_occlusion_fraction, m6a_tss_centered, fp10_80_tss)]), digits = 3)
 ```
 
@@ -846,16 +966,7 @@ gini_associations <- fread(file.path(GINI_TABLES, "simpson_feature_associations.
 knitr::kable(gini_associations[stratum == "all"], digits = 4)
 ```
 
-8. `ranked_cluster_group_composition.tsv`
-
-  - One row per gene group × abundance rank: the mean and median share of a promoter's fibers in its rank-$r$ cluster, over the group's promoters (ranks a promoter lacks count as 0, so each group's means sum to 1)
-
-```{r table-gini-ranked-composition, results='asis'}
-gini_ranked <- fread(file.path(GINI_TABLES, "ranked_cluster_group_composition.tsv"))
-knitr::kable(gini_ranked[order(gene_group, abundance_rank)], digits = 3)
-```
-
-9. `representative_promoters.tsv`
+8. `representative_promoters.tsv`
 
   - The promoters with the lowest, median and highest $G$ (`representative` = Low, Intermediate, High), with all columns of table 5
 
@@ -867,178 +978,76 @@ knitr::kable(gini_representatives[, .(representative, gene_name, gene_group, n_f
 
 
 ```{r gini-simpson-figure-data}
-suppressPackageStartupMessages(library(patchwork))
 GINI_FIGURES <- file.path(GINI_OUT, "figures")
 dir.create(GINI_FIGURES, recursive = TRUE, showWarnings = FALSE)
 save_gini_pdf <- function(p, name, width = 10, height = 7)
   save_figure(p, file.path(GINI_FIGURES, name), width = width, height = height,
               device = "pdf", useDingbats = FALSE, limitsize = FALSE)
 gini_valid <- gini_features[is.finite(gini_simpson)]
-gini_composition_height <- max(10, nrow(gini_valid) * .13 + 2)
 
-# Gene-group violin of one diversity metric, one point per promoter
-plot_gini_by_group <- function(d, metric, ylab) {
-  z <- d[is.finite(get(metric))]
-  z[, gene_group := factor(gene_group, GROUPS)]
-  n <- z[, .N, by = gene_group]
-  lab <- setNames(sprintf("%s\nn=%d", GROUP_LABELS[as.character(n$gene_group)], n$N), as.character(n$gene_group))
-  ggplot(z, aes(gene_group, .data[[metric]], fill = gene_group)) + geom_violin(trim = TRUE, alpha = .35) +
-    geom_boxplot(width = .15, fill = "white", outlier.shape = NA) +
-    geom_point(position = position_jitter(width = .12, seed = 2026), size = 1.5, alpha = .65) +
-    scale_fill_manual(values = GROUP_COLORS) + scale_x_discrete(labels = lab) +
-    labs(x = NULL, y = ylab) + theme_fiberseq(base_size = 11) + theme(legend.position = "none")
-}
-
-# Gini-Simpson diversity against promoter features, one panel per feature,
-# labelled with the pooled Spearman rho
-plot_gini_vs_features <- function(d, labels, associations, title, ncol = 2, ylab = NULL) {
-  features <- names(labels)
-  z <- melt(d, id.vars = c("promoter_id", "gene_name", "gene_group", "gini_simpson"),
-            measure.vars = features, variable.name = "feature", value.name = "value")
-  z <- z[is.finite(gini_simpson) & is.finite(value)]
-  stats <- associations[stratum == "all" & feature %in% features]
-  lab <- setNames(vapply(features, function(f) {
-    a <- stats[feature == f]
-    sprintf("%s\nn=%d; Spearman rho=%.2f", labels[[f]], a$n_promoters, a$spearman_rho)
-  }, character(1)), features)
-  z[, feature := factor(feature, features)]
-  ggplot(z, aes(gini_simpson, value, colour = gene_group)) + geom_point(size = 1.7, alpha = .7) +
-    facet_wrap(~ feature, scales = "free_y", ncol = ncol, labeller = labeller(feature = lab)) +
-    scale_colour_manual(values = GROUP_COLORS, breaks = GROUPS, labels = GROUP_LABELS, name = "Gene group") +
-    labs(x = "Gini-Simpson diversity", y = ylab, title = title) +
-    theme_fiberseq(base_size = 11) + theme(legend.position = "bottom", strip.text = element_text(size = 9))
-}
-
-
-gini_ranks <- sort(unique(gini_proportions$abundance_rank))
-gini_rank_colors <- setNames(grDevices::hcl.colors(length(gini_ranks), "Dark 3"), as.character(gini_ranks))
+# Promoter features (motif, +1 start, short footprints) are the nucleosome-section ones
+GINI_SPEC <- list(name = "Gini-Simpson diversity",
+  raw = "gini_simpson", raw_label = "Gini-Simpson diversity", raw_max = NULL,
+  normalized = "normalized_gini_simpson", normalized_label = "Normalized Gini-Simpson diversity",
+  normalized_max = 1,
+  subtitle = "Left: raw Gini-Simpson diversity G = 1 - sum(p_k^2)  |  Right: normalized diversity G / (1 - 1/K), K = number of clusters")
+gini_metrics <- gini_valid[, .(gene_name, gini_simpson, normalized_gini_simpson)]
+gini_plot <- merge(gini_metrics, genes[, .(gene_name, group, puffin_motif, plus1_start_mean_bp)],
+                   by = "gene_name")
+stopifnot(setequal(gini_plot$gene_name, gini_valid$gene_name),
+          setequal(gini_plot$gene_name, genes$gene_name))
+gini_fp <- merge(fp_genes[, .(gene_name, group, footprint_class, fraction_with_footprint)],
+                 gini_metrics, by = "gene_name")
 ```
 
-### 1. gini-Simpson diversity by gene group
+### 1. Gini-Simpson diversity by gene group
 
-Distribution of raw Gini-Simpson diversity in each gene group, one point per gene.
+Each point is one gene, black diamond marks the median. Normalized diversity is each gene's $G$ divided by the maximum possible for its number of clusters, $1 - 1/K$, and runs from 0 to 1. Left: raw diversity, right: normalized diversity
 
   - as with raw Shannon entropy, housekeeping promoters are higher because they tend to have more clusters
 
-```{r show-gini-groups, out.width="100%", fig.width=10, fig.height=7}
-p <- plot_gini_by_group(gini_features, "gini_simpson", "Gini-Simpson diversity")
-save_gini_pdf(p, "01_gini_simpson_by_gene_group.pdf")
+```{r show-gini-groups, out.width="100%", fig.width=15, fig.height=6.5}
+p <- plot_group_pair(gini_plot, GINI_SPEC)
+save_gini_pdf(p, "01_gene_group_entropy.pdf", 15, 6.5)
 p
 ```
 
-### 2. normalized gini-simpson based by gene group
+### 2. Gini-Simpson diversity by Puffin dominant motif
 
-Each gene's $G$ divided by the maximum possible for its number of clusters, $1 - 1/K$. Normalized diversity runs from 0 to 1
+Each point is one gene, grouped by its Puffin dominant motif. Motifs are ordered by median raw diversity. Left: raw diversity, right: normalized diversity
 
-```{r show-gini-normalized, out.width="100%", fig.width=10, fig.height=7}
-p <- plot_gini_by_group(gini_features, "normalized_gini_simpson", "Normalized Gini-Simpson diversity")
-save_gini_pdf(p, "02_normalized_simpson_by_gene_group.pdf")
+```{r show-gini-motif, out.width="100%", fig.width=22, fig.height=6.5}
+p <- plot_motif_pair(gini_plot, GINI_SPEC)
+save_gini_pdf(p, "02_entropy_by_puffin_motif.pdf", 22, 6.5)
 p
 ```
 
-## Gini-Simpson diversity and promoter chromatin features
+### 3. Gini-Simpson diversity and +1 nucleosome start position
 
-**Steps** 
+Each point is one gene. The +1 coordinate is the same as in the nucleosome section. Left: raw diversity, right: normalized diversity
 
-Spearman correlation of $G$ with each of the 13 features, pooled and within each gene group, one value per promoter; correlation only, no p-values 
-
-
-
-+1 nucleosome features: the fraction of fibers with a +1 nucleosome, the SD and IQR
-of the +1 start position, and the fraction of fibers with a nucleosome over the TSS
-
-```{r show-gini-plus1, out.width="100%", fig.width=12, fig.height=8}
-p <- plot_gini_vs_features(gini_features, c(plus1_fraction = "+1 nucleosome fraction",
-  plus1_start_sd = "+1 start SD (bp)", plus1_start_iqr = "+1 start IQR (bp)",
-  tss_occlusion_fraction = "TSS nucleosome occlusion fraction"),
-  gini_associations, "Promoter diversity and +1 nucleosome features")
-save_gini_pdf(p, "03_simpson_vs_plus1_nucleosome.pdf", 12, 8)
+```{r show-gini-plus1, out.width="100%", fig.width=14, fig.height=7}
+p <- plot_plus1_pair(gini_plot, GINI_SPEC)
+save_gini_pdf(p, "03_entropy_vs_plus1_start.pdf", 14, 7)
 p
 ```
 
-Mean m6A rate in three windows: upstream -500..-201 bp, TSS -200..+200 bp and
-downstream +201..+500 bp. Each rate uses the sites observed as m6A in at least one
-fiber of the promoter's cohort.
+### 4. Gini-Simpson diversity and footprint presence at promoters
 
-```{r show-gini-m6a, out.width="100%", fig.width=12, fig.height=8}
-p <- plot_gini_vs_features(gini_features, c(m6a_promoter_proximal = "m6A: upstream -500..-201 bp",
-  m6a_tss_centered = "m6A: TSS -200..+200 bp", m6a_downstream = "m6A: downstream +201..+500 bp"),
-  gini_associations, "Promoter diversity and m6A accessibility", ncol = 3)
-save_gini_pdf(p, "04_simpson_vs_m6a.pdf", 12, 8)
+Footprint fractions are the nucleosome-section ones (fibers with a 10-<30, 30-<60 or 60-80 bp footprint overlapping TSS -100..+100 bp). Left: raw diversity, right: normalized diversity
+
+```{r show-gini-footprints, out.width="100%", fig.width=12, fig.height=11}
+p <- plot_footprint_pair(gini_fp, GINI_SPEC)
+save_gini_pdf(p, "04_entropy_vs_short_footprints.pdf", 12, 11)
 p
 ```
 
-Short-footprint presence: the fraction of fibers spanning the whole window that have
-at least one footprint of the size class, for three size classes in the TSS
--100..+100 bp and 0..+300 bp windows. At least 50% of a footprint's length must lie
-in the window, and each fiber counts once per size class and window.
+### 5. gene ranking by raw and normalized Gini-Simpson diversity
 
-```{r show-gini-footprints, out.width="100%", fig.width=12, fig.height=10}
-p <- plot_gini_vs_features(gini_features, c(fp40_60_tss = "40-<60 bp; TSS -100..+100",
-  fp60_80_tss = "60-80 bp; TSS -100..+100", fp10_80_tss = "10-80 bp; TSS -100..+100",
-  fp40_60_downstream = "40-<60 bp; TSS 0..+300", fp60_80_downstream = "60-80 bp; TSS 0..+300",
-  fp10_80_downstream = "10-80 bp; TSS 0..+300"),
-  gini_associations, "Promoter diversity and short-footprint presence", ncol = 3,
-  ylab = "Fraction of eligible fibers with a qualifying footprint")
-save_gini_pdf(p, "05_simpson_vs_footprints.pdf", 12, 10)
-p
-```
+Each row is one gene, ranked from highest diversity at the top to lowest at the bottom; each panel has its own gene order. Left: raw Gini-Simpson diversity, right: normalized Gini-Simpson diversity (evenness only)
 
-## Cluster composition
-
-Each row is one promoter, ordered from lowest diversity at the top to highest at
-the bottom. The stacked bar shows the fraction of the promoter's fibers in each of
-its clusters, colored by abundance rank within the promoter (rank 1 = largest
-cluster). The narrow column shows the gene group and the right bar the promoter's
-Gini-Simpson diversity. Rank colors do not mean the same cluster identity across genes.
-
-```{r show-gini-composition, out.width="100%", fig.width=14, fig.height=gini_composition_height}
-plot_promoter_composition <- function(d, counts) {
-  dd <- d[order(gini_simpson, gene_name)]
-  cc <- copy(counts)[, `:=`(promoter = factor(promoter_id, levels = rev(dd$promoter_id)),
-                            rank = factor(abundance_rank, levels = gini_ranks))]
-  dd[, promoter := factor(promoter_id, levels = rev(promoter_id))]
-  bars <- ggplot(cc, aes(proportion, promoter, fill = rank)) +
-    geom_col(width = .85, position = position_stack(reverse = TRUE)) +
-    scale_fill_manual(values = gini_rank_colors, name = "Abundance rank") +
-    scale_y_discrete(labels = setNames(dd$gene_name, dd$promoter_id), drop = FALSE) +
-    scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0, 1)) +
-    labs(x = "Fraction of assigned fibers", y = NULL) + theme_fiberseq(base_size = 11) +
-    theme(axis.text.y = element_text(size = 6), legend.position = "bottom")
-  annotation <- ggplot(dd, aes(1, promoter, fill = gene_group)) + geom_tile() +
-    scale_fill_manual(values = GROUP_COLORS, breaks = GROUPS, labels = GROUP_LABELS, name = "Gene group") +
-    scale_y_discrete(drop = FALSE) + labs(x = "Group", y = NULL) +
-    theme_void() + theme(legend.position = "bottom", axis.title.x = element_text())
-  diversity <- ggplot(dd, aes(gini_simpson, promoter)) + geom_col(fill = "#555555", width = .85) +
-    scale_y_discrete(drop = FALSE) + scale_x_continuous(limits = c(0, 1)) +
-    labs(x = "Gini-Simpson", y = NULL) + theme_fiberseq(base_size = 11) +
-    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
-  bars + annotation + diversity + plot_layout(widths = c(7, .35, 2), guides = "collect") +
-    plot_annotation(title = "Promoter cluster composition, ordered by Gini-Simpson diversity",
-                    theme = theme_fiberseq(base_size = 11))
-}
-p <- plot_promoter_composition(gini_valid, gini_proportions)
-save_gini_pdf(p, "06_promoter_cluster_composition.pdf", 14, gini_composition_height)
-p
-```
-
-Mean fraction of fibers in each abundance rank, averaged over the promoters of each
-gene group with equal weight per promoter. Ranks a promoter does not have count as
-zero, so each group's bar sums to 1.
-
-```{r show-gini-group-composition, out.width="100%", fig.width=10, fig.height=5}
-plot_group_composition <- function(ranked) {
-  z <- copy(ranked)[, `:=`(rank = factor(abundance_rank, levels = gini_ranks),
-                           gene_group = factor(gene_group, levels = rev(GROUPS)))]
-  ggplot(z, aes(mean_proportion, gene_group, fill = rank)) +
-    geom_col(position = position_stack(reverse = TRUE), width = .6) +
-    scale_fill_manual(values = gini_rank_colors, name = "Abundance rank") +
-    scale_y_discrete(labels = GROUP_LABELS) +
-    labs(x = "Mean within-promoter cluster fraction", y = NULL,
-         title = "Gene-group composition: equal weight per promoter") +
-    theme_fiberseq(base_size = 11) + theme(legend.position = "bottom")
-}
-p <- plot_group_composition(gini_ranked)
-save_gini_pdf(p, "07_gene_group_cluster_composition.pdf", 10, 5)
+```{r show-gini-ranking, out.width="100%", fig.width=12, fig.height=ranking_height(gini_plot)}
+p <- plot_ranking_pair(gini_plot, GINI_SPEC)
+save_gini_pdf(p, "05_entropy_ranking.pdf", 12, ranking_height(gini_plot))
 p
 ```

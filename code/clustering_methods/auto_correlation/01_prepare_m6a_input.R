@@ -19,7 +19,7 @@ recover_m6a_selection <- function(leiden_dir, destination) {
   if (file.exists(destination))
     stop("Refusing to replace an existing selection signature: ", destination)
   paths <- sort(Sys.glob(file.path(leiden_dir,
-    "rank*", "bin0", "k10", "resolution1", "tables", "clustering.rds")))
+    "AS_FIRE", "rank*", "bin0", "k10", "resolution1", "tables", "clustering.rds")))
   if (length(paths) != 10L)
     stop("Selection recovery requires all ten original Leiden clustering.rds files in ",
       leiden_dir, "; found ", length(paths))

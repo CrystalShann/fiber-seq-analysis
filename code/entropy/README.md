@@ -34,7 +34,7 @@ From `/project/spott/cshan/fiber-seq`, after the PolII read-feature and
 recurrent-pattern steps (`code/pausing/PolII`) have written their tables:
 
 ```bash
-# 1. nucleosome entropy + short-footprint fractions -> LCL_project/entropy/tables
+# 1. nucleosome entropy + short-footprint fractions -> LCL_project/entropy/nucleosome_entropy/tables
 sbatch code/entropy/nucleosome/run_entropy.sh --by-cluster
 # 2. molecule-cluster entropy -> LCL_project/entropy/molecule_cluster_entropy
 bash code/pausing/PolII/run_gene_examples.sh code/entropy/molecule_cluster/molecule_cluster_entropy.R

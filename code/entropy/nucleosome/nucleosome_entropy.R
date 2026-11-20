@@ -16,6 +16,9 @@ setDTthreads(1L)
 SHORT_FP_ROOT <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/FiberHMM/merged"
 SHORT_FP_BREAKS <- c(10L, 30L, 60L, 80L)
 SHORT_FP_WINDOW <- c(-100L, 100L) # inclusive, 201 bases; entropy stays at +1..+500
+# Genes need > MIN_READS saved reads and > MIN_CLUSTERS Leiden clusters for entropy
+MIN_READS <- 20L
+MIN_CLUSTERS <- 1L
 
 # Legacy FiberHMM v1 is BED10: chr,start,end,RID,thickStart,thickEnd,rgb,
 # blockCount,blockStarts,blockSizes. Supply neutral score/strand fields to the
@@ -158,9 +161,10 @@ nucleotide_profile <- function(footprints, reads, anchors) {
 }
 
 # Query original calls, retaining the exact alignment used for the saved cohort.
-# A missing BED record is an error, whereas a present record with no retained
-# nucleosome blocks is a valid unoccupied fiber. Sentinel blocks are removed by
-# the shared parser before the existing inclusive 130-160 bp filter is applied.
+# A saved read without a BED record (fibertools writes none for reads with almost
+# no m6A) counts as a covering fiber with no nucleosomes, like a present record
+# with no retained blocks. Sentinel blocks are removed by the shared parser
+# before the existing inclusive 130-160 bp filter is applied.
 load_nucleosomes <- function(g, reads, samples) {
   region <- GenomicRanges::GRanges(g$chrom,
     IRanges::IRanges(g$tss - 1000L, g$tss + 1000L))
@@ -171,12 +175,13 @@ load_nucleosomes <- function(g, reads, samples) {
                       paste0(sn, ".ft_extracted_nuc.", g$chrom, ".bed.gz"))
     b <- as.data.table(read_ft_bed12(path, region, longest_alignment = FALSE))
     wanted <- reads[sample_name == sn]
-    if (!nrow(b)) stop("No nucleosome BED records for cohort in ", path)
+    if (!nrow(b)) return(NULL)
     key <- paste(sn, b$RID, sep = "::")
     ix <- match(key, wanted$RID)
     b <- unique(b[which(!is.na(ix) & b$start + 1L == wanted$start[ix] & b$end == wanted$end[ix])])
-    if (anyDuplicated(b$RID) || nrow(b) != nrow(wanted))
-      stop("Missing or ambiguous nucleosome alignment for saved cohort: ", sn)
+    if (anyDuplicated(b$RID))
+      stop("Ambiguous nucleosome alignment for saved cohort: ", sn)
+    if (!nrow(b)) return(NULL)
     blocks <- as.data.table(convert_ft_bed12_to_bed6(b, format = "bed12_fibertools", source = path))
     blocks <- blocks[!is.na(assign_size_class(end - start, c(130L, 160L)))]
     if (nrow(blocks) && any(blocks$start < b$start[match(blocks$RID, b$RID)] |
@@ -184,8 +189,9 @@ load_nucleosomes <- function(g, reads, samples) {
       stop("Nucleosome call outside its alignment: ", path)
     blocks[, .(RID = paste(sn, RID, sep = "::"), start, end)]
   })
-  if (!length(out)) return(data.table(RID = character(), start = integer(), end = integer()))
-  rbindlist(out)
+  out <- rbindlist(out)
+  if (!nrow(out)) return(data.table(RID = character(), start = integer(), end = integer()))
+  out
 }
 
 finite_mean <- function(x) if (any(is.finite(x))) mean(x[is.finite(x)]) else NA_real_
@@ -207,7 +213,9 @@ summarize_subset <- function(g, reads, footprints, anchors, ix, level, cluster =
     min_coverage = min(depth), mean_coverage = mean(depth),
     max_coverage = max(depth), n_uncovered_positions = sum(depth == 0),
     total_nucleosome_occupancy_signal = result$total,
-    nucleosome_entropy_bits = result$entropy, status = result$status, error = "",
+    nucleosome_entropy_bits = result$entropy,
+    normalized_nucleosome_entropy = result$entropy / log2(500), # H / maximum entropy over 500 bases
+    status = result$status, error = "",
     n_plus1_fibers = sum(is.finite(a$plus1_start)),
     plus1_start_mean_bp = finite_mean(a$plus1_start),
     plus1_start_sd_bp = finite_sd(a$plus1_start),
@@ -225,6 +233,11 @@ calculate_gene <- function(g, reads, samples, cluster_root, by_cluster = TRUE) {
   if (is.na(g$tss) || !g$strand %in% c("+", "-")) stop("No resolved TSS")
   if (nrow(reads) && (any(reads$chrom != g$chrom | reads$tss != g$tss | reads$strand != g$strand) ||
                      anyDuplicated(reads$RID))) stop("Inconsistent saved read metadata")
+  if (nrow(reads) && (nrow(reads) <= MIN_READS ||
+                      uniqueN(entropy_cluster_labels(g, reads, cluster_root)$cluster) <= MIN_CLUSTERS))
+    return(list(summary = cbind(g[, .(gene_name, gene_id, group, chrom, tss, strand, tss_source)],
+      data.table(level = "gene", n_fibers = nrow(reads), nucleosome_entropy_bits = NA_real_,
+                 status = "below_min_reads_or_clusters", error = "")), profile = NULL))
   nucs <- load_nucleosomes(g, reads, samples)
   anchors <- build_region_anchors(NULL, NULL, NULL, relative_window = c(1L, 500L),
     anchor_table = data.table(region_id = g$gene_name, chr = g$chrom, anchor = g$tss,
@@ -290,7 +303,7 @@ main <- function() {
                 tss_source = metadata$tss_source, source_error = metadata$error)]
   reads <- fread(file.path(BASE, "read_features/tables/read_features.tsv.gz"))
   samples <- fread(SAMPLES)
-  out <- Sys.getenv("ENTROPY_OUT", file.path(PROJECT, "LCL_project/entropy"))
+  out <- Sys.getenv("ENTROPY_OUT", file.path(PROJECT, "LCL_project/entropy/nucleosome_entropy"))
   workers <- as.integer(Sys.getenv("ENTROPY_WORKERS", Sys.getenv("SLURM_CPUS_PER_TASK", "1")))
   stopifnot(!is.na(workers), workers >= 1L)
   table_dir <- file.path(out, "tables")

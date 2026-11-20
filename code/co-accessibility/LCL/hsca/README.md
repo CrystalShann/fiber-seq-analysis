@@ -36,12 +36,12 @@
    ```r
    rmarkdown::render(
      "/project/spott/cshan/fiber-seq/code/co-accessibility/LCL/hsca/LCL_hsca.Rmd",
-     output_dir = "/project/spott/cshan/fiber-seq/docs",
+     output_dir = "/project/spott/cshan/fiber-seq/docs/co_accessibility",
      params = list(make_molecule_plots = TRUE)
    )
    ```
 
-6. Open `/project/spott/cshan/fiber-seq/docs/LCL_hsca.html`.
+6. Open `/project/spott/cshan/fiber-seq/docs/co_accessibility/LCL_hsca.html`.
 
 REF/ALT tests use the same coverage threshold throughout: at least 10 REF reads and
 10 ALT reads per donor and cCRE/pair. Pooled tests sum only donor/unit rows meeting
