@@ -26,26 +26,30 @@ full-span cohort (fibers spanning TSS ±1 kb).
 **Molecule-cluster Shannon entropy** — the same cluster proportions $p_k$ as above,
 summarized with $H$, $H / \log_2 K$ and $2^H$ (effective number of clusters).
 
-Rao diversity (`diversity/`) is a separate analysis using fiber-to-fiber m6A distances.
+Cluster Manhattan diversity (`diversity/`) uses abundance-weighted mean absolute
+profile differences across consensus Leiden clusters (10 neighbors, resolution 1).
+Distances are divided by all 2,001 genomic bases. The pipeline exports this Q as
+`manhattan_between` and the main diversity score as
+`cluster_quadratic_diversity = 1 / (1 - manhattan_between)`.
+The notebook reports gene groups, motifs, chromatin-feature associations and rankings.
 
 ## Run order
 
 From `/project/spott/cshan/fiber-seq`, after the PolII read-feature and
-recurrent-pattern steps (`code/pausing/PolII`) have written their tables:
+recurrent-pattern steps (`code/Pol2/PolII`) have written their tables:
 
 ```bash
 # 1. nucleosome entropy + short-footprint fractions -> LCL_project/entropy/nucleosome_entropy/tables
 sbatch code/entropy/nucleosome/run_entropy.sh --by-cluster
 # 2. molecule-cluster entropy -> LCL_project/entropy/molecule_cluster_entropy
-bash code/pausing/PolII/run_gene_examples.sh code/entropy/molecule_cluster/molecule_cluster_entropy.R
+bash code/Pol2/PolII/run_gene_examples.sh code/entropy/molecule_cluster/molecule_cluster_entropy.R
 # 3. Gini-Simpson + chromatin features (needs 2) -> LCL_project/entropy/gini_simpson_molecule_cluster
-bash code/pausing/PolII/run_gene_examples.sh code/entropy/gini_simpson_molecule_cluster/simpson_functions.R
-# 4. optional: Rao diversity -> LCL_project/entropy/diversity
-bash code/pausing/PolII/run_gene_examples.sh code/entropy/diversity/run_diversity.R
-# 5. notebook: tables + figures (needs 1-3)
-bash code/entropy/nucleosome/run_entropy_features.sh
+bash code/Pol2/PolII/run_gene_examples.sh code/entropy/gini_simpson_molecule_cluster/simpson_functions.R
+# 4. optional: cluster Manhattan diversity -> LCL_project/entropy/diversity
+#    tables + feature PDFs: run the chunks of diversity_features.rmd
+#    (compute-gene-diversity recomputes gene_diversity.tsv when missing or RECOMPUTE_DIVERSITY = TRUE)
+# 5. notebook: tables + figures (needs 1-3): run the chunks of entropy_features.rmd
 ```
 
-Step 1 also runs step 5 at the end; on a fresh run that pass fails until steps 2-3
-exist, so run step 5 again last. Details: [nucleosome/](nucleosome/README.md),
+Details: [nucleosome/](nucleosome/README.md),
 [molecule_cluster/](molecule_cluster/README.md).

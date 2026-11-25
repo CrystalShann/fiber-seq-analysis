@@ -12,6 +12,7 @@ suppressPackageStartupMessages({library(data.table); library(ggplot2); library(p
 setDTthreads(1L)
 
 PROJECT <- "/project/spott/cshan/fiber-seq"
+knitr::opts_knit$set(root.dir = PROJECT)
 OUT <- Sys.getenv("ENTROPY_OUT", file.path(PROJECT, "LCL_project/entropy/nucleosome_entropy"))
 TABLES <- file.path(OUT, "tables")
 PLOTS <- file.path(OUT, "plots")
@@ -104,7 +105,7 @@ plot_footprint_pair <- function(fp, spec) {
             geom_point(size = 1.8, alpha = .7) +
             facet_wrap(~ footprint_class, ncol = 1, labeller = labeller(footprint_class = strip)) +
             group_colour + scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .25)) +
-            labs(x = lab, y = "Fraction of fibers with a short footprint\noverlapping TSS -100 to +100 bp"),
+            labs(x = lab, y = "Fraction of fibers with a short footprint\nfully contained within TSS -100 to +100 bp"),
           spec, paste(spec$name, "and short-footprint presence near the TSS"))
 }
 # Each panel has its own gene order, highest at the top
@@ -131,7 +132,7 @@ stopifnot(nrow(genes) > 0L, all(genes$group %in% GROUPS),
 EXCLUSION <- paste0(nrow(genes), " valid genes; ", nrow(all_genes) - nrow(genes), " excluded.")
 
 
-pf <- fread(file.path(PROJECT, "LCL_project/pausing/PolII/promoter_annotation/tables/04a_puffin_motif_scores.tsv"),
+pf <- fread(file.path(PROJECT, "LCL_project/Pol2/PolII/promoter_annotation/tables/04a_puffin_motif_scores.tsv"),
             check.names = FALSE)
 stopifnot(!anyDuplicated(pf$gene_name))
 ix <- match(genes$gene_name, pf$gene_name)
@@ -153,19 +154,19 @@ Nucleosome entropy measures how evenly nucleosome occupancy is spread over the f
 
 **Input files**
 
-- Genes: `code/pausing/PolII/example_gene_list.tsv` (150 genes, three groups)
+- Genes: `code/Pol2/PolII/example_gene_list.tsv` (150 genes, three groups)
 
-- TSS and strand: `LCL_project/pausing/PolII/read_features/tables/gene_features.tsv`
+- TSS and strand: `LCL_project/Pol2/PolII/read_features/tables/gene_features.tsv`
 
-- included reads: `LCL_project/pausing/PolII/read_features/tables/read_features.tsv.gz`
+- included reads: `LCL_project/Pol2/PolII/read_features/tables/read_features.tsv.gz`
   
 - fibertools nucleosome: fibertools `<fire_dir>/extracted_results/nuc_by_chr/<sample>.ft_extracted_nuc.<chr>.bed.gz`
   
-- Cluster labels: `LCL_project/pausing/PolII/recurrent_patterns/tables/<gene>/read_features.tsv.gz`
+- Cluster labels: `LCL_project/Pol2/PolII/recurrent_patterns/tables/<gene>/read_features.tsv.gz`
 
 - FiberHMM v1 footprints: `LCL_Fiber_seq/FiberHMM/merged/<sample>/joint_trained_results/<sample>_<chr>_fp.bed.gz`
   
-- Puffin motif classes: `LCL_project/pausing/PolII/promoter_annotation/tables/04a_puffin_motif_scores.tsv`
+- Puffin motif classes: `LCL_project/Pol2/PolII/promoter_annotation/tables/04a_puffin_motif_scores.tsv`
 
 
 
@@ -203,7 +204,7 @@ Nucleosome entropy measures how evenly nucleosome occupancy is spread over the f
 
   -  mean start over fibers that have one
   
-2. footprint fraction: footprints in the size classes [10,30), [30,60) and [60,80] bp. A fiber is a success for a class if at least one footprint of that class overlaps TSS -100..+100 bp by $\ge 1$ bp. The fraction is
+2. footprint fraction: footprints in the size classes [10,30), [30,60) and [60,80] bp. A fiber is a success for a class if at least one footprint of that class is fully contained within TSS -100..+100 bp. Containment is checked after converting BED coordinates to one-based inclusive, strand-oriented intervals: $-100 \le s \le e \le 100$. Boundary-touching calls are included; any call extending outside the window is excluded. Multiple calls of the same class on one fiber count once. The fraction is
 $$f = \frac{\#\{\text{fibers spanning all 201 bases with }\ge 1\text{ qualifying footprint}\}}
              {\#\{\text{fibers spanning all 201 bases}\}}.$$
 
@@ -268,7 +269,7 @@ knitr::kable(head(occupancy[, .(gene_name, level, offset, genomic_position, cove
 
   - Three rows per gene, one per footprint size class (`footprint_class`: 10-30, 30-60 and 60-80 bp)
 
-  - `n_fibers` is all of the gene's reads, `n_evaluable_fibers` the reads spanning all 201 bases of TSS -100..+100 bp (the denominator), `n_fibers_with_footprint` the evaluable reads with at least one footprint of that class overlapping the window
+  - `n_fibers` is all of the gene's reads, `n_evaluable_fibers` the reads spanning all 201 bases of TSS -100..+100 bp (the denominator), `n_fibers_with_footprint` the evaluable reads with at least one footprint of that class fully contained within the window
   
   - `fraction_with_footprint` their ratio $f$
 
@@ -276,6 +277,7 @@ knitr::kable(head(occupancy[, .(gene_name, level, offset, genomic_position, cove
 
 ```{r table-short-footprints, results='asis'}
 short_fp <- fread(file.path(TABLES, "short_footprint_fractions.tsv"))
+stopifnot("footprint_inclusion" %in% names(short_fp), all(short_fp$footprint_inclusion == "fully_contained"))
 knitr::kable(head(short_fp[, .(gene_name, footprint_class, n_fibers, n_evaluable_fibers,
   n_fibers_with_footprint, fraction_with_footprint)]), digits = 3,
   caption = "short_footprint_fractions.tsv: first rows.")
@@ -359,7 +361,7 @@ p
 
 The footprint window is -100..+100 bp, the entropy window remains +1..+500 bp 
 
-The y-axis measures the fraction of fully spanning reads with at least one footprint overlapping the promoter window. It does not measure the fraction of bases covered or the number of calls. Left: raw entropy, right: normalized entropy
+The y-axis measures the fraction of fully spanning reads with at least one footprint fully contained within the promoter window. It does not measure the fraction of bases covered or the number of calls. Left: raw entropy, right: normalized entropy
 
 ```{r entropy-short-footprints, out.width="100%", fig.width=12, fig.height=11}
 fp_path <- file.path(TABLES, "short_footprint_fractions.tsv")
@@ -387,11 +389,11 @@ p
 
 
 
-higher nucleosome entropy is associated with fewer promoter short footprints and a farther-downstream mean +1 nucleosome start
+The figures show nucleosome entropy versus fully contained footprint frequency and mean +1 nucleosome start; these associations are descriptive.
 
 
 
-footprint columns are percentages of fibers with at least one overlapping footprint in TSS -100 to +100 bp
+footprint columns are percentages of fibers with at least one fully contained footprint in TSS -100 to +100 bp
 
 ```{r promoter-class-table, results='asis'}
 class_order <- c("TATA", "SP1", "CREB", "NFY", "NRF1", "ETS", "YY1", "ZNF143")
@@ -475,11 +477,13 @@ function to plot selected gene cluster combination
 entropy_helpers <- new.env(parent = globalenv())
 sys.source(file.path(PROJECT, "code/entropy/nucleosome/nucleosome_entropy.R"), envir = entropy_helpers)
 pol2 <- new.env(parent = globalenv())
-source(file.path(PROJECT, "code/pausing/PolII/pol2_pausing_functions.r"), local = pol2)
+# Required by the project rtracklayer/curl build.
+dyn.load(file.path(PROJECT, "../envs/dimelo/lib/libcurl.so.4"), local = FALSE)
+source(file.path(PROJECT, "code/Pol2/PolII/pol2_pausing_functions.r"), local = pol2)
 
 # Reads, m6A matrix, plot rows and nucleosome/footprint intervals of one selected cluster
 load_selected_cluster <- function(g, samples, cohort) {
-  assignments <- fread(file.path(PROJECT, "LCL_project/pausing/PolII/recurrent_patterns/tables",
+  assignments <- fread(file.path(PROJECT, "LCL_project/Pol2/PolII/recurrent_patterns/tables",
     g$group, paste0(g$gene_name, "_read_clusters.tsv")))
   chosen <- assignments[cluster == g$cluster][order(clustered_row)]
   stopifnot(nrow(chosen) == g$n_fibers, !anyDuplicated(chosen$RID))
@@ -518,14 +522,14 @@ load_selected_cluster <- function(g, samples, cohort) {
   title_g <- copy(g)
   title_g[, gene_name := sprintf("%s %s | H=%.3f bits | entropy +1..+500 bp",
     g$gene_name, g$cluster, g$nucleosome_entropy_bits)]
-  # figure heights (in) used by plot_example_m6a() / plot_example_footprints() for one cluster
+
   heights <- c(m6a = 6 + 0.55, footprints = 1.6 + 0.65 + pol2$READ_ROW_IN * nrow(rows) + 0.15 + 1.2)
   list(g = title_g, gene = g$gene_name, cluster = g$cluster, dat = dat, rows = rows, bundle = bundle,
        heights = heights)
 }
 
 samples <- fread(pol2$SAMPLES)[, .(sample_name, fire_dir)]
-cohort <- fread(file.path(PROJECT, "LCL_project/pausing/PolII/read_features/tables/read_features.tsv.gz"))
+cohort <- fread(file.path(PROJECT, "LCL_project/Pol2/PolII/read_features/tables/read_features.tsv.gz"))
 selected_data <- setNames(lapply(seq_len(nrow(selected_clusters)), function(i)
   load_selected_cluster(selected_clusters[i], samples, cohort)), selected_clusters$gene_name)
 ```
@@ -534,10 +538,10 @@ selected_data <- setNames(lapply(seq_len(nrow(selected_clusters)), function(i)
 
 pol2$footprint_caption <- function(g) NULL
 pol2$save_figure <- function(plot, path, ..., draw = NULL) {
-  # Footprint figures: more space between the title and the top m6A track
+
   if (inherits(plot, "patchwork"))
     plot <- plot + patchwork::plot_annotation(theme = theme(plot.title = element_text(margin = margin(b = 12))))
-  # m6A heatmaps: hide the "cluster" row-annotation name, which overlaps the -1000 tick (the legend names it)
+
   if (inherits(plot, "Heatmap") && !is.null(plot@left_annotation))
     for (a in names(plot@left_annotation@anno_list))
       plot@left_annotation@anno_list[[a]]@name_param$show <- FALSE
@@ -607,11 +611,11 @@ single-molecule promoter patterns. It is calculated by `code/entropy/molecule_cl
 
 Input files:
 
-  - Genes: `code/pausing/PolII/example_gene_list.tsv`
+  - Genes: `code/Pol2/PolII/example_gene_list.tsv`
 
-  - Cluster assignments: `LCL_project/pausing/PolII/recurrent_patterns/tables/<group>/<gene>_read_clusters.tsv`, one row per fiber with the original per-gene Leiden `cluster` label. These come from the full-span promoter reads(TSS +/-1000 bp)
+  - Cluster assignments: `LCL_project/Pol2/PolII/recurrent_patterns/tables/<group>/<gene>_read_clusters.tsv`, one row per fiber with the original per-gene Leiden `cluster` label. These come from the full-span promoter reads(TSS +/-1000 bp)
 
-  - reads: `LCL_project/pausing/PolII/read_features/tables/read_features.tsv.gz`
+  - reads: `LCL_project/Pol2/PolII/read_features/tables/read_features.tsv.gz`
 
 **Steps**
 
@@ -633,22 +637,18 @@ Input files:
      
 5. Raw $H$ grows with both the number of clusters and their evenness, whereas $H_{\text{norm}}$ measures evenness only, relative to that gene's $K$. 
 
-Output tables(`LCL_project/entropy/molecule_cluster_entropy/tables/`):
+Output tables(`LCL_project/entropy/molecule_cluster_entropy/k10_n1/`):
 
   - `gene_molecule_cluster_entropy.tsv` (one row per gene)
   
   - `cluster_proportions.tsv` ($n_k$, $p_k$)
   
-  - `gene_group_summary.tsv` and `gene_group_tests.tsv` (KW + plus pairwise Wilcoxon tests BH-adjusted across the three gene groups)
+  - `gene_group_summary.tsv` (per gene group summaries)
 
-    - *Kruskal-Wallis (KW)*: whether the three gene groups have the same distribution, using one value per gene. It works on ranks and does not assume normal distribution, and a small p-value means at least one group differs, without saying which
-
-    - *Pairwise Wilcoxon rank-sum*: compares two groups at a time (housekeeping vs cell-type-specific, housekeeping vs not expressed, cell-type-specific vs not expressed) to find which groups differ
-    
 ```{r molecule-cluster-tables-setup}
 MOLECULE_OUT <- Sys.getenv("MOLECULE_ENTROPY_OUT",
   file.path(PROJECT, "LCL_project/entropy/molecule_cluster_entropy"))
-MOLECULE_TABLES <- file.path(MOLECULE_OUT, "tables")
+MOLECULE_TABLES <- file.path(MOLECULE_OUT, "k10_n1")
 MOLECULE_FIGURES <- file.path(MOLECULE_OUT, "figures")
 dir.create(MOLECULE_FIGURES, recursive = TRUE, showWarnings = FALSE)
 ```
@@ -657,7 +657,7 @@ dir.create(MOLECULE_FIGURES, recursive = TRUE, showWarnings = FALSE)
 
   - One row per gene (150 genes): `n_clusters` is $K$, `n_assigned_reads` is $N$, and `shannon_entropy_bits`, `normalized_entropy` and `effective_states` are $H$, $H_{\text{norm}}$ and $D$
   
-  - `status` is `valid` for 148 genes; SLC44A4 is `no_valid_assignments` because it has no saved reads, and HLA-DMA is `below_min_reads_or_clusters` (5 reads, one cluster). Only valid genes are used in the summaries, tests and figures
+  - `status` is `valid` for 148 genes; SLC44A4 is `no_valid_assignments` because it has no saved reads, and HLA-DMA is `below_min_reads_or_clusters` (5 reads, one cluster). Only valid genes are used in the summaries and figures
 
 ```{r table-molecule-gene-entropy, results='asis'}
 molecule_genes <- fread(file.path(MOLECULE_TABLES, "gene_molecule_cluster_entropy.tsv"))
@@ -684,15 +684,6 @@ knitr::kable(molecule_group_summary[, .(group, n_valid_genes, median_shannon_ent
   median_normalized_entropy, median_effective_states, median_cluster_number)], digits = 3)
 ```
 
-4. `gene_group_tests.tsv`
-
-  - For each of $H$, $H_{\text{norm}}$ and $D$: a Kruskal-Wallis test across the three gene groups, then the three pairwise Wilcoxon rank-sum tests with BH-adjusted p-values (`p_adjusted_BH`, adjusted within each metric)
-
-```{r table-molecule-group-tests, results='asis'}
-molecule_group_tests <- fread(file.path(MOLECULE_TABLES, "gene_group_tests.tsv"))
-knitr::kable(molecule_group_tests, digits = 4)
-```
-
 
 ```{r molecule-cluster-plot-data}
 stopifnot(!anyDuplicated(molecule_genes$gene_name))
@@ -702,7 +693,7 @@ molecule_valid[, group := factor(group, GROUPS)]
 save_molecule_pdf <- function(p, name, width = 9, height = 6)
   save_figure(p, file.path(MOLECULE_FIGURES, name), width = width, height = height,
               device = "pdf", useDingbats = FALSE)
-# Promoter features (motif, +1 start, short footprints) are the nucleosome-section ones
+
 MOLECULE_SPEC <- list(name = "Molecule-cluster entropy",
   raw = "shannon_entropy_bits", raw_label = "Molecule-cluster Shannon entropy (bits)", raw_max = NULL,
   normalized = "normalized_entropy", normalized_label = "Normalized molecule-cluster entropy",
@@ -750,7 +741,7 @@ p
 
 ### 4. molecule-cluster entropy and footprint presence at promoters
 
-Footprint fractions are the nucleosome-section ones (fibers with a 10-<30, 30-<60 or 60-80 bp footprint overlapping TSS -100..+100 bp). Left: raw entropy, right: normalized entropy
+Footprint fractions are the nucleosome-section ones (fibers with a 10-<30, 30-<60 or 60-80 bp footprint fully contained within TSS -100..+100 bp). Left: raw entropy, right: normalized entropy
 
 ```{r molecule-entropy-short-footprints, out.width="100%", fig.width=12, fig.height=11}
 p <- plot_footprint_pair(molecule_fp, MOLECULE_SPEC)
@@ -849,11 +840,11 @@ The approach is adapted from de Langen et al. (Pol II atlas), who use Gini-Simps
 
 Input:
 
-  - Cluster counts and proportions: `LCL_project/entropy/molecule_cluster_entropy/tables/cluster_proportions.tsv` and `gene_molecule_cluster_entropy.tsv` 
+  - Cluster counts and proportions: `LCL_project/entropy/molecule_cluster_entropy/k10_n1/cluster_proportions.tsv` and `gene_molecule_cluster_entropy.tsv` 
   
-  - cluster assignments:`LCL_project/pausing/PolII/recurrent_patterns/tables/<group>/<gene>_read_clusters.tsv`
+  - cluster assignments:`LCL_project/Pol2/PolII/recurrent_patterns/tables/<group>/<gene>_read_clusters.tsv`
 
-  - Per-read chromatin features (+1 nucleosome, TSS occupancy, m6A): `LCL_project/pausing/PolII/read_features/tables/read_features.tsv.gz`
+  - Per-read chromatin features (+1 nucleosome, TSS occupancy, m6A): `LCL_project/Pol2/PolII/read_features/tables/read_features.tsv.gz`
   
   
   - FiberHMM v1 footprints: `LCL_Fiber_seq/FiberHMM/merged/<sample>/joint_trained_results/<sample>_<chr>_fp.bed.gz`
@@ -879,7 +870,7 @@ Input:
    
 4. For each read, compute promoter chromatin features: the fraction of fibers with a +1 nucleosome and its mean start position (+1..+299 bp), the fraction of fibers with a nucleosome over the TSS, the mean m6A rate in -500..-201, -200..+200 and +201..+500 bp, and footprint fractions
 
-  - a read has a footprint of a size class ([40,60), [60,80] or [10,80] bp) in a window (-100..+100 or 0..+300 bp) if at least 50% of the footprint's length lies in the window, the denominator is the reads spanning the whole window
+  - a read has a footprint of a size class ([40,60), [60,80] or [10,80] bp) in a window (-100..+100 or 0..+300 bp) if the entire footprint lies within the window, the denominator is the reads spanning the whole window
   
 5. Correlate $G$ with each of the 12 features (Spearman), pooled and within each group
 
@@ -924,17 +915,7 @@ gini_median <- function(group, column) sprintf("%.3f", gini_summary[gene_group =
 knitr::kable(gini_summary, digits = 3)
 ```
 
-4. `simpson_group_tests.tsv`
-
-  - For $G$ and $G_{\text{norm}}$: a Kruskal-Wallis test across the three gene groups and the three pairwise Wilcoxon rank-sum tests, BH-adjusted within each metric (same tests as for molecule-cluster entropy)
-
-```{r table-gini-group-tests, results='asis'}
-gini_tests <- fread(file.path(GINI_TABLES, "simpson_group_tests.tsv"))
-gini_kw <- function(m) signif(gini_tests[metric == m & test == "Kruskal-Wallis", p_value], 2)
-knitr::kable(gini_tests, digits = 4)
-```
-
-5. `chromatin_features.tsv`
+4. `chromatin_features.tsv`
 
   - One row per promoter: the diversity columns of table 1 joined to the 12 chromatin features of the steps below (+1 nucleosome fraction and mean start, TSS occlusion, three m6A windows, six short-footprint fractions), all from the same assigned fibers
   
@@ -946,18 +927,19 @@ knitr::kable(head(gini_features[, .(gene_name, gene_group, gini_simpson, plus1_f
   tss_occlusion_fraction, m6a_tss_centered, fp10_80_tss)]), digits = 3)
 ```
 
-6. `short_footprint_features.tsv`
+5. `short_footprint_features.tsv`
 
   - Six rows per promoter, one per size class × window: `n_eligible_fibers` (fibers spanning the whole window, the denominator), `n_fibers_with_footprint` (those with a qualifying footprint) and their ratio `fraction`
   
 
 ```{r table-gini-short-footprints, results='asis'}
 gini_short_fp <- fread(file.path(GINI_TABLES, "short_footprint_features.tsv"))
+stopifnot(all(gini_short_fp$minimum_footprint_overlap_fraction == 1))
 knitr::kable(head(gini_short_fp[, .(gene_name, size_class, window, window_start, window_end,
   n_eligible_fibers, n_fibers_with_footprint, fraction, status)]), digits = 3)
 ```
 
-7. `simpson_feature_associations.tsv`
+6. `simpson_feature_associations.tsv`
 
   - One row per feature × stratum (`all` = pooled, or one gene group): number of promoters, and the Spearman $\rho$ between $G$ and the feature (no p-values)
 
@@ -966,9 +948,9 @@ gini_associations <- fread(file.path(GINI_TABLES, "simpson_feature_associations.
 knitr::kable(gini_associations[stratum == "all"], digits = 4)
 ```
 
-8. `representative_promoters.tsv`
+7. `representative_promoters.tsv`
 
-  - The promoters with the lowest, median and highest $G$ (`representative` = Low, Intermediate, High), with all columns of table 5
+  - The promoters with the lowest, median and highest $G$ (`representative` = Low, Intermediate, High), with all columns of table 4
 
 ```{r table-gini-representatives, results='asis'}
 gini_representatives <- fread(file.path(GINI_TABLES, "representative_promoters.tsv"))
@@ -985,7 +967,7 @@ save_gini_pdf <- function(p, name, width = 10, height = 7)
               device = "pdf", useDingbats = FALSE, limitsize = FALSE)
 gini_valid <- gini_features[is.finite(gini_simpson)]
 
-# Promoter features (motif, +1 start, short footprints) are the nucleosome-section ones
+
 GINI_SPEC <- list(name = "Gini-Simpson diversity",
   raw = "gini_simpson", raw_label = "Gini-Simpson diversity", raw_max = NULL,
   normalized = "normalized_gini_simpson", normalized_label = "Normalized Gini-Simpson diversity",
@@ -1034,7 +1016,7 @@ p
 
 ### 4. Gini-Simpson diversity and footprint presence at promoters
 
-Footprint fractions are the nucleosome-section ones (fibers with a 10-<30, 30-<60 or 60-80 bp footprint overlapping TSS -100..+100 bp). Left: raw diversity, right: normalized diversity
+Footprint fractions are the nucleosome-section ones (fibers with a 10-<30, 30-<60 or 60-80 bp footprint fully contained within TSS -100..+100 bp). Left: raw diversity, right: normalized diversity
 
 ```{r show-gini-footprints, out.width="100%", fig.width=12, fig.height=11}
 p <- plot_footprint_pair(gini_fp, GINI_SPEC)

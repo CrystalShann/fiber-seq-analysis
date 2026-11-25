@@ -1,11 +1,10 @@
 # Molecule-cluster entropy
 
 
-Run `bash code/pausing/PolII/run_gene_examples.sh code/entropy/molecule_cluster/molecule_cluster_entropy.R`.
-Outputs go exclusively to `LCL_project/entropy/molecule_cluster_entropy/{tables,figures}`;
+Run `bash code/Pol2/PolII/run_gene_examples.sh code/entropy/molecule_cluster/molecule_cluster_entropy.R`.
+Outputs go exclusively to `LCL_project/entropy/molecule_cluster_entropy/{k10_n1,figures}`;
 the calculation writes tables only. The shared `../entropy_features.rmd` reads these
-tables to generate PDFs. Run `bash code/entropy/nucleosome/run_entropy_features.sh`
-after calculation. This calculation does not read or rewrite nucleosome entropy outputs.
+tables to generate PDFs; run its chunks after calculation. This calculation does not read or rewrite nucleosome entropy outputs.
 
 The script uses original `recurrent_patterns/tables/<group>/<gene>_read_clusters.tsv`
 assignments for the example gene list. These represent the original full-span promoter
@@ -24,10 +23,8 @@ and effective states are `2^H`. For K=1, H=0 and normalized entropy is NA; for
 no assigned reads all entropy measures are NA. Proportions are validated to sum
 to one.
 
-Tables include gene estimates, cluster counts/proportions, group summaries and
-group tests. Wilcoxon pairwise p-values are BH-adjusted across the three group
-contrasts separately for each outcome; Kruskal-Wallis p-values are unadjusted. Tests use
-one observation per gene and do not adjust for depth or clustering resolution.
+Tables include gene estimates, cluster counts/proportions and group summaries
+(one observation per gene, no adjustment for depth or clustering resolution).
 PDFs show raw/normalized entropy by group and entropy versus cluster count.
 No session information or run metadata are generated.
 
@@ -44,19 +41,14 @@ cluster, so normalized entropy is available for 148 genes.
 | Cell-type-specific | 50 | 2.2519 | 0.9583 | 4.7632 | 5 | 516.5 |
 | Nonexpressed | 49 | 2.2573 | 0.9722 | 4.7809 | 5 | 558 |
 
-Raw entropy differs across groups (Kruskal-Wallis p=0.00599). Housekeeping genes
-have higher raw entropy than cell-type-specific genes (pairwise BH-adjusted
-p=0.0226) and nonexpressed genes (p=0.00976). Cell-type-specific and nonexpressed
-genes are not distinguishable in this comparison (p=0.395).
-
-Normalized entropy shows no clear group difference (Kruskal-Wallis p=0.235;
-all pairwise BH-adjusted p>=0.295). High median normalized entropies indicate
-relatively even read proportions across each gene's observed clusters.
+Housekeeping genes have the highest median raw entropy; cell-type-specific and
+nonexpressed genes have similar medians. Median normalized entropy is similar in
+all three groups, and the high values indicate relatively even read proportions
+across each gene's observed clusters.
 
 Raw entropy strongly tracks observed cluster count (Spearman rho=0.951), but
-has little association with assigned-read depth (rho=0.061, p=0.463).
-Normalized entropy has little association with cluster count (rho=-0.047,
-p=0.573). The higher housekeeping raw entropy is therefore consistent with
+has little association with assigned-read depth (rho=0.061).
+Normalized entropy has little association with cluster count (rho=-0.047). The higher housekeeping raw entropy is therefore consistent with
 more observed states rather than a strong difference in cluster evenness.
 This is descriptive: normalized entropy does not remove clustering-resolution
 or read-depth effects, and these cluster states are not direct counts of

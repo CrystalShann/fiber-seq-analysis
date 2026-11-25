@@ -16,4 +16,3 @@ export LD_LIBRARY_PATH="/software/gcc-12.2.0-el8-x86_64/lib64:/software/openblas
 export R_LIBS_USER="/project/spott/cshan/Rlibs/x86_64-pc-linux-gnu-library/4.4"
 /software/R-4.4.1-el8-x86_64/bin/Rscript --vanilla \
   /project/spott/cshan/fiber-seq/code/entropy/nucleosome/nucleosome_entropy.R "$@"
-bash /project/spott/cshan/fiber-seq/code/entropy/nucleosome/run_entropy_features.sh

@@ -1,0 +1,515 @@
+---
+title: "Quadratic diversity of promoter clusters"
+output: html_document
+---
+
+This analysis characterizes promoter diversity using cluster abundances and Manhattan distances between cluster-average m6A profiles.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = TRUE)
+suppressPackageStartupMessages({library(data.table); library(ggplot2); library(patchwork)})
+setDTthreads(1L)
+PROJECT <- "/project/spott/cshan/fiber-seq"
+knitr::opts_knit$set(root.dir = PROJECT)
+OUT <- file.path(PROJECT, "LCL_project/entropy/diversity")
+RUN_NAME <- "k10_n1"
+K_NEIGHBORS <- 10L
+LEIDEN_RESOLUTION <- 1
+CONSENSUS_RUNS <- 100L
+CONSENSUS_TAU <- 0.5
+TABLES <- file.path(OUT, "tables", RUN_NAME)
+CONSENSUS_DIR <- file.path(PROJECT, "LCL_project/Leiden_manhattan/parameters_test/tables",
+  if (RUN_NAME == "k10_n1") "consensus_cluster" else paste0("consensus_cluster_", RUN_NAME))
+# TRUE recomputes tables/<RUN_NAME>/gene_diversity.tsv; otherwise it is computed only when missing
+RECOMPUTE_DIVERSITY <- FALSE
+RUN_CAPTION <- "Consensus Leiden: k = 10; n = 1 (resolution); 100 seeds; tau = 0.5."
+
+
+source(file.path(PROJECT, "code/parsing_functions/plotting_functions.r"))
+GROUPS <- c("housekeeping", "cell_type_specific", "not_expressed")
+GROUP_LABELS <- c(housekeeping = "Housekeeping", cell_type_specific = "Cell-type-specific", not_expressed = "Not expressed")
+GROUP_COLORS <- c(housekeeping = "#1B9E77", cell_type_specific = "#D95F02", not_expressed = "#7570B3")
+theme_set(theme_fiberseq(base_size = 11, overrides = list(plot.title = element_text(face = "bold"),
+  legend.position = "bottom", strip.background = element_rect(fill = "#F2F2F2", colour = NA))))
+
+#########
+# Diversity boxplot by gene group, saved as a PDF
+#######
+# 1. Keep genes with a finite diversity value
+# 2. Compute the number of genes and median per group
+# 3. Draw a boxplot with jittered genes and the median as a labelled black diamond
+# 4. Save 01_gene_group_diversity.pdf to output_dir
+# Visualization only. Jitter changes display positions, never the analyzed cohort.
+plot_diversity <- function(d, output_dir, groups) {
+  labels <- c(cluster_quadratic_diversity = "Diversity (1 / (1 - Manhattan Q))")
+  files <- c(cluster_quadratic_diversity = "01_gene_group_diversity")
+  d$gene_group <- factor(d$gene_group, levels = groups)
+  colors <- setNames(c('#1B9E77', '#D95F02', '#7570B3'), groups)
+  group_labels <- setNames(c('Housekeeping', 'Cell-type-specific', 'Not expressed'), groups)
+  # Same style as the nucleosome entropy 01_gene_group_entropy.pdf; black diamond = median
+  for (metric in names(labels)) {
+    z <- d[is.finite(d[[metric]]), ]
+    s <- do.call(rbind, lapply(split(z[[metric]], z$gene_group, drop = TRUE), function(v)
+      data.frame(n_genes = length(v), median_value = median(v))))
+    s$gene_group <- factor(rownames(s), levels = groups)
+    label_y <- max(z[[metric]]) + .05 * diff(range(z[[metric]]))
+    p <- ggplot2::ggplot(z, ggplot2::aes(x = gene_group, y = .data[[metric]], colour = gene_group)) +
+      ggplot2::geom_boxplot(ggplot2::aes(fill = gene_group), width = .46, outlier.shape = NA,
+                            alpha = .15, show.legend = FALSE) +
+      ggplot2::geom_point(position = ggplot2::position_jitter(width = .13, seed = 12),
+                          size = 1.8, alpha = .65, show.legend = FALSE) +
+      ggplot2::geom_point(data = s, ggplot2::aes(gene_group, median_value), inherit.aes = FALSE,
+                          shape = 18, size = 4) +
+      ggplot2::geom_text(data = s, ggplot2::aes(gene_group, label_y,
+                         label = sprintf('Median %.4g', median_value)), inherit.aes = FALSE, size = 3.6) +
+      ggplot2::scale_colour_manual(values = colors) + ggplot2::scale_fill_manual(values = colors) +
+      ggplot2::scale_x_discrete(labels = setNames(sprintf('%s\nn = %d genes',
+        group_labels[as.character(s$gene_group)], s$n_genes), as.character(s$gene_group))) +
+      ggplot2::labs(x = NULL, y = labels[[metric]], title = paste(labels[[metric]], 'by gene group')) +
+      ggplot2::theme_classic(base_size = 11) +
+      ggplot2::theme(plot.title = ggplot2::element_text(face = 'bold'))
+    ggplot2::ggsave(file.path(output_dir, paste0(files[[metric]], '.pdf')), p,
+      device = 'pdf', width = 8.5, height = 6.5, useDingbats = FALSE)
+  }
+}
+
+
+knitr::opts_chunk$set(fig.cap = RUN_CAPTION)
+PLOTS <- file.path(OUT, "plots")
+
+
+reference <- readLines(file.path(PROJECT, "code/entropy/entropy_features.rmd"))
+start <- grep("^ranking_height <- function", reference)
+end <- grep("^NUCLEOSOME_SPEC <- list", reference)
+stopifnot(length(start) == 1L, length(end) == 1L, start < end)
+eval(parse(text = reference[start:(end - 1L)]))
+save_pdf <- function(p, name, width, height)
+  save_figure(p + labs(caption = RUN_CAPTION), file.path(PLOTS, name), width = width, height = height, device = "pdf", useDingbats = FALSE)
+```
+
+Each gene receives one Manhattan-based diversity score. First calculate the abundance-weighted profile distance $Q_{\mathrm{cluster}}$, then convert it to $\gamma_{\mathrm{cluster}}$:
+
+$$\boxed{Q_{\mathrm{cluster}}=\sum_{k,l}p_kp_l\left[\frac{1}{2001}\sum_b|\mu_{kb}-\mu_{lb}|\right],\qquad
+\gamma_{\mathrm{cluster}}=\frac{1}{1-Q_{\mathrm{cluster}}}.}$$
+
+Here $p_k$ is the fraction of fibers in cluster $k$, and $\mu_{kb}$ is its m6A-call frequency at base $b$. Higher scores indicate a more diverse mixture of distinct cluster profiles. A $Q$ of 0.10 means an expected absolute difference of ten percentage points per base, including same-cluster draws, which contribute zero. The conversion preserves gene rankings. This adapts the conversion in [Smouse, Banks and Peakall (2017), equations 1 and 3](https://doi.org/10.1371/journal.pone.0185499) using Manhattan profile distances; it is not a reproduction of the paper's full method. Quadratic refers to the frequency products $p_kp_l$.
+
+**Parameters**
+
+| Setting | Value | Meaning |
+|---|---|---|
+| k | 10 | nearest neighbors|
+| n | 1 | Leiden resolution parameter |
+| Consensus runs | 100, seeds 1–100 | Repeated Leiden partitions per round |
+| Consensus threshold | 0.5 | Minimum retained co-clustering frequency, with isolated-node reconnection |
+| Window | TSS +/- 1,000 bp | 2,001 genomic bases, no binning |
+| Diversity eligibility | N > 20 fibers, K > 1 clusters | gene selection criteria |
+
+All current diversity calculations use `tables/k10_n1/gene_diversity.tsv` and the corresponding default `tables/consensus_cluster` 
+
+**Input files**
+
+- Gene panel: `code/Pol2/PolII/example_gene_list.tsv` (150 genes).
+- Analysis coordinates and read cohort: `LCL_project/Pol2/PolII/recurrent_patterns/tables/<group>/<gene>_clustering.rds`.
+- Consensus Leiden clusters (Manhattan KNN k = 10, resolution = 1, 100 seeds, tau = 0.5): `LCL_project/Leiden_manhattan/parameters_test/tables/consensus_cluster/<group>/<gene>_read_clusters.tsv`.
+
+
+**Diversity calculation for each gene**
+
+1. **Select reads.** Pool reads spanning the entire inclusive TSS −1000..+1000 bp window across project samples. Require more than 20 reads and at least two consensus clusters. Represent the reads as a binary matrix with one row per read and one column per genomic base: $X_{ib}=1$ when read $i$ has an m6A call at base $b$, otherwise 0. All $L=2001$ bases are retained, with no binning or smoothing.
+
+2. **Calculate cluster frequencies.** For $N$ reads and $n_k$ reads in cluster $k$,
+   $$p_k=n_k/N,\qquad \sum_kp_k=1.$$
+   A cluster containing 30 of 100 reads has $p_k=0.30$. These frequencies determine the cluster-pair weights; pooled samples contribute in proportion to their eligible read counts.
+
+3. **Calculate cluster-average profiles.** At every base, average calls across the reads in each cluster:
+   $$\mu_{kb}=\frac{1}{n_k}\sum_{i\in k}X_{ib}.$$
+   A value of 0.60 means 60% of that cluster's reads have an m6A call at that base.
+
+4. **Calculate Manhattan profile distances.** For each pair of clusters,
+   $$\delta_{kl}=\frac{1}{L}\sum_{b=1}^{L}|\mu_{kb}-\mu_{lb}|.$$
+   Frequencies 0.60 and 0.20 contribute 0.40 at a base. Average these differences over all 2,001 bases, including all-zero positions. No per-gene maximum-distance rescaling is applied.
+
+5. **Combine distances and abundances.** Calculate
+   $$Q_{\mathrm{cluster}}=\sum_{k,l}p_kp_l\delta_{kl}
+   =2\sum_{k<l}p_kp_l\delta_{kl}.$$
+   The notation $k<l$ includes each distinct pair once; the factor 2 counts both ordered directions. The probability of selecting cluster $k$ then cluster $l$ in two independent read draws is $p_kp_l$. Same-cluster pairs have zero profile distance. No random draws are performed: sampling with replacement describes the probability model used to compute the exact weighted average. The output column `manhattan_between` stores this $Q$.
+
+6. **Convert to diversity.** Calculate
+   $$\gamma_{\mathrm{cluster}}=1/(1-Q_{\mathrm{cluster}}).$$
+   Two clusters with frequencies 0.6 and 0.4 and distance 0.02 give $Q=2(0.6)(0.4)(0.02)=0.0096$ and $\gamma\approx1.009693$. Save the result as `cluster_quadratic_diversity`. Under this bounded-frequency scale, $0\le Q\le0.5$ and $1\le\gamma\le2$. A value of 1 corresponds to identical mean profiles. This is a distance-sensitive index, not a count of clusters. Failed or filtered genes receive `NA`.
+
+7. **Join chromatin features.** Compare diversity with promoter motifs, +1 nucleosome position, and fully contained footprint fractions. For length classes [10,30), [30,60), and [60,80] bp, require the entire strand-oriented footprint interval to satisfy $-100\le s\le e\le100$. Convert BED coordinates to one-based inclusive coordinates before applying this rule. For each class, divide the number of eligible reads with at least one qualifying footprint by the number spanning the entire 201-base window. Count each read at most once per class. These features are associated with diversity afterward and are not inputs to the score.
+
+The calculations are implemented in the `compute-gene-diversity` chunk below and `code/entropy/diversity/diversity_functions.R`.
+
+**Output tables** (`LCL_project/entropy/diversity/tables/k10_n1/`)
+
+1. Read the saved diversity results. Load each gene’s existing Manhattan Q from gene_diversity.tsv and calculate diversity as $\gamma=1/(1-Q)$
+
+2. Use genes that passed the read count and cluster count requirements
+
+3. Attach promoter features. Add each gene’s dominant Puffin motif and average +1 nucleosome start position
+
+4. Attach footprint information. Load the fraction of reads with short footprints in each size class
+
+6. Save the combined tables. Write:
+   - gene_diversity_features.tsv
+   - diversity_vs_short_footprints.tsv
+   - gene_diversity_ranking.tsv, sorted by decreasing diversity
+   - group_diversity_summary.tsv, summarizing Q and diversity by gene group
+
+**`gene_diversity.tsv`** is computed here from the consensus clusters (`CONSENSUS_DIR`) when it is missing or `RECOMPUTE_DIVERSITY` is `TRUE`; otherwise the saved table is used. This takes several minutes (one m6A matrix per gene, 4 workers).
+
+```{r compute-gene-diversity}
+#########
+# Manhattan diversity for the 150 PolII genes
+#######
+# 1. Load gene panel, sample sheet and upstream gene features
+# 2. Per gene, load the saved read cohort and consensus Leiden clusters
+# 3. Keep upstream failures and genes with <= 20 fibers or 1 cluster as NA
+# 4. Build the 2,001-base m6A matrix and compute Q
+# 5. Add diversity and write gene_diversity.tsv
+if (RECOMPUTE_DIVERSITY || !file.exists(file.path(TABLES, "gene_diversity.tsv"))) local({
+  # Genes need > MIN_READS assigned fibers and > MIN_CLUSTERS consensus Leiden clusters for diversity
+  MIN_READS <- 20L
+  MIN_CLUSTERS <- 1L
+  WORKERS <- 4L
+  source(file.path(PROJECT, "code/entropy/diversity/diversity_functions.R"), local = TRUE)
+  source(file.path(PROJECT, "code/parsing_functions/parsing_footprints_functions.r"), local = TRUE)
+  source(file.path(PROJECT, "code/clustering_methods/Leiden_Manhattan/leiden_manhattan_functions.r"), local = TRUE)
+  validate_diversity()
+  genes <- as.data.frame(fread(file.path(PROJECT, "code/Pol2/PolII/example_gene_list.tsv")))
+  stopifnot(nrow(genes) == 150L, !anyDuplicated(genes$gene_id),
+    !anyDuplicated(genes$gene_name), all(genes$group %in% GROUPS))
+  samples <- as.data.frame(fread("/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"))
+  samples <- samples[, c("sample_name", "fire_dir")]
+  upstream <- as.data.frame(fread(file.path(PROJECT, "LCL_project/Pol2/PolII/read_features/tables/gene_features.tsv")))
+  analyze_gene <- function(i) {
+    gene <- genes[i, ]
+    prefix <- file.path(PROJECT, "LCL_project/Pol2/PolII/recurrent_patterns/tables", gene$group, gene$gene_name)
+    if (!file.exists(paste0(prefix, "_clustering.rds"))) {
+      old <- upstream[upstream$gene_id == gene$gene_id, , drop = FALSE]
+      # Preserve known upstream failures as missing, never infer zero fibers or clusters.
+      stopifnot(nrow(old) == 1L, old$status == "error",
+        grepl("Insufficient full-span reads/m6A sites", old$error, fixed = TRUE),
+        !file.exists(paste0(prefix, "_read_clusters.tsv")))
+      message(gene$gene_name, ": NA; upstream failure: ", old$error)
+      return(data.frame(gene_id = gene$gene_id, gene_name = gene$gene_name,
+        gene_group = gene$group, n_fibers = NA_integer_, n_clusters = NA_integer_,
+        manhattan_between = NA_real_, status = "upstream_failure"))
+    }
+    saved <- readRDS(paste0(prefix, "_clustering.rds"))
+    region <- saved$region
+    a <- as.data.frame(saved$assignments)
+    # Consensus Leiden clusters on the saved read cohort
+    tab <- as.data.frame(fread(file.path(CONSENSUS_DIR, gene$group, paste0(gene$gene_name, "_read_clusters.tsv"))))
+    stopifnot(saved$params$window_size == 0L, region$chr == gene$chrom,
+      region$analysis_start == region$tss - 1000L,
+      region$analysis_end == region$tss + 1000L,
+      saved$params$region_start == region$analysis_start,
+      saved$params$region_end == region$analysis_end,
+      !anyDuplicated(a$RID), !anyDuplicated(tab$RID), setequal(a$RID, tab$RID))
+    a$cluster <- tab$cluster[match(a$RID, tab$RID)]
+    if (nrow(a) <= MIN_READS || length(unique(a$cluster)) <= MIN_CLUSTERS) {
+      message(gene$gene_name, ": NA; below read/cluster filter")
+      return(data.frame(gene_id = gene$gene_id, gene_name = gene$gene_name,
+        gene_group = gene$group, n_fibers = nrow(a), n_clusters = length(unique(a$cluster)),
+        manhattan_between = NA_real_, status = "below_min_reads_or_clusters"))
+    }
+    dat <- assemble_region_m6a(samples, region, full_span = TRUE,
+      positions = seq.int(region$analysis_start, region$analysis_end),
+      matrix_dir = NULL, reuse = FALSE)
+    # Require the complete eligible cohort, rather than silently intersecting IDs.
+    stopifnot(setequal(rownames(dat$met_mat), a$RID),
+      nrow(dat$met_mat) == nrow(a), nrow(a) == saved$params$n_reads,
+      all(dat$rids_df$start <= region$analysis_start),
+      all(dat$rids_df$end >= region$analysis_end))
+    mat <- bin_read_matrix(dat$met_mat, region$analysis_start, region$analysis_end, window_size = 0L)$mat
+    stopifnot(ncol(mat) == 2001L, saved$params$n_features == ncol(mat))
+    r <- manhattan_diversity(mat, a$cluster[match(rownames(mat), a$RID)])
+    cbind(data.frame(gene_id = gene$gene_id, gene_name = gene$gene_name,
+      gene_group = gene$group), r, status = "valid")
+  }
+  # Independent genes can be read concurrently; no sampling or random analysis steps.
+  rows <- parallel::mclapply(seq_len(nrow(genes)), analyze_gene,
+    mc.cores = WORKERS, mc.set.seed = FALSE)
+  if (any(vapply(rows, inherits, logical(1), "try-error"))) stop("Gene analysis failed; no outputs written")
+  d <- add_quadratic_diversity(do.call(rbind, rows))
+  dir.create(TABLES, recursive = TRUE, showWarnings = FALSE)
+  fwrite(d, file.path(TABLES, "gene_diversity.tsv"), sep = "\t", na = "NA")
+  message(sum(d$status == "valid"), " valid genes; ", sum(d$status != "valid"),
+    " upstream failures or filtered genes retained as NA")
+})
+```
+
+```{r prepare-diversity-data}
+source(file.path(PROJECT, "code/entropy/diversity/diversity_functions.R"))
+all_diversity <- as.data.table(add_quadratic_diversity(fread(file.path(TABLES, "gene_diversity.tsv"))))
+diversity_plot <- all_diversity[status == "valid"]
+consensus_summary <- fread(file.path(PROJECT,
+  "LCL_project/Leiden_manhattan/parameters_test/tables/consensus_cluster/consensus_summary.tsv"))
+ci <- match(diversity_plot$gene_name, consensus_summary$gene_name)
+stopifnot(!anyNA(ci), all(consensus_summary$converged[ci]),
+  all(diversity_plot$n_fibers == consensus_summary$n_reads[ci]),
+  all(diversity_plot$n_clusters == consensus_summary$n_clusters[ci]),
+  all(consensus_summary$k_eff[ci] == K_NEIGHBORS))
+features <- fread(file.path(PROJECT, "LCL_project/entropy/nucleosome_entropy/tables/gene_entropy_features.tsv"))
+ix <- match(diversity_plot$gene_id, features$gene_id)
+stopifnot(!anyDuplicated(diversity_plot$gene_id), !anyDuplicated(features$gene_id), !anyNA(ix),
+  all(diversity_plot$gene_name == features$gene_name[ix]), all(diversity_plot$gene_group == features$group[ix]),
+  all(diversity_plot$n_fibers == features$n_fibers[ix]), all(is.finite(diversity_plot$cluster_quadratic_diversity)),
+  all(diversity_plot$cluster_quadratic_diversity >= 1 & diversity_plot$cluster_quadratic_diversity <= 2))
+diversity_plot[, `:=`(group = factor(gene_group, GROUPS), puffin_motif = features$puffin_motif[ix],
+  plus1_start_mean_bp = features$plus1_start_mean_bp[ix])]
+diversity_fp <- fread(file.path(PROJECT, "LCL_project/entropy/nucleosome_entropy/tables/short_footprint_fractions.tsv"))
+stopifnot("footprint_inclusion" %in% names(diversity_fp), all(diversity_fp$footprint_inclusion == "fully_contained"))
+diversity_fp <- diversity_fp[gene_id %in% diversity_plot$gene_id]
+stopifnot(nrow(diversity_fp) == 3 * nrow(diversity_plot), !anyDuplicated(diversity_fp[, .(gene_id, footprint_class)]),
+  all(diversity_fp$n_fibers == diversity_plot$n_fibers[match(diversity_fp$gene_id, diversity_plot$gene_id)]),
+  all(diversity_fp$footprint_window_start_offset == -100), all(diversity_fp$footprint_window_end_offset == 100))
+diversity_fp <- diversity_fp[footprint_status == "complete" & is.finite(fraction_with_footprint)]
+diversity_fp <- merge(diversity_fp[, .(gene_id, footprint_class, n_evaluable_fibers, fraction_with_footprint)],
+  diversity_plot[, .(gene_id, gene_name, group, manhattan_between, cluster_quadratic_diversity)], by = "gene_id")
+stopifnot(all(diversity_fp$fraction_with_footprint >= 0 & diversity_fp$fraction_with_footprint <= 1))
+fwrite(diversity_plot, file.path(TABLES, "gene_diversity_features.tsv"), sep = "\t")
+fwrite(diversity_fp, file.path(TABLES, "diversity_vs_short_footprints.tsv"), sep = "\t")
+fwrite(diversity_plot[order(-cluster_quadratic_diversity, gene_id)][, rank_highest_first := seq_len(.N)],
+  file.path(TABLES, "gene_diversity_ranking.tsv"), sep = "\t")
+metrics <- c("manhattan_between", "cluster_quadratic_diversity")
+diversity_summary <- as.data.table(summarize_diversity(as.data.frame(diversity_plot), metrics, GROUPS))
+fwrite(diversity_summary, file.path(TABLES, "group_diversity_summary.tsv"), sep = "\t")
+```
+
+
+**`gene_diversity.tsv`**
+
+One row per gene, including failed or filtered genes; counts, status, Manhattan Q and converted diversity.
+
+```{r preview-gene-diversity, results="asis"}
+preview <- fread(file.path(TABLES, "gene_diversity.tsv"))
+cat(sprintf("%d rows × %d columns.\n\n", nrow(preview), ncol(preview)))
+knitr::kable(head(preview, 6L), digits = 6)
+```
+
+**`group_diversity_summary.tsv`**
+
+One row per gene group and metric
+
+```{r preview-group-diversity-summary, results="asis"}
+preview <- fread(file.path(TABLES, "group_diversity_summary.tsv"))
+cat(sprintf("%d rows × %d columns.\n\n", nrow(preview), ncol(preview)))
+knitr::kable(head(preview, 6L), digits = 6)
+```
+
+**`gene_diversity_features.tsv`**
+
+genes with their diversity scores, dominant Puffin motif and mean +1 nucleosome start position.
+
+```{r preview-gene-diversity-features, results="asis"}
+preview <- fread(file.path(TABLES, "gene_diversity_features.tsv"))
+cat(sprintf("%d rows × %d columns.\n\n", nrow(preview), ncol(preview)))
+knitr::kable(head(preview, 6L), digits = 6)
+```
+
+**`diversity_vs_short_footprints.tsv`**
+
+One row per gene and footprint class, with the read count and fraction containing a qualifying footprint
+
+```{r preview-diversity-short-footprints, results="asis"}
+preview <- fread(file.path(TABLES, "diversity_vs_short_footprints.tsv"))
+cat(sprintf("%d rows × %d columns.\n\n", nrow(preview), ncol(preview)))
+knitr::kable(head(preview, 6L), digits = 6)
+```
+
+**`gene_diversity_ranking.tsv`**
+
+genes ordered from highest to lowest converted diversity; rank 1 is highest.
+
+```{r preview-gene-diversity-ranking, results="asis"}
+preview <- fread(file.path(TABLES, "gene_diversity_ranking.tsv"))
+cat(sprintf("%d rows × %d columns.\n\n", nrow(preview), ncol(preview)))
+knitr::kable(head(preview, 6L), digits = 6)
+```
+
+```{r quadratic-axis-helpers}
+DIVERSITY_LABEL <- "Diversity (1 / (1 - Manhattan cluster entropy))"
+plot_group_pair <- function(d) plot_box_by_group(d, "cluster_quadratic_diversity",
+  "group", GROUP_COLORS, DIVERSITY_LABEL, "Diversity by gene group", labels = GROUP_LABELS)
+plot_motif_pair <- function(d) {
+  z <- copy(d)
+  ord <- z[, .(m = median(cluster_quadratic_diversity)), by = puffin_motif][order(m), puffin_motif]
+  z[, puffin_motif := factor(puffin_motif, ord)]
+  plot_box_by_group(z, "cluster_quadratic_diversity", "puffin_motif", MOTIF_COLORS,
+    DIVERSITY_LABEL, "Diversity by promoter motif")
+}
+plot_plus1_pair <- function(d) ggplot(d, aes(cluster_quadratic_diversity, plus1_start_mean_bp, colour = group)) +
+  geom_point(alpha = .75) + group_colour + labs(x = DIVERSITY_LABEL, y = "Mean +1 nucleosome start (bp)")
+plot_footprint_pair <- function(d) ggplot(d, aes(cluster_quadratic_diversity, fraction_with_footprint, colour = group)) +
+  geom_point(alpha = .75) +
+  geom_smooth(aes(group = 1), method = "lm", formula = y ~ x, se = FALSE, colour = "black", linetype = "dashed", linewidth = .6) +
+  facet_wrap(~footprint_class, ncol = 1) + group_colour +
+  labs(x = DIVERSITY_LABEL, y = "Fraction of fibers with a footprint fully contained within TSS ±100 bp")
+plot_ranking_pair <- function(d) {
+  z <- copy(d)[order(cluster_quadratic_diversity, gene_id)]
+  z[, gene := factor(gene_name, gene_name)]
+  ggplot(z, aes(cluster_quadratic_diversity, gene, colour = group)) + geom_point() +
+    group_colour + labs(x = DIVERSITY_LABEL, y = NULL, title = "Gene ranking by converted quadratic diversity")
+}
+```
+
+### 1. Converted quadratic diversity by gene group
+
+Each point is one gene; the box marks the distribution and median. The table below reports the group median and quartiles of the precursor quadratic entropy (`manhattan_between`).
+
+```{r diversity-by-group, out.width="100%", fig.width=15, fig.height=6.5}
+p <- plot_group_pair(diversity_plot)
+save_pdf(p, "01_gene_group_diversity.pdf", 15, 6.5)
+p
+```
+
+```{r diversity-group-table, results='asis'}
+knitr::kable(diversity_summary[metric == "manhattan_between",
+  .(gene_group, n_genes, median, q25, q75)], digits = 5)
+```
+
+### 2. Converted quadratic diversity by Puffin dominant motif
+
+Motif classes are ordered by their median converted diversity. Each point is one gene. Class sizes vary, so the displayed differences are descriptive and may also reflect gene-group composition.
+
+```{r diversity-by-motif, out.width="100%", fig.width=22, fig.height=6.5}
+p <- plot_motif_pair(diversity_plot)
+save_pdf(p, "02_diversity_by_puffin_motif.pdf", 22, 6.5)
+p
+```
+
+### 3. Converted quadratic diversity and +1 nucleosome start position
+
+Each point is one gene, colored by gene group. The y-axis is the mean first nucleosome start at +1..+299 bp over fibers with a qualifying 130-160 bp nucleosome that does not cover the TSS. Diversity is measured over the full TSS ±1000 bp window.
+
+```{r diversity-plus1, out.width="100%", fig.width=14, fig.height=7}
+p <- plot_plus1_pair(diversity_plot)
+save_pdf(p, "03_diversity_vs_plus1_start.pdf", 14, 7)
+p
+```
+
+### 4. Converted quadratic diversity and short-footprint presence
+
+The three rows show 10-<30, 30-<60 and 60-80 bp footprints. The y-axis is the fraction of evaluable fibers with at least one footprint of that class fully contained within TSS -100..+100 bp, not the number of footprints or fraction of bases covered. The dashed black line in each row is a least-squares linear fit across all genes, shown to indicate the trend.
+
+```{r diversity-footprints, out.width="100%", fig.width=12, fig.height=11}
+p <- plot_footprint_pair(diversity_fp)
+save_pdf(p, "04_diversity_vs_short_footprints.pdf", 12, 11)
+p
+```
+
+### 5. Associations with chromatin features
+
+Spearman correlations describe the existing feature scatterplots, pooled and separately within each gene group. Footprint frequency is the fraction of evaluable fibers with at least one qualifying footprint fully contained within TSS −100..+100 bp. These are gene-level associations, not causal effects or donor-adjusted estimates.
+
+```{r diversity-feature-associations, results='asis'}
+association_data <- rbindlist(list(
+  diversity_plot[, .(gene_id, group, cluster_quadratic_diversity, feature = "+1 nucleosome start", value = plus1_start_mean_bp)],
+  diversity_fp[, .(gene_id, group, cluster_quadratic_diversity, feature = paste("Footprint", footprint_class),
+    value = fraction_with_footprint)]))
+association_results <- rbindlist(lapply(unique(association_data$feature), function(f) {
+  rbindlist(lapply(c("all", GROUPS), function(g) {
+    z <- association_data[feature == f & (g == "all" | as.character(group) == g) &
+      is.finite(value) & is.finite(cluster_quadratic_diversity)]
+    data.table(feature = f, gene_group = g, n_genes = nrow(z),
+      spearman_rho = cor(z$cluster_quadratic_diversity, z$value, method = "spearman"))
+  }))
+}))
+fwrite(association_results, file.path(TABLES, "diversity_feature_correlations.tsv"), sep = "\t")
+knitr::kable(association_results, digits = 4)
+```
+
+### 6. Gene ranking by converted quadratic diversity
+
+Highest converted quadratic diversity is at the top. The table below lists the three highest and lowest genes from the current analysis.
+
+```{r diversity-ranking, out.width="100%", fig.width=12, fig.height=ranking_height(diversity_plot)}
+p <- plot_ranking_pair(diversity_plot)
+save_pdf(p, "05_diversity_ranking.pdf", 12, ranking_height(diversity_plot))
+p
+```
+
+```{r diversity-extremes, results='asis'}
+diversity_extremes <- rbindlist(list(
+  head(diversity_plot[order(-cluster_quadratic_diversity, gene_id)], 3L)[, tail := "Highest"],
+  head(diversity_plot[order(cluster_quadratic_diversity, gene_id)], 3L)[, tail := "Lowest"]
+))
+diversity_extremes[, rank_within_tail := seq_len(.N), by = tail]
+knitr::kable(diversity_extremes[, .(tail, rank_within_tail, gene_name, gene_group,
+                             n_clusters, cluster_quadratic_diversity)], digits = 5)
+```
+
+### 7. Highest and lowest diversity: consensus m6A examples
+
+
+```{r extreme-diversity-scores, fig.width=10, fig.height=5, out.width="100%"}
+extreme_order <- diversity_extremes$gene_name
+extreme_plot <- copy(diversity_extremes)[, gene := factor(gene_name, levels = rev(extreme_order))]
+p <- ggplot(extreme_plot, aes(cluster_quadratic_diversity, gene, colour = group)) +
+  geom_segment(aes(x = 1, xend = cluster_quadratic_diversity, yend = gene), linewidth = .6) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sprintf("%.5f | %d fibers | %d clusters", cluster_quadratic_diversity,
+    n_fibers, n_clusters)), hjust = -.08, size = 3.3, show.legend = FALSE) +
+  group_colour + scale_x_continuous(expand = expansion(mult = c(.03, .65))) +
+  labs(x = DIVERSITY_LABEL, y = NULL,
+    title = "Top three and bottom three genes by diversity")
+save_pdf(p, "06_top_bottom_three_diversity.pdf", 10, 5)
+p
+```
+
+Each example shows the consensus-clustered m6A heatmap, drawn with `plot_example_m6a()` as in `consensus_cluster_genes.R`: full-span reads over TSS ±1000 bp, rows ordered by consensus cluster, with each cluster's m6A fraction on top. The heatmaps are saved as `07_` to `12_<gene>_consensus_m6a.pdf`.
+
+```{r extreme-m6a-helpers}
+pol2 <- new.env(parent = globalenv())
+
+dyn.load(file.path(PROJECT, "../envs/dimelo/lib/libcurl.so.4"), local = FALSE)
+source(file.path(PROJECT, "code/Pol2/PolII/pol2_pausing_functions.r"), local = pol2)
+
+pol2$save_figure <- function(plot, path, ..., draw = NULL) {
+  save_figure(plot, path, ..., draw = draw)
+  if (is.null(draw)) print(plot) else draw(plot)
+  invisible(path)
+}
+consensus_root <- file.path(PROJECT, "LCL_project/Leiden_manhattan/parameters_test")
+saved_root <- file.path(PROJECT, "LCL_project/Pol2/PolII/recurrent_patterns/tables")
+m6a_samples <- as.data.frame(fread(pol2$SAMPLES)[, .(sample_name, fire_dir)])
+
+# Consensus m6A heatmap of one example gene: saved region, consensus read clusters, full-span m6A
+plot_extreme_m6a <- function(z, figure_number) {
+  region <- readRDS(file.path(saved_root, z$gene_group, paste0(z$gene_name, "_clustering.rds")))$region
+  assignments <- fread(file.path(consensus_root, "tables/consensus_cluster", z$gene_group,
+    paste0(z$gene_name, "_read_clusters.tsv")))[order(clustered_row)]
+  dat <- assemble_region_m6a(m6a_samples, region, full_span = TRUE,
+    positions = seq(region$analysis_start, region$analysis_end))
+  stopifnot(nrow(assignments) == z$n_fibers, uniqueN(assignments$RID) == z$n_fibers,
+    uniqueN(assignments$cluster) == z$n_clusters, setequal(assignments$RID, dat$rids_df$RID))
+  rows <- pol2$example_rows(assignments$RID, dat$rids_df,
+    factor(assignments$cluster, paste0("cluster", seq_len(z$n_clusters))))
+  g <- data.table(group = z$gene_group, gene_name = sprintf(
+      "%s (consensus of seeds 1-%d, tau = %g, k = %d, resolution = %g)",
+      z$gene_name, CONSENSUS_RUNS, CONSENSUS_TAU, K_NEIGHBORS, LEIDEN_RESOLUTION),
+    chrom = region$chr, tss = region$tss, strand = region$strand, tss_source = region$tss_source)
+  pol2$plot_example_m6a(g, dat, rows,
+    file.path(PLOTS, sprintf("%02d_%s_consensus_m6a.pdf", figure_number, z$gene_name)), clustered = TRUE)
+}
+```
+
+```{r extreme-consensus-m6a, results='asis'}
+for (i in seq_len(nrow(diversity_extremes))) {
+  z <- diversity_extremes[i]
+  cat(sprintf("\n\n#### %s %d: %s\n\n%s; diversity **%.5f**; %d fibers; %d clusters.\n\n",
+    z$tail, z$rank_within_tail, z$gene_name, GROUP_LABELS[z$gene_group],
+    z$cluster_quadratic_diversity, z$n_fibers, z$n_clusters))
+  
+  cat(knitr::knit_child(quiet = TRUE, envir = environment(), text = c(
+    sprintf("```{r extreme-m6a-%d, echo=FALSE, out.width='100%%', fig.width=10, fig.height=%g}",
+      i, 6 + 0.55 * z$n_clusters),
+    sprintf("plot_extreme_m6a(diversity_extremes[%d], %dL)", i, 6L + i),
+    "```")))
+}
+```

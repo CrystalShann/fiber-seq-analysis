@@ -7,7 +7,7 @@
 
 suppressPackageStartupMessages(library(data.table))
 PROJECT <- "/project/spott/cshan/fiber-seq"
-BASE <- file.path(PROJECT, "LCL_project/pausing/PolII")
+BASE <- file.path(PROJECT, "LCL_project/Pol2/PolII")
 SAMPLES <- "/project/spott/1_Shared_projects/LCL_Fiber_seq/Data/LCL_sample_metatable_merged_samples_31samples.csv"
 # This also sources the shared parsing functions; existing files stay unchanged.
 source(file.path(PROJECT, "code/nucleosome_positioning/process_nuc_pos.R"), local = TRUE)
@@ -20,6 +20,11 @@ SHORT_FP_WINDOW <- c(-100L, 100L) # inclusive, 201 bases; entropy stays at +1..+
 MIN_READS <- 20L
 MIN_CLUSTERS <- 1L
 
+#########
+# Convert FiberHMM v1 BED10 rows to one row per footprint
+#######
+# 1. Rebuild BED12 columns with neutral score/strand
+# 2. Expand blocks with the shared converter, keeping first/last blocks
 # Legacy FiberHMM v1 is BED10: chr,start,end,RID,thickStart,thickEnd,rgb,
 # blockCount,blockStarts,blockSizes. Supply neutral score/strand fields to the
 # shared BED12 converter. These are real blocks, including the first and last;
@@ -32,6 +37,13 @@ decode_short_footprints <- function(raw) {
   as.data.table(convert_ft_bed12_to_bed6(bed, drop_sentinels = FALSE, validate_blocks = TRUE))
 }
 
+#########
+# Load FiberHMM footprints of cohort fibers around a TSS
+#######
+# 1. Build the genomic region of the TSS window
+# 2. Per sample, read the tabix footprint file in that region
+# 3. Keep exactly the saved cohort fibers (error if missing or duplicated)
+# 4. Expand to footprints and assign size classes
 load_short_footprints <- function(g, reads, window = SHORT_FP_WINDOW, root = SHORT_FP_ROOT) {
   stopifnot(length(window) == 2L, window[1] <= window[2], g$strand %in% c("+", "-"))
   endpoints <- g$tss + if (g$strand == "+") window else -window
@@ -57,8 +69,14 @@ load_short_footprints <- function(g, reads, window = SHORT_FP_WINDOW, root = SHO
   unique(rbindlist(parts))
 }
 
+#########
+# Fraction of fibers with a footprint in the TSS window, per size class
+#######
+# 1. Keep fibers spanning the whole window
+# 2. Keep footprints fully inside the window and assign size classes
+# 3. Count each fiber once per class and divide by spanning fibers
 # Each retained fiber contributes at most one success per size class. A footprint
-# qualifies if at least one of its bases overlaps the inclusive window. Denominator:
+# qualifies only if all its bases lie within the inclusive window. Denominator:
 # fibers spanning the ENTIRE footprint window, whether or not they have a call.
 short_footprint_fraction <- function(reads, footprints, tss, strand, window = SHORT_FP_WINDOW) {
   stopifnot(!anyDuplicated(reads$RID), strand %in% c("+", "-"), length(window) == 2L,
@@ -68,7 +86,7 @@ short_footprint_fraction <- function(reads, footprints, tss, strand, window = SH
   f <- copy(footprints)
   f[, c("lo", "hi") := rel_interval(start + 1L, end, tss, strand)]
   f[, footprint_class := assign_size_class(end - start, SHORT_FP_BREAKS)]
-  hits <- unique(f[RID %in% eligible & hi >= window[1] & lo <= window[2] & !is.na(footprint_class),
+  hits <- unique(f[RID %in% eligible & lo >= window[1] & hi <= window[2] & !is.na(footprint_class),
                    .(RID, footprint_class)])
   classes <- levels(assign_size_class(integer(), SHORT_FP_BREAKS))
   data.table(footprint_class = classes, n_fibers = nrow(reads), n_evaluable_fibers = length(eligible),
@@ -76,6 +94,12 @@ short_footprint_fraction <- function(reads, footprints, tss, strand, window = SH
       , fraction_with_footprint := if (length(eligible)) n_fibers_with_footprint / length(eligible) else NA_real_][]
 }
 
+#########
+# Footprint fractions for all genes, written to a table
+#######
+# 1. Per gene with complete entropy, load footprints and compute fractions
+# 2. Record status and errors for the other genes
+# 3. Write short_footprint_fractions.tsv; stop if any gene failed
 write_short_footprint_fractions <- function(entropy_genes, reads, table_dir, workers = 1L) {
   classes <- levels(assign_size_class(integer(), SHORT_FP_BREAKS))
   run_one <- function(i) {
@@ -96,7 +120,7 @@ write_short_footprint_fractions <- function(entropy_genes, reads, table_dir, wor
       chrom = g$chrom, tss = g$tss, strand = g$strand, entropy_status = g$status,
       nucleosome_entropy_bits = g$nucleosome_entropy_bits,
       footprint_window_start_offset = SHORT_FP_WINDOW[1], footprint_window_end_offset = SHORT_FP_WINDOW[2],
-      footprint_window_bp = diff(SHORT_FP_WINDOW) + 1L, footprint_status = status, error), result)
+      footprint_window_bp = diff(SHORT_FP_WINDOW) + 1L, footprint_inclusion = "fully_contained", footprint_status = status, error), result)
   }
   result <- parallel::mclapply(seq_len(nrow(entropy_genes)), run_one, mc.cores = workers)
   if (any(vapply(result, inherits, logical(1), "try-error"))) stop("Footprint worker failed")
@@ -111,6 +135,12 @@ write_short_footprint_fractions <- function(entropy_genes, reads, table_dir, wor
   invisible(result)
 }
 
+#########
+# Load saved Leiden cluster labels for one gene
+#######
+# 1. Find the per-gene label file
+# 2. Check the labels match the saved fiber cohort
+# 3. Return RID, cluster and eligible in cohort order
 # Use the saved per-gene Leiden labels.
 entropy_cluster_labels <- function(g, reads, cluster_root) {
   path <- file.path(cluster_root, g$gene_name, "read_features.tsv.gz")
@@ -124,6 +154,13 @@ entropy_cluster_labels <- function(g, reads, cluster_root) {
   labels[match(reads$RID, RID), .(RID, cluster, eligible)]
 }
 
+#########
+# Nucleosome entropy from per-base counts over +1..+500
+#######
+# 1. Occupancy = nucleosome fibers / covering fibers at each base
+# 2. Set status: no fibers, incomplete coverage, zero occupancy or complete
+# 3. If complete, normalize occupancy to probabilities and compute H in bits
+# 4. Return total, entropy, status and the per-base profile
 # Missing coverage is unknown, not zero occupancy. Require all 500 positions to
 # be observed; otherwise a smaller effective window would change the estimand.
 entropy_profile <- function(nucleosome_fibers, covering_fibers) {
@@ -147,6 +184,12 @@ entropy_profile <- function(nucleosome_fibers, covering_fibers) {
                             occupancy, probability = p))
 }
 
+#########
+# Per-base nucleosome occupancy and entropy for a fiber set
+#######
+# 1. Count covering and occupied fibers per base with occupancy_profile
+# 2. Fill missing positions with zero depth
+# 3. Compute entropy with entropy_profile
 # Reuse the existing occupancy engine at 1 bp resolution. It counts each fiber
 # once per base and divides by fibers whose alignments cover that base. Explicitly
 # restore absent positions to depth zero so gaps cannot silently shrink the window.
@@ -160,6 +203,13 @@ nucleotide_profile <- function(footprints, reads, anchors) {
   entropy_profile(counts$n_occupied, counts$n_reads)
 }
 
+#########
+# Load 130-160 bp nucleosome calls of cohort fibers
+#######
+# 1. Per sample, read ft nuc_by_chr records in TSS +/- 1000 bp
+# 2. Keep records matching the saved cohort reads and alignments
+# 3. Expand blocks and keep 130-160 bp nucleosomes
+# 4. Return nucleosomes with sample::RID
 # Query original calls, retaining the exact alignment used for the saved cohort.
 # A saved read without a BED record (fibertools writes none for reads with almost
 # no m6A) counts as a covering fiber with no nucleosomes, like a present record
@@ -194,9 +244,25 @@ load_nucleosomes <- function(g, reads, samples) {
   out
 }
 
+#########
+# Mean of finite values
+#######
+# 1. Drop non-finite values
+# 2. Return their mean, or NA if none are left
 finite_mean <- function(x) if (any(is.finite(x))) mean(x[is.finite(x)]) else NA_real_
+#########
+# Standard deviation of finite values
+#######
+# 1. Drop non-finite values
+# 2. Return their sd, or NA if fewer than 2 are left
 finite_sd <- function(x) if (sum(is.finite(x)) >= 2L) sd(x[is.finite(x)]) else NA_real_
 
+#########
+# Entropy and nucleosome summary for a subset of fibers
+#######
+# 1. Compute the per-base occupancy profile and entropy of the subset
+# 2. Add coverage, +1 nucleosome, m6A and TSS-occupancy summaries
+# 3. Return one summary row and the per-base profile
 summarize_subset <- function(g, reads, footprints, anchors, ix, level, cluster = NA_character_,
                              eligible = NA) {
   a <- reads[ix]
@@ -229,6 +295,13 @@ summarize_subset <- function(g, reads, footprints, anchors, ix, level, cluster =
   list(summary = row, profile = profile)
 }
 
+#########
+# Gene- and cluster-level nucleosome entropy for one gene
+#######
+# 1. Check TSS and saved read metadata; return NA if below the read/cluster filter
+# 2. Load nucleosomes and convert them to TSS-relative coordinates
+# 3. Check re-extracted +1 and TSS occupancy against saved features
+# 4. Summarize all fibers, then each Leiden cluster
 calculate_gene <- function(g, reads, samples, cluster_root, by_cluster = TRUE) {
   if (is.na(g$tss) || !g$strand %in% c("+", "-")) stop("No resolved TSS")
   if (nrow(reads) && (any(reads$chrom != g$chrom | reads$tss != g$tss | reads$strand != g$strand) ||
@@ -282,8 +355,16 @@ calculate_gene <- function(g, reads, samples, cluster_root, by_cluster = TRUE) {
 
 # PDF comparisons are generated separately by entropy_features.rmd.
 
+#########
+# Nucleosome entropy for the gene panel
+#######
+# 1. Parse options and select genes
+# 2. Load gene TSSs, saved reads and sample sheet
+# 3. With --footprints-only, recompute footprint fractions only
+# 4. Otherwise compute entropy per gene in parallel and write tables
+# 5. Compute and write short footprint fractions
 main <- function() {
-  genes <- fread(file.path(PROJECT, "code/pausing/PolII/example_gene_list.tsv"))
+  genes <- fread(file.path(PROJECT, "code/Pol2/PolII/example_gene_list.tsv"))
   args <- commandArgs(trailingOnly = TRUE)
   flags <- args[startsWith(args, "--")]
   if (any(!flags %in% c("--by-cluster", "--gene-only", "--footprints-only"))) stop("Unknown option")

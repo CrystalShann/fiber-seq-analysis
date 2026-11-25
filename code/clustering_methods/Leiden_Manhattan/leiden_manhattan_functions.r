@@ -327,6 +327,99 @@ leiden_partition <- function(graph, resolution = 1, n_iterations = -1, seed = 1)
 
 
 # ---------------------------------------------------------------------------
+# Step 7 with an optional consensus over seeds (Lancichinetti & Fortunato
+# 2012, "Consensus clustering in complex networks", Sci Rep 2:336, Methods).
+# consensus = FALSE is leiden_partition() unchanged. consensus = TRUE:
+#   1. run leiden_partition() n_partitions times on graph, seeds seed,
+#      seed + 1, ..., seed + n_partitions - 1
+#   2. consensus matrix D: D[i, j] = fraction of the partitions that put
+#      reads i and j in the same cluster
+#   3. set entries of D below tau to 0; a read left without any edge is
+#      joined to the read(s) it shares its highest D with
+#   4. run leiden_partition() n_partitions times (same seeds and resolution)
+#      on D as a weighted graph
+#   5. stop when all n_partitions partitions group the reads identically;
+#      otherwise rebuild D from them and go back to 3, at most max_rounds
+#      rounds of steps 3-5 (the paper: one round is usually enough)
+#
+# Inputs:
+#   graph, resolution, n_iterations, seed - see leiden_partition()
+#   consensus    - FALSE = one leiden_partition() run; TRUE = consensus
+#   n_partitions - Leiden runs per round (the paper's n_P)
+#   tau          - threshold on D (the paper's tau)
+#   max_rounds   - rounds of steps 3-5 before giving up
+# Output:
+#   list(membership = cluster number per read, named by read ID; quality =
+#   quality of the partition on graph). consensus = TRUE adds n_rounds,
+#   converged (FALSE = the partitions of the last round still differed; the
+#   partition of its first seed is returned, with a warning) and
+#   consensus_matrix = the D of the last round, before thresholding
+# ---------------------------------------------------------------------------
+leiden_consensus_partition <- function(graph, resolution = 1, n_iterations = -1, seed = 1,
+                                       consensus = FALSE, n_partitions = 100,
+                                       tau = 0.5, max_rounds = 10) {
+  if (!consensus)
+    return(leiden_partition(graph, resolution = resolution,
+                            n_iterations = n_iterations, seed = seed))
+  reads <- igraph::V(graph)$name
+  seeds <- seed + seq_len(n_partitions) - 1L
+
+  # reads x partitions table of cluster numbers
+  run_all <- function(g) {
+    sapply(seeds, function(s) {
+      leiden_partition(g, resolution = resolution, n_iterations = n_iterations,
+                       seed = s)$membership[reads]
+    })
+  }
+  # fraction of the partitions that co-cluster each pair of reads
+  coclustering <- function(memb) {
+    D <- Reduce(`+`, lapply(seq_len(ncol(memb)), function(p) {
+      ind <- Matrix::sparseMatrix(i = seq_along(reads), j = memb[, p], x = 1)
+      as.matrix(Matrix::tcrossprod(ind))
+    })) / ncol(memb)
+    dimnames(D) <- list(reads, reads)
+    D
+  }
+  # TRUE when two partitions group the reads identically, whatever the labels
+  same_grouping <- function(a, b) {
+    n_a <- length(unique(a))
+    n_a == length(unique(b)) && nrow(unique(cbind(a, b))) == n_a
+  }
+
+  memb <- run_all(graph)
+  converged <- FALSE
+  for (round in seq_len(max_rounds)) {
+    D <- coclustering(memb)
+    W <- D
+    diag(W) <- 0
+    best <- apply(W, 1, max)
+    W[W < tau] <- 0
+    # reconnect reads that lost every edge to their most co-clustered read(s)
+    for (i in which(rowSums(W) == 0 & best > 0)) {
+      j <- which(D[i, ] == best[i] & seq_along(reads) != i)
+      W[i, j] <- W[j, i] <- best[i]
+    }
+    g_D <- igraph::graph_from_adjacency_matrix(W, mode = "undirected",
+                                              weighted = TRUE, diag = FALSE)
+    memb <- run_all(g_D)
+    if (all(apply(memb, 2, same_grouping, b = memb[, 1]))) {
+      converged <- TRUE
+      break
+    }
+  }
+  if (!converged)
+    warning(sprintf(paste("consensus clustering did not converge in %d rounds;",
+                          "returning the partition of seed %d"), max_rounds, seed))
+
+  membership <- setNames(memb[, 1], reads)
+  quality <- igraph::modularity(graph, membership, weights = igraph::E(graph)$weight,
+                                resolution = resolution)
+  list(membership = membership, quality = quality, n_rounds = round,
+       converged = converged, consensus_matrix = D)
+}
+
+
+# ---------------------------------------------------------------------------
 # Rename clusters by size: the largest becomes "cluster1", the next
 # "cluster2", and so on, so labels do not depend on Leiden's arbitrary
 # numbering. Keep the existing size ordering (including table()'s order for
@@ -462,6 +555,105 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
                           mean_knn_dist = knn$mean_knn_dist,
                           quality = part$quality,
                           seed = seed,
+                          region_start = region_start, region_end = region_end,
+                          n_reads = nrow(feat), n_features = ncol(feat)))
+}
+
+
+# ---------------------------------------------------------------------------
+# leiden_manhattan_cluster() with consensus Leiden (Lancichinetti & Fortunato
+# 2012), at the settings of the PolII example-gene consensus clusters
+# (parameters_test/consensus_cluster_genes.R):
+#   1. bin the read x site matrix into features (bin_read_matrix);
+#      window_size = 0 keeps one feature per base
+#   2. Manhattan KNN graph: each read joined to its k_neighbors nearest reads
+#      (union of both directions), edge weight exp(-distance / sigma)
+#   3. consensus = TRUE (leiden_consensus_partition):
+#      a. run Leiden n_partitions times, seeds seed ... seed + n_partitions - 1
+#      b. co-clustering matrix: fraction of the runs that put each pair of
+#         reads in the same cluster
+#      c. drop pairs below tau; a read left without any edge is joined to the
+#         read(s) it co-clustered with most
+#      d. run Leiden n_partitions times on this co-clustering graph
+#      e. stop when all runs group the reads identically; otherwise rebuild
+#         the co-clustering matrix from them and go back to c (at most
+#         max_rounds rounds). Without convergence the partition of seed is
+#         kept (converged = FALSE, with a warning)
+#      consensus = FALSE: a single Leiden run with seed
+#   4. name clusters by size (cluster1 = largest) and average each cluster's
+#      features
+#
+# Inputs:
+#   met_mat, rids_df, region_start, region_end, window_size, sigma, verbose -
+#                  see leiden_manhattan_cluster()
+#   k_neighbors  - neighbours per read (default 10)
+#   resolution   - Leiden resolution (default 1)
+#   seed         - first Leiden seed
+#   consensus    - TRUE = consensus Leiden; FALSE = one Leiden run
+#   n_partitions - Leiden runs per consensus round (default 100)
+#   tau          - co-clustering threshold (default 0.5)
+#   max_rounds   - consensus rounds before giving up
+# Output:
+#   as leiden_manhattan_cluster(); params also hold consensus, n_partitions,
+#   tau, n_rounds and converged (NA when consensus = FALSE). quality =
+#   modularity of the final partition on the KNN graph
+# ---------------------------------------------------------------------------
+leiden_manhattan_consensus_cluster <- function(met_mat, rids_df,
+                                               region_start, region_end,
+                                               window_size = 0,
+                                               k_neighbors = 10,
+                                               resolution = 1,
+                                               sigma = NULL, seed = 1,
+                                               consensus = TRUE,
+                                               n_partitions = 100,
+                                               tau = 0.5, max_rounds = 10,
+                                               verbose = TRUE) {
+  rids_df <- rids_df[match(rownames(met_mat), as.character(rids_df$RID)), ]
+  stopifnot(!any(is.na(rids_df$RID)))
+
+  binned <- bin_read_matrix(met_mat, region_start, region_end, window_size)
+  feat   <- binned$mat
+  if (ncol(feat) < 2) stop("fewer than 2 informative features")
+  if (anyNA(feat))
+    warning(sprintf("%d missing feature value(s) remain; use full-span reads", sum(is.na(feat))))
+
+  knn  <- manhattan_knn_graph(feat, k_neighbors = k_neighbors, sigma = sigma,
+                              verbose = verbose)
+  part <- leiden_consensus_partition(knn$graph, resolution = resolution, seed = seed,
+                                     consensus = consensus, n_partitions = n_partitions,
+                                     tau = tau, max_rounds = max_rounds)
+  cluster <- relabel_clusters_by_size(part$membership[rownames(feat)])
+  if (verbose) {
+    cat(sprintf("%s Leiden (resolution = %g): %d clusters\n",
+                if (consensus) "consensus" else "single", resolution, nlevels(cluster)))
+    print(table(cluster))
+  }
+
+  meta_cols <- intersect(c("sample_name", "chr", "start", "end", "strand"),
+                         colnames(rids_df))
+  assignments <- data.frame(RID = rownames(feat), cluster = cluster,
+                            stringsAsFactors = FALSE)
+  assignments <- cbind(assignments,
+                       rids_df[match(assignments$RID, as.character(rids_df$RID)),
+                               meta_cols, drop = FALSE])
+  rownames(assignments) <- NULL
+
+  list(feat_mat    = feat,
+       window_anno = binned$window_anno,
+       assignments = assignments,
+       profiles    = cluster_feature_profiles(feat, cluster),
+       graph       = knn$graph,
+       n_clusters  = nlevels(cluster),
+       params      = list(window_size = window_size,
+                          k_neighbors = k_neighbors, k_eff = knn$k_eff,
+                          resolution = resolution, sigma = knn$sigma,
+                          mean_knn_dist = knn$mean_knn_dist,
+                          quality = part$quality, seed = seed,
+                          consensus = consensus,
+                          n_partitions = if (consensus) n_partitions else NA_integer_,
+                          tau = if (consensus) tau else NA_real_,
+                          n_rounds = if (consensus) part$n_rounds else NA_integer_,
+                          converged = if (consensus) part$converged else NA,
                           region_start = region_start, region_end = region_end,
                           n_reads = nrow(feat), n_features = ncol(feat)))
 }

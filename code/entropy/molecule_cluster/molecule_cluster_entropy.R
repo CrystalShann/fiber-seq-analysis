@@ -2,12 +2,23 @@
 # Molecule-state entropy from original promoter cluster proportions; no resampling.
 suppressPackageStartupMessages({library(data.table)})
 PROJECT <- '/project/spott/cshan/fiber-seq'
-BASE <- file.path(PROJECT, 'LCL_project/pausing/PolII')
+BASE <- file.path(PROJECT, 'LCL_project/Pol2/PolII')
 OUT <- file.path(PROJECT, 'LCL_project/entropy/molecule_cluster_entropy')
 # Genes need > MIN_READS assigned reads and > MIN_CLUSTERS clusters to be valid
 MIN_READS <- 20L
 MIN_CLUSTERS <- 1L
+# CONSENSUS_K + CONSENSUS_RESOLUTION use the consensus clusters of
+# LCL_project/Leiden_manhattan/parameters_test/tables/consensus_cluster_k<K>_n<R> and write to OUT/k<K>_n<R>
+RUN_NAME <- if (nzchar(Sys.getenv('CONSENSUS_K'))) sprintf('k%d_n%g',
+  as.integer(Sys.getenv('CONSENSUS_K')), as.numeric(Sys.getenv('CONSENSUS_RESOLUTION'))) else ''
+CLUSTER_DIR <- if (nzchar(RUN_NAME)) file.path(PROJECT, 'LCL_project/Leiden_manhattan/parameters_test/tables',
+  paste0('consensus_cluster_', RUN_NAME)) else file.path(BASE, 'recurrent_patterns/tables')
 
+#########
+# Shannon entropy of cluster counts
+#######
+# 1. Drop empty clusters and convert counts to proportions
+# 2. Return H in bits, H / log2(K) and effective states 2^H
 entropy_from_counts <- function(n) {
   stopifnot(all(is.finite(n)), all(n >= 0))
   n <- n[n > 0]; k <- length(n)
@@ -17,6 +28,12 @@ entropy_from_counts <- function(n) {
   list(H = h, normalized = if (k > 1) h / log2(k) else NA_real_, effective = 2^h)
 }
 
+#########
+# Standardize read IDs to sample::RID
+#######
+# 1. Fill missing sample names from qualified RIDs
+# 2. Flag reads with missing or conflicting identity
+# 3. Build fiber_id as sample::RID
 canonical_reads <- function(d) {
   d <- copy(d)
   if (!'sample_name' %in% names(d)) d[, sample_name := NA_character_]
@@ -31,6 +48,13 @@ canonical_reads <- function(d) {
   d
 }
 
+#########
+# Cluster proportions and entropy for one gene
+#######
+# 1. Standardize read IDs in the assignments and the saved cohort
+# 2. Mark each fiber as assigned, unassigned, ambiguous or missing
+# 3. Count assigned fibers per cluster and compute proportions
+# 4. Compute entropy; return summary, counts and audit table
 analyze_assignments <- function(a, cohort) {
   a <- canonical_reads(a); cohort <- canonical_reads(cohort)
   a[, cluster := as.character(cluster)]
@@ -57,16 +81,23 @@ analyze_assignments <- function(a, cohort) {
   list(summary = summary, counts = counts, audit = audit)
 }
 
+#########
+# Molecule-cluster entropy for all panel genes
+#######
+# 1. Load gene panel and saved read cohort
+# 2. Per gene, read cluster labels and run analyze_assignments
+# 3. Flag genes below the read/cluster filter
+# 4. Write per-gene entropy, cluster proportions and group summary
 main <- function() {
   setDTthreads(1L)
-  td <- file.path(OUT, 'tables')
+  td <- file.path(OUT, if (nzchar(RUN_NAME)) RUN_NAME else 'k10_n1')
   dir.create(td, recursive = TRUE, showWarnings = FALSE)
-  genes <- fread(file.path(PROJECT, 'code/pausing/PolII/example_gene_list.tsv'))
+  genes <- fread(file.path(PROJECT, 'code/Pol2/PolII/example_gene_list.tsv'))
   stopifnot(!anyDuplicated(genes$gene_name))
   cohort <- fread(file.path(BASE, 'read_features/tables/read_features.tsv.gz'))
   results <- lapply(seq_len(nrow(genes)), function(i) {
     g <- genes[i]
-    path <- file.path(BASE, 'recurrent_patterns/tables', g$group, paste0(g$gene_name, '_read_clusters.tsv'))
+    path <- file.path(CLUSTER_DIR, g$group, paste0(g$gene_name, '_read_clusters.tsv'))
     exists <- file.exists(path)
     a <- if(exists) fread(path, colClasses = c(RID='character', cluster='character')) else
       data.table(RID=character(), sample_name=character(), cluster=character())
@@ -91,16 +122,6 @@ main <- function() {
     median_effective_states=median(effective_states), median_cluster_number=as.numeric(median(n_clusters)),
     median_assigned_reads=as.numeric(median(n_assigned_reads))), by=group]
   write(gs,'gene_group_summary.tsv')
-  tests <- rbindlist(lapply(c('shannon_entropy_bits','normalized_entropy','effective_states'),function(metric) {
-    d <- valid[is.finite(get(metric))]; d[, value := get(metric)]
-    kw <- kruskal.test(value ~ group, data=d)
-    pairs <- combn(sort(unique(d$group)),2,simplify=FALSE)
-    pair <- rbindlist(lapply(pairs,function(z) data.table(metric=metric,test='Wilcoxon rank-sum',
-      comparison=paste(z,collapse=' vs '),p_value=wilcox.test(d[group==z[1],value],d[group==z[2],value],exact=FALSE)$p.value)))
-    pair[, p_adjusted_BH := p.adjust(p_value,'BH')]
-    rbind(data.table(metric=metric,test='Kruskal-Wallis',comparison='all groups',p_value=kw$p.value,p_adjusted_BH=NA_real_),pair)
-  }))
-  write(tests,'gene_group_tests.tsv')
   cat('Analyzed',nrow(s),'genes;',nrow(valid),'valid;',sum(valid$n_assigned_reads),'assigned gene/fiber observations.\n')
   print(gs)
 }

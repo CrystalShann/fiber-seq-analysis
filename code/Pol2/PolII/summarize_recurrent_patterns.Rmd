@@ -1,0 +1,570 @@
+---
+title: "Identify recurrent cluster features"
+author: "Crystal Shan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+This analysis is to identify recurrent clusters from individual examples, I previously did clustering on housekeeping, cell type specific and not expressed genes in `/project/spott/cshan/fiber-seq/code/Pol2/PolII` using example genes in `/project/spott/cshan/fiber-seq/code/Pol2/PolII/example_gene_list.tsv`
+
+I want to know if there is 
+
+1. features representative for each gene groups?
+2. features shared across different gene groups?
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("/project/spott/cshan/fiber-seq/code/Pol2/PolII/pol2_pausing_functions.r")
+source("/project/spott/cshan/fiber-seq/code/Pol2/PolII/pol2_pausing_functions.r")
+  
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(cowplot)
+})
+
+```
+
+
+```{r show-figures}
+show_pdf_pages <- function(pdf, dpi = 100) {
+  out <- tempfile()
+  status <- system2("/project/spott/cshan/envs/poppler/bin/pdftoppm",
+                    c("-png", "-r", dpi, shQuote(pdf), shQuote(out)))
+  pngs <- sort(Sys.glob(paste0(out, "-*.png")))
+  if (status != 0 || !length(pngs)) stop("pdftoppm failed on ", pdf)
+  pngs
+}
+```
+
+# Gene and read level accessibility and nucleosome occupancy features 
+
+From each gene, I extracted the read features:
+
+I classified each read into 4 broad categories:
+  1) **A1 open / +1-depleted** - TSS base is nucleosome-free and no nucleosome begins in the first 300 bp downstream, so the fiber is open with no positioned +1 (26,801 reads)
+  2) **A2 open / +1-enriched** - TSS base is nucleosome-free but a nucleosome begins within +0..+299, the canonical open promoter with a positioned +1 (35,939 reads)
+  3) **A3 occluded / +1-depleted** - A nucleosome covers the TSS base and no further nucleosome begins within +0..+299, so the fiber is closed at the start site with the downstream region unoccupied (5,408 reads)
+  4) **A4 occluded / +1-enriched** - A nucleosome covers the TSS base and a separate nucleosome begins within +0..+299, so the fiber is closed with an additional positioned downstream nucleosome (7,128 reads)
+
+1. `LCL_project/Pol2/PolII/read_features/tables/read_features.tsv.gz`
+
+
+| Column | Meaning |
+|---|---|
+| `gene` | Gene symbol the window belongs to. |
+| `group` | Curated class: `housekeeping`, `cell_type_specific` or `not_expressed`. |
+| `chrom` | Chromosome of the TSS. |
+| `tss` | TSS position, 1-based. FANTOM5 LCL dominant TSS, or GENCODE v46 canonical as fallback. |
+| `strand` | Gene strand. All offsets below are oriented by transcription, so offset 0 is the TSS base and positive is downstream. |
+| `RID` | Read identifier, namespaced as `<sample>::<read name>`. |
+| `sample_name` | LCL sample the read came from (31 merged samples). |
+| `start` | Read alignment start, 1-based inclusive. |
+| `end` | Read alignment end, 1-based inclusive. |
+| `m6a_total` | m6A fraction over the whole window (offsets −1000..1000), averaged over observed sites only. |
+| `m6a_core` | m6A fraction over the core promoter, offsets −200..200. |
+| `m6a_upstream` | m6A fraction over offsets −500..−201. |
+| `m6a_downstream` | m6A fraction over offsets 201..500. |
+| `m6a_far_up` | m6A fraction over offsets −1000..−501. |
+| `m6a_far_down` | m6A fraction over offsets 501..1000. |
+| `nuc_total` | Fraction of the 2,001 window bases covered by a 130–160 bp fibertools nucleosome call. |
+| `nuc_core` | Same, restricted to offsets −200..200. |
+| `tf_10_30_total` | Fraction of window bases covered by a FiberHMM 10–30 bp footprint. |
+| `tf_10_30_core` | Same, restricted to offsets −200..200. |
+| `tf_30_60_total` | Fraction of window bases covered by a FiberHMM 30–60 bp footprint. |
+| `tf_30_60_core` | Same, restricted to offsets −200..200. |
+| `tf_60_80_total` | Fraction of window bases covered by a FiberHMM 60–80 bp footprint. |
+| `tf_60_80_core` | Same, restricted to offsets −200..200. |
+| `nuc_at_tss` | `TRUE` when a nucleosome call covers offset 0|
+| `plus1` | First offset in 0..299 *covered* by a nucleosome; `NA` if none. Original `plus1_offset()` definition, used for read ordering in the figures. |
+| `plus1_start` | First offset in 0..299 at which a nucleosome *starts*, excluding any nucleosome that covers the TSS; `NA` if none. Independent of `nuc_at_tss`. |
+| `archetype` | `A1 open / +1-depleted`, `A2 open / +1-enriched`, `A3 occluded / +1-depleted` or `A4 occluded / +1-enriched`|
+
+```{r read-feature-table}
+read_feature_table <- read.delim("/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/read_features/tables/read_features.tsv.gz")
+print(head(read_feature_table))
+```
+
+bar plot showing the archetype for different gene groups
+```{r archetype-bar}
+GROUP_LEVELS <- c("housekeeping", "cell_type_specific", "not_expressed")
+ARCHETYPE_COLORS <- c("A1 open / +1-depleted"     = "#4a9b3f",
+                      "A2 open / +1-enriched"     = "#1f6fb4",
+                      "A3 occluded / +1-depleted" = "#e8871a",
+                      "A4 occluded / +1-enriched" = "#d0241f")
+
+
+subset_gene_archetype <- read_feature_table %>%
+  select(group, archetype) %>%
+  count(group, archetype, name = "n_reads") %>%
+  mutate(fraction = n_reads / sum(n_reads)) %>%
+  ungroup() %>%
+  mutate (
+    group = factor(group, levels = GROUP_LEVELS),
+    archetype = factor(archetype, levels = names(ARCHETYPE_COLORS))
+  )
+
+ggplot(subset_gene_archetype, aes(x = group, y = fraction, fill = archetype)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = ARCHETYPE_COLORS) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "fraction of reads", fill = "archetype") +
+  theme_cowplot()
+```
+
+
+2. `bins/<gene>.tsv.gz` - gene level features per 10 bp bins, one row per read x 10 bp bins
+
+| Column | Meaning |
+|---|---|
+| `gene` | Gene symbol. |
+| `RID` | Read identifier, joins to `read_features.tsv.gz` on `gene` + `RID` |
+| `bin` | Bin index 0–199 across the TSS ±1 kb window, oriented by transcription |
+| `position` | Bin centre in bp from the TSS: −995, −985, … , 995 |
+| `m6a_sites` | Observed m6A sites in this bin. A per-gene constant, repeated on every read's row |
+| `bin_bases` | Genomic bases in this bin: 10 for bins 0–198, 11 for bin 199, which absorbs offset +1000 |
+| `m6a_calls` | m6A calls on this read within this bin |
+| `nuc_bases` | Bases of this bin covered on this read by a 130–160 bp nucleosome call |
+| `tf_10_30_bases` | Bases covered on this read by a FiberHMM 10–30 bp footprint |
+| `tf_30_60_bases` | Bases covered on this read by a FiberHMM 30–60 bp footprint |
+| `tf_60_80_bases` | Bases covered on this read by a FiberHMM 60–80 bp footprint |
+
+
+```{r binned-gene-feature}
+# take SCYGR1 gene as an example
+example_binned_table <- read.delim("/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/read_features/bins/SCYGR1.tsv.gz")
+print(head(example_binned_table))
+```
+
+
+3. `tables/gene_features.tsv` - one row per gene
+
+| Column | Meaning |
+|---|---|
+| `group` | Curated class of the gene. |
+| `gene_name` | Gene symbol. |
+| `gene_id` | Ensembl gene ID. |
+| `chrom` | Chromosome. |
+| `tpm_rep1` | GM12878 TPM, ENCODE ENCSR820PHH replicate 1. |
+| `tpm_rep2` | GM12878 TPM, replicate 2. |
+| `tpm_mean` | Mean of the two replicate TPMs. |
+| `status` | `complete`, or `error` when the gene could not be extracted. |
+| `error` | Error message for failed genes, empty otherwise. |
+| `tss` | Resolved TSS, 1-based. `NA` if the gene failed. |
+| `strand` | Gene strand. |
+| `tss_source` | `FANTOM5 dominant TSS` or `GENCODE v46 canonical TSS`. |
+| `n_reads` | Full-span reads in the window. |
+| `n_samples` | Distinct LCL samples contributing reads. |
+| `occluded_fraction` | Fraction of reads whose TSS base is covered by a nucleosome. |
+| `plus1_fraction` | Fraction of reads with a `plus1_start`, i.e. a +1 nucleosome that does not cover the TSS. |
+| `m6a_total` | Mean of the reads' `m6a_total`. |
+| `m6a_core` | Mean of the reads' `m6a_core`. |
+| `m6a_upstream` | Mean of the reads' `m6a_upstream`. |
+| `m6a_downstream` | Mean of the reads' `m6a_downstream`. |
+| `m6a_far_up` | Mean of the reads' `m6a_far_up`. |
+| `m6a_far_down` | Mean of the reads' `m6a_far_down`. |
+| `nuc_total` | Mean of the reads' `nuc_total`. |
+| `nuc_core` | Mean of the reads' `nuc_core`. |
+| `tf_10_30_total` | Mean of the reads' `tf_10_30_total`. |
+| `tf_10_30_core` | Mean of the reads' `tf_10_30_core`. |
+| `tf_30_60_total` | Mean of the reads' `tf_30_60_total`. |
+| `tf_30_60_core` | Mean of the reads' `tf_30_60_core`. |
+| `tf_60_80_total` | Mean of the reads' `tf_60_80_total`. |
+| `tf_60_80_core` | Mean of the reads' `tf_60_80_core`. |
+| `nuc_at_tss` | Mean of the reads' `nuc_at_tss`. Numerically identical to `occluded_fraction`. |
+| `plus1` | Mean `plus1` offset over reads that have one, `NA` values dropped. |
+| `plus1_start` | Mean `plus1_start` offset over reads that have one, `NA` values dropped. |
+| `fraction_A1` | Fraction of reads in archetype A1, open / +1-depleted. |
+| `fraction_A2` | Fraction of reads in archetype A2, open / +1-enriched. |
+| `fraction_A3` | Fraction of reads in archetype A3, occluded / +1-depleted. |
+| `fraction_A4` | Fraction of reads in archetype A4, occluded / +1-enriched. |
+
+```{r gene-feature}
+gene_feature_table <- read.delim("/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/read_features/tables/gene_features.tsv")
+print(head(gene_feature_table))
+```
+
+
+# examples genes clustered individually
+
+```{r show-example-plots}
+EXAMPLE_VIEWS <- c("unclustered/%s_unclustered_m6a", "unclustered/%s_unclustered_footprints",
+                   "clustered/%s_clustered_m6a", "clustered/%s_clustered_footprints",
+                   "read_level_plots/%s_read_level")
+
+show_example_genes <- function(genes, group, dpi = 100) {
+  pngs <- unlist(lapply(genes, function(sym) {
+    a <- fread(file.path(OUT_DIR, "recurrent_patterns/tables", group, paste0(sym, "_read_clusters.tsv")))
+    message(sym, ": ", nrow(a), " reads, ", uniqueN(a$cluster), " clusters")
+    pdfs <- file.path(OUT_DIR, "plots/example_reads", group, sym, paste0(sprintf(EXAMPLE_VIEWS, sym), ".pdf"))
+    stopifnot(file.exists(pdfs))
+    vapply(pdfs, function(pdf) {
+      out <- tempfile()
+      status <- system2("/project/spott/cshan/envs/poppler/bin/pdftoppm",
+                        c("-png", "-singlefile", "-r", dpi, shQuote(pdf), shQuote(out)))
+      if (status != 0 || !file.exists(paste0(out, ".png"))) stop("pdftoppm failed on ", pdf)
+      paste0(out, ".png")
+    }, character(1))
+  }))
+  knitr::include_graphics(pngs)
+}
+```
+
+## 1. housekeeping genes: B2M, ENO1
+
+```{r housekeeping-examples, out.width = "100%"}
+show_example_genes(c("B2M", "ENO1"), "housekeeping")
+```
+
+
+## 2. cell type specifc genes: NFKB2, BATF
+
+```{r cell-type-specific-examples, out.width = "100%"}
+show_example_genes(c("NFKB2", "BATF"), "cell_type_specific")
+```
+
+
+## 3. not expressed genes: APOBEC1, SUSD5
+
+```{r not-expressed-examples, out.width = "100%"}
+show_example_genes(c("APOBEC1", "SUSD5"), "not_expressed")
+```
+
+
+# Identify recurrent clusters from individual clusters from 150 example genes 
+
+`/project/spott/cshan/fiber-seq/code/Pol2/PolII/recurrent_cluster_features/01_summarize_recurrent_patterns.R` computed one 40 bin profile per cluster
+
+Steps to identify recurrent clusters:
+
+1.read the saved Leiden read clusters (`extract_gene()`):  `recurrent_patterns/tables/<group>/<gene>_read_clusters.tsv`, assemble the gene's full-span m6A reads in the TSS ±1 kb window and orient them by transcription
+
+2. split the window into 40 × 50 bp bins (bin centres −975 … 975; the last bin includes +1000). Per cluster × bin, compute the m6A rate at observed sites and the nucleosome coverage
+
+3. bins with no observed m6A site are set to 0
+
+4. filter for eligible clusters: the gene has ≥ 50 reads, the cluster has ≥ 20 reads, and ≤ 4 of the 40 bins had no observed m6A site. Ineligible clusters keep their original label but get no family
+
+5. **global clustering on indiviudal example clusters**: Euclidean distance between the 40 bin m6A profiles of all eligible clusters pooled across genes, Ward.D2 hierarchical clustering, cut at k = 6
+
+  -6 families are relabelled F1-F6 by increasing mean m6
+  - k = 6 is hard coded,  mean silhouettes for k = 2..8 show how well separated the families are
+  
+6. rank cluster families (identified from step 5 global clustering) by m6a signal
+
+  - `low_signal` - 90th percentile of bins < 0.25 and max < 0.40)
+  - `promoter_enriched` - core m6A (200 bp around promoter) >= 0.3, mean of far up/down (-1000 to -501 and +501 to +1000) >= 0.15
+  - `broad_signal` - >= 40% of bins with m6A >= 0.30
+  
+7. **Recurrence per gene**: for each family, the gene's read fraction is the summed read fraction of its eligible clusters in that family. A family is *present* in a gene when that fraction is ≥ 10% (genes ≥ 50 reads only). The dominant family is the one with the largest read fraction
+
+  - each cluster's `read_fraction` = cluster reads / all reads of the gene (`gene_reads`, summed over every cluster, eligible or not)
+  - `Fk_read_fraction` = sum of `read_fraction` over the gene's eligible clusters assigned to family Fk; 0 if the gene has no cluster in Fk
+  - `Fk_present` = TRUE when the gene has ≥ 50 reads and `Fk_read_fraction` ≥ 0.10
+  - `retained_read_fraction` = `F1_read_fraction` + … + `F6_read_fraction`
+  - `dominant_family` = the Fk with the largest `Fk_read_fraction` 
+
+8. **Recurrence per gene group**: per group and family, the fraction of genes in which the family is present (`gene_prevalence`) and the mean read fraction per gene. Genes are weighted equally
+  - only genes with ≥ 50 reads are counted
+  - `gene_prevalence` for group g and family Fk = number of genes in g with `Fk_present` / number of genes in g
+  - `mean_gene_read_fraction` for group g and family Fk = mean of `Fk_read_fraction` over the genes in g, counting genes without Fk as 0
+  - each gene counts once
+
+9. **Gene and category profiles**: read-weighted gene profiles use every cluster. Category means average those profiles over genes with >= 50 reads, each gene weighted equally.
+  - gene profile, per 50 bp bin: m6A = sum over the gene's clusters (`read_fraction` × cluster m6A in that bin)
+  - all clusters of a gene share the same observed sites per bin, so this equals pooling all of the gene's reads into one cluster
+  - gene profiles are written to `tables/gene_features.tsv` as `m6a_bin01` … `m6a_bin40` and `nuc_bin01` … `nuc_bin40` (`bin01` = −1000..−951, `bin40` = +950..+1000)
+
+
+Outputs under `LCL_project/Pol2/PolII/recurrent_patterns/`: `tables/gene_features.tsv`, `tables/<gene>/{read_features.tsv.gz, cluster_features.tsv, cluster_profiles.tsv.gz}` and `plots/recurrent_patterns_summary.pdf`
+
+
+
+SLC44A4 do not have enough reads, all other 149 genes are used for global clustering
+
+
+
+### overview of the clustering steps
+
+
+1. read output form leiden clustering for each gene
+```{r global-cluster-1}
+acgt1_read_cluster <- read.delim("/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/recurrent_patterns/tables/housekeeping/ACTG1_read_clusters.tsv")
+
+head(acgt1_read_cluster)
+```
+
+2. build 40bp bin profile per leiden cluster
+```{r global-cluster-2}
+actg1_cluster_profile <- read.delim("/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/recurrent_patterns/tables/ACTG1/cluster_profiles.tsv.gz")
+head(actg1_cluster_profile)
+```
+
+3. stack every gene's clusters into one matrix
+
+  - each gene cluster combination becomes one row of 40 bins of m6a values
+
+```{r global-cluster-3}
+root <- "/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/recurrent_patterns/tables"
+genes <- fread(file.path(root, "example_genes.tsv"))[status == "complete", .(group, gene = gene_name, gene_reads = n_reads)]
+profiles <- rbindlist(lapply(genes$gene, function(g) fread(file.path(root, g, "cluster_profiles.tsv.gz"))))
+pooled <- dcast(profiles, gene + cluster + n_reads ~ bin, value.var = "m6a")
+bins <- paste0("bin", 0:39)
+setnames(pooled, as.character(0:39), bins)
+pooled <- merge(genes, pooled, by = "gene")
+setorder(pooled, group, gene, cluster)
+dim(pooled)  
+
+head(pooled)
+
+```
+
+4. Fill missing bins and keep eligible clusters
+
+A bin with no observed m6A site is set to 0. A cluster is kept if:
+  - its gene has ≥50 reads,
+  - it has ≥20 reads itself, and
+  - at most 4 of its bins were missing
+  
+```{r global-cluster-4}
+x <- as.matrix(pooled[, ..bins])
+pooled[, missing_profile_bins := rowSums(is.na(x))]
+x[is.na(x)] <- 0
+pooled[, eligible := gene_reads >= 50 & n_reads >= 20 & missing_profile_bins <= 4]
+fit <- which(pooled$eligible)
+length(fit)  
+```
+
+
+5. k means + ward hierchical clustering
+
+ 1) euclidean distance
+ Each cluster is a point described by its 40 binned m6A values. The Euclidean distance between two clusters is the square root of the sum, over the 40 bins, of their squared differences in m6A. A small distance means the two clusters have similar m6A at the same positions around the TSS
+ 
+ 2) ward D2 hierarchical clustering 
+ It starts with every cluster in its own group. At each step it merges the two groups whose merge causes the smallest increase in within-group variance, meaning the summed squared Euclidean distance of members to their group's mean profile. This repeats until everything is one group, and the resulting tree (dendrogram) records the height at which each merge happened. A low merge means nearly identical profiles; a high merge means the two branches differ a lot
+
+```{r global-cluster-5}
+distance <- dist(x[fit, ])                      # Euclidean between 40-bin profiles
+tree <- hclust(distance, method = "ward.D2")
+list(tree)
+```
+
+### outputs of global clustering
+
+For each gene, recurrent gene features table summarize the m6a and nucleosome signal in each 40 bp bin, and the fraction of reads belonging to each cluster family from global clustering
+
+```{r recurrent-gene-features-table}
+recurrent_gene_feature_table <- read.delim("/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/recurrent_patterns/tables/gene_features.tsv")
+print(head(recurrent_gene_feature_table))
+```
+
+For every read in each gene, I calculated m6a fraction along different positions in the gene body and the family the read belongs to
+
+`tables/<gene>/read_features.tsv.gz` - one row per full-span read of the gene 
+
+Columns: the read's original Leiden `cluster`, its coordinates and plot rows, regional m6A rates over the TSS ±1 kb window (`m6a_total`, `m6a_core` −200..200, `m6a_upstream` −500..−201, `m6a_downstream` 201..500, `m6a_far_up` −1000..−501, `m6a_far_down` 501..1000), nucleosome coverage (`nuc_at_tss`, `nuc_core`, `nuc_total`), the first +1 nucleosome offset (`plus1`)
+
+- produced by step 1 (read features, in `extract_gene()`)
+```{r recurrent-read-feature-table}
+recurrent_gene_example_root <- "/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/recurrent_patterns/tables/ACTG1"
+
+example_recurrent_gene_read_feature <- read.delim(file.path(recurrent_gene_example_root, "read_features.tsv.gz"))
+print(head(example_recurrent_gene_read_feature))
+```
+
+
+`tables/<gene>/cluster_features.tsv` - one row per original Leiden cluster of the gene
+
+Columns: read and sample counts, the cluster means of the read features above, `gene_reads` and `read_fraction` (cluster reads / gene reads), `core_enrichment` (`m6a_core` − mean of `m6a_far_up` and `m6a_far_down`), `missing_profile_bins`, `eligible`, `family` (`NA` when not eligible) and the three shape flags
+
+- cluster means come from step 1
+
+```{r recurrent-cluster-feature-table}
+example_recurrent_gene_cluster_feature <- read.delim(file.path(recurrent_gene_example_root, "cluster_features.tsv"))
+print(example_recurrent_gene_cluster_feature)
+```
+
+`tables/<gene>/cluster_profiles.tsv.gz` - one row per cluster × 50 bp bin (ACTG1: 6 clusters × 40 bins = 240 rows). Columns: `bin` (0–39), `position` (bin centre, −975..975), `n_reads`, `n_observed_sites` (observed m6A sites in the bin), `m6a` (m6A rate at observed sites), `nucleosome` (130–160 bp nucleosome coverage), and the cluster's `family` / `eligible`. These 40 bin `m6a` values are the profiles clustered in step 5; a bin with no observed site is `NA` here and only set to 0 in memory (step 3)
+
+- produced by step 2; `eligible` from step 4 and `family` from step 5
+
+```{r recurrent-cluster-profile-table}
+example_recurrent_gene_cluster_profile <- read.delim(file.path(recurrent_gene_example_root, "cluster_profiles.tsv.gz"))
+print(head(example_recurrent_gene_cluster_profile))
+```
+
+
+# Summary figures
+
+`recurrent_patterns/plots/recurrent_patterns_summary.pdf` (from 01), four pages: the six family profiles (step 5), family prevalence and mean read fraction per gene group (step 8), gene group mean m6A and nucleosome profiles (step 9), silhouettes for k = 2..8 and core m6A vs core nucleosome per cluster
+
+`recurrent_patterns/plots/03_cluster_gene_summary.pdf` (from `03_cluster_gene_summary.R`), four pages: family profiles of the five signals, gene group profiles, occluded-TSS fiber fraction per gene group, and archetype profiles
+
+```{r summary-figures, out.width = "100%"}
+summary_plot_dir <- file.path(OUT_DIR, "recurrent_patterns/plots")
+knitr::include_graphics(unlist(lapply(
+  file.path(summary_plot_dir, c("recurrent_patterns_summary.pdf", "03_cluster_gene_summary.pdf")),
+  show_pdf_pages)))
+```
+
+
+
+# Puffin for promoter annotations
+
+`/project/spott/cshan/fiber-seq/code/Pol2/PolII/promoter_annotation/04a_puffin_motif_scores.py` asks which promoter motif contributes most to transcription start at each example gene's TSS. It uses Puffin (Dudnyk et al., 2024), a deep-learning model that predicts TSS activity from DNA sequence alone. Puffin also breaks each prediction into the contributions of individual motifs (TATA, YY1, SP, ETS, NFY, CREB, NRF1, ZNF143, U1 snRNP), plus initiator and trinucleotide effects
+
+1. load the genes used for clustering
+
+2. get the sequence for each gene, for each gene it cuts 1,650 bp of hg38 centred on the TSS the fiber analysis used (TSS +/- 825 bp)
+
+3. run puffin using `net.interpret(seq, "FANTOM_CAGE")` --> per-base tracks over TSS −500 to +499. These are the predicted TSS signal (the CAGE-like prediction), each motif's effect, and the summed motif, initiator, trinucleotide and total effects
+
+4. score gene motif at the TSS by taking the 20 bp around the TSS (−10 to +9). It averages each motif's effect over those bases, weighting each base by Puffin's predicted TSS signal there -->
+This gives one number per motif per gene. Bases where Puffin predicts initiation count most
+
+5. find the TATA box by searching the TATA+ motif activation track between −60 and −10 bp. The peak position is tata_center and its height is tata_activation
+
+6. label ach gene by its strongest motif. Among the 14 motif scores, excluding U1 snRNP, the largest is dominant_motif_excl_U1, and its value is dominant_contribution_excl_U1
+
+
+one row per gene, with every motif score, the summed effects, the TATA position and activation, and the dominant-motif label
+
+  - the position of the motif is inferred from puffin predicted motif center, and I chose the motif span based on the length of the consensus sequence (TATA box: TATAWAWR - 8bp, YY1 - AAGTAGGCGG - 10bp)
+
+```{r puffin-motif-score}
+puffin_root <- "/project/spott/cshan/fiber-seq/LCL_project/Pol2/PolII/promoter_annotation/tables"
+motif_score <- read.delim(file.path(puffin_root, "04a_puffin_motif_scores.tsv"))
+head(motif_score)
+```
+
+one row per gene per position from −500 to +499
+```{r puffin-motif-effect}
+motif_effect <- read.delim(file.path(puffin_root, "04a_puffin_effect_profiles.tsv.gz"))
+head(motif_effect)
+```
+
+## TATA promoters on single molecules: SRSF3, NFKBIA, CR2, SPIB
+
+TATA-class genes with the strongest drop in m6A and the strongest 10-30 bp footprint at their own TATA box (TATA box bin vs the bins 30-60 bp around it). The read level figure of `plot_read_level()` (as in `plots/example_reads/<group>/<gene>/read_level_plots`: TSS +/- 1 kb, reads ordered by +1 nucleosome start, all nucleosomes and 10-80 bp TF footprints) with a TATA box panel, the Pol II ChIP track, the m6A fraction of all reads and the TATA box (Puffin `tata_center` +/- 4 bp) shaded yellow. PDFs are saved under `promoter_annotation/plots/TATA_motif_read_examples/`.
+
+```{r tata-molecule-functions}
+TATA_GENES <- c("SRSF3", "NFKBIA", "CR2", "SPIB")
+TATA_MOLECULE_DIR <- file.path(OUT_DIR, "promoter_annotation/plots/TATA_motif_read_examples")
+
+# TSS, strand and Puffin TATA box and YY1 site centres of one gene
+tata_gene <- function(gene) {
+  gf <- fread(file.path(OUT_DIR, "read_features/tables/gene_features.tsv"))[gene_name == gene]
+  pf <- fread(file.path(OUT_DIR, "promoter_annotation/tables/04a_puffin_motif_scores.tsv"))[gene_name == gene]
+  stopifnot(nrow(gf) == 1L, nrow(pf) == 1L)
+  cbind(gf[, .(group, gene_name, chrom, tss, strand, tss_source)], pf[, .(tata_center, yy1_center)])
+}
+
+# read level figure of one gene: the reads, footprints and read order of plot_curated_gene(), with
+# the Puffin motif centre `center` (column of tata_gene()) shaded and labelled `label`
+plot_tata_read_level <- function(gene, center = "tata_center", label = "TATA box",
+                                 out_dir = TATA_MOLECULE_DIR, suffix = "tata") {
+  g <- tata_gene(gene)
+  region <- data.frame(region_id = g$gene_name, chr = g$chrom,
+    start = g$tss + EXAMPLE_RANGE[1] - 1L, end = g$tss + EXAMPLE_RANGE[2],
+    analysis_start = g$tss + EXAMPLE_RANGE[1], analysis_end = g$tss + EXAMPLE_RANGE[2])
+  samples <- fread(SAMPLES)[, .(sample_name, fire_dir)]
+  dat <- assemble_region_m6a(as.data.frame(samples), region, full_span = TRUE,
+    positions = seq(region$analysis_start, region$analysis_end))
+  meta <- dat$rids_df
+  plain <- meta$RID[order(match(meta$sample_name, samples$sample_name), meta$start, meta$RID)]
+  plot_read_level(g, example_footprints(g, dat), plain,
+                  file.path(out_dir, paste0(gene, "_", suffix, "_read_level.pdf")),
+                  met_mat = dat$met_mat, tata_center = g[[center]], motif_label = label)
+}
+```
+
+```{r tata-molecules, out.width = "100%"}
+tata_pdfs <- vapply(TATA_GENES, plot_tata_read_level, character(1))
+knitr::include_graphics(unlist(lapply(tata_pdfs, show_pdf_pages)))
+```
+
+### Motif and nucleosome and footprint occupancy features
+
+Genes are grouped by their Puffin dominant motif (`group_excl_U1` of 04a)
+
+`puffin_motif_class_plus1_density.pdf`: the +1 start of every read with an accessible TSS (`plus1_start`, the first nucleosome start within +0..+299 bp), for motifs with >= 5 genes and genes with >= 10 such reads. Each gene gets the same total weight, so deeply covered genes do not dominate a motif's density. The dashed line is the median of the motif's per-gene median +1 start
+
+
+Each line is the mean (+/- se) of the per-gene 10 bp bin profiles of over the motif's genes (TSS +/- 500 bp, oriented by strand), and the grey line is the mean over all other genes
+
+the examples for TATA and YY1 are selected based on top contribution score predicted by puffin
+
+```{r motif-smf-figures, out.width = "100%"}
+motif_plot_dir <- file.path(OUT_DIR, "promoter_annotation/plots")
+knitr::include_graphics(unlist(lapply(
+  file.path(motif_plot_dir, c("puffin_motif_class_plus1_density.pdf", "puffin_motif_smf_features.pdf")),
+  show_pdf_pages)))
+```
+
+YY1 seems to have the most strongly positioned +1 nucleosome and is depleted of 10-30 bp footprints upstream of TSS, while TATA has the weakest +1 nucleosome and is enriched in 10-30 bp footprints
+
+TSS used for puffin is fantom5 dominant TSS for each gene, it this is not present for the selected gene, then the gencode canonical TSS is used
+
+## YY1 promoters on single molecules: SPCS2, NDUFA9, EIF3E, RPS11, ATP5PO
+
+
+```{r yy1-molecules, out.width = "100%"}
+YY1_GENES <- c("SPCS2", "NDUFA9", "EIF3E", "RPS11", "ATP5PO")
+YY1_MOLECULE_DIR <- file.path(OUT_DIR, "promoter_annotation/plots/YY1_motif_read_examples")
+dir.create(YY1_MOLECULE_DIR, recursive = TRUE, showWarnings = FALSE)
+yy1_pdfs <- vapply(YY1_GENES, plot_tata_read_level, character(1), center = "yy1_center",
+                   label = "YY1 site", out_dir = YY1_MOLECULE_DIR, suffix = "yy1")
+knitr::include_graphics(unlist(lapply(yy1_pdfs, show_pdf_pages)))
+```
+
+
+
+# Promoter QTLs from Einarsson et al., 2022
+
+**they proposed that "Alternative TSSs of low variability promoters indicate a novel mechanism of mutational robustness"**
+
+
+eQTLs are rarely found at housekeeping or ubiquitous genes and have limited effects when present, possibly due to selection or robustness mechanisms - flexible TSS architecture could mask variant effects on individual core promoters.
+
+1. **Promoter eQTLs (prQTLs)**
+    Testing common SNPs (MAF ≥ 10%, within 25 kb) found 2,457 promoters with >= 1 prQTL (5% FDR), more often at highly variable promoters. Fewer common variants lie near low-variable promoters, suggesting negative selection, and lead-SNP effect size correlates with variability 
+
+2. **Decomposed promoter eQTLs (dprQTLs)**
+    dprQTLs show similar prevalence and maximum effect sizes across variability classes, indicating that flexible TSS architecture limits how variant effects on individual core promoters propagate to total promoter output
+
+3. **Fraction QTLs (frQTLs)**
+    Testing association with each decomposed promoter's fractional contribution to its parent found 1,230 promoters with >=1 frQTL. Unlike prQTLs and dprQTLs, frQTLs are more common in low-variable promoters
+
+
+#### Single molecules at the RGS14 and GGNBP2 promoter QTLs
+
+1. Partial shift example: RGS14
+
+  - SNP rs56235845 (chr5:177371039 T/G) affects contributions of decomposed promoters 1 and 2 and still has a noticeable effect on total promoter activity 
+
+2. Compensatory switch example: GGNBP2
+
+    - SNP rs9906189 (chr17:36549567 G/A) shifts the two decomposed promoters in opposite directions, yet total output is essentially unchanged
+
+
+m6A molecules of the 27 phased LCL samples spanning SNP +/- 1 kb, split by donor VCF genotype and, in heterozygous donors, by the base each read carries at the SNP
+
+```{r promoter-qtl-examples, out.width = "100%"}
+QTL_DIR <- file.path(OUT_DIR, "promoter_annotation/plots/promoter_qtl_examples_Einarsson")
+qtl_config <- list(root = file.path(PROJECT, "LCL_project/co-accessibility/CRE_co-accessibility_FIRE"),
+  fire_root = file.path(SHARED, "FIRE/results"), tabix = "/project/spott/cshan/envs/dimelo/bin/tabix",
+  code_root = file.path(PROJECT, "code"), locus_flank_bp = 1000L)
+qtl_gene_models <- load_canonical_gene_models("/project/spott/cshan/annotations/gencode.v46.annotation.gtf.gz")
+qtl_snps <- data.frame(gene = c("RGS14", "GGNBP2"), snp_id = c("rs56235845", "rs9906189"),
+  chrom = c("chr5", "chr17"), pos = c(177371039L, 36549567L), ref = c("T", "G"), alt = c("G", "A"))
+qtl_examples <- lapply(seq_len(nrow(qtl_snps)), function(i) with(qtl_snps[i, ],
+  plot_snp_genotype_molecules(chrom, pos, ref, alt, snp_id, gene, QTL_DIR,
+    config = qtl_config, models = qtl_gene_models, profile_bars = TRUE)))
+knitr::kable(rbindlist(lapply(qtl_examples, function(x)
+  x$group_sizes[, .(SNP = x$region$focal_snp, group = cluster, molecules, samples, donors)])))
+knitr::include_graphics(unlist(lapply(qtl_examples, function(x) show_pdf_pages(x$file))))
+```
+

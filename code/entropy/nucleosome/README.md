@@ -16,9 +16,6 @@ From `/project/spott/cshan/fiber-seq`:
 mkdir -p results/logs
 sbatch code/entropy/nucleosome/run_entropy.sh
 
-# Regenerate PDF figures and supporting tables from existing entropy results
-bash code/entropy/nucleosome/run_entropy_features.sh
-
 # Extract promoter footprint fractions against existing gene entropy, then plot
 sbatch code/entropy/nucleosome/run_entropy.sh --footprints-only
 
@@ -50,8 +47,8 @@ saved genes. Normal successful entropy runs also calculate these fractions.
 
 ## Inputs and shared functions
 
-The gene list is `code/pausing/PolII/example_gene_list.tsv`. TSSs and fiber identities
-come from `LCL_project/pausing/PolII/read_features/tables/{gene_features.tsv,read_features.tsv.gz}`.
+The gene list is `code/Pol2/PolII/example_gene_list.tsv`. TSSs and fiber identities
+come from `LCL_project/Pol2/PolII/read_features/tables/{gene_features.tsv,read_features.tsv.gz}`.
 These retain the existing FANTOM5 LCL dominant TSS, or GENCODE v46 canonical TSS
 fallback, and the fibers spanning TSS +/-1,000 bp. Thus entropy, cluster assignments,
 and saved accessibility features refer to the same cohort. This does not recruit
@@ -111,7 +108,7 @@ make these cases explicit. The maximum entropy is `log2(500) = 8.965784` bits.
 
 Each gene is analyzed over all its retained fibers. Saved recurrent-cluster labels
 are joined by sample-qualified RID from
-`LCL_project/pausing/PolII/recurrent_patterns/tables/<gene>/read_features.tsv.gz`.
+`LCL_project/Pol2/PolII/recurrent_patterns/tables/<gene>/read_features.tsv.gz`.
 Every original cluster is analyzed separately, including ineligible clusters;
 their `eligible` flag is retained.
 An absent label file leaves gene entropy available and sets
@@ -149,7 +146,7 @@ in `LCL_project/entropy/nucleosome_entropy/plots/`.
    position on y, colored by gene group. The mean uses only fibers with a start
    at +1..+299 and is a position rather than a variability statistic.
 4. `04_entropy_vs_short_footprints.pdf`: gene entropy on x and fraction of fibers
-   with a short footprint overlapping **-100..+100 bp** on y, colored by gene
+   with a short footprint fully contained within **-100..+100 bp** on y, colored by gene
    group and faceted by short-footprint size class. Entropy remains +1..+500 bp.
 
 Puffin annotations are taken from `04a_puffin_motif_scores.tsv` in the existing
@@ -174,7 +171,7 @@ The per-sample calls reproduced the existing CD74 and HLA-DRA per-fiber core
 footprint occupancy measurements to floating-point precision in a pilot check.
 
 The footprint window includes both endpoints and the TSS: 201 bases from -100
-through +100. A footprint qualifies with at least 1 bp of overlap; its full size,
+through +100. A footprint qualifies only when fully contained within the window; its full size,
 before clipping, determines its class. The shared class boundaries are
 10 <= length < 30, 30 <= length < 60, and 60 <= length <= 80 bp. Each fiber is
 counted at most once per class even if it has several footprints; a fiber can

@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 # Gini-Simpson diversity of original, gene-specific Fiber-seq clusters.
 # Run in the project's R environment:
-# bash code/pausing/PolII/run_gene_examples.sh code/entropy/gini_simpson_molecule_cluster/simpson_functions.R
+# bash code/Pol2/PolII/run_gene_examples.sh code/entropy/gini_simpson_molecule_cluster/simpson_functions.R
 # GINI_MODE=diversity-only validates assignments and exports diversity without feature extraction.
 
 # 1. Packages and paths. All outputs are isolated from existing entropy results.
@@ -10,21 +10,26 @@ setDTthreads(1L)
 PROJECT <- '/project/spott/cshan/fiber-seq'
 CODE <- file.path(PROJECT,'code/entropy/gini_simpson_molecule_cluster')
 OUT <- file.path(PROJECT,'LCL_project/entropy/gini_simpson_molecule_cluster')
-POLII <- file.path(PROJECT,'LCL_project/pausing/PolII')
-SHANNON <- file.path(PROJECT,'LCL_project/entropy/molecule_cluster_entropy/tables')
+POLII <- file.path(PROJECT,'LCL_project/Pol2/PolII')
+SHANNON <- file.path(PROJECT,'LCL_project/entropy/molecule_cluster_entropy/k10_n1')
 GROUPS <- c('housekeeping','cell_type_specific','not_expressed')
 
 # Feature settings confirmed by the user.
 # Fixed per the request: all assigned fibers, original cluster labels, no resampling.
 FOOTPRINT_WINDOWS <- list(tss=c(-100L,100L),downstream=c(0L,300L))
 FOOTPRINT_SIZES <- list(fp40_60=c(40L,60L),fp60_80=c(60L,80L),fp10_80=c(10L,80L))
-FOOTPRINT_MIN_OVERLAP <- .5
-# 60 bp belongs to fp60_80, not fp40_60; 80 bp is included. At least 50% of the footprint length must overlap.
+FOOTPRINT_MIN_OVERLAP <- 1
+# 60 bp belongs to fp60_80, not fp40_60; 80 bp is included. The entire footprint must lie within the window.
 # Existing continuous m6A features: upstream [-500,-201], core [-200,200], downstream [201,500].
 # No new binary accessibility rule is defined.
 
 
 # Calculation functions. No clustering or resampling.
+#########
+# Gini-Simpson indices from cluster counts
+#######
+# 1. Drop empty clusters and convert counts to proportions
+# 2. Return 1 - sum(p^2), its normalized form and inverse Simpson
 simpson_indices <- function(counts) {
   stopifnot(all(is.finite(counts)), all(counts >= 0), all(counts == floor(counts)))
   counts <- counts[counts > 0]; k <- length(counts)
@@ -34,9 +39,26 @@ simpson_indices <- function(counts) {
   list(gini_simpson=g, normalized_gini_simpson=if(k>1) g/(1-1/k) else NA_real_, inverse_simpson=1/concentration)
 }
 
+#########
+# Mean of finite values
+#######
+# 1. Drop non-finite values
+# 2. Return their mean, or NA if none are left
 finite_mean <- function(x) if(any(is.finite(x))) mean(x[is.finite(x)]) else NA_real_
+#########
+# Median of finite values
+#######
+# 1. Drop non-finite values
+# 2. Return their median, or NA if none are left
 finite_median <- function(x) if(any(is.finite(x))) as.numeric(median(x[is.finite(x)])) else NA_real_
 
+#########
+# Fraction of fibers with a footprint per window and size class
+#######
+# 1. Convert reads and footprints to TSS-relative coordinates
+# 2. For each window, keep fibers spanning the whole window
+# 3. For each size class, count fibers with a footprint inside the window
+# 4. Return counts and fraction per window x size class
 # Same FiberHMM v1 calls as existing entropy helpers, with new exact size ranges.
 # Coordinates supplied here are 1-based inclusive relative to the oriented TSS.
 footprint_presence <- function(reads, fp, tss, strand) {
@@ -63,6 +85,11 @@ footprint_presence <- function(reads, fp, tss, strand) {
   }))
 }
 
+#########
+# Spearman correlation of Gini-Simpson with each feature
+#######
+# 1. For each feature and stratum (all genes, each group), keep finite pairs
+# 2. Compute Spearman rho (NA if < 3 genes or constant values)
 feature_associations <- function(d, features) {
   r <- rbindlist(lapply(features,function(f) rbindlist(lapply(c('all',GROUPS),function(gr) {
     z <- d[is.finite(gini_simpson) & is.finite(get(f))]
@@ -75,21 +102,17 @@ feature_associations <- function(d, features) {
   r
 }
 
-group_comparisons <- function(d) {
-  rbindlist(lapply(c('gini_simpson','normalized_gini_simpson'),function(f) {
-    z <- d[is.finite(get(f))]; z[, value := get(f)]
-    kw <- kruskal.test(value~gene_group,data=z)
-    pw <- rbindlist(lapply(combn(GROUPS,2,simplify=FALSE),function(g) {
-      data.table(metric=f,test='Wilcoxon rank-sum',comparison=paste(g,collapse=' vs '),
-        p_value=suppressWarnings(wilcox.test(z[gene_group==g[1],value],z[gene_group==g[2],value],exact=FALSE)$p.value))
-    }))
-    pw[, p_adjusted_BH := p.adjust(p_value,'BH')]
-    rbind(data.table(metric=f,test='Kruskal-Wallis',comparison='all groups',p_value=kw$p.value,p_adjusted_BH=NA_real_),pw)
-  }))
-}
-
+#########
+# Write a table to OUT/tables
+#######
+# 1. Write d as a TSV with NA for missing values
 save_analysis_table <- function(d,name) fwrite(d,file.path(OUT,'tables',name),sep='\t',na='NA')
 
+#########
+# Pick the low, median and high Gini-Simpson promoters
+#######
+# 1. Sort valid promoters by Gini-Simpson
+# 2. Take the first, middle and last; label them Low / Intermediate / High
 # Lowest, median and highest Gini-Simpson promoters.
 representative_promoters <- function(d) {
   sorted <- d[is.finite(gini_simpson)][order(gini_simpson,gene_name)]
@@ -98,12 +121,20 @@ representative_promoters <- function(d) {
   representatives
 }
 
+#########
+# Gini-Simpson diversity and chromatin features per promoter
+#######
+# 1. Load gene panel, TSS locations and saved Shannon cluster proportions
+# 2. Per gene, re-check cluster counts against the original assignments
+# 3. Compute Gini-Simpson indices and write diversity tables
+# 4. Full mode: add +1 nucleosome, m6A and footprint features of assigned fibers
+# 5. Correlate features with Gini-Simpson and write feature tables
 main <- function() {
   dir.create(file.path(OUT,'tables'),recursive=TRUE,showWarnings=FALSE)
   mode <- Sys.getenv('GINI_MODE','full')
   stopifnot(mode %in% c('full','diversity-only'))
   # 2. Example gene list: exactly one existing promoter per gene in this dataset.
-  genes <- fread(file.path(PROJECT,'code/pausing/PolII/example_gene_list.tsv'))
+  genes <- fread(file.path(PROJECT,'code/Pol2/PolII/example_gene_list.tsv'))
   stopifnot(!anyDuplicated(genes$gene_name),!anyDuplicated(genes$gene_id),all(genes$group %in% GROUPS))
   locations <- fread(file.path(POLII,'read_features/tables/gene_features.tsv'))
   stopifnot(!anyDuplicated(locations$gene_name))
@@ -160,14 +191,13 @@ main <- function() {
   setnames(counts,'group','gene_group')
   save_analysis_table(d,'gini_simpson_molecule_cluster.tsv')
   save_analysis_table(counts,'cluster_proportions.tsv')
-  # 11. Promoter-level comparisons; every promoter contributes once, no depth matching.
+  # 11. Promoter-level group summary; every promoter contributes once, no depth matching.
   group_summary <- d[is.finite(gini_simpson),.(n_valid_genes=.N,
     median_gini_simpson=median(gini_simpson),q25=quantile(gini_simpson,.25),q75=quantile(gini_simpson,.75),
     iqr=IQR(gini_simpson),median_normalized_gini_simpson=finite_median(normalized_gini_simpson),
     median_inverse_simpson=median(inverse_simpson),median_cluster_count=finite_median(n_clusters),
     median_assigned_fibers=finite_median(n_fibers_assigned)),by=gene_group]
   save_analysis_table(group_summary,'simpson_group_summary.tsv')
-  save_analysis_table(group_comparisons(d),'simpson_group_tests.tsv')
   message('Diversity: ',sum(is.finite(d$gini_simpson)),' valid genes; ',sum(d$n_fibers_assigned),' assigned gene/fiber observations.')
   if(mode=='diversity-only') return(invisible(d))
 
