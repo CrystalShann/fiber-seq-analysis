@@ -84,3 +84,78 @@ add_quadratic_diversity <- function(d) {
   d$cluster_quadratic_diversity[valid] <- 1 / (1 - d$manhattan_between[valid])
   d
 }
+
+#########
+# GO biological-process terms ordered by where their genes sit in the diversity ranking
+#######
+# 1. Check the ranking: unique genes, ranks 1..N (1 = highest cluster_quadratic_diversity)
+# 2. Annotate panel genes with GO BP terms (GOALL, ancestor-propagated, ENSEMBL keys)
+# 3. Keep terms covering >= min_genes panel genes but not every panel gene
+# 4. Collapse terms with identical member sets, keeping the one smallest genome-wide
+# 5. Per term: members' median rank, shift from the panel median rank, rank percentile, median diversity
+# Descriptive only: the universe is the ranked panel, pooled across gene groups, no tests.
+# rank_shift < 0 means the term's genes sit toward high diversity, > 0 toward low.
+go_term_rank_shift <- function(d, min_genes = 5L) {
+  stopifnot(requireNamespace('org.Hs.eg.db', quietly = TRUE),
+    requireNamespace('GO.db', quietly = TRUE), requireNamespace('AnnotationDbi', quietly = TRUE))
+  d <- as.data.frame(d)
+  N <- nrow(d)
+  stopifnot(all(c('gene_id', 'gene_name', 'rank_highest_first', 'cluster_quadratic_diversity') %in% names(d)),
+    !anyDuplicated(d$gene_id), setequal(d$rank_highest_first, seq_len(N)))
+  org <- org.Hs.eg.db::org.Hs.eg.db
+  ann <- suppressMessages(AnnotationDbi::select(org, keys = intersect(d$gene_id,
+    AnnotationDbi::keys(org, keytype = 'ENSEMBL')), keytype = 'ENSEMBL', columns = c('GOALL', 'ONTOLOGYALL')))
+  ann <- unique(ann[!is.na(ann$GOALL) & ann$ONTOLOGYALL == 'BP', c('ENSEMBL', 'GOALL')])
+  sets <- lapply(split(ann$ENSEMBL, ann$GOALL), sort)
+  sets <- sets[lengths(sets) >= min_genes & lengths(sets) < N]
+  stopifnot(length(sets) > 0L)
+  # Genome-wide BP size per term, used to keep the most specific of identical sets.
+  genome_size <- lengths(AnnotationDbi::mget(names(sets), org.Hs.eg.db::org.Hs.egGO2ALLEGS))
+  key <- vapply(sets, paste, character(1), collapse = ';')
+  keep <- names(sets)[order(genome_size, names(sets))]
+  keep <- keep[!duplicated(key[keep])]
+  terms <- suppressMessages(AnnotationDbi::select(GO.db::GO.db, keys = names(sets),
+    keytype = 'GOID', columns = 'TERM'))
+  term_of <- setNames(terms$TERM, terms$GOID)
+  panel_median <- stats::median(seq_len(N))
+  go <- do.call(rbind, lapply(keep, function(id) {
+    i <- match(sets[[id]], d$gene_id); r <- d$rank_highest_first[i]
+    same <- setdiff(names(key)[key == key[[id]]], id)
+    data.frame(go_id = id, term = term_of[[id]], n_genes = length(i),
+      median_rank = stats::median(r), rank_shift = stats::median(r) - panel_median,
+      rank_percentile = (stats::median(r) - 0.5) / N,
+      median_diversity = stats::median(d$cluster_quadratic_diversity[i]),
+      gene_names = paste(d$gene_name[i][order(r)], collapse = ';'),
+      collapsed_terms = paste(term_of[same], collapse = ';'))
+  }))
+  go <- go[order(go$rank_shift, go$go_id), , drop = FALSE]
+  rownames(go) <- NULL
+  go
+}
+
+#########
+# Member-gene ranks for the GO terms shifted most toward high and low diversity
+#######
+# 1. Take the n_each most negative and n_each most positive rank_shift terms
+# 2. One row per term, one point per member gene at its diversity rank
+# 3. Mark each term's median rank (black diamond) and the panel median (dashed line)
+# Returns the ggplot; saving is left to the caller.
+plot_go_term_rank_shift <- function(go, d, n_each = 15L) {
+  d <- as.data.frame(d)
+  top <- unique(rbind(head(go, n_each), tail(go, n_each)))
+  pts <- do.call(rbind, lapply(seq_len(nrow(top)), function(j) {
+    g <- strsplit(top$gene_names[j], ';', fixed = TRUE)[[1]]
+    data.frame(label = sprintf('%s (n=%d)', top$term[j], top$n_genes[j]), gene_name = g,
+      rank = d$rank_highest_first[match(g, d$gene_name)])
+  }))
+  lev <- sprintf('%s (n=%d)', top$term, top$n_genes)
+  pts$label <- factor(pts$label, levels = rev(lev))
+  med <- data.frame(label = factor(lev, levels = rev(lev)), rank = top$median_rank)
+  ggplot2::ggplot(pts, ggplot2::aes(rank, label)) +
+    ggplot2::geom_vline(xintercept = stats::median(seq_len(nrow(d))), linetype = 'dashed', colour = 'grey50') +
+    ggplot2::geom_point(alpha = 0.5, size = 1.2, colour = 'grey30') +
+    ggplot2::geom_point(data = med, shape = 18, size = 3.5, colour = 'black') +
+    ggplot2::scale_x_continuous(limits = c(1, nrow(d)), breaks = c(1, 50, 100, nrow(d))) +
+    ggplot2::labs(x = 'Diversity rank (1 = highest cluster_quadratic_diversity)', y = NULL) +
+    ggplot2::theme_bw(base_size = 9)
+}

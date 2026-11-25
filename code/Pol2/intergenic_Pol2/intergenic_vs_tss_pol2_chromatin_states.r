@@ -200,7 +200,7 @@ run_states <- function() {
   fwrite(bp[order(axis, bin)], file.path(OUT, "chromhmm_bp_summary.tsv"), sep = "\t")
 
   # Pol II ChIP overlap per bin (promoters are ChIP peaks by definition: NA)
-  ranks <- b[, .(n = .N, median_fire_freq = median(fire_freq), median_fp_freq = median(fp_freq),
+  ranks <- b[, .(n = .N, median_fire_freq = median(fire_freq, na.rm = TRUE), median_fp_freq = median(fp_freq, na.rm = TRUE),
                  frac_pol2_chip = mean(in_pol2_chip)), by = .(axis, bin)][order(axis, bin)]
   fwrite(ranks, file.path(OUT, "rank_bin_summary.tsv"), sep = "\t")
 

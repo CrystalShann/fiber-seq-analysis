@@ -28,7 +28,7 @@ eqtl_pairs: /project/spott/cshan/annotations/LCL_public_data/GTEx_Analysis_v8_eQ
 pb_cpg_tools: /project/spott/cshan/envs/pb-CpG-tools/bin/aligned_bam_to_cpg_scores
 python: /project/spott/cshan/envs/Jupyter-notebook/bin/python3
 reference: /project/spott/cshan/annotations/hg38.fa
-grocap_plus: /project/spott/cshan/annotations/LCL_public_data/GRO_cap_ENCFF799JUK.bigWig
+grocap_plus: /project/spott/cshan/annotations/LCL_public_data/GRO-cap/GRO_cap_ENCFF799JUK.bigWig
 grocap_minus: /project/spott/cshan/annotations/LCL_public_data/GRO-cap/ENCFF368RBW.bigWig
 dnase: /project/spott/cshan/annotations/LCL_public_data/DNase.ENCFF743ULW.bigWig
 # GM12878 histone ChIP fold change over control, ENCODE4 GRCh38 reprocessing of the Broad

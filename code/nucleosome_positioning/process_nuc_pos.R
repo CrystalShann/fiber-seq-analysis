@@ -280,8 +280,50 @@ extract_tf_footprints <- function(reads, chr, view_start, view_end,
 # Footprints of every clustered read over its region's window, in genomic
 # (BED) and anchor-relative coordinates. One row per footprint; join to the
 # read table on (region_id, RID, sample_name) to attach cluster and timepoint.
+#   format = "bed13_fiberhmm" (default): FiberHMM footprints, as below.
+#   format = "bed12_fibertools": fibertools `ft extract` nucleosomes
+#     (<fire_dir>/extracted_results/nuc_by_chr/<sample>.ft_extracted_nuc.<chr>.bed.gz)
+#     read by extract_nucleosomes(): one tabix query per region window, the
+#     longest alignment of each read, sentinel blocks dropped, no size filter.
+#     Needs sample_table (sample_name, fire_dir); reads[[original_id_col]] must
+#     be the raw read names; no TF footprints.
 extract_region_footprints <- function(reads, anchors, input_paths = NULL, include_tf = TRUE,
-                                      original_id_col = "RID") {
+                                      original_id_col = "RID", format = "bed13_fiberhmm",
+                                      sample_table = NULL) {
+  stopifnot(format %in% c("bed13_fiberhmm", "bed12_fibertools"))
+  if (format == "bed12_fibertools") {
+    stopifnot(is.null(input_paths), !include_tf, !is.null(sample_table),
+      all(unique(reads$sample_name) %in% sample_table$sample_name),
+      !anyDuplicated(reads[, .(region_id, RID)]))
+    out <- list()
+    for (i in seq_len(nrow(anchors))) {
+      m <- anchors[i]
+      rr <- reads[region_id == m$region_id]
+      if (!nrow(rr)) next
+      # extract_nucleosomes() names fibertools reads "<sample>::<read>"
+      ids <- paste(rr$sample_name, rr[[original_id_col]], sep = "::")
+      stopifnot(!anyDuplicated(ids))
+      nuc <- extract_nucleosomes(
+        sample_table = as.data.frame(sample_table)[sample_table$sample_name %in% rr$sample_name, , drop = FALSE],
+        region = list(chr = m$chr, start = m$view_start - 1L, end = m$view_end,
+                      analysis_start = m$view_start, analysis_end = m$view_end),
+        assignments = data.frame(RID = ids, original_RID = rr[[original_id_col]]),
+        min_size = NULL, max_size = NULL)
+      if (!nrow(nuc)) next
+      k <- match(nuc$RID, ids)
+      fp <- data.table(region_id = m$region_id, RID = rr$RID[k], sample_name = rr$sample_name[k],
+        fp_class = "nucleosome", fp_start = nuc$start, fp_end = nuc$end, fp_size = as.integer(nuc$size))
+      fp[, c("rel_start", "rel_end") := rel_interval(fp_start + 1L, fp_end, m$anchor, m$strand)]
+      fp[, `:=`(fp_mid = (fp_start + 1L + fp_end) / 2, rel_mid = (rel_start + rel_end) / 2)]
+      out[[m$region_id]] <- fp
+      if (i %% 500L == 0L) message("fibertools nucleosomes: ", i, "/", nrow(anchors), " regions")
+    }
+    if (!length(out)) stop("No fibertools nucleosomes in any region window")
+    fp <- rbindlist(out)
+    setcolorder(fp, c("region_id", "RID", "sample_name", "fp_class", "fp_start", "fp_end",
+                      "fp_mid", "rel_start", "rel_end", "rel_mid", "fp_size"))
+    return(fp[])
+  }
   # Explicit per-sample paths support other cohorts without changing macrophage defaults.
   # Batch tabix queries return complete BED records; never clip block boundaries.
   if (!is.null(input_paths)) {

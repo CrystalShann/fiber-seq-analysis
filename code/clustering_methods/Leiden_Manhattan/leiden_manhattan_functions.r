@@ -168,6 +168,27 @@ leiden_manhattan_cluster_regions <- function(sample_names, regions, ft_result_di
 
 
 # ---------------------------------------------------------------------------
+# Strand-orient a reads x positions (or x features) matrix: the rows of reads
+# whose TSS strand is "-" are reversed, so transcription runs left to right
+# for every read. Used when reads from many promoters are pooled; the caller
+# must give minus-strand windows that cover the same TSS-relative positions
+# once mirrored (e.g. TSS -500..+499 on both strands).
+#
+# Inputs:
+#   mat    - reads x consecutive positions / features matrix
+#   strand - one "+" or "-" per row (the TSS strand, not the read strand)
+# Output:
+#   mat with the "-" rows reversed; dimnames unchanged
+# ---------------------------------------------------------------------------
+orient_rows_by_strand <- function(mat, strand) {
+  stopifnot(length(strand) == nrow(mat), all(strand %in% c("+", "-")))
+  minus <- which(strand == "-")
+  if (length(minus)) mat[minus, ] <- mat[minus, rev(seq_len(ncol(mat))), drop = FALSE]
+  mat
+}
+
+
+# ---------------------------------------------------------------------------
 # Step 1: read x feature matrix.
 #
 # window_size > 0: consecutive windows tiling [region_start, region_end]; a
@@ -479,21 +500,29 @@ cluster_feature_profiles <- function(feat_mat, cluster, na.rm = TRUE) {
 #   k_neighbors, sigma - see manhattan_knn_graph()
 #   resolution, seed   - see leiden_partition()
 #   verbose     - print feature, graph and cluster summaries
+#   orient_strand - TRUE reverses the reads whose rids_df[[strand_col]] is "-"
+#                 before binning (orient_rows_by_strand()), for reads pooled
+#                 from many promoters; FALSE (default) keeps the input
+#                 orientation, e.g. for one promoter
+#   strand_col  - rids_df column with each read's TSS strand ("+" / "-");
+#                 rids_df$strand is the read alignment strand, not the TSS's
 # Output:
-#   list(feat_mat, window_anno (from bin_read_matrix), assignments =
-#   data.frame(RID, cluster, sample_name, chr, start, end, strand), profiles =
-#   clusters x features means, graph, n_clusters, params = the settings plus
-#   k_eff, sigma, mean_knn_dist, Leiden quality, region_start / region_end,
-#   n_reads, n_features)
+#   list(feat_mat (oriented when orient_strand), window_anno (from
+#   bin_read_matrix), assignments = data.frame(RID, cluster, sample_name, chr,
+#   start, end, strand), profiles = clusters x features means, graph,
+#   n_clusters, params = the settings plus k_eff, sigma, mean_knn_dist, Leiden
+#   quality, region_start / region_end, n_reads, n_features, orient_strand)
 # ---------------------------------------------------------------------------
 leiden_manhattan_cluster <- function(met_mat, rids_df,
                                      region_start, region_end,
                                      window_size = 0,
                                      k_neighbors = 50,
                                      resolution = 1,
-                                     sigma = NULL, seed = 1, verbose = TRUE) {
+                                     sigma = NULL, seed = 1, verbose = TRUE,
+                                     orient_strand = FALSE, strand_col = "tss_strand") {
   rids_df <- rids_df[match(rownames(met_mat), as.character(rids_df$RID)), ]
   stopifnot(!any(is.na(rids_df$RID)))
+  if (orient_strand) met_mat <- orient_rows_by_strand(met_mat, rids_df[[strand_col]])
 
   ## step 1: read x feature matrix
   binned <- bin_read_matrix(met_mat, region_start, region_end, window_size)
@@ -556,7 +585,8 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
                           quality = part$quality,
                           seed = seed,
                           region_start = region_start, region_end = region_end,
-                          n_reads = nrow(feat), n_features = ncol(feat)))
+                          n_reads = nrow(feat), n_features = ncol(feat),
+                          orient_strand = orient_strand))
 }
 
 
@@ -593,6 +623,8 @@ leiden_manhattan_cluster <- function(met_mat, rids_df,
 #   n_partitions - Leiden runs per consensus round (default 100)
 #   tau          - co-clustering threshold (default 0.5)
 #   max_rounds   - consensus rounds before giving up
+#   orient_strand, strand_col - see leiden_manhattan_cluster(); TRUE when
+#                  pooling promoters
 # Output:
 #   as leiden_manhattan_cluster(); params also hold consensus, n_partitions,
 #   tau, n_rounds and converged (NA when consensus = FALSE). quality =
@@ -607,9 +639,11 @@ leiden_manhattan_consensus_cluster <- function(met_mat, rids_df,
                                                consensus = TRUE,
                                                n_partitions = 100,
                                                tau = 0.5, max_rounds = 10,
-                                               verbose = TRUE) {
+                                               verbose = TRUE,
+                                               orient_strand = FALSE, strand_col = "tss_strand") {
   rids_df <- rids_df[match(rownames(met_mat), as.character(rids_df$RID)), ]
   stopifnot(!any(is.na(rids_df$RID)))
+  if (orient_strand) met_mat <- orient_rows_by_strand(met_mat, rids_df[[strand_col]])
 
   binned <- bin_read_matrix(met_mat, region_start, region_end, window_size)
   feat   <- binned$mat
@@ -655,7 +689,8 @@ leiden_manhattan_consensus_cluster <- function(met_mat, rids_df,
                           n_rounds = if (consensus) part$n_rounds else NA_integer_,
                           converged = if (consensus) part$converged else NA,
                           region_start = region_start, region_end = region_end,
-                          n_reads = nrow(feat), n_features = ncol(feat)))
+                          n_reads = nrow(feat), n_features = ncol(feat),
+                          orient_strand = orient_strand))
 }
 
 

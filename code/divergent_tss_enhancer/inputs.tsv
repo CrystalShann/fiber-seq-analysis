@@ -1,0 +1,3 @@
+accession	strand	experiment	assembly	biological_replicate	technical_replicate	source_path
+ENCFF799JUK	+	ENCSR719WNF	GRCh38	1	1_1	/project/spott/cshan/annotations/LCL_public_data/GRO-cap/GRO_cap_ENCFF799JUK.bigWig
+ENCFF368RBW	-	ENCSR719WNF	GRCh38	1	1_1	/project/spott/cshan/annotations/LCL_public_data/GRO-cap/ENCFF368RBW.bigWig

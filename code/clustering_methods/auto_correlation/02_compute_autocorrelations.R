@@ -1,9 +1,20 @@
 # Mean-centered, variance-normalized linear ACF; columns are consecutive bases.
 # Lag k uses sum(x_centered[t] * x_centered[t+k]) / sum(x_centered^2).
-autocorrelations <- function(binary, n_features = NULL, positions = NULL, window = NULL) {
+# strand (optional, one "+"/"-" TSS strand per read): "-" reads are reversed
+# first, so positions / window are TSS-oriented (transcription to the right);
+# use it when pooling promoters. NULL keeps the input orientation. The
+# whole-window ACF is the same either way; sub-windows are not.
+autocorrelations <- function(binary, n_features = NULL, positions = NULL, window = NULL,
+                             strand = NULL) {
   x <- as.matrix(binary)
   if (length(dim(binary)) != 2L || ncol(x) < 2L)
     stop("Expected reads x consecutive genomic bases")
+  if (!is.null(strand)) {
+    if (length(strand) != nrow(x) || !all(strand %in% c("+", "-")))
+      stop("strand must give '+' or '-' for every read")
+    minus <- strand == "-"
+    x[minus, ] <- x[minus, rev(seq_len(ncol(x))), drop = FALSE]
+  }
   if (!is.null(window)) {
     if (is.null(positions)) stop("Window selection requires a position for each input column")
     if (length(positions) != ncol(x) || length(window) != 2L ||
